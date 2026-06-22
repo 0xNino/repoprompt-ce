@@ -1062,10 +1062,10 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
             currentTabID: rootTabID,
             searchText: ""
         )
-        XCTAssertEqual(initialRows.map(\.tabID), [rootTabID])
-        XCTAssertEqual(initialRows.first?.isThreadCollapsed, true)
-        XCTAssertEqual(initialRows.first?.hiddenThreadDescendantCount, 2)
-        XCTAssertEqual(viewModel.ui.sessionSidebar.snapshot.collapsedThreadKeys, [rootKey, childKey])
+        XCTAssertEqual(initialRows.map(\.tabID), [rootTabID, childTabID])
+        XCTAssertEqual(initialRows.map(\.isThreadCollapsed), [false, true])
+        XCTAssertEqual(initialRows.map(\.hiddenThreadDescendantCount), [0, 1])
+        XCTAssertEqual(viewModel.ui.sessionSidebar.snapshot.collapsedThreadKeys, [childKey])
 
         let activeGrandchildRows = viewModel.displaySidebarSessions(
             for: tabs,
@@ -1085,6 +1085,10 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
 
         viewModel.expandAllSidebarThreads(for: tabs, currentTabID: rootTabID)
         XCTAssertTrue(viewModel.ui.sessionSidebar.snapshot.collapsedThreadKeys.isEmpty)
+        XCTAssertEqual(
+            viewModel.ui.sessionSidebar.snapshot.defaultCollapsedThreadKeysHandled,
+            [rootKey, childKey]
+        )
         let expandedRows = viewModel.displaySidebarSessions(
             for: tabs,
             currentTabID: rootTabID,

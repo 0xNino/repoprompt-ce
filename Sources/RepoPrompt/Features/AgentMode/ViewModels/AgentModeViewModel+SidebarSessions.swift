@@ -449,15 +449,18 @@ extension AgentModeViewModel {
 
     private func seedDefaultCollapsedSidebarThreads(
         for tabs: [ComposeTabState],
-        currentTabID: UUID?,
-        diagnosticSource: String
+        currentTabID _: UUID?,
+        diagnosticSource _: String
     ) {
-        let eligibleKeys = collapsibleSidebarThreadKeys(
-            for: tabs,
-            currentTabID: currentTabID,
-            searchText: "",
-            diagnosticSource: diagnosticSource
-        )
+        let rows = sidebarSessions(for: tabs)
+        let eligibleKeys = rows.indices.compactMap { index -> AgentSidebarThreadKey? in
+            let nextIndex = rows.index(after: index)
+            guard rows[index].depth > 0,
+                  nextIndex < rows.endIndex,
+                  rows[nextIndex].depth > rows[index].depth
+            else { return nil }
+            return AgentSidebarThreadKey.key(sessionID: rows[index].sessionID, tabID: rows[index].tabID)
+        }
         ui.sessionSidebar.seedDefaultCollapsedThreads(eligibleKeys: eligibleKeys)
     }
 
