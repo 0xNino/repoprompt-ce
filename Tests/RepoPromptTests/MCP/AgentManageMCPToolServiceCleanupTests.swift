@@ -466,6 +466,7 @@ final class AgentManageMCPToolServiceCleanupTests: XCTestCase {
                         recorder.openDeleteTabIDs.append(tabID)
                         recorder.openDeleteWorkspaceIDs.append(workspace.id)
                     }
+                    return nil
                 },
                 deletePersistedSession: { sessionID, workspace in
                     if let deletePersistedSession {

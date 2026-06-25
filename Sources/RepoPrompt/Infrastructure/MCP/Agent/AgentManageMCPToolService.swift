@@ -13,7 +13,7 @@ struct AgentManageMCPToolService {
             _ viewModel: AgentModeViewModel,
             _ tabID: UUID,
             _ workspace: WorkspaceModel
-        ) async throws -> Void
+        ) async throws -> ProviderConversationCleanupOutcome?
         let deletePersistedSession: @MainActor (_ sessionID: UUID, _ workspace: WorkspaceModel) async throws -> Void
         let finalizePersistedReferences: @MainActor (
             _ viewModel: AgentModeViewModel,
@@ -835,6 +835,7 @@ struct AgentManageMCPToolService {
 
             var usedOpenTabAuthority = false
             do {
+                var providerCleanupOutcome: ProviderConversationCleanupOutcome?
                 let openTabID = candidate.tabID.flatMap { tabID -> UUID? in
                     guard targetWindow.workspaceManager.activeWorkspace?.id == workspace.id,
                           workspace.composeTabs.contains(where: { $0.id == tabID })
@@ -853,7 +854,11 @@ struct AgentManageMCPToolService {
                     #if DEBUG
                         let deleteOpenStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
                     #endif
-                    try await cleanupDependencies.deleteOpenSession(agentModeVM, openTabID, workspace)
+                    providerCleanupOutcome = try await cleanupDependencies.deleteOpenSession(
+                        agentModeVM,
+                        openTabID,
+                        workspace
+                    )
                     #if DEBUG
                         AgentModePerfDiagnostics.durationEvent(
                             "cleanup.sessions.deleteOpen",
@@ -869,6 +874,9 @@ struct AgentManageMCPToolService {
                         debugOpenDeletedCount += 1
                     #endif
                 } else {
+                    if let persistedSession = try? await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace) {
+                        providerCleanupOutcome = await agentModeVM.cleanupProviderConversationForPersistedAgentSession(persistedSession)
+                    }
                     #if DEBUG
                         let deletePersistedStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
                     #endif
@@ -901,11 +909,21 @@ struct AgentManageMCPToolService {
                         )
                     #endif
                 }
-                deletedSessions.append([
+                var deletedSession: [String: Value] = [
                     "session_id": .string(sessionID.uuidString),
                     "name": .string(candidate.name),
                     "durable": .bool(true)
-                ])
+                ]
+                if let providerCleanupOutcome {
+                    var cleanupObject: [String: Value] = [
+                        "status": .string(providerCleanupOutcome.status)
+                    ]
+                    if let message = providerCleanupOutcome.message {
+                        cleanupObject["message"] = .string(message)
+                    }
+                    deletedSession["provider_cleanup"] = .object(cleanupObject)
+                }
+                deletedSessions.append(deletedSession)
             } catch is CancellationError {
                 wasCancelled = true
                 skippedSessions.append([
