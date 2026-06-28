@@ -310,6 +310,25 @@ public struct ProviderConversationCleanupHandle: Codable, Equatable {
     public var hasProviderIdentifier: Bool {
         conversationID != nil || sessionID != nil || rolloutPath != nil
     }
+
+    static func resolved(
+        provider: String,
+        explicit: ProviderConversationCleanupHandle?,
+        providerSessionID: String?,
+        codexConversationID: String?,
+        codexRolloutPath: String?
+    ) -> ProviderConversationCleanupHandle? {
+        if let explicit, explicit.hasProviderIdentifier {
+            return explicit
+        }
+        let handle = ProviderConversationCleanupHandle(
+            provider: provider,
+            conversationID: codexConversationID,
+            sessionID: providerSessionID,
+            rolloutPath: codexRolloutPath
+        )
+        return handle.hasProviderIdentifier ? handle : nil
+    }
 }
 
 private extension String {

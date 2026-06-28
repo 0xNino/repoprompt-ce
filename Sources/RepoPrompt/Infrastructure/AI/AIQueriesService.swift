@@ -249,6 +249,11 @@ public class AIQueriesService {
         _ message: AIMessage,
         _ model: AIModel
     ) async throws -> (id: ChatStreamID, stream: AsyncThrowingStream<ChatStreamOutput, Error>)
+    typealias CleanupProviderConversationOverride = @Sendable (
+        _ handle: ProviderConversationCleanupHandle,
+        _ model: AIModel,
+        _ action: ProviderConversationCleanupAction
+    ) async -> ProviderConversationCleanupOutcome
 
     private let taskManager = TaskManager()
     private let chunkSizeThreshold = 8000 // e.g. 8KB
@@ -256,15 +261,18 @@ public class AIQueriesService {
     private let providerPool: DisposableProviderPool
     private let keyManager: KeyManager
     private let sendPromptOverride: SendPromptOverride?
+    private let cleanupProviderConversationOverride: CleanupProviderConversationOverride?
     private var currentModel: AIModel
 
     init(
         keyManager: KeyManager,
-        sendPromptOverride: SendPromptOverride? = nil
+        sendPromptOverride: SendPromptOverride? = nil,
+        cleanupProviderConversationOverride: CleanupProviderConversationOverride? = nil
     ) {
         currentModel = .claude4Sonnet
         self.keyManager = keyManager
         self.sendPromptOverride = sendPromptOverride
+        self.cleanupProviderConversationOverride = cleanupProviderConversationOverride
         providerPool = DisposableProviderPool(keyManager: keyManager)
     }
 
@@ -273,11 +281,13 @@ public class AIQueriesService {
         ollamaURL: URL? = nil,
         azureConfiguration: AzureOpenAIConfiguration? = nil,
         keyManager: KeyManager,
-        sendPromptOverride: SendPromptOverride? = nil
+        sendPromptOverride: SendPromptOverride? = nil,
+        cleanupProviderConversationOverride: CleanupProviderConversationOverride? = nil
     ) {
         currentModel = model
         self.keyManager = keyManager
         self.sendPromptOverride = sendPromptOverride
+        self.cleanupProviderConversationOverride = cleanupProviderConversationOverride
         providerPool = DisposableProviderPool(keyManager: keyManager)
     }
 
@@ -334,6 +344,9 @@ public class AIQueriesService {
         model: AIModel,
         action: ProviderConversationCleanupAction = .delete
     ) async -> ProviderConversationCleanupOutcome {
+        if let cleanupProviderConversationOverride {
+            return await cleanupProviderConversationOverride(handle, model, action)
+        }
         do {
             let provider = try await providerPool.createProvider(for: model)
             defer { Task { await provider.dispose() } }
