@@ -705,6 +705,7 @@ print_matches \
 # promoted into the contributor-facing documentation set.
 allowed_tracked_docs=(
   "docs/architecture/codex-app-server-schema-gate.md"
+  "docs/architecture/compose.md"
   "docs/architecture/provider-plugins.md"
   "docs/architecture/settings-persistence.md"
   "docs/architecture/source-layout.md"
