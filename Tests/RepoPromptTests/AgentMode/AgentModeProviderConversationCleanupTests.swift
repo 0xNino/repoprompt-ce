@@ -34,7 +34,7 @@ final class AgentModeProviderConversationCleanupTests: XCTestCase {
         XCTAssertEqual(calls.first?.action, .archive)
     }
 
-    func testDeleteSessionCleansLiveProviderConversationOnce() async {
+    func testDeleteSessionCleansLiveProviderConversationOnce() async throws {
         let previousAction = GlobalSettingsStore.shared.providerConversationCleanupAction()
         GlobalSettingsStore.shared.setProviderConversationCleanupAction(.archive, commit: false)
         defer { GlobalSettingsStore.shared.setProviderConversationCleanupAction(previousAction, commit: false) }
@@ -45,6 +45,7 @@ final class AgentModeProviderConversationCleanupTests: XCTestCase {
         let viewModel = makeViewModel(codexController: controller)
         let sessionID = UUID()
         let tabID = UUID()
+        let workspace = WorkspaceModel(name: "Provider cleanup", repoPaths: ["/tmp/workspace"])
         let session = viewModel.session(for: tabID)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         session.selectedAgent = .codexExec
@@ -55,7 +56,7 @@ final class AgentModeProviderConversationCleanupTests: XCTestCase {
             rolloutPath: "/tmp/delete-rollout.jsonl"
         )
 
-        let outcome = await viewModel.deleteSession(tabID: tabID)
+        let outcome = try await viewModel.deleteSession(tabID: tabID, workspace: workspace)
 
         XCTAssertEqual(outcome, .succeeded(message: "controller cleanup"))
         let calls = controller.cleanupCalls()

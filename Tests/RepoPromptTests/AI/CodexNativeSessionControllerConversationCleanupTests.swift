@@ -83,7 +83,7 @@ final class CodexNativeSessionControllerConversationCleanupTests: XCTestCase {
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,
-            workspacePath: "/tmp/workspace",
+            workspacePaths: .uniform("/tmp/workspace"),
             requestExecutor: { method, params, timeout in
                 try recorder.handle(method: method, params: params, timeout: timeout)
             }

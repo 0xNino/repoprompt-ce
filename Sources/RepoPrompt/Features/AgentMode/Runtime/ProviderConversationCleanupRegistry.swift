@@ -51,7 +51,7 @@ struct ProviderConversationCleanupRegistry {
                 requestExecutor: { method, params, timeout in
                     try await client.request(method: method, params: params, timeout: timeout)
                 },
-                timeout: CodexNativeSessionController.Options.agentModeDefault(forceExperimentalSteering: true).requestTimeout
+                timeout: CodexNativeSessionController.Options.agentModeDefault().requestTimeout
             )
             let outcome = await cleanup.cleanup(handle, action: action)
             await client.stop()
