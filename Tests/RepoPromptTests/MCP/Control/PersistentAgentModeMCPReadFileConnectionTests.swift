@@ -897,8 +897,12 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 ]
             )
             let structureText = try Self.readFileText(from: structureResponse, id: 15)
-            XCTAssertTrue(structureText.contains("- **Status**: `unavailable`"), structureText)
-            XCTAssertTrue(structureText.contains("`git_root_unavailable`"), structureText)
+            XCTAssertTrue(
+                structureText.contains("## Code Structure ❌ unavailable — requested root is unavailable"),
+                structureText
+            )
+            XCTAssertTrue(structureText.contains("- Resolve the reported root issue, then retry."), structureText)
+            XCTAssertFalse(structureText.contains("git_root_unavailable"), structureText)
             let work = MCPToolWorkCountDiagnostics.debugSnapshots().git
             XCTAssertEqual(work.count, 1)
             XCTAssertEqual(work.first?.operation, MCPWindowToolName.getCodeStructure)
