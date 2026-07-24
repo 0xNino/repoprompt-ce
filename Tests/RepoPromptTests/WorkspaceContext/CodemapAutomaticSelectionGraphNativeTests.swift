@@ -608,6 +608,60 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         XCTAssertEqual(cleaned.values.map(\.fileID), [target.id])
     }
 
+    func testDefaultCandidateDemandCapRejects1025Targets() {
+        let policy = WorkspaceCodemapAutomaticSelectionRequestPolicy.default
+
+        XCTAssertNil(policy.candidateDemandLimitIssue(attemptedCount: 1024))
+        XCTAssertEqual(
+            policy.candidateDemandLimitIssue(attemptedCount: 1025),
+            .budget(.targetDemandLimit(attempted: 1025, limit: 1024))
+        )
+    }
+
+    func testCandidateDemandCapStopsBeforeTargetDemandLoop() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let rootURL = try repository.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "protocol SourceProtocol { var first: FirstTarget { get }; var second: SecondTarget { get } }\n",
+                "Sources/First.swift": "struct FirstTarget {}\n",
+                "Sources/Second.swift": "struct SecondTarget {}\n"
+            ]
+        )
+        let fixture = try CodemapStoreFixture(name: #function, syntheticGraphArtifacts: true)
+        addTeardownBlock {
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+        let store = fixture.makeStore()
+        let root = try await store.loadRoot(path: rootURL.path)
+        let files = await store.files(inRoot: root.id)
+        let source = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Source.swift" })
+        let first = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/First.swift" })
+        let second = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Second.swift" })
+        _ = try await waitForAutomaticSelection(
+            store: store,
+            sourceFileIDs: [source.id],
+            expectedTargetFileIDs: [first.id, second.id]
+        )
+        let ticketOffset = fixture.demandedTickets.values.count
+        let service = WorkspaceSelectionMutationService(
+            store: store,
+            automaticSelectionPolicy: .init(maximumCandidateDemandCount: 1)
+        )
+
+        let result = try await service.resolveAutomaticCodemapSelection(sourceFileIDs: [source.id])
+
+        let issue = WorkspaceCodemapAutomaticSelectionIssue.budget(
+            .targetDemandLimit(attempted: 2, limit: 1)
+        )
+        XCTAssertEqual(result.status, .unavailable)
+        XCTAssertEqual(result.aggregateCoverage, .unavailable([issue]))
+        XCTAssertEqual(result.targets, [])
+        XCTAssertNil(result.receipt)
+        XCTAssertEqual(fixture.demandedTickets.values.count, ticketOffset)
+    }
+
     func testRootReloadAndVisibleScopeChangesInvalidateReceipts() async throws {
         let repository = try ReviewGitRepositoryFixture(name: #function)
         let rootURL = try repository.makeRepository(

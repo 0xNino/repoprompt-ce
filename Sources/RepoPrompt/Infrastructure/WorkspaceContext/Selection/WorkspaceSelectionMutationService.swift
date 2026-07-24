@@ -71,6 +71,16 @@ struct WorkspaceCodemapAutomaticSelectionRequestPolicy: Equatable {
         self.maximumTotalWait = maximumTotalWait
         self.maximumCandidateDemandCount = maximumCandidateDemandCount
     }
+
+    func candidateDemandLimitIssue(
+        attemptedCount: Int
+    ) -> WorkspaceCodemapAutomaticSelectionIssue? {
+        guard attemptedCount > maximumCandidateDemandCount else { return nil }
+        return .budget(.targetDemandLimit(
+            attempted: attemptedCount,
+            limit: maximumCandidateDemandCount
+        ))
+    }
 }
 
 struct WorkspaceCodemapAutomaticSelectionWaiter {
@@ -817,6 +827,14 @@ struct WorkspaceSelectionMutationService {
                 rootScope: rootScope
             )
             let initiallyValid = Set(initialRevalidation.validTargets)
+            if let issue = automaticSelectionPolicy.candidateDemandLimitIssue(
+                attemptedCount: initiallyValid.count
+            ) {
+                return WorkspaceCodemapAutomaticSelectionResult(
+                    roots: [],
+                    aggregateCoverage: .unavailable([issue])
+                )
+            }
             var resultsByTarget: [WorkspaceCodemapAutomaticSelectionTarget: WorkspaceCodemapArtifactDemandResult] = [:]
             var ticketsByTarget: [WorkspaceCodemapAutomaticSelectionTarget: WorkspaceCodemapArtifactDemandTicket] = [:]
             let rootReceiptByEpoch = Dictionary(uniqueKeysWithValues: receipt.roots.map { ($0.rootEpoch, $0) })
