@@ -135,17 +135,16 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             - `expand`: Optional `uses`, `used_by`, or `both`; omit for seeds only.
             - `depth`: Relationship depth 1...4 (default 1; meaningful only with `expand`).
             - `signatures`: Include codemap signature text (default true). False performs no artifact demands.
-            - `max_tokens`: Whole-response budget (default 6000), silently clamped to 1000...25000.
+            - `size`: Output size `small`, `medium` (default), or `large`.
 
             Inspect per-root results in mixed workspaces. `updates_pending` graph data is usable.
-            When `truncated` is present, rerun the same call with a larger `max_tokens` value.
-            Seeds render before related files, so small budgets preserve the graph and degrade signature text gracefully.
+            When `truncated` is present, rerun the same call with the next larger `size`.
+            Seeds render before related files, so small outputs preserve the graph and degrade signature text gracefully.
 
             Examples:
             - Signatures for a folder: {"paths":["Sources/Auth/"]}
-            - Who uses a file: {"paths":["Sources/Auth/SessionStore.swift"],"expand":"used_by"}
-            - Selection dependencies: {"expand":"uses"}
-            - Graph only: {"paths":["Sources/Auth/SessionStore.swift"],"expand":"both","depth":2,"signatures":false}
+            - Who uses a file with large output: {"paths":["Sources/Auth/SessionStore.swift"],"expand":"used_by","size":"large"}
+            - Cheap graph-only sweep: {"expand":"both","depth":2,"signatures":false,"size":"small"}
             """,
             annotations: .repoPromptLocalReadOnly,
             inputSchema: .object(
@@ -160,7 +159,10 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     ),
                     "depth": .integer(description: "Relationship depth 1...4 (default 1)"),
                     "signatures": .boolean(description: "Include codemap signature text (default true)"),
-                    "max_tokens": .integer(description: "Whole-response budget; clamped to 1000...25000 (default 6000)")
+                    "size": .string(
+                        description: "Output size (default medium)",
+                        enum: ["small", "medium", "large"]
+                    )
                 ],
                 required: [],
                 additionalProperties: .boolean(false)
@@ -171,9 +173,9 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     operation: MCPWindowToolName.getCodeStructure
                 ) {
                     try Task.checkCancellation()
-                    let allowedKeys: Set = ["paths", "expand", "depth", "signatures", "max_tokens"]
+                    let allowedKeys: Set = ["paths", "expand", "depth", "signatures", "size"]
                     guard Set(args.keys).isSubset(of: allowedKeys) else {
-                        throw MCPError.invalidParams("unknown or deprecated get_code_structure parameter")
+                        throw MCPError.invalidParams("unknown get_code_structure parameter")
                     }
 
                     let direction: WorkspaceCodemapStructureTraversalDirection?
@@ -214,23 +216,26 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                         includesSignatures = true
                     }
 
-                    let requestedMaxTokens: Int
-                    if let value = args["max_tokens"] {
-                        guard let maxTokens = value.intValue else {
-                            throw MCPError.invalidParams("max_tokens must be an integer")
+                    let size: WorkspaceCodemapGraphOutputSize
+                    if let value = args["size"] {
+                        guard let rawSize = value.stringValue,
+                              let parsedSize = WorkspaceCodemapGraphOutputSize(rawValue: rawSize)
+                        else {
+                            throw MCPError.invalidParams("size must be 'small', 'medium', or 'large'")
                         }
-                        requestedMaxTokens = maxTokens
+                        size = parsedSize
                     } else {
-                        requestedMaxTokens = WorkspaceCodemapGraphPolicy.initial.defaultTokenCount
+                        size = .medium
                     }
                     let budget = WorkspaceCodemapGraphPolicy.initial.queryBudget(
-                        maximumTokenCount: requestedMaxTokens,
+                        size: size,
                         includesSignatures: includesSignatures
                     )
                     let request = MCPServerViewModel.CodeStructureRequest(
                         direction: direction,
                         maximumDepth: direction == nil ? 0 : suppliedDepth,
                         includesSignatures: includesSignatures,
+                        size: size,
                         budget: budget
                     )
 
@@ -245,6 +250,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     try Task.checkCancellation()
 
                     let files: [WorkspaceFileRecord]
+                    var requestedPaths: [String] = []
                     if let pathsValue = args["paths"] {
                         guard let rawPaths = pathsValue.arrayValue,
                               !rawPaths.isEmpty,
@@ -254,6 +260,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                             throw MCPError.invalidParams("paths must contain one to 256 strings")
                         }
                         let translated = lookupContext.translateInputPaths(rawPaths.compactMap(\.stringValue))
+                        requestedPaths = translated
                         for path in translated {
                             try Task.checkCancellation()
                             if let issue = await dependencies.promptVM.workspaceFileContextStore
@@ -289,6 +296,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                         files,
                         request,
                         true,
+                        requestedPaths,
                         lookupContext
                     )
                     try Task.checkCancellation()

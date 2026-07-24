@@ -82,7 +82,7 @@ enum ToolArgsDTOs {
         let expand: String?
         let depth: Int?
         let signatures: Bool?
-        let maxTokens: Int?
+        let size: String?
     }
 
     struct ManageSelectionArgs: Decodable {

@@ -2988,7 +2988,7 @@ func printUsage() {
         get_code_structure (structure, map) - Traverse root-local code graphs
           structure                                   Current selection, seed nodes only
           structure src/auth/ --expand uses --depth 2  Traverse referenced definitions
-          get_code_structure paths=["src/"] signatures=false max_tokens=12000
+          get_code_structure paths=["src/"] signatures=false size=large
 
         workspace_context (context) - Get workspace snapshot
           context                                      Default snapshot

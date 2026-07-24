@@ -418,6 +418,7 @@ enum ToolResultDTOs {
         }
 
         let status: Status
+        let size: WorkspaceCodemapGraphOutputSize
         let roots: [RootDTO]
         let files: [FileDTO]
         let summary: SummaryDTO
@@ -425,8 +426,28 @@ enum ToolResultDTOs {
         let retry: RetryDTO?
         let worktreeScope: WorktreeScopeDTO?
 
+        init(
+            status: Status,
+            size: WorkspaceCodemapGraphOutputSize,
+            roots: [RootDTO],
+            files: [FileDTO],
+            summary: SummaryDTO,
+            issues: [IssueDTO],
+            retry: RetryDTO?,
+            worktreeScope: WorktreeScopeDTO?
+        ) {
+            self.status = status
+            self.size = size
+            self.roots = roots
+            self.files = files
+            self.summary = summary
+            self.issues = issues
+            self.retry = retry
+            self.worktreeScope = worktreeScope
+        }
+
         private enum CodingKeys: String, CodingKey {
-            case status, roots, files, summary, issues, retry
+            case status, size, roots, files, summary, issues, retry
             case worktreeScope = "worktree_scope"
         }
     }

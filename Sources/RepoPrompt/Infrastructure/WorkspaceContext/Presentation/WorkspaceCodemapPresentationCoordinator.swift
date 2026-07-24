@@ -526,8 +526,8 @@ struct WorkspaceCodemapPresentationCoordinator {
         rootScope: WorkspaceLookupRootScope,
         logicalRootDisplayNamesByRootID: [UUID: String],
         ownership: WorkspaceCodemapOperationPresentationOwnership,
-        clock _: ContinuousClock,
-        deadline _: ContinuousClock.Instant
+        clock: ContinuousClock,
+        deadline: ContinuousClock.Instant
     ) async throws -> AutomaticPreparation {
         let sourceCollection = await store.codemapOperationPresentationCandidates(
             forFileIDs: sourceFileIDs,
@@ -586,6 +586,7 @@ struct WorkspaceCodemapPresentationCoordinator {
         )
         let validTargets = Set(initialRevalidation.validTargets)
         let rootReceipts = Dictionary(uniqueKeysWithValues: receipt.roots.map { ($0.rootEpoch, $0) })
+        var demandedTargetFileIDs: [UUID] = []
         for target in selection.targets where validTargets.contains(target) {
             guard let rootReceipt = rootReceipts[target.rootEpoch],
                   let owned = await store.requestAutomaticCodemapTargetWithOwnership(
@@ -596,6 +597,16 @@ struct WorkspaceCodemapPresentationCoordinator {
                   )
             else { continue }
             await ownership.record(owned)
+            demandedTargetFileIDs.append(target.fileID)
+        }
+        if !demandedTargetFileIDs.isEmpty {
+            _ = try await demand(
+                fileIDs: demandedTargetFileIDs,
+                priority: .background,
+                ownership: ownership,
+                clock: clock,
+                deadline: deadline
+            )
         }
 
         let collection = await store.codemapOperationPresentationCandidates(

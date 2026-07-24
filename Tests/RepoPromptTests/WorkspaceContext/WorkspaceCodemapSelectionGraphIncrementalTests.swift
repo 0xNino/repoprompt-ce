@@ -429,7 +429,7 @@ final class WorkspaceCodemapSelectionGraphIncrementalTests: XCTestCase {
         ))
         XCTAssertEqual(bounded.nodes.map(\.fileID), [seedID, firstTargetID])
         XCTAssertEqual(bounded.truncation?.droppedNodeCount, 1)
-        XCTAssertTrue(bounded.issues.contains(.maxTokens))
+        XCTAssertTrue(bounded.issues.contains(.sizeLimit))
     }
 
     func testAutomaticSelectionQueriesCommittedSnapshotWithoutSourceArtifactDemand() async throws {

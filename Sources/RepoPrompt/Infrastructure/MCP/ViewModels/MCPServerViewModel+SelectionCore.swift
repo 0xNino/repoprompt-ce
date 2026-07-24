@@ -260,10 +260,7 @@ extension MCPServerViewModel {
     }
 
     enum SelectionReplyAssembler {
-        private static let codemapPresentationPolicy = WorkspaceCodemapPresentationRequestPolicy(
-            maximumReadinessRounds: 1,
-            maximumTotalWait: .zero
-        )
+        private static let codemapPresentationPolicy = WorkspaceCodemapPresentationRequestPolicy.default
 
         struct SelectedEntry {
             let entry: ResolvedPromptFileEntry

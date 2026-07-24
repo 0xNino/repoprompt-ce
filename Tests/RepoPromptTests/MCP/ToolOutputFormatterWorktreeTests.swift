@@ -243,7 +243,7 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         }
     }
 
-    func testCodeStructureOutputShowsTypedPendingIssueAndWorktreeScope() throws {
+    func testCodeStructurePendingOutputUsesSemanticRecoveryAndWorktreeScope() throws {
         let issue = ToolResultDTOs.CodeStructureReplyDTO.IssueDTO(
             code: "graph_indexing",
             phase: "graph_snapshot",
@@ -256,6 +256,7 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         )
         let dto = ToolResultDTOs.CodeStructureReplyDTO(
             status: .pending,
+            size: .medium,
             roots: [
                 .init(
                     root: "Project",
@@ -279,13 +280,15 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
 
         let text = try Self.onlyText(ToolOutputFormatter.formatCodeStructure(value: Self.value(dto)))
 
-        XCTAssertTrue(text.contains("## Code Structure ⚠️"), text)
-        XCTAssertTrue(text.contains("**Status**: `pending`"), text)
-        XCTAssertTrue(text.contains("`graph_indexing`"), text)
-        XCTAssertTrue(text.contains("`Project/Sources/App.swift`"), text)
-        XCTAssertTrue(text.contains("codemap scans use"), text)
-        XCTAssertTrue(text.contains("Displayed paths use logical/canonical roots"), text)
-        XCTAssertTrue(text.contains("`Project` → session-bound worktree"), text)
+        XCTAssertTrue(text.contains("## Code Structure ⏳ pending — `Sources/App.swift` is not in the code graph yet"), text)
+        XCTAssertTrue(text.contains("- Retry shortly. If this persists, the file may be excluded or of an unsupported type."), text)
+        XCTAssertFalse(text.contains("**Status**"), text)
+        XCTAssertFalse(text.contains("Index:"), text)
+        XCTAssertFalse(text.contains("≈"), text)
+        XCTAssertFalse(text.contains("Unresolved"), text)
+        XCTAssertFalse(text.contains("Internal refs"), text)
+        XCTAssertFalse(text.contains("`Project/Sources/App.swift`"), text)
+        XCTAssertTrue(text.contains("- Root `Project` — paths below are root-relative; session-bound worktree `wt_123`"), text)
         XCTAssertFalse(text.contains("/repo/project"), text)
         XCTAssertFalse(text.contains("/tmp/worktrees/project-agent"), text)
         XCTAssertTrue(text.contains("wt_123"), text)

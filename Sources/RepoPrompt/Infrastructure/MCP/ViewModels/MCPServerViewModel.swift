@@ -223,7 +223,22 @@ final class MCPServerViewModel: ObservableObject {
         let direction: WorkspaceCodemapStructureTraversalDirection?
         let maximumDepth: Int
         let includesSignatures: Bool
+        let size: WorkspaceCodemapGraphOutputSize
         let budget: WorkspaceCodemapGraphQueryBudget
+
+        init(
+            direction: WorkspaceCodemapStructureTraversalDirection?,
+            maximumDepth: Int,
+            includesSignatures: Bool,
+            size: WorkspaceCodemapGraphOutputSize,
+            budget: WorkspaceCodemapGraphQueryBudget
+        ) {
+            self.direction = direction
+            self.maximumDepth = maximumDepth
+            self.includesSignatures = includesSignatures
+            self.size = size
+            self.budget = budget
+        }
     }
 
     private static let maximumCodeStructureSeedCount = 8192
@@ -1459,12 +1474,13 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { throw MCPError.internalError("Window deallocated while performing file action") }
             return try await performFileAction(action: action, path: path, content: content, newPath: newPath, ifExists: ifExists, operationID: operationID)
         },
-        buildCodeStructureDTO: { [weak self] files, request, includePathNotFoundIssue, lookupContext in
+        buildCodeStructureDTO: { [weak self] files, request, includePathNotFoundIssue, requestedPaths, lookupContext in
             guard let self else { throw MCPError.internalError("Window deallocated while building code structure") }
             return try await buildCodeStructureDTO(
                 fromRecords: files,
                 request: request,
                 includePathNotFoundIssue: includePathNotFoundIssue,
+                requestedPaths: requestedPaths,
                 lookupContext: lookupContext
             )
         },
@@ -5043,6 +5059,7 @@ final class MCPServerViewModel: ObservableObject {
         fromRecords files: [WorkspaceFileRecord],
         request: CodeStructureRequest,
         includePathNotFoundIssue: Bool,
+        requestedPaths: [String] = [],
         lookupContext: WorkspaceLookupContext = .visibleWorkspace
     ) async throws -> ToolResultDTOs.CodeStructureReplyDTO {
         try Task.checkCancellation()
@@ -5064,6 +5081,7 @@ final class MCPServerViewModel: ObservableObject {
                     limit: nil,
                     message: "Codemap generation is disabled."
                 ),
+                size: request.size,
                 worktreeScope: worktreeScope
             )
         }
@@ -5084,6 +5102,7 @@ final class MCPServerViewModel: ObservableObject {
                     limit: nil,
                     message: "The session-bound worktree root is unavailable."
                 ),
+                size: request.size,
                 worktreeScope: worktreeScope
             )
         }
@@ -5101,13 +5120,14 @@ final class MCPServerViewModel: ObservableObject {
                 issue: .init(
                     code: "path_not_found",
                     phase: "seed_resolution",
-                    path: nil,
+                    path: requestedPaths.first,
                     retryable: false,
                     retryAfterMilliseconds: nil,
                     attempted: nil,
                     limit: nil,
                     message: "No requested path resolved to a file."
                 ),
+                size: request.size,
                 worktreeScope: worktreeScope
             )
         }
@@ -5189,6 +5209,7 @@ final class MCPServerViewModel: ObservableObject {
             revalidation: revalidation,
             includesSignatures: request.includesSignatures,
             budget: request.budget,
+            size: request.size,
             worktreeScope: worktreeScope
         )
     }
@@ -5199,6 +5220,7 @@ final class MCPServerViewModel: ObservableObject {
         revalidation: [WorkspaceCodemapRootEpoch: WorkspaceCodemapStructureGraphRevalidationResult],
         includesSignatures: Bool,
         budget: WorkspaceCodemapGraphQueryBudget,
+        size: WorkspaceCodemapGraphOutputSize,
         worktreeScope: ToolResultDTOs.WorktreeScopeDTO?
     ) -> ToolResultDTOs.CodeStructureReplyDTO {
         typealias DTO = ToolResultDTOs.CodeStructureReplyDTO
@@ -5212,51 +5234,63 @@ final class MCPServerViewModel: ObservableObject {
             root.nodes.map { ($0.fileID, $0.path) }
         })
         var globalIssues = aggregate.issues.map(codeStructureIssueDTO)
+        let signatureIssueCoverage: CodeStructureSignatureIssueCoverage
         if let presentation {
             globalIssues.append(contentsOf: presentation.issues.map {
                 codeStructureSignatureIssueDTO($0, pathByFileID: pathByFileID)
             })
+            signatureIssueCoverage = codeStructureSignatureIssueCoverage(presentation.issues)
+        } else {
+            signatureIssueCoverage = CodeStructureSignatureIssueCoverage()
         }
 
         var renderedFiles: [DTO.FileDTO] = []
         var renderedFileIDs = Set<UUID>()
+        var sizeOmittedFileIDs = Set<UUID>()
         var renderedTokenCount = 0
         let separatorTokens = TokenCalculationService.estimateTokens(for: "\n\n")
         var signatureBudgetReached = false
         if includesSignatures, let presentation {
-            for root in orderedRoots {
-                if case .invalid? = revalidation[root.rootEpoch] { continue }
-                for node in root.nodes {
-                    guard let rendered = presentation.renderedEntriesByFileID[node.fileID] else { continue }
-                    let separator = renderedFiles.isEmpty ? 0 : separatorTokens
-                    let attempted = renderedTokenCount + separator + rendered.tokenCount
-                    guard attempted <= budget.renderTokenCount else {
-                        signatureBudgetReached = true
-                        continue
-                    }
-                    renderedTokenCount = attempted
-                    renderedFileIDs.insert(node.fileID)
-                    renderedFiles.append(DTO.FileDTO(
-                        path: node.path,
-                        role: node.isSeed ? "seed" : "related",
-                        depth: node.depth,
-                        reachedBy: node.reachedBy.map(codeStructureDirectionName).sorted(),
-                        content: rendered.text,
-                        tokens: rendered.tokenCount
-                    ))
+            let orderedSignatureNodes: [WorkspaceCodemapStructureNodeResult] = orderedRoots.flatMap { root -> [WorkspaceCodemapStructureNodeResult] in
+                if case .invalid? = revalidation[root.rootEpoch] { return [] }
+                return root.nodes
+            }.sorted { lhs, rhs in
+                if lhs.isSeed != rhs.isSeed { return lhs.isSeed }
+                if lhs.depth != rhs.depth { return lhs.depth < rhs.depth }
+                if lhs.path != rhs.path { return lhs.path.utf8.lexicographicallyPrecedes(rhs.path.utf8) }
+                return lhs.fileID.uuidString < rhs.fileID.uuidString
+            }
+            for node in orderedSignatureNodes {
+                guard let rendered = presentation.renderedEntriesByFileID[node.fileID] else { continue }
+                let separator = renderedFiles.isEmpty ? 0 : separatorTokens
+                let attempted = renderedTokenCount + separator + rendered.tokenCount
+                guard attempted <= budget.renderTokenCount else {
+                    signatureBudgetReached = true
+                    sizeOmittedFileIDs.insert(node.fileID)
+                    continue
                 }
+                renderedTokenCount = attempted
+                renderedFileIDs.insert(node.fileID)
+                renderedFiles.append(DTO.FileDTO(
+                    path: node.path,
+                    role: node.isSeed ? "seed" : "related",
+                    depth: node.depth,
+                    reachedBy: node.reachedBy.map(codeStructureDirectionName).sorted(),
+                    content: rendered.text,
+                    tokens: rendered.tokenCount
+                ))
             }
         }
         if signatureBudgetReached {
             globalIssues.append(DTO.IssueDTO(
-                code: "signature_max_tokens",
+                code: "signature_size_limit",
                 phase: "render",
                 path: nil,
                 retryable: false,
                 retryAfterMilliseconds: nil,
                 attempted: nil,
-                limit: budget.renderTokenCount,
-                message: "Some signatures were omitted to preserve the max_tokens budget."
+                limit: nil,
+                message: "Some signatures were omitted to fit the requested output size."
             ))
         }
 
@@ -5269,7 +5303,21 @@ final class MCPServerViewModel: ObservableObject {
             } else {
                 false
             }
-            var rootIssues = root.issues.map(codeStructureIssueDTO)
+            let coverage = root.coverage
+            var rootIssues = root.issues.map { issue in
+                let mapped = codeStructureIssueDTO(issue)
+                guard issue.code == "seed_not_indexed", coverage?.isComplete != true else { return mapped }
+                return DTO.IssueDTO(
+                    code: mapped.code,
+                    phase: mapped.phase,
+                    path: mapped.path,
+                    retryable: true,
+                    retryAfterMilliseconds: 100,
+                    attempted: mapped.attempted,
+                    limit: mapped.limit,
+                    message: mapped.message
+                )
+            }
             if case let .invalid(code, message)? = graphRevalidation {
                 rootIssues.append(DTO.IssueDTO(
                     code: code,
@@ -5282,8 +5330,12 @@ final class MCPServerViewModel: ObservableObject {
                     message: message
                 ))
             }
-            let missingSignature = includesSignatures && root.nodes.contains {
-                !renderedFileIDs.contains($0.fileID)
+            let signatureIssueCoversRoot = signatureIssueCoverage.coversAll ||
+                signatureIssueCoverage.rootEpochs.contains(root.rootEpoch)
+            let missingSignature = includesSignatures && !graphInvalid && !signatureIssueCoversRoot && root.nodes.contains {
+                !renderedFileIDs.contains($0.fileID) &&
+                    !sizeOmittedFileIDs.contains($0.fileID) &&
+                    !signatureIssueCoverage.fileIDs.contains($0.fileID)
             }
             if missingSignature {
                 rootIssues.append(DTO.IssueDTO(
@@ -5304,7 +5356,6 @@ final class MCPServerViewModel: ObservableObject {
             } else {
                 .ok
             }
-            let coverage = root.coverage
             rootDTOs.append(DTO.RootDTO(
                 root: root.rootDisplayName,
                 status: status,
@@ -5341,7 +5392,7 @@ final class MCPServerViewModel: ObservableObject {
                     )
                 },
                 truncated: graphInvalid ? nil : root.truncation.map {
-                    DTO.TruncatedDTO(reason: "max_tokens", droppedNodes: $0.droppedNodeCount)
+                    DTO.TruncatedDTO(reason: "size", droppedNodes: $0.droppedNodeCount)
                 },
                 issues: rootIssues
             ))
@@ -5361,6 +5412,7 @@ final class MCPServerViewModel: ObservableObject {
         let retryableIssues = allIssues.filter(\.retryable)
         return DTO(
             status: status,
+            size: size,
             roots: rootDTOs,
             files: renderedFiles,
             summary: DTO.SummaryDTO(
@@ -5381,10 +5433,12 @@ final class MCPServerViewModel: ObservableObject {
 
     private static func codeStructureUnavailableReply(
         issue: ToolResultDTOs.CodeStructureReplyDTO.IssueDTO,
+        size: WorkspaceCodemapGraphOutputSize,
         worktreeScope: ToolResultDTOs.WorktreeScopeDTO?
     ) -> ToolResultDTOs.CodeStructureReplyDTO {
         ToolResultDTOs.CodeStructureReplyDTO(
             status: .unavailable,
+            size: size,
             roots: [],
             files: [],
             summary: .init(seeds: 0, nodes: 0, edges: 0, files: 0, tokens: 0),
@@ -5399,16 +5453,60 @@ final class MCPServerViewModel: ObservableObject {
     private static func codeStructureIssueDTO(
         _ issue: WorkspaceCodemapStructureIssueRecord
     ) -> ToolResultDTOs.CodeStructureReplyDTO.IssueDTO {
-        .init(
+        let isSizeIssue = ["graph_size_limit", "signature_size_limit"].contains(issue.code)
+        return .init(
             code: issue.code,
             phase: issue.phase,
             path: issue.path,
             retryable: issue.retryable,
             retryAfterMilliseconds: issue.retryAfterMilliseconds,
-            attempted: issue.attempted,
-            limit: issue.limit,
+            attempted: isSizeIssue ? nil : issue.attempted,
+            limit: isSizeIssue ? nil : issue.limit,
             message: issue.message
         )
+    }
+
+    private struct CodeStructureSignatureIssueCoverage {
+        var fileIDs = Set<UUID>()
+        var rootEpochs = Set<WorkspaceCodemapRootEpoch>()
+        var coversAll = false
+    }
+
+    private static func codeStructureSignatureIssueCoverage(
+        _ issues: [WorkspaceCodemapOperationIssue]
+    ) -> CodeStructureSignatureIssueCoverage {
+        var coverage = CodeStructureSignatureIssueCoverage()
+        for issue in issues {
+            switch issue {
+            case .coordinationUnavailable, .cancelled, .automatic:
+                coverage.coversAll = true
+            case let .candidate(candidate):
+                switch candidate {
+                case let .fileNotCataloged(fileID),
+                     let .fileOutsideRootScope(fileID),
+                     let .logicalPathUnavailable(fileID):
+                    coverage.fileIDs.insert(fileID)
+                case let .incompleteRootSet(missingFileIDs):
+                    coverage.fileIDs.formUnion(missingFileIDs)
+                }
+            case let .pending(fileID, _), let .unavailable(fileID, _):
+                coverage.fileIDs.insert(fileID)
+            case let .freezeUnavailable(rootEpoch, _), let .renderUnavailable(rootEpoch, _):
+                coverage.rootEpochs.insert(rootEpoch)
+            case let .publicationStale(reason):
+                switch reason {
+                case .rootScope, .automatic:
+                    coverage.coversAll = true
+                case let .rootEpoch(rootEpoch), let .bundle(rootEpoch, _):
+                    coverage.rootEpochs.insert(rootEpoch)
+                case let .catalog(fileID):
+                    coverage.fileIDs.insert(fileID)
+                case let .demand(ticket):
+                    coverage.fileIDs.insert(ticket.fileID)
+                }
+            }
+        }
+        return coverage
     }
 
     private static func codeStructureSignatureIssueDTO(

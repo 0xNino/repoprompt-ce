@@ -61,7 +61,7 @@ enum WorkspaceCodemapGraphStructureIssue: Hashable {
     case seedNotIndexed(UUID)
     case seedExcluded(UUID)
     case seedFenced(UUID)
-    case maxTokens
+    case sizeLimit
     case deadline
     case graphRevoked(WorkspaceCodemapGraphRevocationReason)
     case graphPending

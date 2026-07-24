@@ -7,7 +7,7 @@ import XCTest
 
 @MainActor
 final class MCPCodeStructureWorktreeTests: XCTestCase {
-    func testPublishedSchemaHasExactlyFiveFlatOptionalFieldsAndRejectsDeprecatedUnknownFields() async throws {
+    func testPublishedSchemaHasExactlyFiveFlatOptionalFieldsAndRejectsUnknownFields() async throws {
         let root = try makeTemporaryRoot(name: #function)
         let fileURL = root.appendingPathComponent("Sources/App.swift")
         try write("struct App {}\n", to: fileURL)
@@ -16,72 +16,92 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
         let schema = try XCTUnwrap(Value(tool.inputSchema).objectValue)
         let properties = try XCTUnwrap(schema["properties"]?.objectValue)
-        XCTAssertEqual(Set(properties.keys), Set(["paths", "expand", "depth", "signatures", "max_tokens"]))
+        XCTAssertEqual(Set(properties.keys), Set(["paths", "expand", "depth", "signatures", "size"]))
         XCTAssertNotEqual(schema["required"]?.arrayValue?.isEmpty, false)
         XCTAssertEqual(schema["additionalProperties"]?.boolValue, false)
         XCTAssertEqual(
             properties["expand"]?.objectValue?["enum"]?.arrayValue?.compactMap(\.stringValue),
             ["uses", "used_by", "both"]
         )
+        XCTAssertEqual(
+            properties["size"]?.objectValue?["enum"]?.arrayValue?.compactMap(\.stringValue),
+            ["small", "medium", "large"]
+        )
 
-        let rejected: [[String: Value]] = [
-            ["scope": .string("selected")],
-            ["limits": .object(["max_files": .int(10)])],
-            ["max_results": .int(10)],
-            ["expand": .object(["direction": .string("both")])],
-            ["paths": .array([.string(fileURL.path)]), "unknown": .bool(true)]
+        let arguments: [String: Value] = [
+            "paths": .array([.string(fileURL.path)]),
+            "unexpected": .bool(true)
         ]
-        for arguments in rejected {
-            do {
-                _ = try await ServerNetworkManager.withConnectionID(connectionID) {
-                    try await tool(arguments)
-                }
-                XCTFail("Expected deprecated or unknown arguments to be rejected: \(arguments)")
-            } catch {
-                XCTAssertTrue(
-                    String(describing: error).contains("unknown or deprecated") ||
-                        String(describing: error).contains("expand must"),
-                    "Unexpected error for \(arguments): \(error)"
-                )
+        do {
+            _ = try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await tool(arguments)
             }
+            XCTFail("Expected an unknown argument to be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("unknown get_code_structure parameter"))
         }
     }
 
-    func testOnlyMaxTokensClampsAndFlatArgumentsDecodeStrictly() async throws {
+    func testSemanticSizeMappingAndFlatArgumentsDecodeStrictly() async throws {
         let root = try makeTemporaryRoot(name: #function)
         let fileURL = root.appendingPathComponent("Sources/App.swift")
         try write("struct App {}\n", to: fileURL)
         let window = try await makeWindow(root: root)
         let (tool, connectionID) = try await boundCodeStructureTool(window: window)
 
-        func invoke(maxTokens: Int) async throws -> MCPServerViewModel.CodeStructureRequest {
+        func invoke(size: String?) async throws -> (
+            request: MCPServerViewModel.CodeStructureRequest,
+            reply: ToolResultDTOs.CodeStructureReplyDTO
+        ) {
             window.mcpServer.resetLastCodeStructureRequestForTesting()
-            _ = try await ServerNetworkManager.withConnectionID(connectionID) {
-                try await tool([
-                    "paths": .array([.string(fileURL.path)]),
-                    "expand": .string("both"),
-                    "depth": .int(4),
-                    "signatures": .bool(false),
-                    "max_tokens": .int(maxTokens)
-                ])
+            var arguments: [String: Value] = [
+                "paths": .array([.string(fileURL.path)]),
+                "expand": .string("both"),
+                "depth": .int(4),
+                "signatures": .bool(false)
+            ]
+            if let size { arguments["size"] = .string(size) }
+            let value = try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await tool(arguments)
             }
-            return try XCTUnwrap(window.mcpServer.capturedCodeStructureRequestForTesting())
+            return try (
+                XCTUnwrap(window.mcpServer.capturedCodeStructureRequestForTesting()),
+                XCTUnwrap(value.decode(ToolResultDTOs.CodeStructureReplyDTO.self))
+            )
         }
 
-        let minimum = try await invoke(maxTokens: 1)
-        XCTAssertEqual(minimum.direction, .both)
-        XCTAssertEqual(minimum.maximumDepth, 4)
-        XCTAssertFalse(minimum.includesSignatures)
-        XCTAssertEqual(minimum.budget.maximumTokenCount, 1000)
-        XCTAssertEqual(minimum.budget.renderTokenCount, 0)
+        let small = try await invoke(size: "small")
+        XCTAssertEqual(small.request.direction, .both)
+        XCTAssertEqual(small.request.maximumDepth, 4)
+        XCTAssertFalse(small.request.includesSignatures)
+        XCTAssertEqual(small.request.size, .small)
+        XCTAssertEqual(small.request.budget.maximumTokenCount, 2000)
+        XCTAssertEqual(small.request.budget.renderTokenCount, 0)
+        XCTAssertEqual(small.reply.size, .small)
 
-        let maximum = try await invoke(maxTokens: 100_000)
-        XCTAssertEqual(maximum.budget.maximumTokenCount, 25000)
+        let medium = try await invoke(size: nil)
+        XCTAssertEqual(medium.request.size, .medium)
+        XCTAssertEqual(medium.request.budget.maximumTokenCount, 6000)
+        XCTAssertEqual(medium.reply.size, .medium)
+
+        let large = try await invoke(size: "large")
+        XCTAssertEqual(large.request.size, .large)
+        XCTAssertEqual(large.request.budget.maximumTokenCount, 25000)
+        XCTAssertEqual(large.reply.size, .large)
+
+        let currentData = try JSONEncoder().encode(large.reply)
+        let roundTrippedReply = try JSONDecoder().decode(
+            ToolResultDTOs.CodeStructureReplyDTO.self,
+            from: currentData
+        )
+        XCTAssertEqual(roundTrippedReply, large.reply)
 
         let invalid: [[String: Value]] = [
             ["paths": .array([.string(fileURL.path)]), "expand": .string("referenced_definitions")],
             ["paths": .array([.string(fileURL.path)]), "depth": .int(0)],
-            ["paths": .array([.string(fileURL.path)]), "signatures": .int(1)]
+            ["paths": .array([.string(fileURL.path)]), "signatures": .int(1)],
+            ["paths": .array([.string(fileURL.path)]), "size": .string("extra_large")],
+            ["paths": .array([.string(fileURL.path)]), "size": .int(6000)]
         ]
         for arguments in invalid {
             do {
@@ -184,7 +204,8 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             presentation: presentation,
             revalidation: [root.rootEpoch: .valid(updatesPending: true)],
             includesSignatures: true,
-            budget: WorkspaceCodemapGraphPolicy.initial.queryBudget(maximumTokenCount: 6000, includesSignatures: true),
+            budget: WorkspaceCodemapGraphPolicy.initial.queryBudget(size: .medium, includesSignatures: true),
+            size: .medium,
             worktreeScope: nil
         )
 
@@ -194,6 +215,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         XCTAssertEqual(reply.roots.first?.updatesPending, true)
         XCTAssertTrue(reply.roots.first?.issues.contains { $0.code == "watcher_gap_reconciling" } == true)
         XCTAssertTrue(reply.issues.contains { $0.code == "signature_render_failed" })
+        XCTAssertFalse(reply.roots.flatMap(\.issues).contains { $0.code == "signature_unavailable" })
 
         let renderedNode = try XCTUnwrap(root.nodes.first)
         let pipeline = try SyntaxManager().pipelineIdentity(
@@ -230,15 +252,110 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             )],
             includesSignatures: true,
             budget: WorkspaceCodemapGraphPolicy.initial.queryBudget(
-                maximumTokenCount: 6000,
+                size: .medium,
                 includesSignatures: true
             ),
+            size: .medium,
             worktreeScope: nil
         )
         XCTAssertEqual(invalidated.status, .unavailable)
         XCTAssertTrue(invalidated.files.isEmpty)
         XCTAssertTrue(invalidated.roots.first?.nodes.isEmpty == true)
         XCTAssertTrue(invalidated.roots.first?.edges.isEmpty == true)
+        XCTAssertFalse(invalidated.roots.flatMap(\.issues).contains { $0.code == "signature_unavailable" })
+    }
+
+    func testConstrainedMultiRootSignaturesRemainGloballySeedFirst() throws {
+        let pipeline = try SyntaxManager().pipelineIdentity(
+            for: .swift,
+            decoderPolicy: .workspaceAutomaticV1
+        )
+        let rootASeedOnly = structureRoot(name: "A", status: .ok, useful: true)
+        let rootASeed = try XCTUnwrap(rootASeedOnly.nodes.first)
+        let relatedID = UUID()
+        let relatedPath = "A/Sources/Related.swift"
+        let rootA = WorkspaceCodemapStructureRootResult(
+            rootEpoch: rootASeedOnly.rootEpoch,
+            rootDisplayName: rootASeedOnly.rootDisplayName,
+            status: rootASeedOnly.status,
+            coverage: rootASeedOnly.coverage,
+            updatesPending: rootASeedOnly.updatesPending,
+            seeds: rootASeedOnly.seeds,
+            nodes: [
+                rootASeed,
+                .init(fileID: relatedID, path: relatedPath, depth: 1, isSeed: false, reachedBy: [.referencedDefinitions])
+            ],
+            edges: [],
+            unresolved: [],
+            truncation: nil,
+            issues: [],
+            receipt: nil
+        )
+        let rootB = structureRoot(name: "B", status: .ok, useful: true)
+        let rootBSeed = try XCTUnwrap(rootB.nodes.first)
+
+        func entry(
+            node: WorkspaceCodemapStructureNodeResult,
+            root: WorkspaceCodemapStructureRootResult,
+            digestByte: UInt8
+        ) throws -> WorkspaceCodemapOperationRenderedEntry {
+            let relativePath = String(node.path.dropFirst(root.rootDisplayName.count + 1))
+            return try WorkspaceCodemapOperationRenderedEntry(
+                bundleID: WorkspaceCodemapFrozenPresentationBundleID(),
+                fileID: node.fileID,
+                rootEpoch: root.rootEpoch,
+                artifactKey: CodeMapArtifactKey(
+                    rawSHA256: CodeMapRawSourceDigest(bytes: Data(repeating: digestByte, count: 32)),
+                    rawByteCount: 20,
+                    pipelineIdentity: pipeline
+                ),
+                logicalPath: XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+                    rootDisplayName: root.rootDisplayName,
+                    standardizedRelativePath: relativePath
+                )),
+                text: "struct Rendered{}",
+                tokenCount: 10
+            )
+        }
+
+        let presentation = try WorkspaceCodemapOperationPresentation(
+            orderedEntries: [
+                entry(node: rootASeed, root: rootA, digestByte: 1),
+                entry(
+                    node: .init(fileID: relatedID, path: relatedPath, depth: 1, isSeed: false, reachedBy: [.referencedDefinitions]),
+                    root: rootA,
+                    digestByte: 2
+                ),
+                entry(node: rootBSeed, root: rootB, digestByte: 3)
+            ],
+            coverage: .complete,
+            issues: [],
+            publicationReceipt: nil
+        )
+        let reply = MCPServerViewModel.codeStructureReplyDTO(
+            aggregate: .init(status: .ok, roots: [rootA, rootB], issues: []),
+            presentation: presentation,
+            revalidation: [:],
+            includesSignatures: true,
+            budget: WorkspaceCodemapGraphQueryBudget(
+                maximumTokenCount: 2000,
+                maximumNodeCount: 40,
+                maximumEdgeCount: 4000,
+                maximumGraphByteCount: 32000,
+                graphEvidenceTokenCount: 500,
+                renderTokenCount: 20 + TokenCalculationService.estimateTokens(for: "\n\n")
+            ),
+            size: .small,
+            worktreeScope: nil
+        )
+
+        XCTAssertEqual(reply.files.map(\.path), [rootASeed.path, rootBSeed.path])
+        XCTAssertEqual(reply.files.map(\.role), ["seed", "seed"])
+        XCTAssertEqual(reply.size, .small)
+        XCTAssertTrue(reply.issues.contains { $0.code == "signature_size_limit" })
+        XCTAssertNil(reply.issues.first { $0.code == "signature_size_limit" }?.attempted)
+        XCTAssertNil(reply.issues.first { $0.code == "signature_size_limit" }?.limit)
+        XCTAssertFalse(reply.roots.flatMap(\.issues).contains { $0.code == "signature_unavailable" })
     }
 
     func testDeterministicTruncationAndNodeOrderingAreStable() throws {
@@ -259,7 +376,7 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             edges: [.init(fromPath: "Project/A.swift", toPath: "Project/B.swift", symbols: ["B"], ambiguous: false)],
             unresolved: [],
             truncation: .init(droppedNodeCount: 3),
-            issues: [.init(code: "max_tokens", phase: "graph_traversal", path: nil, retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil, message: "Truncated")],
+            issues: [.init(code: "graph_size_limit", phase: "graph_traversal", path: nil, retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil, message: "Truncated to fit the requested output size.")],
             receipt: nil
         )
         let first = assemble(roots: [root], aggregateStatus: .partial, includesSignatures: false)
@@ -267,8 +384,64 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
 
         XCTAssertEqual(first, second)
         XCTAssertEqual(first.roots.first?.nodes.map(\.path), ["Project/A.swift", "Project/B.swift"])
-        XCTAssertEqual(first.roots.first?.truncated?.reason, "max_tokens")
+        XCTAssertEqual(first.roots.first?.truncated?.reason, "size")
+        XCTAssertEqual(first.roots.first?.issues.first?.code, "graph_size_limit")
+        XCTAssertNil(first.roots.first?.issues.first?.attempted)
+        XCTAssertNil(first.roots.first?.issues.first?.limit)
+        XCTAssertEqual(first.size, .medium)
         XCTAssertEqual(first.roots.first?.truncated?.droppedNodes, 3)
+    }
+
+    func testUnavailableBuilderEchoesRequestedPathWithoutChangingDTOShape() async throws {
+        let root = try makeTemporaryRoot(name: #function)
+        let window = try await makeWindow(root: root)
+        let requestedPath = "Project/Sources/Missing.swift"
+
+        let reply = try await window.mcpServer.buildCodeStructureDTO(
+            fromRecords: [],
+            request: codeStructureRequest(includesSignatures: false),
+            includePathNotFoundIssue: true,
+            requestedPaths: [requestedPath],
+            lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
+        )
+
+        XCTAssertEqual(reply.status, .unavailable)
+        XCTAssertEqual(reply.issues.first?.code, "path_not_found")
+        XCTAssertEqual(reply.issues.first?.path, requestedPath)
+    }
+
+    func testAssemblerMakesSeedNotIndexedRetryableOnlyWhileIndexing() {
+        let seedIssue = WorkspaceCodemapStructureIssueRecord(
+            code: "seed_not_indexed",
+            phase: "graph_snapshot",
+            path: "Project/Sources/App.swift",
+            retryable: false,
+            retryAfterMilliseconds: nil,
+            attempted: nil,
+            limit: nil,
+            message: "The seed is not indexed."
+        )
+        let pending = structureRoot(name: "Project", status: .pending, useful: false)
+        let root = WorkspaceCodemapStructureRootResult(
+            rootEpoch: pending.rootEpoch,
+            rootDisplayName: pending.rootDisplayName,
+            status: pending.status,
+            coverage: nil,
+            updatesPending: pending.updatesPending,
+            seeds: pending.seeds,
+            nodes: pending.nodes,
+            edges: pending.edges,
+            unresolved: pending.unresolved,
+            truncation: pending.truncation,
+            issues: [seedIssue],
+            receipt: nil
+        )
+
+        let reply = assemble(roots: [root], aggregateStatus: .pending, includesSignatures: false)
+
+        XCTAssertEqual(reply.roots.first?.issues.first?.retryable, true)
+        XCTAssertEqual(reply.roots.first?.issues.first?.retryAfterMilliseconds, 100)
+        XCTAssertEqual(reply.retry?.retryable, true)
     }
 
     private func assemble(
@@ -282,9 +455,10 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             revalidation: [:],
             includesSignatures: includesSignatures,
             budget: WorkspaceCodemapGraphPolicy.initial.queryBudget(
-                maximumTokenCount: 6000,
+                size: .medium,
                 includesSignatures: includesSignatures
             ),
+            size: .medium,
             worktreeScope: nil
         )
     }
@@ -324,8 +498,9 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             direction: nil,
             maximumDepth: 0,
             includesSignatures: includesSignatures,
+            size: .medium,
             budget: WorkspaceCodemapGraphPolicy.initial.queryBudget(
-                maximumTokenCount: 6000,
+                size: .medium,
                 includesSignatures: includesSignatures
             )
         )

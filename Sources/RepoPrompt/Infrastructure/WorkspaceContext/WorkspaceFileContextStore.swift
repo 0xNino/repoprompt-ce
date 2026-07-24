@@ -12867,7 +12867,7 @@ actor WorkspaceFileContextStore {
                     edges: [],
                     unresolved: [],
                     truncation: WorkspaceCodemapGraphStructureTruncation(droppedNodeCount: rootSeedIDs.count),
-                    issues: [.maxTokens]
+                    issues: [.sizeLimit]
                 )
             } else if let session = codemapSessionsByRootEpoch[rootEpoch],
                       codemapAuthorityIsCurrent(session.authority),
@@ -13197,8 +13197,8 @@ actor WorkspaceFileContextStore {
             .init(code: "seed_excluded", phase: "graph_snapshot", path: path(fileID), retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil, message: "The seed is excluded from codemap indexing.")
         case let .seedFenced(fileID):
             .init(code: "seed_fenced", phase: "graph_revalidation", path: path(fileID), retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil, message: "The seed crossed a destructive safety fence.")
-        case .maxTokens:
-            .init(code: "max_tokens", phase: "graph_traversal", path: nil, retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil, message: "Graph output was deterministically truncated; rerun with a larger max_tokens value.")
+        case .sizeLimit:
+            .init(code: "graph_size_limit", phase: "graph_traversal", path: nil, retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil, message: "Graph output was deterministically truncated to fit the requested output size.")
         case .deadline:
             .init(code: "graph_deadline", phase: "graph_traversal", path: nil, retryable: true, retryAfterMilliseconds: 100, attempted: nil, limit: nil, message: "The fixed graph traversal deadline was reached; partial data remains usable.")
         case .graphRevoked:

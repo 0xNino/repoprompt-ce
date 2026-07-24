@@ -324,7 +324,7 @@ enum MCPToolArgsNormalizer {
         case "file_search":
             return common.union(["pattern", "regex", "mode", "context_lines", "count_only", "max_results"])
         case "get_code_structure":
-            return common.union(["paths", "expand", "depth", "signatures", "max_tokens"])
+            return common.union(["paths", "expand", "depth", "signatures", "size"])
         default:
             return common // conservative fallback
         }

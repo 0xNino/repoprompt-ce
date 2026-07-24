@@ -1,5 +1,11 @@
 import Foundation
 
+enum WorkspaceCodemapGraphOutputSize: String, Codable, CaseIterable, Hashable {
+    case small
+    case medium
+    case large
+}
+
 struct WorkspaceCodemapGraphQueryBudget: Hashable {
     let maximumTokenCount: Int
     let maximumNodeCount: Int
@@ -37,7 +43,7 @@ struct WorkspaceCodemapGraphPolicy: Hashable {
     let candidateOverflowThreshold: UInt64
     let graphSizePolicy: WorkspaceCodemapSelectionGraphSizePolicy
 
-    // The public max_tokens value clamps; all other query limits derive here.
+    // Semantic output sizes map to these internal token budgets; callers never set them directly.
     let minimumTokenCount: Int
     let defaultTokenCount: Int
     let maximumTokenCount: Int
@@ -82,6 +88,8 @@ struct WorkspaceCodemapGraphPolicy: Hashable {
               candidateOverflowThreshold > 0,
               candidateOverflowThreshold == graphSizePolicy.maxDefinitionCandidates,
               minimumTokenCount >= 1000,
+              minimumTokenCount <= 2000,
+              defaultTokenCount >= 2000,
               minimumTokenCount <= defaultTokenCount,
               defaultTokenCount <= maximumTokenCount,
               maximumTokenCount <= 25000,
@@ -113,6 +121,21 @@ struct WorkspaceCodemapGraphPolicy: Hashable {
         self.queryGraphByteCountPerToken = queryGraphByteCountPerToken
         self.renderedEvidenceBudgetNumerator = renderedEvidenceBudgetNumerator
         self.renderedEvidenceBudgetDenominator = renderedEvidenceBudgetDenominator
+    }
+
+    func queryBudget(
+        size: WorkspaceCodemapGraphOutputSize,
+        includesSignatures: Bool
+    ) -> WorkspaceCodemapGraphQueryBudget {
+        let tokenCount = switch size {
+        case .small: 2000
+        case .medium: defaultTokenCount
+        case .large: maximumTokenCount
+        }
+        return queryBudget(
+            maximumTokenCount: tokenCount,
+            includesSignatures: includesSignatures
+        )
     }
 
     func queryBudget(

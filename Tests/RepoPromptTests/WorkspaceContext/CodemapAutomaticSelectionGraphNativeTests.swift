@@ -752,6 +752,133 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         XCTAssertEqual(targets.map(\.fileID), [second.id])
     }
 
+    @MainActor
+    func testPendingViewModelSelectionRetriesWhenMarkerBecomesReadyWithoutRootStatusChange() async throws {
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let rootURL = try repository.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "protocol SourceProtocol { var target: Target { get } }\n",
+                "Sources/Target.swift": "struct Target {}\n"
+            ]
+        )
+        let fixture = try CodemapStoreFixture(name: #function, syntheticGraphArtifacts: true)
+        let readyPublication = TestReleaseFence(name: "delayed automatic target readiness")
+        addTeardownBlock {
+            readyPublication.release()
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+        let store = fixture.makeStore(readyPublicationHook: { _ in
+            await readyPublication.enterAndWait()
+        })
+        let root = try await store.loadRoot(path: rootURL.path)
+        let files = await store.files(inRoot: root.id)
+        let source = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Source.swift" })
+        let target = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/Target.swift" })
+        _ = try await waitForAutomaticSelection(
+            store: store,
+            sourceFileIDs: [source.id],
+            expectedTargetFileIDs: [target.id]
+        )
+
+        let manager = WorkspaceFilesViewModel(
+            workspaceFileContextStore: store,
+            automaticCodemapSelectionRequestPolicy: .init(
+                maximumReadinessRounds: 1,
+                initialBackoffMilliseconds: 1,
+                maximumBackoffMilliseconds: 1,
+                maximumTotalWait: .milliseconds(1)
+            ),
+            automaticCodemapReadinessRetryDelay: .milliseconds(500)
+        )
+        _ = try manager.attachRootShell(for: root, workspaceID: UUID())
+        let sourceViewModelValue = await manager.materializeFileForUserInput(source.standardizedFullPath)
+        let sourceViewModel = try XCTUnwrap(sourceViewModelValue)
+        manager.selectFileForTesting(sourceViewModel)
+        let clock = ContinuousClock()
+        let retryDeadline = clock.now.advanced(by: .seconds(3))
+        while fixture.demandedTickets.values.count < 2, clock.now < retryDeadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        XCTAssertTrue(manager.autoCodemapFiles.isEmpty)
+        let unchangedRootStatus = manager.codemapRootStatus(rootID: root.id)
+        XCTAssertEqual(fixture.demandedTickets.values.map(\.fileID), [target.id, target.id])
+
+        readyPublication.release()
+        let deadline = clock.now.advanced(by: .seconds(5))
+        while manager.autoCodemapFiles.map(\.id) != [target.id], clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+
+        XCTAssertEqual(manager.autoCodemapFiles.map(\.id), [target.id])
+        XCTAssertFalse(manager.automaticCodemapReadinessRetryPendingForTesting)
+        XCTAssertFalse(manager.automaticCodemapReadinessRetryTaskActiveForTesting)
+        XCTAssertEqual(
+            manager.codemapRootStatus(rootID: root.id)?.availability,
+            unchangedRootStatus?.availability
+        )
+        XCTAssertEqual(fixture.demandedTickets.values.map(\.fileID), [target.id, target.id])
+        XCTAssertTrue(readyPublication.hasEntered)
+
+        let presentation = try await WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            policy: WorkspaceCodemapPresentationRequestPolicy(
+                maximumReadinessRounds: 32,
+                initialBackoffMilliseconds: 5,
+                maximumBackoffMilliseconds: 50,
+                maximumTotalWait: .seconds(5)
+            )
+        ).presentation(
+            for: .automatic(sourceFileIDs: [source.id]),
+            rootScope: .visibleWorkspace,
+            logicalRootDisplayNamesByRootID: [root.id: rootURL.lastPathComponent]
+        )
+        XCTAssertEqual(presentation.orderedEntries.map(\.fileID), [target.id])
+        if case .pending = presentation.coverage {
+            XCTFail("Automatic presentation must wait for the target instead of returning pending.")
+        }
+        await manager.unloadAllRootFolders()
+    }
+
+    @MainActor
+    func testPartialResultWithPendingSiblingRequiresReadinessRetryAfterPublishing() throws {
+        let rootEpoch = WorkspaceCodemapRootEpoch(
+            rootID: UUID(),
+            rootLifetimeID: UUID()
+        )
+        let readyTarget = try WorkspaceCodemapAutomaticSelectionTarget(
+            rootEpoch: rootEpoch,
+            fileID: UUID(),
+            catalogGeneration: 4,
+            requestGeneration: 7,
+            logicalPath: XCTUnwrap(WorkspaceCodemapLogicalPresentationPath(
+                rootDisplayName: "repository",
+                standardizedRelativePath: "Sources/Ready.swift"
+            ))
+        )
+        let pendingFileID = UUID()
+        let root = WorkspaceCodemapAutomaticSelectionRootResult(
+            rootEpoch: rootEpoch,
+            status: .partial,
+            targets: [readyTarget],
+            sources: [],
+            issues: [.targetDemandPending(rootEpoch: rootEpoch, fileID: pendingFileID)],
+            coverage: nil,
+            graphTargetCount: 2,
+            graphResolutionCount: 1,
+            graphReferenceFailureCount: 0,
+            graphByteCount: 128,
+            receipt: nil
+        )
+        let result = WorkspaceCodemapAutomaticSelectionResult(roots: [root])
+
+        XCTAssertEqual(result.status, .partial)
+        XCTAssertEqual(result.targets, [readyTarget])
+        XCTAssertTrue(WorkspaceFilesViewModel.automaticCodemapResultNeedsReadinessRetry(result))
+    }
+
     private func waitForAutomaticSelection(
         store: WorkspaceFileContextStore,
         sourceFileIDs: [UUID],

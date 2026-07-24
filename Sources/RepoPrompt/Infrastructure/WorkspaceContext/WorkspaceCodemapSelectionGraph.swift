@@ -821,7 +821,7 @@ actor WorkspaceCodemapSelectionGraph {
             return String(describing: lhs.reason) < String(describing: rhs.reason)
         }
 
-        if truncated { issues.append(.maxTokens) }
+        if truncated { issues.append(.sizeLimit) }
         if deadlineReached { issues.append(.deadline) }
         let hasPartialIssue = !issues.isEmpty || unresolved.contains { $0.reason == .notIndexedYet }
         return WorkspaceCodemapGraphStructureRootResult(

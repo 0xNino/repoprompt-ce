@@ -317,6 +317,15 @@ final class WorkspaceCodemapGraphFoundationModelTests: XCTestCase {
         XCTAssertEqual(clampedLow.graphEvidenceTokenCount, 250)
         XCTAssertEqual(clampedLow.renderTokenCount, 750)
 
+        let small = policy.queryBudget(size: .small, includesSignatures: true)
+        let medium = policy.queryBudget(size: .medium, includesSignatures: true)
+        let large = policy.queryBudget(size: .large, includesSignatures: true)
+        XCTAssertEqual(small.maximumTokenCount, 2000)
+        XCTAssertEqual(medium.maximumTokenCount, 6000)
+        XCTAssertEqual(large.maximumTokenCount, policy.maximumTokenCount)
+        XCTAssertLessThan(small.maximumTokenCount, medium.maximumTokenCount)
+        XCTAssertLessThan(medium.maximumTokenCount, large.maximumTokenCount)
+
         let graphOnly = policy.queryBudget(maximumTokenCount: Int.max, includesSignatures: false)
         XCTAssertEqual(graphOnly.maximumTokenCount, 25000)
         XCTAssertEqual(graphOnly.maximumNodeCount, 200)

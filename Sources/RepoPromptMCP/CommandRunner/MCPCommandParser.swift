@@ -703,11 +703,17 @@ enum MCPCommandParser {
             args["mode"] = UncheckedSendableValue(mode)
             return .aliasCall(toolName: "get_file_tree", args: args)
 
-        // Code structure: structure [path ...] [--expand uses|used_by|both] [--depth 1...4]
+        // Code structure: structure [path ...] [--expand uses|used_by|both] [--depth 1...4] [--size small|medium|large]
         // Omitting paths targets the current selection.
         case "structure", "struct", "map":
             let remaining = Array(parts.dropFirst())
             let flags = parseFlagArgs(remaining)
+            let allowedFlags: Set = ["paths", "path", "p", "expand", "depth", "signatures", "size"]
+            if let unknown = flags.named.keys.first(where: {
+                !allowedFlags.contains($0.replacingOccurrences(of: "-", with: "_"))
+            }) {
+                throw CommandParseError.invalidArgument("unknown structure flag --\(unknown)")
+            }
 
             var args: [String: UncheckedSendableValue] = [:]
             var paths = flags.positional.map { ctx.resolveWorkspacePathArg($0) }
@@ -723,18 +729,23 @@ enum MCPCommandParser {
             if let expand = flags["expand"] {
                 args["expand"] = UncheckedSendableValue(expand)
             }
-            if let rawDepth = flags["depth"], let depth = Int(rawDepth) {
+            if let rawDepth = flags["depth"] {
+                guard let depth = Int(rawDepth), (1 ... 4).contains(depth) else {
+                    throw CommandParseError.invalidArgument("structure --depth must be an integer from 1 through 4")
+                }
                 args["depth"] = UncheckedSendableValue(depth)
             }
-            if let signatures = parseBoolFlag(flags["signatures"]) {
+            if let rawSignatures = flags["signatures"] {
+                guard let signatures = parseBoolFlag(rawSignatures) else {
+                    throw CommandParseError.invalidArgument("structure --signatures must be true or false")
+                }
                 args["signatures"] = UncheckedSendableValue(signatures)
-            } else if flags["signatures"] != nil {
-                args["signatures"] = UncheckedSendableValue(true)
             }
-            if let rawMaxTokens = flags["max-tokens"] ?? flags["max_tokens"],
-               let maxTokens = Int(rawMaxTokens)
-            {
-                args["max_tokens"] = UncheckedSendableValue(maxTokens)
+            if let size = flags["size"] {
+                guard ["small", "medium", "large"].contains(size) else {
+                    throw CommandParseError.invalidArgument("structure --size must be small, medium, or large")
+                }
+                args["size"] = UncheckedSendableValue(size)
             }
 
             return .aliasCall(toolName: "get_code_structure", args: args)
