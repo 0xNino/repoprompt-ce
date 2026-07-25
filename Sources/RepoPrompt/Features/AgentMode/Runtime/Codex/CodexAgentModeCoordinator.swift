@@ -221,6 +221,22 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         case probeFailure
     }
 
+    private struct BufferedCodexTurnCompletion {
+        let turnID: String
+        let status: CodexNativeSessionController.TurnStatus
+        let failure: CodexNativeSessionController.TurnFailure?
+    }
+
+    /// Holds one exact terminal event while a replacement controller restores the
+    /// authoritative identity for the same run attempt from its thread snapshot.
+    private struct CodexReattachReconciliation {
+        let token: UUID
+        let runID: UUID
+        let runAttemptID: UUID
+        let expectedTurnID: String
+        var bufferedCompletion: BufferedCodexTurnCompletion?
+    }
+
     private final class CodexControllerRetirementClaim {
         weak var controller: (any CodexSessionControlling)?
 
@@ -267,6 +283,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private let codexRecoveryProbeTimeout: TimeInterval
     private var codexRecoveryAttemptKeys: Set<CodexRecoveryAttemptKey> = []
     private var codexActiveReattachAttemptKeys: Set<CodexRecoveryAttemptKey> = []
+    private var codexReattachReconciliationsByTabID: [UUID: CodexReattachReconciliation] = [:]
     private var codexAuthRecoveryAttemptedRunIDs: Set<UUID> = []
     private var pendingCodexThreadNameSyncByTabID: [UUID: PendingCodexThreadNameSync] = [:]
     private var codexThreadNameSyncTaskByTabID: [UUID: (generation: UUID, task: Task<Void, Never>)] = [:]
@@ -1071,6 +1088,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         stopAllCodexThreadNameSyncTasks()
         codexRecoveryAttemptKeys.removeAll()
         codexActiveReattachAttemptKeys.removeAll()
+        codexReattachReconciliationsByTabID.removeAll()
     }
 
     func updateCodexModelPolling() {
@@ -3254,6 +3272,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 codexActiveReattachAttemptKeys.filter { $0.runID != runID }
             )
         }
+        codexReattachReconciliationsByTabID = codexReattachReconciliationsByTabID.filter { _, reconciliation in
+            guard reconciliation.runID == runID else { return true }
+            if let runAttemptID {
+                return reconciliation.runAttemptID != runAttemptID
+            }
+            return false
+        }
     }
 
     func scheduleCodexThreadNameSyncIfPossible(
@@ -3430,6 +3455,126 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
     }
 
+    private func beginCodexReattachReconciliation(
+        session: AgentModeViewModel.TabSession,
+        runID: UUID,
+        runAttemptID: UUID,
+        expectedTurnID: String
+    ) -> UUID {
+        let token = UUID()
+        codexReattachReconciliationsByTabID[session.tabID] = .init(
+            token: token,
+            runID: runID,
+            runAttemptID: runAttemptID,
+            expectedTurnID: expectedTurnID,
+            bufferedCompletion: nil
+        )
+        return token
+    }
+
+    private func clearCodexReattachReconciliation(
+        for tabID: UUID,
+        token: UUID
+    ) {
+        guard codexReattachReconciliationsByTabID[tabID]?.token == token else { return }
+        codexReattachReconciliationsByTabID.removeValue(forKey: tabID)
+    }
+
+    private func bufferCodexTurnCompletionDuringReattachIfNeeded(
+        turnID: String?,
+        status: CodexNativeSessionController.TurnStatus,
+        failure: CodexNativeSessionController.TurnFailure?,
+        session: AgentModeViewModel.TabSession,
+        sourceController: (any CodexSessionControlling)?
+    ) -> Bool {
+        guard session.codexAuthoritativeActiveTurn == nil,
+              session.codexAnonymousActiveTurn == nil,
+              session.runState.isActive,
+              let runID = session.runID,
+              let runAttemptID = session.activeRunAttemptID,
+              let sourceController,
+              let activeController = session.codexController,
+              Self.sameCodexControllerInstance(activeController, sourceController),
+              let normalizedTurnID = turnID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !normalizedTurnID.isEmpty,
+              var reconciliation = codexReattachReconciliationsByTabID[session.tabID],
+              reconciliation.runID == runID,
+              reconciliation.runAttemptID == runAttemptID,
+              reconciliation.expectedTurnID == normalizedTurnID
+        else {
+            return false
+        }
+        if reconciliation.bufferedCompletion == nil {
+            reconciliation.bufferedCompletion = .init(
+                turnID: normalizedTurnID,
+                status: status,
+                failure: failure
+            )
+            codexReattachReconciliationsByTabID[session.tabID] = reconciliation
+            recordCodexWatchdogTransition(
+                "activeReattachTerminalBuffered",
+                session: session
+            )
+        }
+        return true
+    }
+
+    private func replayBufferedCodexTurnCompletionIfNeeded(
+        reconciliationToken: UUID?,
+        session: AgentModeViewModel.TabSession,
+        controller: any CodexSessionControlling
+    ) async -> Bool {
+        guard let reconciliationToken,
+              let reconciliation = codexReattachReconciliationsByTabID[session.tabID],
+              reconciliation.token == reconciliationToken,
+              reconciliation.runID == session.runID,
+              reconciliation.runAttemptID == session.activeRunAttemptID,
+              session.runState.isActive,
+              let activeController = session.codexController,
+              Self.sameCodexControllerInstance(activeController, controller),
+              let completion = reconciliation.bufferedCompletion
+        else {
+            return false
+        }
+        guard let identity = session.codexAuthoritativeActiveTurn,
+              authoritativeCodexTurnIsCurrent(identity, session: session),
+              identity.turnID == reconciliation.expectedTurnID
+        else {
+            return false
+        }
+        clearCodexReattachReconciliation(
+            for: session.tabID,
+            token: reconciliationToken
+        )
+        await handleCodexNativeEvent(
+            .turnCompleted(
+                turnID: completion.turnID,
+                status: completion.status,
+                failure: completion.failure
+            ),
+            session: session,
+            sourceController: controller
+        )
+        return true
+    }
+
+    private func activeCodexReattachReconciliationIsComplete(
+        for session: AgentModeViewModel.TabSession
+    ) -> Bool {
+        guard let runID = session.runID,
+              let runAttemptID = session.activeRunAttemptID,
+              codexActiveReattachAttemptKeys.contains(.init(
+                  runID: runID,
+                  runAttemptID: runAttemptID
+              )),
+              codexReattachReconciliationsByTabID[session.tabID] == nil,
+              let identity = session.codexAuthoritativeActiveTurn
+        else {
+            return false
+        }
+        return authoritativeCodexTurnIsCurrent(identity, session: session)
+    }
+
     private func settleCodexIdleRecovery(
         session: AgentModeViewModel.TabSession,
         snapshot: CodexNativeSessionController.ThreadSnapshot
@@ -3559,6 +3704,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             ?? session.codexAnonymousActiveTurn?.turnKind
             ?? session.codexPendingTurnKind
             ?? .unknown
+        let recoveryTurnID = session.codexAuthoritativeActiveTurn.flatMap { identity -> String? in
+            guard authoritativeCodexTurnIsCurrent(identity, session: session) else { return nil }
+            let turnID = identity.turnID.trimmingCharacters(in: .whitespacesAndNewlines)
+            return turnID.isEmpty ? nil : turnID
+        }
         var stallRecoveryReason: CodexStallRecoveryReason?
         if trigger == .stallWatchdog {
             let referenceDate = codexWatchdogReferenceDate(for: session)
@@ -3756,6 +3906,29 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
         }
 
+        let reattachReconciliationToken: UUID?
+        if trigger == .stallWatchdog,
+           stallRecoveryReason == .activeReattach,
+           let recoveryTurnID
+        {
+            reattachReconciliationToken = beginCodexReattachReconciliation(
+                session: session,
+                runID: runID,
+                runAttemptID: expectedRunAttemptID,
+                expectedTurnID: recoveryTurnID
+            )
+        } else {
+            reattachReconciliationToken = nil
+        }
+        defer {
+            if let reattachReconciliationToken {
+                clearCodexReattachReconciliation(
+                    for: session.tabID,
+                    token: reattachReconciliationToken
+                )
+            }
+        }
+
         let recoveryStartedAt = Date()
         setRunningStatus("Reconnecting…", source: .reconnect, session: session, urgent: true)
         session.codexLastEventAt = recoveryStartedAt
@@ -3839,6 +4012,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     session: session,
                     sourceController: recoveredController
                 )
+                if await replayBufferedCodexTurnCompletionIfNeeded(
+                    reconciliationToken: reattachReconciliationToken,
+                    session: session,
+                    controller: recoveredController
+                ) {
+                    return .recovered
+                }
                 let transition = switch stallRecoveryReason {
                 case .some(.activeReattach):
                     "activeReattachCompleted"
@@ -6755,6 +6935,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.setAgentRunActive(session.tabID, isActive: true)
             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         case let .turnCompleted(turnID, status, failure):
+            if bufferCodexTurnCompletionDuringReattachIfNeeded(
+                turnID: turnID,
+                status: status,
+                failure: failure,
+                session: session,
+                sourceController: sourceController
+            ) {
+                return
+            }
             guard let completion = correlatedCodexTurnKindForCompletion(
                 turnID: turnID,
                 session: session
@@ -7783,9 +7972,28 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         @_spi(TestSupport)
         public func test_handleCodexNativeEvent(
             _ event: CodexNativeSessionController.Event,
-            session: AgentModeViewModel.TabSession
+            session: AgentModeViewModel.TabSession,
+            sourceController: (any CodexSessionControlling)? = nil
         ) async {
-            await handleCodexNativeEvent(event, session: session)
+            await handleCodexNativeEvent(
+                event,
+                session: session,
+                sourceController: sourceController
+            )
+        }
+
+        @_spi(TestSupport)
+        public func test_codexActiveReattachReconciliationIsComplete(
+            session: AgentModeViewModel.TabSession
+        ) -> Bool {
+            activeCodexReattachReconciliationIsComplete(for: session)
+        }
+
+        @_spi(TestSupport)
+        public func test_codexReattachReconciliationIsPending(
+            session: AgentModeViewModel.TabSession
+        ) -> Bool {
+            codexReattachReconciliationsByTabID[session.tabID] != nil
         }
 
         @_spi(TestSupport)
