@@ -234,6 +234,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let runID: UUID
         let runAttemptID: UUID
         let expectedTurnID: String
+        let expectedTurnKind: AgentModeViewModel.TabSession.CodexTurnKind
         var bufferedCompletion: BufferedCodexTurnCompletion?
     }
 
@@ -3459,7 +3460,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session: AgentModeViewModel.TabSession,
         runID: UUID,
         runAttemptID: UUID,
-        expectedTurnID: String
+        expectedTurnID: String,
+        expectedTurnKind: AgentModeViewModel.TabSession.CodexTurnKind
     ) -> UUID {
         let token = UUID()
         codexReattachReconciliationsByTabID[session.tabID] = .init(
@@ -3467,6 +3469,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             runID: runID,
             runAttemptID: runAttemptID,
             expectedTurnID: expectedTurnID,
+            expectedTurnKind: expectedTurnKind,
             bufferedCompletion: nil
         )
         return token
@@ -3535,6 +3538,18 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
               let completion = reconciliation.bufferedCompletion
         else {
             return false
+        }
+        if session.codexAuthoritativeActiveTurn == nil {
+            let priorPendingTurnKind = session.codexPendingTurnKind
+            session.codexPendingTurnKind = reconciliation.expectedTurnKind
+            guard installAuthoritativeCodexTurnForStart(
+                turnID: reconciliation.expectedTurnID,
+                session: session,
+                sourceController: controller
+            ) != nil else {
+                session.codexPendingTurnKind = priorPendingTurnKind
+                return false
+            }
         }
         guard let identity = session.codexAuthoritativeActiveTurn,
               authoritativeCodexTurnIsCurrent(identity, session: session),
@@ -3906,19 +3921,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
         }
 
-        let reattachReconciliationToken: UUID?
-        if trigger == .stallWatchdog,
-           stallRecoveryReason == .activeReattach,
-           let recoveryTurnID
+        let reattachReconciliationToken: UUID? = if trigger == .stallWatchdog,
+                                                    stallRecoveryReason == .activeReattach,
+                                                    let recoveryTurnID
         {
-            reattachReconciliationToken = beginCodexReattachReconciliation(
+            beginCodexReattachReconciliation(
                 session: session,
                 runID: runID,
                 runAttemptID: expectedRunAttemptID,
-                expectedTurnID: recoveryTurnID
+                expectedTurnID: recoveryTurnID,
+                expectedTurnKind: recoveryTurnKind
             )
         } else {
-            reattachReconciliationToken = nil
+            nil
         }
         defer {
             if let reattachReconciliationToken {
@@ -3967,6 +3982,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             preserveExistingRunID: true
         )
 
+        if let recoveredController = session.codexController,
+           await replayBufferedCodexTurnCompletionIfNeeded(
+               reconciliationToken: reattachReconciliationToken,
+               session: session,
+               controller: recoveredController
+           )
+        {
+            return .recovered
+        }
+
         guard session.runID == runID,
               session.activeRunAttemptID == expectedRunAttemptID,
               session.runState.isActive,
@@ -3994,7 +4019,21 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 logCodex(
                     "[AgentModeVM][CodexWatchdog] could not reconcile thread after reconnect for tab \(session.tabID): \(error.localizedDescription)"
                 )
+                if await replayBufferedCodexTurnCompletionIfNeeded(
+                    reconciliationToken: reattachReconciliationToken,
+                    session: session,
+                    controller: recoveredController
+                ) {
+                    return .recovered
+                }
                 updateCodexStallWatchdogState(for: session)
+                return .recovered
+            }
+            if await replayBufferedCodexTurnCompletionIfNeeded(
+                reconciliationToken: reattachReconciliationToken,
+                session: session,
+                controller: recoveredController
+            ) {
                 return .recovered
             }
             guard session.runID == runID,
@@ -4036,6 +4075,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 )
                 updateCodexStallWatchdogState(for: session)
                 return .recovered
+            }
+            if let reattachReconciliationToken {
+                clearCodexReattachReconciliation(
+                    for: session.tabID,
+                    token: reattachReconciliationToken
+                )
             }
             return await settleCodexIdleRecovery(
                 session: session,
