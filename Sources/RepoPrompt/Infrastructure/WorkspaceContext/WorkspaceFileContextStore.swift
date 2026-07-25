@@ -182,27 +182,27 @@ struct WorkspaceSessionRootLifetimeSnapshot: @unchecked Sendable {
 }
 
 actor WorkspaceFileContextStore {
+    enum CodemapGraphIndexBuildStoreEventKind: String, Hashable {
+        case rootInventoryAndSearchReady
+        case scheduled
+        case started
+        case eligibilityEligible
+        case eligibilityTerminal
+        case eligibilityTransient
+        case setupJoining
+        case engineScheduling
+        case handedOff
+        case cancelled
+        case superseded
+        case retryScheduled
+        case retryStarted
+        case repositoryAuthorityDetached
+    }
+
     #if DEBUG
         enum CodemapGraphIndexBuildLaunchPolicyForTesting: Equatable {
             case enabled
             case disabled
-        }
-
-        enum CodemapGraphIndexBuildStoreEventKind: String, Hashable {
-            case rootInventoryAndSearchReady
-            case scheduled
-            case started
-            case eligibilityEligible
-            case eligibilityTerminal
-            case eligibilityTransient
-            case setupJoining
-            case engineScheduling
-            case handedOff
-            case cancelled
-            case superseded
-            case retryScheduled
-            case retryStarted
-            case repositoryAuthorityDetached
         }
 
         struct CodemapGraphIndexBuildStoreEvent: Hashable {
