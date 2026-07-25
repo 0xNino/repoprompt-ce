@@ -456,6 +456,7 @@ extension AgentModeViewModel {
         var suppressUntil: Date?
         /// Bounded, in-memory identity for the last ambiguous upstream probe.
         /// Never logged or persisted; real provider/tool progress clears it.
+        var lastAmbiguousProbeKind: String?
         var lastAmbiguousProbeFingerprint: String?
         var ambiguousActiveProbeCount: Int = 0
     }

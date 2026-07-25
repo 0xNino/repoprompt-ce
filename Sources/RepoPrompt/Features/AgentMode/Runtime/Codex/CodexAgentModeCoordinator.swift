@@ -215,6 +215,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let runAttemptID: UUID
     }
 
+    private enum CodexStallRecoveryReason: Equatable {
+        case activeReattach
+        case idle
+        case probeFailure
+    }
+
     private final class CodexControllerRetirementClaim {
         weak var controller: (any CodexSessionControlling)?
 
@@ -260,6 +266,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private let codexTransportClosedFallbackTasksByTabID = PerKeyTaskStore<UUID>()
     private let codexRecoveryProbeTimeout: TimeInterval
     private var codexRecoveryAttemptKeys: Set<CodexRecoveryAttemptKey> = []
+    private var codexActiveReattachAttemptKeys: Set<CodexRecoveryAttemptKey> = []
     private var codexAuthRecoveryAttemptedRunIDs: Set<UUID> = []
     private var pendingCodexThreadNameSyncByTabID: [UUID: PendingCodexThreadNameSync] = [:]
     private var codexThreadNameSyncTaskByTabID: [UUID: (generation: UUID, task: Task<Void, Never>)] = [:]
@@ -442,6 +449,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.codexWatchdogState.lastProgressAt = timestamp
         session.codexWatchdogState.progressGeneration &+= 1
         session.codexWatchdogState.suppressUntil = nil
+        session.codexWatchdogState.lastAmbiguousProbeKind = nil
         session.codexWatchdogState.lastAmbiguousProbeFingerprint = nil
         session.codexWatchdogState.ambiguousActiveProbeCount = 0
         guard session.runState.isActive else {
@@ -901,32 +909,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return true
     }
 
-    private func deferCodexWatchdogAfterAmbiguousProbe(
-        for session: AgentModeViewModel.TabSession,
-        kind: String,
-        referenceDate: Date,
-        now: Date = Date()
-    ) -> Bool {
-        let recoveryDeadline = referenceDate.addingTimeInterval(codexStallWatchdogRecoveryThreshold)
-        guard recoveryDeadline > now else {
-            return false
-        }
-        session.codexWatchdogState.ambiguousActiveProbeCount += 1
-        session.codexWatchdogState.suppressUntil = recoveryDeadline
-        recordCodexWatchdogTransition(
-            "probeDeferred",
-            session: session,
-            fields: [
-                "kind": kind,
-                "probeCount": String(session.codexWatchdogState.ambiguousActiveProbeCount)
-            ]
-        )
-        logCodex(
-            "[AgentModeVM][CodexWatchdog] deferring ambiguous \(kind) probe for tab \(session.tabID) count=\(session.codexWatchdogState.ambiguousActiveProbeCount) until=\(recoveryDeadline.timeIntervalSince1970)"
-        )
-        return true
-    }
-
     private static func codexWatchdogProbeFingerprint(
         _ snapshot: CodexNativeSessionController.ThreadSnapshot
     ) -> String {
@@ -950,6 +932,64 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         ].joined(separator: "\u{1F}")
     }
 
+    private func activeCodexProbeShouldReattach(
+        fingerprint: String,
+        session: AgentModeViewModel.TabSession,
+        referenceDate: Date,
+        now: Date = Date()
+    ) -> Bool {
+        let probeKind = "active"
+        let previousFingerprint = session.codexWatchdogState.lastAmbiguousProbeKind == probeKind
+            ? session.codexWatchdogState.lastAmbiguousProbeFingerprint
+            : nil
+        if let previousFingerprint, previousFingerprint != fingerprint {
+            recordCodexWatchdogProgress(for: session, at: now)
+            session.codexWatchdogState.lastAmbiguousProbeKind = probeKind
+            session.codexWatchdogState.lastAmbiguousProbeFingerprint = fingerprint
+            recordCodexWatchdogTransition(
+                "snapshotDelta",
+                session: session,
+                fields: ["kind": probeKind]
+            )
+            logCodex(
+                "[AgentModeVM][CodexWatchdog] active probe changed for tab \(session.tabID); treating the delta as progress"
+            )
+            return false
+        }
+
+        session.codexWatchdogState.lastAmbiguousProbeKind = probeKind
+        session.codexWatchdogState.lastAmbiguousProbeFingerprint = fingerprint
+        session.codexWatchdogState.ambiguousActiveProbeCount += 1
+        let recoveryDeadline = referenceDate.addingTimeInterval(codexStallWatchdogRecoveryThreshold)
+        if recoveryDeadline > now {
+            session.codexWatchdogState.suppressUntil = recoveryDeadline
+            recordCodexWatchdogTransition(
+                "probeDeferred",
+                session: session,
+                fields: [
+                    "kind": probeKind,
+                    "probeCount": String(session.codexWatchdogState.ambiguousActiveProbeCount)
+                ]
+            )
+            return false
+        }
+
+        if previousFingerprint == nil {
+            _ = deferCodexWatchdogUntilNextProbeWindow(
+                for: session,
+                reason: "late-first-active-probe",
+                now: now
+            )
+            return false
+        }
+        _ = deferCodexWatchdogUntilNextProbeWindow(
+            for: session,
+            reason: "active-reattach",
+            now: now
+        )
+        return true
+    }
+
     private func ambiguousCodexProbeShouldDefer(
         fingerprint: String,
         kind: String,
@@ -957,41 +997,46 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         referenceDate: Date,
         now: Date = Date()
     ) -> Bool {
-        if let previousFingerprint = session.codexWatchdogState.lastAmbiguousProbeFingerprint {
-            if previousFingerprint != fingerprint {
-                recordCodexWatchdogProgress(for: session, at: now)
-                recordCodexWatchdogTransition(
-                    "snapshotDelta",
-                    session: session,
-                    fields: ["kind": kind]
-                )
-                logCodex(
-                    "[AgentModeVM][CodexWatchdog] \(kind) probe changed for tab \(session.tabID); treating the delta as progress"
-                )
-                return true
-            }
-        } else {
+        let previousFingerprint = session.codexWatchdogState.lastAmbiguousProbeKind == kind
+            ? session.codexWatchdogState.lastAmbiguousProbeFingerprint
+            : nil
+        if let previousFingerprint, previousFingerprint != fingerprint {
+            recordCodexWatchdogProgress(for: session, at: now)
+            session.codexWatchdogState.lastAmbiguousProbeKind = kind
             session.codexWatchdogState.lastAmbiguousProbeFingerprint = fingerprint
-            if deferCodexWatchdogAfterAmbiguousProbe(
-                for: session,
-                kind: kind,
-                referenceDate: referenceDate,
-                now: now
-            ) {
-                return true
-            }
-            // A late first poll has no comparison sample. Grant one probe interval;
-            // an identical follow-up still settles against the expired original deadline.
-            return deferCodexWatchdogUntilNextProbeWindow(
-                for: session,
-                reason: "late-first-\(kind)-probe",
-                now: now
+            recordCodexWatchdogTransition(
+                "snapshotDelta",
+                session: session,
+                fields: ["kind": kind]
             )
+            return true
         }
-        return deferCodexWatchdogAfterAmbiguousProbe(
+
+        session.codexWatchdogState.lastAmbiguousProbeKind = kind
+        session.codexWatchdogState.lastAmbiguousProbeFingerprint = fingerprint
+        session.codexWatchdogState.ambiguousActiveProbeCount += 1
+        let recoveryDeadline = referenceDate.addingTimeInterval(codexStallWatchdogRecoveryThreshold)
+        if recoveryDeadline > now {
+            session.codexWatchdogState.suppressUntil = recoveryDeadline
+            recordCodexWatchdogTransition(
+                "probeDeferred",
+                session: session,
+                fields: [
+                    "kind": kind,
+                    "probeCount": String(session.codexWatchdogState.ambiguousActiveProbeCount)
+                ]
+            )
+            return true
+        }
+
+        guard previousFingerprint == nil else {
+            return false
+        }
+        // A late first probe has no comparison sample. Confirm the idle thread once
+        // more before automatic recovery so a delayed lifecycle event can win.
+        return deferCodexWatchdogUntilNextProbeWindow(
             for: session,
-            kind: kind,
-            referenceDate: referenceDate,
+            reason: "late-first-\(kind)-probe",
             now: now
         )
     }
@@ -1025,6 +1070,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         stopAllCodexTransportClosedFallbackTasks()
         stopAllCodexThreadNameSyncTasks()
         codexRecoveryAttemptKeys.removeAll()
+        codexActiveReattachAttemptKeys.removeAll()
     }
 
     func updateCodexModelPolling() {
@@ -3138,6 +3184,18 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
     }
 
+    private static func missedCodexCompletionRecoveryMessage() -> String {
+        "Repo Prompt reconnected after a quiet period and confirmed that Codex completed the turn."
+    }
+
+    private static func unresolvedCodexIdleRecoveryMessage() -> String {
+        "Codex became idle before the run resolved. Send a message to continue."
+    }
+
+    private static func failedCodexIdleRecoveryMessage() -> String {
+        "Codex's last turn failed while Repo Prompt was reconnecting."
+    }
+
     private static func isMissingRolloutErrorMessage(_ message: String) -> Bool {
         let normalized = message
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3185,10 +3243,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) {
         guard let runID else { return }
         if let runAttemptID {
-            codexRecoveryAttemptKeys.remove(.init(runID: runID, runAttemptID: runAttemptID))
+            let key = CodexRecoveryAttemptKey(runID: runID, runAttemptID: runAttemptID)
+            codexRecoveryAttemptKeys.remove(key)
+            codexActiveReattachAttemptKeys.remove(key)
         } else {
             codexRecoveryAttemptKeys = Set(
                 codexRecoveryAttemptKeys.filter { $0.runID != runID }
+            )
+            codexActiveReattachAttemptKeys = Set(
+                codexActiveReattachAttemptKeys.filter { $0.runID != runID }
             )
         }
     }
@@ -3361,142 +3424,87 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return "Codex events stream ended unexpectedly. The run may need to be restarted."
         case .stallWatchdog:
             if recoveryAlreadyAttempted {
-                return "Codex run stalled again after an automatic recovery attempt. Reconnect required."
+                return "Repo Prompt could not verify Codex's state after an automatic reconnect. Reconnect required."
             }
-            let thresholdSeconds = Int(codexStallWatchdogRecoveryThreshold)
-            if thresholdSeconds > 0 {
-                return "Codex run stalled (no progress for \(thresholdSeconds)s). Reconnect required."
-            }
-            return "Codex run stalled. Reconnect required."
+            return "Repo Prompt could not verify whether the Codex run is still active. Reconnect required."
         }
     }
 
-    private func prepareCodexStallTerminalSettlement(
+    private func settleCodexIdleRecovery(
         session: AgentModeViewModel.TabSession,
-        controller: any CodexSessionControlling,
-        expectedRunID: UUID,
-        expectedRunAttemptID: UUID,
-        expectedProgressGeneration: UInt64,
-        reason: String
-    ) async -> Bool {
-        guard codexWatchdogAttemptRemainsCurrent(
-            session: session,
-            controller: controller,
-            expectedRunID: expectedRunID,
-            expectedRunAttemptID: expectedRunAttemptID,
-            expectedProgressGeneration: expectedProgressGeneration,
-            checkpoint: "prepare"
-        ) else {
-            return false
-        }
-
-        let authoritativeIdentity = session.codexAuthoritativeActiveTurn
-        let exactTurnID: String? = if let authoritativeIdentity,
-                                      authoritativeIdentity.runID == expectedRunID,
-                                      authoritativeIdentity.runAttemptID == expectedRunAttemptID,
-                                      authoritativeCodexTurnIsCurrent(authoritativeIdentity, session: session),
-                                      authoritativeIdentity.controllerInstanceID == ObjectIdentifier(controller)
-        {
-            authoritativeIdentity.turnID
-        } else {
-            nil
-        }
-
-        if let exactTurnID {
-            guard codexWatchdogAttemptRemainsCurrent(
-                session: session,
-                controller: controller,
-                expectedRunID: expectedRunID,
-                expectedRunAttemptID: expectedRunAttemptID,
-                expectedProgressGeneration: expectedProgressGeneration,
-                checkpoint: "before-interrupt"
-            ) else {
-                return false
-            }
-            recordCodexWatchdogTransition(
-                "interruptStarted",
-                session: session,
-                fields: ["hasExactTurn": "true"]
+        snapshot: CodexNativeSessionController.ThreadSnapshot
+    ) async -> CodexRecoveryOutcome {
+        let settlement: (
+            statusField: String,
+            turnStatus: CodexNativeSessionController.TurnStatus,
+            reason: String,
+            notice: String?,
+            errorMessage: String?,
+            notifyOnCompleted: Bool,
+            deleteDeferredFiles: Bool
+        ) = switch snapshot.latestTurnStatus {
+        case .some(.completed):
+            (
+                "completed",
+                .completed,
+                "stall-watchdog-missed-completion",
+                Self.missedCodexCompletionRecoveryMessage(),
+                nil,
+                true,
+                false
             )
-            do {
-                _ = try await controller.interruptUserTurn(expectedTurnID: exactTurnID)
-                guard codexWatchdogAttemptRemainsCurrent(
-                    session: session,
-                    controller: controller,
-                    expectedRunID: expectedRunID,
-                    expectedRunAttemptID: expectedRunAttemptID,
-                    expectedProgressGeneration: expectedProgressGeneration,
-                    checkpoint: "after-interrupt"
-                ) else {
-                    return false
-                }
-                recordCodexWatchdogTransition(
-                    "interruptSucceeded",
-                    session: session,
-                    fields: ["hasExactTurn": "true"]
-                )
-                logCodex(
-                    "[AgentModeVM][CodexWatchdog] exact stalled-turn interrupt succeeded for tab \(session.tabID)"
-                )
-            } catch {
-                guard codexWatchdogAttemptRemainsCurrent(
-                    session: session,
-                    controller: controller,
-                    expectedRunID: expectedRunID,
-                    expectedRunAttemptID: expectedRunAttemptID,
-                    expectedProgressGeneration: expectedProgressGeneration,
-                    checkpoint: "after-interrupt-failure"
-                ) else {
-                    return false
-                }
-                recordCodexWatchdogTransition(
-                    "interruptFailed",
-                    session: session,
-                    fields: ["hasExactTurn": "true"]
-                )
-                logCodex(
-                    "[AgentModeVM][CodexWatchdog] exact stalled-turn interrupt failed for tab \(session.tabID): \(error.localizedDescription)"
-                )
-            }
-        } else {
-            recordCodexWatchdogTransition(
-                "interruptUnavailable",
-                session: session,
-                fields: ["hasExactTurn": "false"]
+        case .some(.failed):
+            (
+                "failed",
+                .failed,
+                "stall-watchdog-reconciled-failure",
+                nil,
+                Self.failedCodexIdleRecoveryMessage(),
+                false,
+                true
             )
-            logCodex(
-                "[AgentModeVM][CodexWatchdog] no authoritative stalled-turn identity for tab \(session.tabID); invalidating the exact controller without reconciling another turn"
+        case .some(.interrupted):
+            (
+                "interrupted",
+                .interrupted,
+                "stall-watchdog-idle-interrupted",
+                Self.unresolvedCodexIdleRecoveryMessage(),
+                nil,
+                false,
+                false
+            )
+        case nil:
+            (
+                "unknown",
+                .interrupted,
+                "stall-watchdog-idle-unresolved",
+                Self.unresolvedCodexIdleRecoveryMessage(),
+                nil,
+                false,
+                false
             )
         }
-
-        guard codexWatchdogAttemptRemainsCurrent(
-            session: session,
-            controller: controller,
-            expectedRunID: expectedRunID,
-            expectedRunAttemptID: expectedRunAttemptID,
-            expectedProgressGeneration: expectedProgressGeneration,
-            checkpoint: "before-invalidation"
-        ) else {
-            return false
+        if let notice = settlement.notice {
+            session.appendItem(AgentChatItem.system(
+                notice,
+                sequenceIndex: session.nextSequenceIndex
+            ))
+            viewModel?.scheduleSave(for: session.tabID)
         }
-
-        let invalidated = invalidateCodexControllerForReconnect(
-            session: session,
-            expectedController: controller,
-            source: "stall-watchdog-\(reason)",
-            cancelStallWatchdog: false,
-            preserveRunID: true
+        await finalizeCodexRun(
+            session,
+            turnStatus: settlement.turnStatus,
+            reason: settlement.reason,
+            errorMessage: settlement.errorMessage,
+            notifyOnCompleted: settlement.notifyOnCompleted,
+            deleteDeferredFilesWhenFailureHasNoInFlight: settlement.deleteDeferredFiles
         )
-        guard invalidated else { return false }
         recordCodexWatchdogTransition(
-            "terminalSettlement",
+            "idleSettlement",
             session: session,
-            fields: [
-                "hasExactTurn": String(exactTurnID != nil),
-                "reason": reason
-            ]
+            fields: ["status": settlement.statusField]
         )
-        return true
+        return .recovered
     }
 
     private func attemptCodexRecovery(
@@ -3547,6 +3555,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             return .unrecoverable(recoveryFailureMessage(for: trigger))
         }
+        let recoveryTurnKind: AgentModeViewModel.TabSession.CodexTurnKind = session.codexAuthoritativeActiveTurn?.turnKind
+            ?? session.codexAnonymousActiveTurn?.turnKind
+            ?? session.codexPendingTurnKind
+            ?? .unknown
+        var stallRecoveryReason: CodexStallRecoveryReason?
         if trigger == .stallWatchdog {
             let referenceDate = codexWatchdogReferenceDate(for: session)
             let expectedProgressGeneration = session.codexWatchdogState.progressGeneration
@@ -3664,39 +3677,26 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     ) {
                         return .skipped
                     }
-                    guard await prepareCodexStallTerminalSettlement(
+                    stallRecoveryReason = .idle
+                    recordCodexWatchdogTransition(
+                        "idleRecoveryStarted",
+                        session: session
+                    )
+                } else {
+                    reconcileCodexReportedWaitingFlags(snapshot.activeFlags, session: session)
+                    guard activeCodexProbeShouldReattach(
+                        fingerprint: fingerprint,
                         session: session,
-                        controller: probeController,
-                        expectedRunID: runID,
-                        expectedRunAttemptID: expectedRunAttemptID,
-                        expectedProgressGeneration: expectedProgressGeneration,
-                        reason: "no-active-turn"
+                        referenceDate: referenceDate
                     ) else {
                         return .skipped
                     }
-                    return .unrecoverable(recoveryFailureMessage(for: trigger))
+                    stallRecoveryReason = .activeReattach
+                    recordCodexWatchdogTransition(
+                        "activeReattachStarted",
+                        session: session
+                    )
                 }
-
-                reconcileCodexReportedWaitingFlags(snapshot.activeFlags, session: session)
-                if ambiguousCodexProbeShouldDefer(
-                    fingerprint: fingerprint,
-                    kind: "active",
-                    session: session,
-                    referenceDate: referenceDate
-                ) {
-                    return .skipped
-                }
-                guard await prepareCodexStallTerminalSettlement(
-                    session: session,
-                    controller: probeController,
-                    expectedRunID: runID,
-                    expectedRunAttemptID: expectedRunAttemptID,
-                    expectedProgressGeneration: expectedProgressGeneration,
-                    reason: "repeated-active"
-                ) else {
-                    return .skipped
-                }
-                return .unrecoverable(recoveryFailureMessage(for: trigger))
             } catch {
                 guard codexWatchdogAttemptRemainsCurrent(
                     session: session,
@@ -3709,24 +3709,20 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     return .skipped
                 }
                 logCodex("[AgentModeVM][CodexWatchdog] stall probe failed for tab \(session.tabID): \(error.localizedDescription)")
-                if deferCodexWatchdogAfterAmbiguousProbe(
-                    for: session,
+                if ambiguousCodexProbeShouldDefer(
+                    fingerprint: "probe-failed",
                     kind: "probe-failed",
+                    session: session,
                     referenceDate: referenceDate
                 ) {
                     return .skipped
                 }
-                guard await prepareCodexStallTerminalSettlement(
+                stallRecoveryReason = .probeFailure
+                recordCodexWatchdogTransition(
+                    "probeRecoveryStarted",
                     session: session,
-                    controller: probeController,
-                    expectedRunID: runID,
-                    expectedRunAttemptID: expectedRunAttemptID,
-                    expectedProgressGeneration: expectedProgressGeneration,
-                    reason: "probe-failed"
-                ) else {
-                    return .skipped
-                }
-                return .unrecoverable(recoveryFailureMessage(for: trigger))
+                    fields: ["kind": "probe-failed"]
+                )
             }
         }
         if let sourceController {
@@ -3741,8 +3737,23 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             runID: runID,
             runAttemptID: expectedRunAttemptID
         )
-        guard codexRecoveryAttemptKeys.insert(recoveryAttemptKey).inserted else {
-            return .unrecoverable(recoveryFailureMessage(for: trigger, recoveryAlreadyAttempted: true))
+        if trigger == .stallWatchdog, stallRecoveryReason == .activeReattach {
+            guard codexActiveReattachAttemptKeys.insert(recoveryAttemptKey).inserted else {
+                setRunningStatus("Waiting for response…", source: .transport, session: session, urgent: true)
+                _ = deferCodexWatchdogUntilNextProbeWindow(
+                    for: session,
+                    reason: "active-reattach-already-attempted"
+                )
+                recordCodexWatchdogTransition(
+                    "activeReattachAlreadyAttempted",
+                    session: session
+                )
+                return .skipped
+            }
+        } else {
+            guard codexRecoveryAttemptKeys.insert(recoveryAttemptKey).inserted else {
+                return .unrecoverable(recoveryFailureMessage(for: trigger, recoveryAlreadyAttempted: true))
+            }
         }
 
         let recoveryStartedAt = Date()
@@ -3798,6 +3809,60 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let recoveredAt = Date()
         session.codexLastEventAt = recoveredAt
         recordCodexWatchdogProgress(for: session, at: recoveredAt)
+
+        if trigger == .stallWatchdog {
+            let recoveredSnapshot: CodexNativeSessionController.ThreadSnapshot
+            do {
+                recoveredSnapshot = try await recoveredController.readThreadSnapshot(
+                    includeTurns: true,
+                    timeout: codexRecoveryProbeTimeout
+                )
+            } catch {
+                logCodex(
+                    "[AgentModeVM][CodexWatchdog] could not reconcile thread after reconnect for tab \(session.tabID): \(error.localizedDescription)"
+                )
+                updateCodexStallWatchdogState(for: session)
+                return .recovered
+            }
+            guard session.runID == runID,
+                  session.activeRunAttemptID == expectedRunAttemptID,
+                  session.runState.isActive,
+                  let activeController = session.codexController,
+                  Self.sameCodexControllerInstance(activeController, recoveredController)
+            else {
+                return .skipped
+            }
+            if recoveredSnapshot.hasActiveTurn {
+                session.codexPendingTurnKind = recoveryTurnKind
+                _ = installAuthoritativeCodexTurnForStart(
+                    turnID: recoveredSnapshot.currentTurnID ?? recoveredSnapshot.activeTurnIDs.last,
+                    session: session,
+                    sourceController: recoveredController
+                )
+                let transition = switch stallRecoveryReason {
+                case .some(.activeReattach):
+                    "activeReattachCompleted"
+                case .some(.idle):
+                    "idleRecoverySuperseded"
+                case .some(.probeFailure):
+                    "probeRecoveryCompleted"
+                case nil:
+                    "stallRecoveryCompleted"
+                }
+                setRunningStatus("Waiting for response…", source: .transport, session: session, urgent: true)
+                recordCodexWatchdogTransition(
+                    transition,
+                    session: session
+                )
+                updateCodexStallWatchdogState(for: session)
+                return .recovered
+            }
+            return await settleCodexIdleRecovery(
+                session: session,
+                snapshot: recoveredSnapshot
+            )
+        }
+
         updateCodexStallWatchdogState(for: session)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         return .recovered
