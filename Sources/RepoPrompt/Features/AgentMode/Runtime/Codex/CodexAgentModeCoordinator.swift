@@ -443,6 +443,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.codexWatchdogState.lastProgressAt = timestamp
         session.codexWatchdogState.progressGeneration &+= 1
         session.codexWatchdogState.suppressUntil = nil
+        session.codexWatchdogState.lastAmbiguousProbeKind = nil
         session.codexWatchdogState.lastAmbiguousProbeFingerprint = nil
         session.codexWatchdogState.ambiguousActiveProbeCount = 0
         guard session.runState.isActive else {
@@ -931,14 +932,18 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         referenceDate: Date,
         now: Date = Date()
     ) -> Bool {
-        let previousFingerprint = session.codexWatchdogState.lastAmbiguousProbeFingerprint
+        let probeKind = "active"
+        let previousFingerprint = session.codexWatchdogState.lastAmbiguousProbeKind == probeKind
+            ? session.codexWatchdogState.lastAmbiguousProbeFingerprint
+            : nil
         if let previousFingerprint, previousFingerprint != fingerprint {
             recordCodexWatchdogProgress(for: session, at: now)
+            session.codexWatchdogState.lastAmbiguousProbeKind = probeKind
             session.codexWatchdogState.lastAmbiguousProbeFingerprint = fingerprint
             recordCodexWatchdogTransition(
                 "snapshotDelta",
                 session: session,
-                fields: ["kind": "active"]
+                fields: ["kind": probeKind]
             )
             logCodex(
                 "[AgentModeVM][CodexWatchdog] active probe changed for tab \(session.tabID); treating the delta as progress"
@@ -946,6 +951,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return false
         }
 
+        session.codexWatchdogState.lastAmbiguousProbeKind = probeKind
         session.codexWatchdogState.lastAmbiguousProbeFingerprint = fingerprint
         session.codexWatchdogState.ambiguousActiveProbeCount += 1
         let recoveryDeadline = referenceDate.addingTimeInterval(codexStallWatchdogRecoveryThreshold)
@@ -955,7 +961,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 "probeDeferred",
                 session: session,
                 fields: [
-                    "kind": "active",
+                    "kind": probeKind,
                     "probeCount": String(session.codexWatchdogState.ambiguousActiveProbeCount)
                 ]
             )
@@ -985,9 +991,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         referenceDate: Date,
         now: Date = Date()
     ) -> Bool {
-        let previousFingerprint = session.codexWatchdogState.lastAmbiguousProbeFingerprint
+        let previousFingerprint = session.codexWatchdogState.lastAmbiguousProbeKind == kind
+            ? session.codexWatchdogState.lastAmbiguousProbeFingerprint
+            : nil
         if let previousFingerprint, previousFingerprint != fingerprint {
             recordCodexWatchdogProgress(for: session, at: now)
+            session.codexWatchdogState.lastAmbiguousProbeKind = kind
             session.codexWatchdogState.lastAmbiguousProbeFingerprint = fingerprint
             recordCodexWatchdogTransition(
                 "snapshotDelta",
@@ -997,6 +1006,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return true
         }
 
+        session.codexWatchdogState.lastAmbiguousProbeKind = kind
         session.codexWatchdogState.lastAmbiguousProbeFingerprint = fingerprint
         session.codexWatchdogState.ambiguousActiveProbeCount += 1
         let recoveryDeadline = referenceDate.addingTimeInterval(codexStallWatchdogRecoveryThreshold)

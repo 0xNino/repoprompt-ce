@@ -90,6 +90,38 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         session.pendingUserInputRequest = makeUserInputRequest(id: "stop-watchdog")
     }
 
+    func testActiveToIdleProbeTransitionDoesNotCountAsProgress() async {
+        let controller = LivenessFakeCodexController(
+            snapshot: .idle,
+            activeTurnIDs: [],
+            snapshotSequence: [
+                .active(activeFlags: []),
+                .idle,
+                .idle
+            ]
+        )
+        let viewModel = makeViewModel(
+            controller: controller,
+            watchdogProbeThreshold: 10,
+            watchdogRecoveryThreshold: 10
+        )
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let originalProgressDate = Date().addingTimeInterval(-20)
+        session.codexWatchdogState.lastProgressAt = originalProgressDate
+        let originalProgressGeneration = session.codexWatchdogState.progressGeneration
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+        XCTAssertEqual(session.codexWatchdogState.lastAmbiguousProbeKind, "active")
+
+        _ = await viewModel.test_codexCoordinator.test_attemptCodexStallRecovery(session: session)
+
+        XCTAssertEqual(session.codexWatchdogState.lastAmbiguousProbeKind, "no-active-turn")
+        XCTAssertEqual(session.codexWatchdogState.lastProgressAt, originalProgressDate)
+        XCTAssertEqual(session.codexWatchdogState.progressGeneration, originalProgressGeneration)
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertEqual(session.runState, .running)
+    }
+
     func testProviderProgressDuringSnapshotProbeSupersedesStaleTerminalization() async throws {
         let snapshotGate = LivenessSnapshotReadGate()
         let controller = LivenessFakeCodexController(
