@@ -10,7 +10,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
             files: ["Sources/Seed.swift": SwiftFixtureSource.emptyStruct("Seed")]
         )
         let fixture = try CodemapStoreFixture(name: #function)
-        let codemapGate = CodemapSuspensionGate()
+        let codemapGate = TestReleaseFence(name: "codemap suspension gate")
         addTeardownBlock {
             await codemapGate.release()
             await fixture.shutdown()
