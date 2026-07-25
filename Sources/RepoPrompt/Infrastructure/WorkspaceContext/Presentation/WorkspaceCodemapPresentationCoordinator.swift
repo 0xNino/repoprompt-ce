@@ -29,6 +29,16 @@ struct WorkspaceCodemapPresentationRequestPolicy: Equatable {
         self.maximumTotalWait = maximumTotalWait
         self.maximumCandidateDemandCount = maximumCandidateDemandCount
     }
+
+    func candidateDemandLimitIssue(
+        attemptedCount: Int
+    ) -> WorkspaceCodemapAutomaticSelectionIssue? {
+        guard attemptedCount > maximumCandidateDemandCount else { return nil }
+        return .budget(.targetDemandLimit(
+            attempted: attemptedCount,
+            limit: maximumCandidateDemandCount
+        ))
+    }
 }
 
 struct WorkspaceCodemapPresentationWaiter {
@@ -585,9 +595,24 @@ struct WorkspaceCodemapPresentationCoordinator {
             rootScope: rootScope
         )
         let validTargets = Set(initialRevalidation.validTargets)
+        let orderedValidTargets = selection.targets.filter { validTargets.contains($0) }
+        if let limitIssue = policy.candidateDemandLimitIssue(
+            attemptedCount: orderedValidTargets.count
+        ) {
+            let coverage = WorkspaceCodemapAutomaticSelectionAggregateCoverage.unavailable([
+                limitIssue
+            ])
+            issues.append(.automatic(coverage))
+            return AutomaticPreparation(
+                candidates: [],
+                issues: issues,
+                coverage: .unavailable(issues),
+                receipt: nil
+            )
+        }
         let rootReceipts = Dictionary(uniqueKeysWithValues: receipt.roots.map { ($0.rootEpoch, $0) })
         var demandedTargetFileIDs: [UUID] = []
-        for target in selection.targets where validTargets.contains(target) {
+        for target in orderedValidTargets {
             guard let rootReceipt = rootReceipts[target.rootEpoch],
                   let owned = await store.requestAutomaticCodemapTargetWithOwnership(
                       target: target,
@@ -610,7 +635,7 @@ struct WorkspaceCodemapPresentationCoordinator {
         }
 
         let collection = await store.codemapOperationPresentationCandidates(
-            forFileIDs: selection.targets.filter { validTargets.contains($0) }.map(\.fileID),
+            forFileIDs: orderedValidTargets.map(\.fileID),
             rootScope: rootScope,
             logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID
         )

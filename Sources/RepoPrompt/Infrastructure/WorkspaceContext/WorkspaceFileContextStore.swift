@@ -11188,20 +11188,21 @@ actor WorkspaceFileContextStore {
                   isDiscoverableFileID(fileID),
                   let state = rootStatesByID[file.rootID],
                   state.fileIDsByRelativePath[file.standardizedRelativePath] == fileID,
-                  let catalogGeneration = catalogGenerationsByRootID[file.rootID]
+                  catalogGenerationsByRootID[file.rootID] != nil
             else { return nil }
             let rootEpoch = WorkspaceCodemapRootEpoch(
                 rootID: file.rootID,
                 rootLifetimeID: state.lifetimeID
             )
-            let requestGeneration = codemapSessionsByRootEpoch[rootEpoch]?
-                .pathGenerationsByRelativePath[file.standardizedRelativePath]
-                ?? codemapSessionsByRootEpoch[rootEpoch]?.authority.ingressGeneration
-            guard let requestGeneration else { return nil }
+            guard let session = codemapSessionsByRootEpoch[rootEpoch],
+                  codemapAuthorityIsCurrent(session.authority)
+            else { return nil }
+            let requestGeneration = session.pathGenerationsByRelativePath[file.standardizedRelativePath]
+                ?? session.authority.ingressGeneration
             return WorkspaceCodemapAutomaticSelectionSourceIdentity(
                 rootEpoch: rootEpoch,
                 fileID: fileID,
-                catalogGeneration: catalogGeneration,
+                catalogGeneration: session.authority.catalogGeneration,
                 requestGeneration: requestGeneration
             )
         }

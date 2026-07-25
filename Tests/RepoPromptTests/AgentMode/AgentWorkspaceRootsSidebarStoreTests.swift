@@ -172,10 +172,10 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
 
         XCTAssertEqual(presentation.state, .updating)
         XCTAssertEqual(presentation.classifiedCount, 6)
-        XCTAssertEqual(presentation.supportedCount, 10)
+        XCTAssertNil(presentation.supportedCount)
         XCTAssertEqual(presentation.pendingCount, 4)
-        XCTAssertEqual(presentation.percentageText, "60%")
-        XCTAssertEqual(presentation.statusText, "Updating 60%")
+        XCTAssertNil(presentation.percentageText)
+        XCTAssertEqual(presentation.statusText, "Updating…")
         XCTAssertTrue(presentation.tooltip.contains("pending updates"))
     }
 

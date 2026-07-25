@@ -135,11 +135,15 @@ struct AgentWorkspaceCodemapPresentation: Equatable {
             case .revoked: .revoked
             }
         }
+        let coverage = snapshot.coverage
+        let stableSupportedCount = coverage?.enumerationState == .complete
+            ? coverage?.supportedCount
+            : nil
         return Self(
             state: state,
-            classifiedCount: snapshot.coverage?.classifiedCount ?? 0,
-            supportedCount: snapshot.coverage?.supportedCount,
-            pendingCount: snapshot.coverage?.pendingCount ?? 0,
+            classifiedCount: coverage?.classifiedCount ?? 0,
+            supportedCount: stableSupportedCount,
+            pendingCount: coverage?.pendingCount ?? 0,
             updatesPending: snapshot.updatesPending,
             graphRevision: snapshot.graphRevision
         )

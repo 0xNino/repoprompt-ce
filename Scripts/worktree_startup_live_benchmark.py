@@ -2090,6 +2090,54 @@ def self_test_command(_args: argparse.Namespace) -> int:
         "summary": {"seeds": 1, "nodes": 1, "edges": 0, "files": 1, "tokens": 1},
         "issues": [],
     }, payload={"paths": [str(fixture_file)], "signatures": True, "size": "medium"})
+    budget_structure = routed_response({
+        "status": "partial", "size": "small", "files": [],
+        "roots": [{
+            "root": fixture_root.name, "status": "partial",
+            "truncated": {"reason": "size", "dropped_nodes": 3},
+            "issues": [{
+                "code": "graph_size_limit", "phase": "graph_traversal",
+                "retryable": False, "retry_after_ms": None,
+                "attempted": None, "limit": None,
+            }],
+        }],
+        "summary": {"seeds": 1, "nodes": 1, "edges": 0, "files": 0, "tokens": 0},
+        "issues": [],
+    }, payload={"paths": [str(fixture_root)], "signatures": False, "size": "small"})
+    checks["codemap_budget_nested_root_issue_accepted"] = (
+        codemap_budget_evidence(budget_structure)["dropped_file_count"] == 3
+    )
+    pending_structure = routed_response({
+        "status": "pending", "size": "large", "files": [],
+        "roots": [{
+            "root": fixture_root.name, "status": "pending",
+            "issues": [{
+                "code": "graph_indexing", "phase": "graph_snapshot",
+                "retryable": True, "retry_after_ms": 100,
+                "attempted": None, "limit": None,
+            }],
+        }],
+        "summary": {"seeds": 1, "nodes": 0, "edges": 0, "files": 0, "tokens": 0},
+        "issues": [],
+        "retry": {"retryable": True, "retry_after_ms": 100},
+    }, payload={"paths": [str(fixture_file)], "signatures": True, "size": "large"})
+    checks["codemap_pending_nullable_retry_metadata_accepted"] = (
+        codemap_retryable_pending_evidence(pending_structure)["issue_codes"]
+        == ["graph_indexing"]
+    )
+    legacy_timeout_structure = json.loads(json.dumps(pending_structure))
+    legacy_timeout_structure["_benchmark_response"]["status"] = "timeout"
+    legacy_timeout_structure["_benchmark_response"]["roots"][0]["issues"][0].update({
+        "code": "readiness_timeout",
+        "attempted": CODEMAP_GATE_WAIT_MILLISECONDS,
+        "limit": CODEMAP_GATE_WAIT_MILLISECONDS,
+    })
+    try:
+        codemap_retryable_pending_evidence(legacy_timeout_structure)
+        checks["codemap_legacy_timeout_contract_rejected"] = False
+    except BenchmarkError:
+        checks["codemap_legacy_timeout_contract_rejected"] = True
+
     tree_fixture_text = (
         f"{fixture_root.name}\n"
         f"└── {fixture_file.name} +\n\n{CODEMAP_TREE_LEGEND}"
@@ -7426,54 +7474,62 @@ def codemap_tree_marker_evidence(
     }
 
 
-def codemap_retryable_terminal_evidence(
-    value: Any,
-    *,
-    expected_status: str,
-    expected_issue_code: str,
-) -> dict[str, Any]:
-    payload = tool_payload(value, "get_code_structure")
-    issues = payload.get("issues")
-    retry = payload.get("retry")
-    if payload.get("status") != expected_status or payload.get("files") != []:
-        raise BenchmarkError(f"expected empty typed {expected_status} code-structure result")
-    if not isinstance(issues, list) or not isinstance(retry, dict):
-        raise BenchmarkError("retryable terminal result omitted typed issues or reply retry")
-    matches = [item for item in issues if isinstance(item, dict) and item.get("code") == expected_issue_code]
-    if len(matches) != 1:
-        raise BenchmarkError(f"terminal result omitted exact issue {expected_issue_code}")
-    issue = matches[0]
-    if (
-        issue.get("retryable") is not True
-        or not positive_integer(issue.get("retry_after_ms"))
-        or not isinstance(issue.get("attempted"), int)
-        or not (
-            CODEMAP_GATE_WAIT_MILLISECONDS - CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS
-            <= issue["attempted"]
-            <= CODEMAP_GATE_WAIT_MILLISECONDS + CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS
+def codemap_reply_issues(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    issues = [
+        issue for issue in payload.get("issues") or []
+        if isinstance(issue, dict)
+    ]
+    for root in payload.get("roots") or []:
+        if not isinstance(root, dict):
+            continue
+        issues.extend(
+            issue for issue in root.get("issues") or []
+            if isinstance(issue, dict)
         )
-        or issue.get("limit") != CODEMAP_GATE_WAIT_MILLISECONDS
-        or retry.get("retryable") is not True
+    return issues
+
+
+def codemap_retryable_pending_evidence(value: Any) -> dict[str, Any]:
+    payload = tool_payload(value, "get_code_structure")
+    issues = codemap_reply_issues(payload)
+    retry = payload.get("retry")
+    retryable_issues = [issue for issue in issues if issue.get("retryable") is True]
+    if payload.get("status") != "pending" or payload.get("files") != []:
+        raise BenchmarkError("expected empty typed pending code-structure result")
+    if not retryable_issues or not isinstance(retry, dict):
+        raise BenchmarkError("pending result omitted typed retryable issues or reply retry")
+    if any(
+        not positive_integer(issue.get("retry_after_ms"))
+        or issue.get("attempted") is not None
+        or issue.get("limit") is not None
+        for issue in retryable_issues
+    ) or (
+        retry.get("retryable") is not True
         or not positive_integer(retry.get("retry_after_ms"))
     ):
-        raise BenchmarkError("retryable terminal result omitted non-null retry metadata")
+        raise BenchmarkError("pending result omitted current nullable retry metadata")
+    issue_codes = sorted({
+        str(issue["code"]) for issue in retryable_issues
+        if isinstance(issue.get("code"), str)
+    })
+    if not issue_codes:
+        raise BenchmarkError("pending result omitted a typed retryable issue code")
     return {
-        "status": expected_status,
-        "issue_codes": [expected_issue_code],
+        "status": "pending",
+        "issue_codes": issue_codes,
         "empty": True,
         "retryable": True,
         "retry_after_ms": retry["retry_after_ms"],
-        "attempted": issue["attempted"],
-        "limit": issue["limit"],
+        "attempted": None,
+        "limit": None,
     }
 
 
 def codemap_budget_evidence(value: Any) -> dict[str, Any]:
     payload = tool_payload(value, "get_code_structure")
-    issues = payload.get("issues")
     matches = [
-        issue for issue in issues or []
-        if isinstance(issue, dict) and issue.get("code") == "graph_size_limit"
+        issue for issue in codemap_reply_issues(payload)
+        if issue.get("code") == "graph_size_limit"
     ]
     truncated = [
         root.get("truncated") for root in payload.get("roots") or []
@@ -7508,9 +7564,9 @@ def codemap_debug_action(
     )
     if not call_succeeded(response):
         raise BenchmarkError(f"DEBUG codemap action {action!r} failed")
-    snapshot = find_value(response, "codemap_projection")
+    snapshot = find_value(response, "codemap_graph_index")
     if not isinstance(snapshot, dict):
-        raise BenchmarkError(f"DEBUG codemap action {action!r} omitted codemap_projection")
+        raise BenchmarkError(f"DEBUG codemap action {action!r} omitted codemap_graph_index")
     return {"response": response, "snapshot": snapshot}
 
 
@@ -8881,7 +8937,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         if not call_succeeded(runtime):
             raise BenchmarkError("codemap root identity snapshot failed")
         root_identity = runtime_root_identity(runtime, str(root))
-        start_snapshot = codemap_debug_action(runner, plan, "codemap_projection_snapshot")["snapshot"]
+        start_snapshot = codemap_debug_action(runner, plan, "codemap_graph_index_snapshot")["snapshot"]
         memory_session_id, _ = start_owned_memory_sampler(
             runner, artifact.name, memory_acquisition
         )
@@ -9051,7 +9107,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
 
         # Directory overflow must fail before any codemap admission or build.
         before_overflow = codemap_debug_action(
-            runner, plan, "codemap_projection_snapshot"
+            runner, plan, "codemap_graph_index_snapshot"
         )["snapshot"]
         overflow = runner.call(
             "codemap-directory-overflow", "get_code_structure",
@@ -9060,16 +9116,16 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         )
         overflow_evidence = codemap_budget_evidence(overflow)
         after_overflow = codemap_debug_action(
-            runner, plan, "codemap_projection_snapshot"
+            runner, plan, "codemap_graph_index_snapshot"
         )["snapshot"]
         overflow_deltas = {
             key: codemap_counter_delta(before_overflow, after_overflow, key)
             for key in (
                 "builds", "materializations", "manifest_writes",
-                "projection_demands_acquired", "projection_batches_queued",
-                "projection_batches_started", "projection_catalog_pages",
-                "projection_catalog_candidates", "projection_builds_started",
-                "projection_segments_published",
+                "graph_index_runs_started", "graph_index_batches_queued",
+                "graph_index_batches_started", "graph_index_catalog_pages",
+                "graph_index_catalog_candidates",
+                "graph_index_changes_published",
             )
         }
         results["directory-overflow"] = {
@@ -9145,7 +9201,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         )
         non_git_deltas = {
             key: codemap_counter_delta(before_non_git["snapshot"], after_non_git["snapshot"], key)
-            for key in ("builds", "projection_batches_started", "projection_catalog_candidates")
+            for key in ("builds", "graph_index_batches_started", "graph_index_catalog_candidates")
         }
         non_git_engine_absent = (
             find_value(before_non_git["response"], "engine_present") is False
@@ -9280,9 +9336,10 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
                        "issue_codes": deleted_issue_codes, "marker_absent": delete_absent},
         }
 
-        # The DEBUG hold pauses only future projection-batch admission; timeout must be real.
+        # The DEBUG hold pauses only future graph-index admission. The graph-native
+        # reply must remain prompt, typed pending, and explicitly retryable.
         hold_result = codemap_debug_action(
-            runner, plan, "codemap_projection_hold_acquire", expires_ms=30_000
+            runner, plan, "codemap_graph_index_hold_acquire", expires_ms=30_000
         )
         hold_id = find_value(hold_result["response"], "hold_id")
         if not isinstance(hold_id, str):
@@ -9302,27 +9359,18 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
              "content": f"struct {timeout_marker} {{}}\n",
              "context_id": plan["scope"]["context_id"]}, check=False,
         )
-        timeout_call = runner.timed_call(
+        pending_call = runner.timed_call(
             "codemap-held-timeout", "get_code_structure",
             {"paths": [timeout_path], "expand": "referrers", "depth": 1,
              "signatures": True, "size": "large",
              "context_id": plan["scope"]["context_id"]},
-            timeout=CODEMAP_GATE_WAIT_MILLISECONDS / 1000
-            + CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS / 1000 + 5,
+            timeout=15,
             check=False,
         )
-        timeout_elapsed_ms = (timeout_call.finished_ns - timeout_call.started_ns) / 1_000_000
-        timeout_evidence = codemap_retryable_terminal_evidence(
-            timeout_call.response, expected_status="timeout", expected_issue_code="readiness_timeout"
-        )
-        if not (
-            CODEMAP_GATE_WAIT_MILLISECONDS - CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS
-            <= timeout_elapsed_ms
-            <= CODEMAP_GATE_WAIT_MILLISECONDS + CODEMAP_GATE_HARNESS_ALLOWANCE_MILLISECONDS
-        ):
-            raise BenchmarkError("held timeout did not honor the 10s ± 500ms monotonic contract")
+        pending_elapsed_ms = (pending_call.finished_ns - pending_call.started_ns) / 1_000_000
+        pending_evidence = codemap_retryable_pending_evidence(pending_call.response)
         released = codemap_debug_action(
-            runner, plan, "codemap_projection_hold_release", hold_id=hold_id
+            runner, plan, "codemap_graph_index_hold_release", hold_id=hold_id
         )
         if find_value(released["response"], "released") is not True:
             raise BenchmarkError("DEBUG codemap hold was not owned/released")
@@ -9342,10 +9390,10 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
             expected_file_path=timeout_path, expected_marker=timeout_marker,
             expected_file_type=plan["dataset"]["code_file_type"],
         )
-        results["explicit-10s-timeout-contract"] = {
+        results["held-indexing-retry-contract"] = {
             "ok": call_succeeded(timeout_create),
-            "elapsed_ms": timeout_elapsed_ms,
-            "timeout": timeout_evidence,
+            "elapsed_ms": pending_elapsed_ms,
+            "pending": pending_evidence,
             "retry": retry_evidence,
             "future_admission_hold_released": True,
         }
@@ -9548,7 +9596,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
             expected_file_path=linked_prewarm_path,
         )
         linked_hold = codemap_debug_action(
-            runner, plan, "codemap_projection_hold_acquire",
+            runner, plan, "codemap_graph_index_hold_acquire",
             target_root_id=linked_identity["id"], expires_ms=60_000,
         )
         linked_hold_id = find_value(linked_hold["response"], "hold_id")
@@ -9690,7 +9738,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
             transcript_xml_from_log(linked_log), expected_first_path=linked_blocked_path,
         )
         linked_released = codemap_debug_action(
-            runner, plan, "codemap_projection_hold_release",
+            runner, plan, "codemap_graph_index_hold_release",
             target_root_id=linked_identity["id"], hold_id=linked_hold_id,
         )
         if find_value(linked_released["response"], "released") is not True:
@@ -9744,7 +9792,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
         }
 
         final_snapshot = codemap_debug_action(
-            runner, plan, "codemap_projection_snapshot"
+            runner, plan, "codemap_graph_index_snapshot"
         )["snapshot"]
         raw_queue_wait_values = final_snapshot.get("queue_wait_ms")
         start_queue_ordinal = start_snapshot.get("queue_wait_sample_ordinal")
@@ -9766,7 +9814,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
             raw_queue_wait_values[-queue_sample_delta:] if queue_sample_delta else []
         )
         resource_keys = (
-            "retained_path_bytes", "retained_source_bytes", "retained_projection_bytes",
+            "retained_path_bytes", "retained_source_bytes", "retained_graph_index_bytes",
             "staged_graph_bytes", "resident_graph_bytes", "queued_manifest_mutation_bytes",
         )
         resources_bounded = all(
@@ -9776,8 +9824,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
             for key in resource_keys
         )
         rejection_keys = (
-            "projection_budget_rejections", "projection_demand_busy_rejections",
-            "busy_rejections", "failures", "manifest_failures",
+            "graph_index_budget_rejections", "busy_rejections", "failures", "manifest_failures",
         )
         rejection_deltas = {
             key: codemap_counter_delta(start_snapshot, final_snapshot, key)
@@ -9809,7 +9856,7 @@ def codemap_gate_command(args: argparse.Namespace) -> int:
             released = runner.call(
                 "codemap-finally-release-hold", DEBUG_TOOL,
                 diagnostic_payload(
-                    plan, "codemap_projection_hold_release", hold_id=active_hold,
+                    plan, "codemap_graph_index_hold_release", hold_id=active_hold,
                     **({"target_root_id": active_hold_target_root_id}
                        if active_hold_target_root_id else {}),
                 ),
@@ -11778,7 +11825,7 @@ def cleanup_command(args: argparse.Namespace) -> int:
             response = runner.call(
                 f"cleanup-release-codemap-hold-{str(hold_id)[:8]}", DEBUG_TOOL,
                 diagnostic_payload(
-                    plan, "codemap_projection_hold_release", hold_id=hold_id,
+                    plan, "codemap_graph_index_hold_release", hold_id=hold_id,
                     **({"target_root_id": hold.get("target_root_id")}
                        if isinstance(hold.get("target_root_id"), str) else {}),
                 ),
