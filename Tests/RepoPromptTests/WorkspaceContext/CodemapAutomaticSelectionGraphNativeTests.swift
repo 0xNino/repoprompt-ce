@@ -3,6 +3,136 @@ import Foundation
 import XCTest
 
 final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStoreCodemapSeamTestSupport {
+    func testPublisherIngressAppliesCatalogWhileCorrelatedCodemapInvalidationIsStalled() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: ["Sources/Seed.swift": SwiftFixtureSource.emptyStruct("Seed")]
+        )
+        let fixture = try CodemapStoreFixture(name: #function)
+        let codemapGate = CodemapSuspensionGate()
+        addTeardownBlock {
+            await codemapGate.release()
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+
+        let store = fixture.makeStore()
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let seed = try XCTUnwrap(files.first {
+            $0.standardizedRelativePath == "Sources/Seed.swift"
+        })
+        let ticket = try await pendingTicket(store.requestCodemapArtifact(forFileID: seed.id))
+        _ = try await readyResult(settledResult(store: store, ticket: ticket))
+
+        await store.setCodemapPathInvalidationStageHandlerForTesting { epoch, _, stage in
+            guard epoch == ticket.rootEpoch, stage == .rootMutationFence else { return }
+            await codemapGate.enterAndWait()
+        }
+
+        let createdRelativePath = "Sources/Generated.swift"
+        let createdURL = root.appendingPathComponent(createdRelativePath)
+        try SwiftFixtureSource.emptyStruct("Generated").write(
+            to: createdURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        try await store.replayPublisherFileSystemDeltasForCodemapIndependenceTesting(
+            rootID: loaded.id,
+            deltas: [.fileAdded(createdRelativePath)],
+            servicePublicationSequence: 41
+        )
+        let codemapStalled = await codemapGate.waitUntilEntered()
+        XCTAssertTrue(codemapStalled)
+        guard codemapStalled else { return }
+
+        let catalogFile = await store.file(rootID: loaded.id, relativePath: createdRelativePath)
+        XCTAssertNotNil(catalogFile)
+
+        let demandDuringInvalidation = await store.requestCodemapArtifact(forFileID: seed.id)
+        guard case .unavailable(.busy) = demandDuringInvalidation else {
+            return XCTFail("Expected the retained codemap invalidation flight to fence demand admission")
+        }
+
+        let rootFenceTask = Task {
+            try await store.replayPublisherFileSystemDeltasForCodemapIndependenceTesting(
+                rootID: loaded.id,
+                deltas: [.fileModified(".git/HEAD", nil)],
+                servicePublicationSequence: 42
+            )
+        }
+        var rootFenceParked = false
+        for _ in 0 ..< 200 {
+            if await store.codemapPathQuiescenceWaiterCountForTesting(rootEpoch: ticket.rootEpoch) == 1 {
+                rootFenceParked = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(rootFenceParked, "Root fence acquisition should park behind retained path work")
+        guard rootFenceParked else {
+            codemapGate.release()
+            _ = try? await rootFenceTask.value
+            return
+        }
+
+        let explicitlyCreatedRelativePath = "Sources/Explicit.swift"
+        let explicitlyCreatedURL = root.appendingPathComponent(explicitlyCreatedRelativePath)
+        let createTask = Task {
+            try await store.createFile(
+                rootID: loaded.id,
+                relativePath: explicitlyCreatedRelativePath,
+                content: SwiftFixtureSource.emptyStruct("Explicit")
+            )
+        }
+        var createdBeforeDerivedInvalidationReleased = false
+        for _ in 0 ..< 200 {
+            if FileManager.default.fileExists(atPath: explicitlyCreatedURL.path) {
+                createdBeforeDerivedInvalidationReleased = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(
+            createdBeforeDerivedInvalidationReleased,
+            "Explicit create must not wait for publisher-derived codemap convergence"
+        )
+        _ = try await createTask.value
+        let waiterCountWhileStalled = await store.codemapPathQuiescenceWaiterCountForTesting(
+            rootEpoch: ticket.rootEpoch
+        )
+        XCTAssertEqual(waiterCountWhileStalled, 1)
+
+        let deleteTask = Task {
+            try await store.deleteFile(rootID: loaded.id, relativePath: createdRelativePath)
+        }
+        var deletedBeforeDerivedInvalidationReleased = false
+        for _ in 0 ..< 200 {
+            if !FileManager.default.fileExists(atPath: createdURL.path) {
+                deletedBeforeDerivedInvalidationReleased = true
+                break
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(
+            deletedBeforeDerivedInvalidationReleased,
+            "Explicit mutation must not wait for publisher-derived codemap convergence"
+        )
+
+        await codemapGate.release()
+        try await deleteTask.value
+        try await rootFenceTask.value
+        let waiterCountAfterRelease = await store.codemapPathQuiescenceWaiterCountForTesting(
+            rootEpoch: ticket.rootEpoch
+        )
+        XCTAssertEqual(waiterCountAfterRelease, 0)
+        await store.setCodemapPathInvalidationStageHandlerForTesting(nil)
+
+        let refreshed = try await readyArtifactDemand(store: store, forFileID: seed.id)
+        XCTAssertEqual(refreshed.ticket.fileID, seed.id)
+    }
+
     func testAutomaticSelectionUsesCommittedGraphAndTargetOnlyBackgroundDemand() async throws {
         let repository = try ReviewGitRepositoryFixture(name: #function)
         let rootURL = try repository.makeRepository(
