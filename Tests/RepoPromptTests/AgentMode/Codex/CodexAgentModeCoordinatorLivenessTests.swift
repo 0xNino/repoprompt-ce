@@ -34,11 +34,14 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
 
         try await waitUntil {
-            controller.shutdownCountSync() == 1
-                && controller.startOrResumeCountSync() == 1
-                && controller.readSnapshotIncludeTurnsValuesSync().contains(true)
+            viewModel.test_codexCoordinator.test_codexActiveReattachReconciliationIsComplete(
+                session: session
+            )
         }
 
+        XCTAssertEqual(controller.shutdownCountSync(), 1)
+        XCTAssertEqual(controller.startOrResumeCountSync(), 1)
+        XCTAssertTrue(controller.readSnapshotIncludeTurnsValuesSync().contains(true))
         XCTAssertEqual(session.runState, .running)
         XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
         XCTAssertEqual(controller.startUserTurnCountSync(), 0)
@@ -54,6 +57,150 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
 
         XCTAssertEqual(session.runState, .completed)
         XCTAssertFalse(session.items.contains { $0.kind == .error })
+    }
+
+    func testCompletionDuringActiveReattachReconciliationIsBufferedAndReplayed() async throws {
+        let snapshotGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            postReattachSnapshotReadGate: snapshotGate
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        defer { snapshotGate.release() }
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("partial answer"),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        try await waitUntil {
+            snapshotGate.isWaitingSync()
+                && viewModel.test_codexCoordinator.test_codexReattachReconciliationIsPending(
+                    session: session
+                )
+        }
+
+        XCTAssertNil(session.codexAuthoritativeActiveTurn)
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session,
+            sourceController: controller
+        )
+
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertTrue(viewModel.test_codexCoordinator.test_codexReattachReconciliationIsPending(
+            session: session
+        ))
+
+        snapshotGate.release()
+        try await waitUntil {
+            session.runState == .completed
+        }
+
+        XCTAssertFalse(viewModel.test_codexCoordinator.test_codexReattachReconciliationIsPending(
+            session: session
+        ))
+        XCTAssertEqual(controller.shutdownCountSync(), 1)
+        XCTAssertEqual(controller.startOrResumeCountSync(), 1)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.interruptedTurnIDsSync().isEmpty)
+        XCTAssertEqual(session.items.filter { $0.kind == .assistant }.map(\.text), ["partial answer"])
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+    }
+
+    func testCompletionDuringActiveReattachReconciliationReplaysWhenSnapshotIsIdle() async throws {
+        let snapshotGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            postReattachSnapshotStatus: .idle,
+            postReattachActiveTurnIDs: [],
+            postReattachSnapshotReadGate: snapshotGate
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        defer { snapshotGate.release() }
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("partial answer"),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        try await waitUntil {
+            snapshotGate.isWaitingSync()
+                && viewModel.test_codexCoordinator.test_codexReattachReconciliationIsPending(
+                    session: session
+                )
+        }
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session,
+            sourceController: controller
+        )
+
+        XCTAssertEqual(session.runState, .running)
+        snapshotGate.release()
+        try await waitUntil {
+            session.runState == .completed
+        }
+
+        XCTAssertFalse(viewModel.test_codexCoordinator.test_codexReattachReconciliationIsPending(
+            session: session
+        ))
+        XCTAssertEqual(controller.shutdownCountSync(), 1)
+        XCTAssertEqual(controller.startOrResumeCountSync(), 1)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+    }
+
+    func testCompletionDuringActiveReattachReconciliationReplaysWhenSnapshotFails() async throws {
+        let snapshotGate = LivenessSnapshotReadGate()
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            failsPostReattachSnapshotRead: true,
+            postReattachSnapshotReadGate: snapshotGate
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        defer { snapshotGate.release() }
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("partial answer"),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        try await waitUntil {
+            snapshotGate.isWaitingSync()
+                && viewModel.test_codexCoordinator.test_codexReattachReconciliationIsPending(
+                    session: session
+                )
+        }
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session,
+            sourceController: controller
+        )
+
+        XCTAssertEqual(session.runState, .running)
+        snapshotGate.release()
+        try await waitUntil {
+            session.runState == .completed
+        }
+
+        XCTAssertFalse(viewModel.test_codexCoordinator.test_codexReattachReconciliationIsPending(
+            session: session
+        ))
+        XCTAssertEqual(controller.shutdownCountSync(), 1)
+        XCTAssertEqual(controller.startOrResumeCountSync(), 1)
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
     }
 
     func testChangingActiveSnapshotsRemainValidProgress() async throws {
@@ -1753,7 +1900,11 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
     private let startUserTurnDelayNanos: UInt64
     private let alwaysFailsSnapshotRead: Bool
     private let failsEveryEvenSnapshotRead: Bool
+    private let failsPostReattachSnapshotRead: Bool
+    private let postReattachSnapshotStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus?
+    private let postReattachActiveTurnIDs: [String]?
     private let snapshotReadGate: LivenessSnapshotReadGate?
+    private let postReattachSnapshotReadGate: LivenessSnapshotReadGate?
     private var pendingTurnFailure: CodexNativeSessionController.TurnFailure?
 
     init(
@@ -1767,7 +1918,11 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         startUserTurnDelayNanos: UInt64 = 0,
         alwaysFailsSnapshotRead: Bool = false,
         failsEveryEvenSnapshotRead: Bool = false,
+        failsPostReattachSnapshotRead: Bool = false,
+        postReattachSnapshotStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus? = nil,
+        postReattachActiveTurnIDs: [String]? = nil,
         snapshotReadGate: LivenessSnapshotReadGate? = nil,
+        postReattachSnapshotReadGate: LivenessSnapshotReadGate? = nil,
         pendingTurnFailure: CodexNativeSessionController.TurnFailure? = nil
     ) {
         snapshotStatuses = if let snapshotSequence, !snapshotSequence.isEmpty {
@@ -1783,7 +1938,11 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         self.startUserTurnDelayNanos = startUserTurnDelayNanos
         self.alwaysFailsSnapshotRead = alwaysFailsSnapshotRead
         self.failsEveryEvenSnapshotRead = failsEveryEvenSnapshotRead
+        self.failsPostReattachSnapshotRead = failsPostReattachSnapshotRead
+        self.postReattachSnapshotStatus = postReattachSnapshotStatus
+        self.postReattachActiveTurnIDs = postReattachActiveTurnIDs
         self.snapshotReadGate = snapshotReadGate
+        self.postReattachSnapshotReadGate = postReattachSnapshotReadGate
         self.pendingTurnFailure = pendingTurnFailure
     }
 
@@ -1855,22 +2014,35 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         let snapshotIndex = readSnapshotCount % snapshotStatuses.count
         readSnapshotCount += 1
         readSnapshotIncludeTurnsValues.append(includeTurns)
-        if let snapshotReadGate {
+        if includeTurns, let postReattachSnapshotReadGate {
+            await postReattachSnapshotReadGate.wait()
+        } else if let snapshotReadGate {
             await snapshotReadGate.wait()
         }
         if alwaysFailsSnapshotRead
             || (failsEveryEvenSnapshotRead && readSnapshotCount.isMultiple(of: 2))
+            || (failsPostReattachSnapshotRead && includeTurns)
         {
             throw LivenessSnapshotError.probeFailed
+        }
+        let runtimeStatus = if includeTurns {
+            postReattachSnapshotStatus ?? snapshotStatuses[snapshotIndex]
+        } else {
+            snapshotStatuses[snapshotIndex]
+        }
+        let activeTurnIDs = if includeTurns {
+            postReattachActiveTurnIDs ?? snapshotActiveTurnIDs
+        } else {
+            snapshotActiveTurnIDs
         }
         return CodexNativeSessionController.ThreadSnapshot(
             conversationID: "fake",
             rolloutPath: nil,
             model: nil,
             reasoningEffort: nil,
-            runtimeStatus: snapshotStatuses[snapshotIndex],
-            currentTurnID: snapshotActiveTurnIDs.first,
-            activeTurnIDs: snapshotActiveTurnIDs,
+            runtimeStatus: runtimeStatus,
+            currentTurnID: activeTurnIDs.first,
+            activeTurnIDs: activeTurnIDs,
             latestTurnStatus: includeTurns ? snapshotLatestTurnStatus : nil
         )
     }
