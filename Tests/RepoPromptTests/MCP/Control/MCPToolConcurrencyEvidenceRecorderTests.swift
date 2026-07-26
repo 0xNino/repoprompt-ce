@@ -109,6 +109,7 @@ final class MCPToolConcurrencyEvidenceRecorderTests: XCTestCase {
         recorder.recordLaneAdmitted(classKey: .smallRead, waitMilliseconds: 4)
         recorder.recordLaneAdmitted(classKey: .smallRead, waitMilliseconds: 12)
         recorder.recordLaneWaitAbandoned(classKey: .smallRead)
+        recorder.recordRejection(classKey: .smallRead, reason: .laneWaitCancelled)
         recorder.recordLanePermitReleased(classKey: .smallRead)
 
         let snapshot = recorder.snapshot()
@@ -117,6 +118,12 @@ final class MCPToolConcurrencyEvidenceRecorderTests: XCTestCase {
         XCTAssertEqual(smallRead.laneHeldHighWater, 2)
         XCTAssertEqual(smallRead.laneAdmittedCount, 2)
         XCTAssertEqual(smallRead.laneWaitAbandonedCount, 1)
+        XCTAssertEqual(
+            smallRead.rejectionCounts[
+                MCPToolConcurrencyEvidenceRejectionReason.laneWaitCancelled.rawValue
+            ],
+            1
+        )
 
         let laneWait = try XCTUnwrap(
             smallRead.stageHistograms[MCPToolConcurrencyEvidenceStage.laneWait.rawValue]

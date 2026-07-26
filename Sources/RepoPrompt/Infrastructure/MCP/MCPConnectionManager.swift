@@ -11458,6 +11458,10 @@ actor ServerNetworkManager {
                     lifecycleCorrelation: lifecycleCorrelation,
                     cancellationResult: {
                         MCPToolConcurrencyEvidenceRecorder.shared.recordLaneWaitAbandoned(classKey: evidenceClass)
+                        MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
+                            classKey: evidenceClass,
+                            reason: .laneWaitCancelled
+                        )
                         return Self.executionContractToolErrorResult(
                             rawJSON: capturedRawJSON,
                             code: "tool_execution_connection_terminal",
