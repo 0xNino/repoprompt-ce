@@ -8,6 +8,7 @@
 
 import Foundation
 import Logging
+import RepoPromptDomainRuntime
 
 private let log = Logger(label: "com.repoprompt.mcp.readiness")
 
@@ -45,9 +46,7 @@ actor MCPToolCatalogReadiness {
 
         while Date() < deadline {
             // Check if required services are registered
-            let isReady = await MainActor.run {
-                checkServicesReady(windowID: windowID)
-            }
+            let isReady = await checkServicesReady(windowID: windowID)
 
             if isReady {
                 mcpToolCatalogReadinessLog("Tool catalog ready for window \(windowID.map(String.init) ?? "nil")")
@@ -93,7 +92,7 @@ actor MCPToolCatalogReadiness {
 
     /// Check if required services are ready (MainActor)
     @MainActor
-    private func checkServicesReady(windowID: Int?) -> Bool {
+    private func checkServicesReady(windowID: Int?) async -> Bool {
         if let windowID {
             // Check if the window exists
             guard let window = WindowStatesManager.shared.window(withID: windowID) else {
@@ -108,33 +107,21 @@ actor MCPToolCatalogReadiness {
             }
         }
 
-        // Always require WindowRoutingService to be registered (provides routing tools)
-        let hasRoutingService = ServiceRegistry.services.contains { service in
-            service is WindowRoutingService
-        }
-
-        if !hasRoutingService {
-            mcpToolCatalogReadinessLog("WindowRoutingService not yet registered")
+        let snapshot = await ServiceRegistry.catalogSnapshot()
+        let globalNames = Set(snapshot.toolNames)
+        guard globalNames.isSuperset(of: MCPGlobalToolName.orderedToolNames) else {
+            mcpToolCatalogReadinessLog("Global domain tool registrations are not ready")
             return false
         }
 
-        // If no specific window required, routing service is enough
-        guard let windowID else {
-            return true
+        guard let windowID else { return true }
+        let requiredScope = MCPDomainToolRegistrationScope.window(id: windowID)
+        let windowCatalogReady = MCPWindowToolGroup.orderedToolNames.allSatisfy { toolName in
+            snapshot.activeScopesByToolName[toolName]?.contains(requiredScope) == true
         }
-
-        // Check if the window's catalog service is registered.
-        let catalogService = WindowStatesManager.shared.window(withID: windowID)?.mcpServer.windowMCPToolCatalogService
-        let isWindowServiceRegistered = ServiceRegistry.services.contains { service in
-            guard let catalogService else { return false }
-            return (service as AnyObject) === (catalogService as AnyObject)
+        if !windowCatalogReady {
+            mcpToolCatalogReadinessLog("Window domain tool registration for window \(windowID) not ready")
         }
-
-        if !isWindowServiceRegistered {
-            mcpToolCatalogReadinessLog("MCPWindowToolCatalogService for window \(windowID) not yet registered")
-            return false
-        }
-
-        return true
+        return windowCatalogReady
     }
 }

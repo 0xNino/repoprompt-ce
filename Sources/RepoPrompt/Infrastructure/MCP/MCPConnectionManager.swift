@@ -3,11 +3,11 @@
 import Darwin
 import Dispatch
 import Foundation
-import JSONSchema
 import Logging
 import MCP
 import Ontology
 import OSLog
+import RepoPromptDomainRuntime
 import RepoPromptShared
 import SwiftUI
 
@@ -1789,7 +1789,7 @@ actor ServerNetworkManager {
         let windowID: Int
         let windowStateIdentity: ObjectIdentifier
         let serverViewModelIdentity: ObjectIdentifier
-        let catalogServiceIdentity: ObjectIdentifier
+        let catalogRegistrationHandle: MCPDomainToolRegistrationHandle
     }
 
     struct ToolDispatchAuthorization: @unchecked Sendable {
@@ -2429,20 +2429,18 @@ actor ServerNetworkManager {
 
     private func captureWindowToolDispatchIdentity(
         windowID: Int,
-        catalogServiceIdentity: ObjectIdentifier
+        catalogRegistrationHandle: MCPDomainToolRegistrationHandle
     ) async -> WindowToolDispatchIdentity? {
-        await MainActor.run {
+        guard await ServiceRegistry.isActive(catalogRegistrationHandle) else { return nil }
+        return await MainActor.run {
             guard let window = WindowStatesManager.shared.window(withID: windowID),
-                  !window.isClosing,
-                  ServiceRegistry.services.contains(where: {
-                      ObjectIdentifier($0 as AnyObject) == catalogServiceIdentity
-                  })
+                  !window.isClosing
             else { return nil }
             return WindowToolDispatchIdentity(
                 windowID: windowID,
                 windowStateIdentity: ObjectIdentifier(window),
                 serverViewModelIdentity: ObjectIdentifier(window.mcpServer),
-                catalogServiceIdentity: catalogServiceIdentity
+                catalogRegistrationHandle: catalogRegistrationHandle
             )
         }
     }
@@ -2451,15 +2449,13 @@ actor ServerNetworkManager {
         _ identity: WindowToolDispatchIdentity,
         expectedServerViewModelIdentity: ObjectIdentifier? = nil
     ) async -> Bool {
-        await MainActor.run {
+        guard await ServiceRegistry.isActive(identity.catalogRegistrationHandle) else { return false }
+        return await MainActor.run {
             guard identity.windowID > 0,
                   let window = WindowStatesManager.shared.window(withID: identity.windowID),
                   !window.isClosing,
                   ObjectIdentifier(window) == identity.windowStateIdentity,
-                  ObjectIdentifier(window.mcpServer) == identity.serverViewModelIdentity,
-                  ServiceRegistry.services.contains(where: {
-                      ObjectIdentifier($0 as AnyObject) == identity.catalogServiceIdentity
-                  })
+                  ObjectIdentifier(window.mcpServer) == identity.serverViewModelIdentity
             else { return false }
             if let expectedServerViewModelIdentity {
                 return ObjectIdentifier(window.mcpServer) == expectedServerViewModelIdentity
@@ -6759,13 +6755,13 @@ actor ServerNetworkManager {
         )
     }
 
-    private func cachedSchema(for name: String, schema: JSONSchema, purpose: MCPRunPurpose) async throws -> Value {
+    private func cachedSchema(for name: String, schema: Value, purpose: MCPRunPurpose) async throws -> Value {
         let cacheKey = ToolSchemaCacheKey(name: name, purpose: purpose)
         if let cached = toolSchemaCache[cacheKey] {
             return cached
         }
 
-        var schemaValue = try Value(schema)
+        var schemaValue = schema
 
         if case var .object(dict) = schemaValue,
            dict["type"]?.stringValue == "object",
@@ -6839,10 +6835,8 @@ actor ServerNetworkManager {
 
     /// Checks if a tool's schema declares a `window_id` parameter.
     /// Pure function - doesn't access actor state.
-    private nonisolated func schemaDeclaresWindowID(schema: JSONSchema) -> Bool {
-        // Convert schema to Value and check for window_id in properties
-        guard let schemaValue = try? Value(schema),
-              case let .object(dict) = schemaValue,
+    private nonisolated func schemaDeclaresWindowID(schema: Value) -> Bool {
+        guard case let .object(dict) = schema,
               let props = dict["properties"]?.objectValue
         else {
             return false
@@ -9549,43 +9543,33 @@ actor ServerNetworkManager {
                 )
             }
 
-            let (disabled, registeredServices) = await MainActor.run {
-                (
-                    ToolAvailabilityStore.shared.effectiveDisabledTools,
-                    ServiceRegistry.services
-                )
+            let disabled = await MainActor.run {
+                ToolAvailabilityStore.shared.effectiveDisabledTools
             }
+            let catalog = await ServiceRegistry.catalogSnapshot()
             let policy = effectivePolicyState(for: connectionID)
             let restricted = policy.restricted
             let additionalTools = policy.additional
-            var seenNames = Set<String>()
-            var names: [String] = []
 
-            if isEnabledState {
-                for service in registeredServices {
-                    for tool in await service.tools {
-                        guard !disabled.contains(tool.name) else { continue }
-                        guard !restricted.contains(tool.name) else { continue }
+            guard isEnabledState else { return [] }
+            return catalog.definitions.compactMap { definition in
+                guard !disabled.contains(definition.name),
+                      !restricted.contains(definition.name)
+                else { return nil }
 
-                        if MCPPolicyGatedTools.names.contains(tool.name),
-                           !additionalTools.contains(tool.name)
-                        {
-                            continue
-                        }
-
-                        if !AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
-                            toolName: tool.name,
-                            taskLabelKind: policy.taskLabelKind,
-                            allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
-                        ) { continue }
-
-                        guard seenNames.insert(tool.name).inserted else { continue }
-                        names.append(tool.name)
-                    }
+                if MCPPolicyGatedTools.names.contains(definition.name),
+                   !additionalTools.contains(definition.name)
+                {
+                    return nil
                 }
-            }
 
-            return names.sorted()
+                guard AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
+                    toolName: definition.name,
+                    taskLabelKind: policy.taskLabelKind,
+                    allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
+                ) else { return nil }
+                return definition.name
+            }.sorted()
         }
 
         func debugSetBeforeToolEventObserverDeliveryForTesting(
@@ -10947,13 +10931,12 @@ actor ServerNetworkManager {
                 reason: "tools/list"
             )
 
-            // Get all MainActor-isolated data in one hop
-            let (disabled, registeredServices) = await MainActor.run {
-                (
-                    ToolAvailabilityStore.shared.effectiveDisabledTools,
-                    ServiceRegistry.services
-                )
+            let disabled = await MainActor.run {
+                ToolAvailabilityStore.shared.effectiveDisabledTools
             }
+            // Listing consumes one immutable actor snapshot. No per-service scan may
+            // observe a partially-mutated catalog or create a second schema authority.
+            let catalog = await ServiceRegistry.catalogSnapshot()
             let policy = await effectivePolicyState(for: connectionID)
             let restricted = policy.restricted
             let additionalTools = policy.additional
@@ -10967,77 +10950,68 @@ actor ServerNetworkManager {
                 }
             #endif
 
-            var seenNames = Set<String>() // ✱ 2. Deduplication helper
             var tools: [MCP.Tool] = []
 
             // Only proceed when the global MCP switch is ON
             if await isEnabledState {
-                // Enumerate every registered Service
-                for service in registeredServices {
-                    // Walk through the service's declared tools
-                    for tool in await service.tools {
-                        if disabled.contains(tool.name) {
-                            #if DEBUG
-                                recordHiddenTool(tool.name, reason: "disabled")
-                            #endif
-                            continue
-                        }
-                        if restricted.contains(tool.name) {
-                            #if DEBUG
-                                recordHiddenTool(tool.name, reason: "restricted")
-                            #endif
-                            continue
-                        }
+                for definition in catalog.definitions {
+                    if disabled.contains(definition.name) {
+                        #if DEBUG
+                            recordHiddenTool(definition.name, reason: "disabled")
+                        #endif
+                        continue
+                    }
+                    if restricted.contains(definition.name) {
+                        #if DEBUG
+                            recordHiddenTool(definition.name, reason: "restricted")
+                        #endif
+                        continue
+                    }
 
-                        // • hide policy-gated tools unless explicitly granted via additionalTools
-                        if MCPPolicyGatedTools.names.contains(tool.name),
-                           !additionalTools.contains(tool.name)
-                        {
-                            #if DEBUG
-                                recordHiddenTool(tool.name, reason: "missing_additional_tool_grant")
-                            #endif
-                            continue
-                        }
+                    // • hide policy-gated tools unless explicitly granted via additionalTools
+                    if MCPPolicyGatedTools.names.contains(definition.name),
+                       !additionalTools.contains(definition.name)
+                    {
+                        #if DEBUG
+                            recordHiddenTool(definition.name, reason: "missing_additional_tool_grant")
+                        #endif
+                        continue
+                    }
 
-                        // • role-based advertisement filtering (advertisement-only, not execution-time)
-                        if !AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
-                            toolName: tool.name,
-                            taskLabelKind: policy.taskLabelKind,
-                            allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
-                        ) {
-                            #if DEBUG
-                                recordHiddenTool(tool.name, reason: "role_advertisement_policy")
-                            #endif
-                            continue
-                        }
+                    // • role-based advertisement filtering (advertisement-only, not execution-time)
+                    if !AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
+                        toolName: definition.name,
+                        taskLabelKind: policy.taskLabelKind,
+                        allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
+                    ) {
+                        #if DEBUG
+                            recordHiddenTool(definition.name, reason: "role_advertisement_policy")
+                        #endif
+                        continue
+                    }
 
-                        // • skip duplicates coming from other windows
-                        guard seenNames.insert(tool.name).inserted else { continue }
+                    let schemaValue = try await cachedSchema(
+                        for: definition.name,
+                        schema: definition.inputSchema,
+                        purpose: policy.purpose
+                    )
+                    let description = advertisedToolDescription(
+                        for: definition.name,
+                        baseDescription: definition.description,
+                        purpose: policy.purpose
+                    )
 
-                        // OK – advertise the tool
-                        let schemaValue = try await cachedSchema(
-                            for: tool.name,
-                            schema: tool.inputSchema,
-                            purpose: policy.purpose
-                        )
-                        let description = advertisedToolDescription(
-                            for: tool.name,
-                            baseDescription: tool.description,
-                            purpose: policy.purpose
-                        )
-
-                        tools.append(
-                            .init(
-                                name: tool.name,
-                                description: description,
-                                inputSchema: schemaValue,
-                                annotations: CodexMCPToolAnnotationProjection.project(
-                                    tool.annotations,
-                                    clientIdentifier: clientIdentifier
-                                )
+                    tools.append(
+                        .init(
+                            name: definition.name,
+                            description: description,
+                            inputSchema: schemaValue,
+                            annotations: CodexMCPToolAnnotationProjection.project(
+                                definition.annotations.mcpAnnotations,
+                                clientIdentifier: clientIdentifier
                             )
                         )
-                    }
+                    )
                 }
             }
 
@@ -11373,26 +11347,25 @@ actor ServerNetworkManager {
                 return result
             }
 
-            // Snapshot routing state before entering the per-connection limiter.
-            // Keep the snapshot local to this call so app-wide tools do not share
-            // mutable cross-connection service state.
+            // Snapshot only routing state before entering the per-connection limiter.
+            // Tool definitions and handlers are resolved exactly once from the domain registry
+            // after window routing chooses the canonical application/window scope.
             let bypassWindowRoutingForSnapshot = Self.shouldBypassWindowRouting(for: toolName)
             connectionLog("tools/call \(toolName): reading MainActor routing state")
-            let routingSnapshot: (Int, [any Service], Bool) = await EditFlowPerf.measure(
+            let routingSnapshot: (Int, Bool) = await EditFlowPerf.measure(
                 EditFlowPerf.Stage.MCPToolCall.routingSnapshot,
                 EditFlowPerf.Dimensions(toolName: toolName)
             ) {
                 await MainActor.run {
-                    let services = ServiceRegistry.services
                     guard !bypassWindowRoutingForSnapshot else {
-                        return (0, services, false)
+                        return (0, false)
                     }
                     let windows = WindowStatesManager.shared.allWindows
                     let effectiveMode = WindowStatesManager.shared.isMultiWindowModeEffectivelyActive
-                    return (windows.count, services, effectiveMode)
+                    return (windows.count, effectiveMode)
                 }
             }
-            connectionLog("tools/call \(toolName): routing state windowCount=\(routingSnapshot.0) services=\(routingSnapshot.1.count) multi=\(routingSnapshot.2)")
+            connectionLog("tools/call \(toolName): routing state windowCount=\(routingSnapshot.0) multi=\(routingSnapshot.1)")
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.MCPToolCall.routingSnapshotCompleted,
                 correlation: lifecycleCorrelation,
@@ -11530,7 +11503,7 @@ actor ServerNetworkManager {
                                 // Hidden params like `_windowID` can explicitly redirect a call even
                                 // when the connection already has a preferred window binding.
 
-                                let (windowCount, allServices, multiWindowModeEffective) = routingSnapshot
+                                let (windowCount, multiWindowModeEffective) = routingSnapshot
                                 var chosenID: Int?
                                 let windowStr: String
                                 let observerRunIDForCallbacksFinal: UUID?
@@ -12453,43 +12426,25 @@ actor ServerNetworkManager {
                                     EditFlowPerf.Stage.MCPToolCall.serviceToolLookup,
                                     EditFlowPerf.Dimensions(toolName: toolName)
                                 )
-                                for service in allServices {
-                                    // App-wide coordination tools have a single owning service. Avoid probing
-                                    // unrelated window-scoped services for their tool lists during startup,
-                                    // because some of those lists hop through UI/window state.
-                                    if toolName == "bind_context", !(service is WindowRoutingService) { continue }
-                                    if toolName == AppSettingsMCPService.toolName, !(service is AppSettingsMCPService) { continue }
-
-                                    let wsSvc = service as? WindowScopedService
-
-                                    // Skip window-scoped services that don't match this connection
-                                    if let wsSvc, windowCount > 1 {
-                                        guard let wID = chosenID, wID == wsSvc.windowID else { continue }
+                                let registrationScope: MCPDomainToolRegistrationScope? = {
+                                    guard let catalogEntry = MCPDomainToolCatalog.entry(named: toolName) else {
+                                        return nil
                                     }
-
-                                    // Get the tool definition (need schema for window_id injection)
-                                    connectionLog("tools/call \(toolName): inspecting service \(String(describing: type(of: service)))")
-                                    #if DEBUG || EDIT_FLOW_PERF
-                                        let serviceToolsAwaitState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupServiceToolsAwait)
-                                    #endif
-                                    let serviceTools = await service.tools
-                                    #if DEBUG || EDIT_FLOW_PERF
-                                        EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupServiceToolsAwait, serviceToolsAwaitState)
-                                    #endif
-                                    connectionLog("tools/call \(toolName): service \(String(describing: type(of: service))) exposes \(serviceTools.count) tools")
-                                    #if DEBUG || EDIT_FLOW_PERF
-                                        let toolDefinitionScanState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan)
-                                    #endif
-                                    guard let toolDef = serviceTools.first(where: { $0.name == toolName }) else {
-                                        #if DEBUG || EDIT_FLOW_PERF
-                                            EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan, toolDefinitionScanState)
-                                        #endif
-                                        continue
+                                    switch catalogEntry.scope {
+                                    case .application:
+                                        return .application
+                                    case .window:
+                                        return chosenID.map(MCPDomainToolRegistrationScope.window)
                                     }
-                                    #if DEBUG || EDIT_FLOW_PERF
-                                        EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan, toolDefinitionScanState)
-                                    #endif
-                                    connectionLog("tools/call \(toolName): dispatching via service \(String(describing: type(of: service))) windowScoped=\(wsSvc != nil)")
+                                }()
+                                if let registrationScope,
+                                   let resolvedTool = await ServiceRegistry.resolve(
+                                       toolName: toolName,
+                                       scope: registrationScope
+                                   )
+                                {
+                                    let toolDef = resolvedTool.binding.definition
+                                    connectionLog("tools/call \(toolName): dispatching exact domain binding scope=\(String(describing: registrationScope))")
 
                                     // Inject window_id from routing if tool schema declares it and caller didn't provide it.
                                     // bind_context manages its own window_id semantics and must not be auto-injected.
@@ -12500,8 +12455,8 @@ actor ServerNetworkManager {
                                             let publicWindowIDInjectionState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupPublicWindowIDInjection)
                                         #endif
                                         let routingWindowID: Int? = {
-                                            if let wsSvc {
-                                                return capturedWindowID ?? chosenID ?? wsSvc.windowID
+                                            if case let .window(windowID) = resolvedTool.scope {
+                                                return capturedWindowID ?? chosenID ?? windowID
                                             }
                                             return capturedWindowID ?? chosenID
                                         }()
@@ -12537,16 +12492,15 @@ actor ServerNetworkManager {
                                                 return try await operation()
                                             }
                                         #endif
-                                        return try await toolDef.callAsFunction(effectiveArgs)
+                                        return try await resolvedTool.binding(effectiveArgs)
                                     }
 
-                                    // Now dispatch. If window-scoped, wrap in ownership scope (fallback to service window).
-                                    if let wsSvc {
-                                        let ownershipWindowID = chosenID ?? wsSvc.windowID
-                                        let catalogServiceIdentity = ObjectIdentifier(wsSvc as AnyObject)
+                                    // Window-scoped bindings retain exact registry generation ownership.
+                                    if case let .window(registeredWindowID) = resolvedTool.scope {
+                                        let ownershipWindowID = chosenID ?? registeredWindowID
                                         guard let windowDispatchIdentity = await self.captureWindowToolDispatchIdentity(
                                             windowID: ownershipWindowID,
-                                            catalogServiceIdentity: catalogServiceIdentity
+                                            catalogRegistrationHandle: resolvedTool.handle
                                         ) else {
                                             return Self.executionContractToolErrorResult(
                                                 rawJSON: capturedRawJSON,

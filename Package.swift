@@ -47,6 +47,7 @@ var packageDependencies: [Package.Dependency] = [
 ]
 
 var repoPromptAppDependencies: [Target.Dependency] = [
+    "RepoPromptDomainRuntime",
     "RepoPromptCodeMapCore",
     "RepoPromptRegexCore",
     "RepoPromptWorkspaceCore",
@@ -78,6 +79,7 @@ var repoPromptAppSwiftSettings: [SwiftSetting] = [
 
 var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptApp",
+    "RepoPromptDomainRuntime",
     "RepoPromptCodeMapCore",
     "RepoPromptMCP",
     "RepoPromptShared"
@@ -104,6 +106,11 @@ if benchmarkTestsEnabled {
     repoPromptCodeMapTestSwiftSettings.append(.define("RPCE_BENCHMARK_TESTS"))
 }
 
+let swift5CompleteChecking: [SwiftSetting] = [
+    .swiftLanguageMode(.v5),
+    .enableExperimentalFeature("StrictConcurrency")
+]
+
 let swift6LanguageMode: [SwiftSetting] = [
     .swiftLanguageMode(.v6)
 ]
@@ -121,6 +128,14 @@ let package = Package(
             name: "RepoPrompt",
             dependencies: ["RepoPromptApp"],
             path: "Sources/RepoPromptExecutable"
+        ),
+        .target(
+            name: "RepoPromptDomainRuntime",
+            dependencies: [
+                .product(name: "MCP", package: "swift-sdk")
+            ],
+            path: "Sources/RepoPromptDomainRuntime",
+            swiftSettings: swift5CompleteChecking
         ),
         .target(
             name: "RepoPromptWorkspaceCore",
@@ -179,6 +194,15 @@ let package = Package(
         // FileManager source probe evaluates false in this root package graph.
         .target(name: "TreeSitterScannerSupport", path: "Sources/TreeSitterScannerSupport", sources: ["src/javascript/scanner.c", "src/python/scanner.c"], publicHeadersPath: "include"),
         .binaryTarget(name: "Sparkle", path: "Vendor/Sparkle/Sparkle.xcframework"),
+        .testTarget(
+            name: "RepoPromptDomainRuntimeTests",
+            dependencies: [
+                "RepoPromptDomainRuntime",
+                .product(name: "MCP", package: "swift-sdk")
+            ],
+            path: "Tests/RepoPromptDomainRuntimeTests",
+            swiftSettings: swift5CompleteChecking
+        ),
         .testTarget(
             name: "RepoPromptWorkspaceCoreTests",
             dependencies: ["RepoPromptWorkspaceCore"],

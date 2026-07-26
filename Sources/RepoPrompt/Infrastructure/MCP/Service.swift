@@ -10,7 +10,7 @@ import MCP
 import SwiftUI
 
 @preconcurrency
-protocol Service {
+protocol Service: AnyObject {
     var tools: [Tool] { get async }
 
     var isActivated: Bool { get async }

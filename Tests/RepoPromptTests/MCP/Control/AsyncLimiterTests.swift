@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptShared
 import XCTest
 
@@ -552,11 +553,16 @@ import XCTest
                 totalToolCalls: 0,
                 createdAt: .distantPast
             )
+            let catalogService = window.mcpServer.windowMCPToolCatalogService
+            guard let catalogHandle = await ServiceRegistry.register(catalogService) else {
+                XCTFail("Window catalog registration failed")
+                return
+            }
             let identity = ServerNetworkManager.WindowToolDispatchIdentity(
                 windowID: window.windowID,
                 windowStateIdentity: ObjectIdentifier(window),
                 serverViewModelIdentity: ObjectIdentifier(window.mcpServer),
-                catalogServiceIdentity: ObjectIdentifier(window.mcpServer.windowMCPToolCatalogService)
+                catalogRegistrationHandle: catalogHandle
             )
             window.beginClose()
 
@@ -577,6 +583,7 @@ import XCTest
             XCTAssertFalse(didRunBody)
 
             await manager.debugRemoveConnection(connectionID)
+            await ServiceRegistry.unregister(catalogService)
             await window.tearDown()
             WindowStatesManager.shared.unregisterWindowState(window)
         }

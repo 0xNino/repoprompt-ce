@@ -786,9 +786,9 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                 await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
                 await MCPRoutingWaiter.cleanup(runID: runID)
                 await HeadlessAgentConnectionGate.cancelAll()
-                ServiceRegistry.unregister(catalogService)
+                await ServiceRegistry.unregister(catalogService)
                 if let ownedRoutingService {
-                    ServiceRegistry.unregister(ownedRoutingService)
+                    await ServiceRegistry.unregister(ownedRoutingService)
                 }
                 if let loadedRootID {
                     await window.workspaceFileContextStore.unloadRoot(id: loadedRootID)
@@ -825,7 +825,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                 let loadedRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: rootURL.path)
                 loadedRootID = loadedRoot.id
 
-                ServiceRegistry.register(catalogService)
+                await ServiceRegistry.register(catalogService)
                 let routing = try await Self.ensureRoutingService()
                 ownedRoutingService = routing.owned ? routing.service : nil
 
@@ -1227,19 +1227,16 @@ private extension MCPBootstrapLeaseTests {
 
     @MainActor
     static func ensureRoutingService() async throws -> (service: WindowRoutingService, owned: Bool) {
-        if let existing = ServiceRegistry.services.first(where: { $0 is WindowRoutingService }) as? WindowRoutingService {
-            return (existing, false)
-        }
         let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
         for _ in 0 ..< 100 {
-            let registered = ServiceRegistry.services.contains { $0 as AnyObject === service as AnyObject }
+            let registered = await ServiceRegistry.isRegistered(service)
             let names = await service.tools.map(\.name)
-            if registered, names.contains("bind_context") {
+            if registered, names.contains(MCPGlobalToolName.bindContext) {
                 return (service, true)
             }
             try await Task.sleep(for: .milliseconds(10))
         }
-        ServiceRegistry.unregister(service)
+        await ServiceRegistry.unregister(service)
         throw MCPBootstrapLeaseTestError.routingServiceUnavailable
     }
 }

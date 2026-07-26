@@ -2959,7 +2959,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
                 let resolvedCatalogService = window.mcpServer.windowMCPToolCatalogService
                 catalogService = resolvedCatalogService
-                ServiceRegistry.register(resolvedCatalogService)
+                await ServiceRegistry.register(resolvedCatalogService)
 
                 var socketFDs = [Int32](repeating: -1, count: 2)
                 guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketFDs) == 0 else {
@@ -3107,7 +3107,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 await window.tearDown()
                 await routingGuardWindow.tearDown()
                 if let catalogService {
-                    ServiceRegistry.unregister(catalogService)
+                    await ServiceRegistry.unregister(catalogService)
                 }
                 if let rootID {
                     await window.workspaceFileContextStore.unloadRoot(id: rootID)
@@ -3498,9 +3498,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let routingService = WindowRoutingService(windowStates: .shared, networkMgr: networkManager)
             ownedRoutingService = routingService
             for _ in 0 ..< 100 {
-                let registered = ServiceRegistry.services.contains {
-                    $0 as AnyObject === routingService as AnyObject
-                }
+                let registered = await ServiceRegistry.isRegistered(routingService)
                 let names = await routingService.tools.map(\.name)
                 if registered, names.contains(MCPGlobalToolName.bindContext) { break }
                 try await Task.sleep(for: .milliseconds(10))
@@ -3508,7 +3506,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             if peerCatalogService == nil {
                 let service = routingGuardWindow.mcpServer.windowMCPToolCatalogService
                 peerCatalogService = service
-                ServiceRegistry.register(service)
+                await ServiceRegistry.register(service)
             }
             var socketFDs = [Int32](repeating: -1, count: 2)
             guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketFDs) == 0 else {
@@ -3863,12 +3861,12 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             await window.tearDown()
             await routingGuardWindow.tearDown()
-            ServiceRegistry.unregister(catalogService)
+            await ServiceRegistry.unregister(catalogService)
             if let peerCatalogService {
-                ServiceRegistry.unregister(peerCatalogService)
+                await ServiceRegistry.unregister(peerCatalogService)
             }
             if let ownedRoutingService {
-                ServiceRegistry.unregister(ownedRoutingService)
+                await ServiceRegistry.unregister(ownedRoutingService)
             }
             await window.workspaceFileContextStore.unloadRoot(id: rootID)
             if let peerRootID {

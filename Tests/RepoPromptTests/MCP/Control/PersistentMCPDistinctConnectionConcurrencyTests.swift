@@ -1531,7 +1531,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 } else {
                     if let contextB { await cleanupContext(contextB) }
                     if let contextA { await cleanupContext(contextA) }
-                    if let ownedRoutingService { ServiceRegistry.unregister(ownedRoutingService) }
+                    if let ownedRoutingService { await ServiceRegistry.unregister(ownedRoutingService) }
                     WindowStatesManager.shared.unregisterWindowState(windowB)
                     WindowStatesManager.shared.unregisterWindowState(windowA)
                     try? FileManager.default.removeItem(at: rootURL)
@@ -1641,15 +1641,15 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             await contextB.window.tearDown()
             await contextA.window.tearDown()
             await contextA.window.mcpServer.shutdownListener()
-            ServiceRegistry.unregister(contextB.catalogService)
-            ServiceRegistry.unregister(contextA.catalogService)
+            await ServiceRegistry.unregister(contextB.catalogService)
+            await ServiceRegistry.unregister(contextA.catalogService)
             await contextB.window.workspaceFileContextStore.unloadRoot(id: contextB.rootID)
             await contextA.window.workspaceFileContextStore.unloadRoot(id: contextA.rootID)
             contextB.window.workspaceManager.workspaces.removeAll { $0.id == contextB.workspaceID }
             contextA.window.workspaceManager.workspaces.removeAll { $0.id == contextA.workspaceID }
             WindowStatesManager.shared.unregisterWindowState(contextB.window)
             WindowStatesManager.shared.unregisterWindowState(contextA.window)
-            if let ownedRoutingService { ServiceRegistry.unregister(ownedRoutingService) }
+            if let ownedRoutingService { await ServiceRegistry.unregister(ownedRoutingService) }
             try? FileManager.default.removeItem(at: rootURL)
         }
 
@@ -1726,7 +1726,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 throw ClientFixtureError.exactAbsoluteCatalogMiss
             }
             let catalogService = window.mcpServer.windowMCPToolCatalogService
-            ServiceRegistry.register(catalogService)
+            await ServiceRegistry.register(catalogService)
             return PersistentMCPTestContext(
                 rootURL: rootURL,
                 fileURL: fileURL,
@@ -1741,24 +1741,21 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         }
 
         private static func ensureRoutingService() async throws -> (service: WindowRoutingService, owned: Bool) {
-            if let existing = ServiceRegistry.services.first(where: { $0 is WindowRoutingService }) as? WindowRoutingService {
-                return (existing, false)
-            }
             let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
             for _ in 0 ..< 100 {
-                let registered = ServiceRegistry.services.contains { $0 as AnyObject === service as AnyObject }
+                let registered = await ServiceRegistry.isRegistered(service)
                 let names = await service.tools.map(\.name)
-                if registered, names.contains("bind_context") {
+                if registered, names.contains(MCPGlobalToolName.bindContext) {
                     return (service, true)
                 }
                 try await Task.sleep(for: .milliseconds(10))
             }
-            ServiceRegistry.unregister(service)
+            await ServiceRegistry.unregister(service)
             throw ClientFixtureError.routingServiceUnavailable
         }
 
         private static func cleanupContext(_ context: PersistentMCPTestContext) async {
-            ServiceRegistry.unregister(context.catalogService)
+            await ServiceRegistry.unregister(context.catalogService)
             await context.window.workspaceFileContextStore.unloadRoot(id: context.rootID)
             context.window.workspaceManager.workspaces.removeAll { $0.id == context.workspaceID }
             try? FileManager.default.removeItem(at: context.rootURL)

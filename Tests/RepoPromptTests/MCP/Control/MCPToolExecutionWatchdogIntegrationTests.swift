@@ -470,7 +470,7 @@ import XCTest
                         operation: nil
                     )
                     await installedScope.restore()
-                    installedScope.assertRestored()
+                    await installedScope.assertRestored()
                     appSettingsScope = nil
                     await fixture.cleanup()
                     try await fixture.assertCleanedUp()
@@ -487,7 +487,7 @@ import XCTest
                     )
                     if let appSettingsScope {
                         await appSettingsScope.restore()
-                        appSettingsScope.assertRestored()
+                        await appSettingsScope.assertRestored()
                     }
                     await fixture.cleanup()
                     throw error
@@ -924,7 +924,7 @@ import XCTest
                     XCTAssertEqual(limiter?.inFlight, 0)
 
                     await installedAppSettingsScope.restore()
-                    installedAppSettingsScope.assertRestored()
+                    await installedAppSettingsScope.assertRestored()
                     appSettingsScope = nil
                     await fixture.cleanup()
                     try await fixture.assertCleanedUp()
@@ -944,7 +944,7 @@ import XCTest
                     await manager.debugResetToolExecutionWatchdogEnvironment()
                     if let appSettingsScope {
                         await appSettingsScope.restore()
-                        appSettingsScope.assertRestored()
+                        await appSettingsScope.assertRestored()
                     }
                     await fixture.cleanup()
                     throw error
@@ -1783,8 +1783,8 @@ import XCTest
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
                 let probe = MCPWindowIDEffectiveArgumentsService(windowID: fixture.contextA.window.windowID)
-                ServiceRegistry.unregister(fixture.contextA.catalogService)
-                ServiceRegistry.register(probe)
+                await ServiceRegistry.unregister(fixture.contextA.catalogService)
+                await ServiceRegistry.register(probe)
                 do {
                     let endpoint = try fixture.endpointA()
                     let cases: [(label: String, arguments: [String: Any], expectedWindowID: Int)] = [
@@ -1819,11 +1819,11 @@ import XCTest
                         XCTAssertEqual((payload["window_id"] as? NSNumber)?.intValue, testCase.expectedWindowID, testCase.label)
                     }
 
-                    ServiceRegistry.unregister(probe)
+                    await ServiceRegistry.unregister(probe)
                     await fixture.cleanup()
                     try await fixture.assertCleanedUp()
                 } catch {
-                    ServiceRegistry.unregister(probe)
+                    await ServiceRegistry.unregister(probe)
                     await fixture.cleanup()
                     throw error
                 }
@@ -2474,16 +2474,16 @@ import XCTest
     private final class MCPAppSettingsServiceScope {
         private let service: AppSettingsMCPService
         private let ownsService: Bool
-        private let baselineServiceIDs: [ObjectIdentifier]
+        private let baselineRegistered: Bool
         private let baselineAvailable: Bool
         private let baselineDisabled: Bool
         private var restored = false
 
-        private init() {
-            let existingServices = ServiceRegistry.services.compactMap { $0 as? AppSettingsMCPService }
-            service = existingServices.first ?? AppSettingsMCPService()
-            ownsService = existingServices.isEmpty
-            baselineServiceIDs = existingServices.map { ObjectIdentifier($0) }
+        private init() async {
+            service = AppSettingsMCPService()
+            let catalog = await ServiceRegistry.catalogSnapshot()
+            baselineRegistered = catalog.activeScopesByToolName[MCPGlobalToolName.appSettings]?.contains(.application) == true
+            ownsService = !baselineRegistered
             baselineAvailable = ToolAvailabilityStore.shared.toolSummaries.contains {
                 $0.name == MCPGlobalToolName.appSettings
             }
@@ -2491,13 +2491,13 @@ import XCTest
         }
 
         static func install() async throws -> MCPAppSettingsServiceScope {
-            let scope = MCPAppSettingsServiceScope()
+            let scope = await MCPAppSettingsServiceScope()
             do {
                 if scope.baselineDisabled {
                     await ToolAvailabilityStore.shared.toggle(MCPGlobalToolName.appSettings, enabled: true)
                 }
                 if scope.ownsService {
-                    ServiceRegistry.register(scope.service)
+                    await ServiceRegistry.register(scope.service)
                 }
                 try await scope.waitUntilReady()
                 XCTAssertTrue(ToolAvailabilityStore.shared.isEnabled(MCPGlobalToolName.appSettings))
@@ -2513,7 +2513,7 @@ import XCTest
             restored = true
 
             if ownsService {
-                ServiceRegistry.unregister(service)
+                await ServiceRegistry.unregister(service)
             }
             if !baselineAvailable {
                 ToolAvailabilityStore.shared.unregisterTools([MCPGlobalToolName.appSettings])
@@ -2527,11 +2527,10 @@ import XCTest
             }
         }
 
-        func assertRestored(file: StaticString = #filePath, line: UInt = #line) {
-            let serviceIDs = ServiceRegistry.services
-                .compactMap { $0 as? AppSettingsMCPService }
-                .map { ObjectIdentifier($0) }
-            XCTAssertEqual(serviceIDs, baselineServiceIDs, file: file, line: line)
+        func assertRestored(file: StaticString = #filePath, line: UInt = #line) async {
+            let catalog = await ServiceRegistry.catalogSnapshot()
+            let isRegistered = catalog.activeScopesByToolName[MCPGlobalToolName.appSettings]?.contains(.application) == true
+            XCTAssertEqual(isRegistered, baselineRegistered, file: file, line: line)
             XCTAssertEqual(
                 ToolAvailabilityStore.shared.toolSummaries.contains {
                     $0.name == MCPGlobalToolName.appSettings
@@ -2550,9 +2549,8 @@ import XCTest
 
         private func waitUntilReady() async throws {
             for _ in 0 ..< 1000 {
-                let isRegistered = ServiceRegistry.services.contains {
-                    ($0 as AnyObject) === (service as AnyObject)
-                }
+                let catalog = await ServiceRegistry.catalogSnapshot()
+                let isRegistered = catalog.activeScopesByToolName[MCPGlobalToolName.appSettings]?.contains(.application) == true
                 let isAvailable = ToolAvailabilityStore.shared.toolSummaries.contains {
                     $0.name == MCPGlobalToolName.appSettings
                 }

@@ -1,11 +1,11 @@
 # Swift 6.2 Concurrency Migration Ledger
 
-Updated: 2026-07-20
+Updated: 2026-07-26
 
 ## Toolchain and policy
 
 - Active compiler: Apple Swift 6.2.4 (`swift-driver` 1.127.15), arm64-apple-macosx26.0.
-- Root package tools version: 6.2; package default and all non-Item-6 targets remain in Swift 5 language mode.
+- Root package tools version: 6.2; the package default remains Swift 5. Target-local Swift 6 boundaries are listed below; the headless domain runtime is first evidenced with Swift 5 complete checking before its separate M1 language-mode promotion.
 - Migration policy: target-scoped complete strict-concurrency checking first, followed by independently evidenced target-local `.swiftLanguageMode(.v6)`. No default MainActor or Swift 6.2 execution/isolation feature is adopted by this tranche.
 
 ## Completed boundaries
@@ -20,6 +20,7 @@ Updated: 2026-07-20
 | Highlighting query compatibility and C# coverage (Item 13) | `a8885ac9b4fefb7e3af170b5899ad80d5037d7da` | Swift 6 unchanged | All 14 app-owned highlighting queries compile against their registered grammars; C# completes the 14-language CodeMapCore fixture/golden matrix without changing the existing 13 outputs. |
 | `RepoPromptRegexCore` | extraction `6feead2fcfbbd53bc9d4b9d0255401ec51bfd374`; Item 6 this change | Swift 6 | Production and owner-test targets compile with `-swift-version 6`; eight owner tests and Swift 5 app-consumer linkage pass. |
 | `RepoPromptCodeMapCore` / owner tests | extraction `22bfff1c5904d5f02c0a881055142c94f4783a84`; Item 6 this change | Swift 6 | Production and owner-test targets compile with `-swift-version 6`; 16 owner tests, mixed-mode app tests, and both Swift 5 product builds pass. |
+| `RepoPromptDomainRuntime` / owner tests (M1 foundation) | foundation commit on `feature/headless-runtime-m1-foundation` | Swift 5 + complete checking | AppKit-free runtime/catalog/registry boundary, inert app composition, app/owner consumers, and normalized schema golden forwarding. Complete Swift 5 owner evidence: conductor ticket `a118d193-0e41-4cd9-93f9-721da73880cd` (9 tests); consumer and parity evidence is recorded below before the separate language-mode promotion. |
 
 ## Item 3 ownership record
 
@@ -52,7 +53,7 @@ Test ownership:
 | `nonisolated(unsafe)` on standard-library `Regex` constants | 25 existing annotations in `LanguageTypeExtractor` | Every value is immutable and initialized once; matching is nonmutating; no mutable shared cache or escaping match state is hidden by the annotation. The annotation exists because the standard-library `Regex` output metadata used here does not expose Sendable conformance. | Re-audit when the deployed Swift standard library makes these concrete/type-erased `Regex` values Sendable; remove only when the active minimum toolchain compiles the declarations without the escape hatch. |
 | `PCRE2Regex: @unchecked Sendable` | One existing class in `RepoPromptRegexCore` | Compilation, including JIT, completes before publication and the compiled `pcre2_code` is immutable afterward. Ordinary matches allocate independent match data/context; `MatchSession` owns mutable state, is deliberately non-Sendable, and is confined to one sequential consumer. A live call retains the regex, preventing deinitialization from racing the call. The current implementation therefore needs no lock around immutable compiled code. | Re-audit on a PCRE2 upgrade or any change that shares mutable match/session state, mutates compiled code after publication, or changes lifetime ownership. |
 
-No new escape hatch or source annotation was added for Item 6. The four target logs and raw verbose invocation evidence contain zero diagnostics attributed to their source or owner-test paths.
+No new escape hatch or source annotation was added for Item 6. M1 likewise adds no `nonisolated(unsafe)`, `@unchecked Sendable`, `@preconcurrency`, or default-actor-isolation escape hatch to `RepoPromptDomainRuntime`. The four target logs and raw verbose invocation evidence contain zero diagnostics attributed to their source or owner-test paths.
 
 ## Item 3 evidence
 
@@ -76,6 +77,13 @@ No new escape hatch or source annotation was added for Item 6. The four target l
 - Swift 5 consumer products: RepoPrompt ticket `6c091ce4…`; repoprompt-mcp ticket `afed7b28…`; both built successfully.
 - Phase boundary: full root ticket `a5f3c831…` passed in 9m28s; full provider ticket `11ad3aad…` passed; lint ticket `ce6cd2f4…`, 23 generator contract tests, and source/license guardrails passed.
 - Package default remains `swiftLanguageModes: [.v5]`; `Package.resolved` and all source files are unchanged.
+
+## M1 headless domain-runtime foundation evidence
+
+- Swift 5 + complete strict-concurrency owner target: conductor ticket `a118d193-0e41-4cd9-93f9-721da73880cd` passed all 9 catalog, per-client visibility/annotation, registry atomicity/generation/concurrency, fingerprint, and inert lifecycle tests with no diagnostics attributed to `Sources/RepoPromptDomainRuntime` or `Tests/RepoPromptDomainRuntimeTests`.
+- Swift 5 consumers: `RepoPrompt` product ticket `ce9039ae-22d8-4a6e-8c83-3e08a682aefa`; `repoprompt-mcp` product ticket `ff33c74a-8d9f-4582-bf7f-7158d01dd773`; both completed successfully before the language-mode change.
+- Frozen contract and app adapter parity: M0 contract ticket `cd154249-761a-427f-bd68-9f8045f91265` (3 tests) and catalog/fingerprint/annotation ticket `a654a699-b62d-4ffa-9da2-bbc7de8aa431` (6 tests) passed. The 24 window schema golden signatures are unchanged.
+- Foundation surfaces: strict lint ticket `8a99f8d2-39db-4f41-8e2e-4b8a9b4dd1a8`; 24 generated-Xcode contracts and source/license guardrails passed. No visible app lifecycle command or persisted-state migration was run.
 
 ## Item 8 official-source cleanup evidence
 

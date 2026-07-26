@@ -349,7 +349,7 @@ final class WindowRoutingService: Service {
             await updateCachedTools()
 
             // Register only after tools are cached
-            ServiceRegistry.register(self)
+            await ServiceRegistry.register(self)
         }
 
         // Listen for changes to relevant MCP settings

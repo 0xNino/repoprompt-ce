@@ -1,0 +1,120 @@
+import Foundation
+import MCP
+
+package struct MCPDomainToolAnnotations: Hashable, Sendable {
+    package let title: String?
+    package let readOnlyHint: Bool?
+    package let destructiveHint: Bool?
+    package let idempotentHint: Bool?
+    package let openWorldHint: Bool?
+
+    package init(
+        title: String? = nil,
+        readOnlyHint: Bool? = nil,
+        destructiveHint: Bool? = nil,
+        idempotentHint: Bool? = nil,
+        openWorldHint: Bool? = nil
+    ) {
+        self.title = title
+        self.readOnlyHint = readOnlyHint
+        self.destructiveHint = destructiveHint
+        self.idempotentHint = idempotentHint
+        self.openWorldHint = openWorldHint
+    }
+
+    package func projected(for profile: MCPClientToolAnnotationProfile) -> Self {
+        switch profile {
+        case .canonical:
+            self
+        case .suppressReadOnlyHint:
+            .init(
+                title: title,
+                readOnlyHint: nil,
+                destructiveHint: destructiveHint,
+                idempotentHint: idempotentHint,
+                openWorldHint: openWorldHint
+            )
+        }
+    }
+}
+
+package struct MCPDomainToolDefinition: Hashable, Sendable {
+    package let name: String
+    package let description: String
+    package let inputSchema: Value
+    package let annotations: MCPDomainToolAnnotations
+    package let isEnabledByDefault: Bool
+
+    package init(
+        name: String,
+        description: String,
+        inputSchema: Value,
+        annotations: MCPDomainToolAnnotations = .init(),
+        isEnabledByDefault: Bool = true
+    ) {
+        self.name = name
+        self.description = description
+        self.inputSchema = inputSchema
+        self.annotations = annotations
+        self.isEnabledByDefault = isEnabledByDefault
+    }
+}
+
+package struct MCPDomainToolBinding: Sendable {
+    package let definition: MCPDomainToolDefinition
+    private let operation: @Sendable ([String: Value]) async throws -> Value
+
+    package init(
+        definition: MCPDomainToolDefinition,
+        operation: @Sendable @escaping ([String: Value]) async throws -> Value
+    ) {
+        self.definition = definition
+        self.operation = operation
+    }
+
+    package func callAsFunction(_ arguments: [String: Value]) async throws -> Value {
+        try await operation(arguments)
+    }
+}
+
+package enum MCPDomainToolRegistrationScope: Hashable, Sendable {
+    case application
+    case window(id: Int)
+
+    package var kind: MCPDomainToolScopeKind {
+        switch self {
+        case .application: .application
+        case .window: .window
+        }
+    }
+}
+
+package struct MCPDomainToolRegistrationID: Hashable, Sendable {
+    package let rawValue: UInt
+
+    package init(rawValue: UInt) {
+        self.rawValue = rawValue
+    }
+}
+
+package struct MCPDomainToolRegistrationHandle: Hashable, Sendable {
+    package let registryID: UUID
+    package let registrationID: MCPDomainToolRegistrationID
+    package let generation: UInt64
+
+    package init(
+        registryID: UUID,
+        registrationID: MCPDomainToolRegistrationID,
+        generation: UInt64
+    ) {
+        self.registryID = registryID
+        self.registrationID = registrationID
+        self.generation = generation
+    }
+}
+
+package struct MCPDomainResolvedTool: Sendable {
+    package let handle: MCPDomainToolRegistrationHandle
+    package let scope: MCPDomainToolRegistrationScope
+    package let binding: MCPDomainToolBinding
+}

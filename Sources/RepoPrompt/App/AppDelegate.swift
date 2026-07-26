@@ -23,6 +23,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     // New global routing/settings services (kept alive by the AppDelegate)
     private var windowRoutingService: WindowRoutingService?
     private var appSettingsMCPService: AppSettingsMCPService?
+    private var domainRuntimeStartupTask: Task<Void, Never>?
 
     // MARK: - Global references
 
@@ -85,8 +86,16 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         // ───────────────────────────────────────────────────
         // Register global MCP app-wide helpers
         let appSettingsMCPService = AppSettingsMCPService()
-        ServiceRegistry.register(appSettingsMCPService)
         self.appSettingsMCPService = appSettingsMCPService
+        let domainRuntime = AppDomainRuntimeComposition.shared.runtime
+        domainRuntimeStartupTask = Task {
+            do {
+                try await domainRuntime.start()
+                await ServiceRegistry.register(appSettingsMCPService)
+            } catch {
+                assertionFailure("Failed to start inert app domain runtime: \(error)")
+            }
+        }
 
         // Register global MCP window-routing helpers
         windowRoutingService = WindowRoutingService(

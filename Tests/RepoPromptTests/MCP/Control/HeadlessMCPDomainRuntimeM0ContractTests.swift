@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 @MainActor
@@ -158,6 +159,14 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
             )
         }
 
+        let annotationProfiles = try stringDictionary(policy, key: "client_annotation_profiles")
+        XCTAssertEqual(
+            annotationProfiles,
+            Dictionary(uniqueKeysWithValues: MCPClientToolPolicyProfile.allCases.map { profile in
+                (profile.rawValue, MCPClientToolPolicyCatalog.classification(for: profile).annotationProfile.rawValue)
+            })
+        )
+
         let resolvedProfiles = try stringArrays(policy, key: "resolved_tools_list")
         XCTAssertEqual(resolvedProfiles["direct"], resolvedAdvertisedTools(allTools: allTools))
         XCTAssertEqual(
@@ -291,10 +300,12 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertTrue(try Set(strings(token, key: "rules")).isSuperset(of: ["single_use", "memory_only", "never_logged", "never_persisted"]))
 
         let packageManifest = try source("Package.swift")
-        XCTAssertFalse(packageManifest.contains("HeadlessMCPDomainRuntime"))
-        XCTAssertFalse(packageManifest.contains("RepoPromptDomainRuntime"))
+        XCTAssertTrue(packageManifest.contains("name: \"RepoPromptDomainRuntime\""))
+        XCTAssertTrue(packageManifest.contains("name: \"RepoPromptDomainRuntimeTests\""))
         let productionSwift = try allSwiftSource()
         XCTAssertFalse(productionSwift.contains("DomainRunLaunchToken"))
+        XCTAssertFalse(productionSwift.contains("DomainWorkspaceStore"))
+        XCTAssertFalse(productionSwift.contains("DomainContextStore"))
     }
 
     func testPersistenceApprovalMainActorAndPerformanceInventoriesRemainComplete() throws {
@@ -349,7 +360,7 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         ).map(mainActorSiteKey).sorted()
         XCTAssertEqual(actualLocalSites, expectedLocalSites)
         XCTAssertEqual(actualLocalSites.count, try integer(actorInventory, key: "mcp_local_declaration_count"))
-        XCTAssertEqual(actualLocalSites.count, 42)
+        XCTAssertEqual(actualLocalSites.count, 41)
 
         let externalSites = try dictionaries(actorInventory, key: "external_collaborators")
         for site in externalSites {
@@ -448,6 +459,10 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
 
     private func stringArrays(_ object: [String: Any], key: String) throws -> [String: [String]] {
         try XCTUnwrap(object[key] as? [String: [String]], key)
+    }
+
+    private func stringDictionary(_ object: [String: Any], key: String) throws -> [String: String] {
+        try XCTUnwrap(object[key] as? [String: String], key)
     }
 
     private func dictionariesByKey(_ object: [String: Any], key: String) throws -> [String: [String: Any]] {

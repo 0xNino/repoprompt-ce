@@ -1,51 +1,92 @@
-//
-//  ServiceRegistry.swift
-//  RepoPrompt
-//
-//  Created by Eric Provencher on 2025-06-20.
-//
+import Foundation
+import RepoPromptDomainRuntime
 
-/// Central registry for all `Service` instances that want to expose tools
-/// to external MCP clients.  Services register themselves at runtime.
-@MainActor
+/// App adapter over the runtime-owned catalog registry. This facade stores no services,
+/// schemas, registrations, or tool definitions of its own.
 enum ServiceRegistry {
-    private static var _services: [any Service] = []
-
-    /// Read-only view of all registered services.
-    static var services: [any Service] {
-        _services
+    @MainActor
+    @discardableResult
+    static func register(_ service: any Service) async -> MCPDomainToolRegistrationHandle? {
+        let tools = await service.tools
+        do {
+            let handle = try await AppDomainRuntimeComposition.shared.runtime.toolRegistry.register(
+                registrationID: registrationID(for: service),
+                scope: registrationScope(for: service),
+                bindings: tools.map { try $0.domainBinding() }
+            )
+            #if DEBUG || EDIT_FLOW_PERF
+                let serviceTools = EditFlowPerf.measure(
+                    EditFlowPerf.Stage.MCPWindowToolCatalog.serviceRegistryToolsPublication
+                ) {
+                    tools
+                }
+                ToolAvailabilityStore.shared.registerTools(serviceTools)
+            #else
+                ToolAvailabilityStore.shared.registerTools(tools)
+            #endif
+            await ServerNetworkManager.shared.broadcastToolListChanged()
+            return handle
+        } catch {
+            assertionFailure("Domain tool registration failed: \(error)")
+            return nil
+        }
     }
 
-    /// Register a new service so its tools become discoverable.
-    static func register(_ service: any Service) {
-        // Avoid duplicate registrations
-        if _services.contains(where: { $0 as AnyObject === service as AnyObject }) {
-            return
-        }
-        _services.append(service)
-        // Inform the availability store so the Settings UI can list them
-        Task {
-            #if DEBUG || EDIT_FLOW_PERF
-                let serviceTools = await EditFlowPerf.measure(EditFlowPerf.Stage.MCPWindowToolCatalog.serviceRegistryToolsPublication) {
-                    await service.tools
-                }
-                await ToolAvailabilityStore.shared.registerTools(serviceTools)
-            #else
-                await ToolAvailabilityStore.shared.registerTools(service.tools)
-            #endif
-            // Tools list has effectively changed; notify connected clients
+    @MainActor
+    static func unregister(_ service: any Service) async {
+        let registry = AppDomainRuntimeComposition.shared.runtime.toolRegistry
+        let removal = await registry.unregister(registrationID: registrationID(for: service))
+        if removal == .removed {
             await ServerNetworkManager.shared.broadcastToolListChanged()
         }
     }
 
-    /// Unregister a service to remove its tools.
-    static func unregister(_ service: any Service) {
-        if let idx = _services.firstIndex(where: { $0 as AnyObject === service as AnyObject }) {
-            _services.remove(at: idx)
-            // Broadcast tool list change to connected clients
-            Task {
-                await ServerNetworkManager.shared.broadcastToolListChanged()
-            }
+    @MainActor
+    static func isRegistered(_ service: any Service) async -> Bool {
+        await AppDomainRuntimeComposition.shared.runtime.toolRegistry.isRegistered(
+            registrationID(for: service)
+        )
+    }
+
+    static func catalogSnapshot() async -> MCPDomainToolCatalogSnapshot {
+        let registry = await MainActor.run {
+            AppDomainRuntimeComposition.shared.runtime.toolRegistry
         }
+        return await registry.snapshot()
+    }
+
+    static func resolve(
+        toolName: String,
+        scope: MCPDomainToolRegistrationScope
+    ) async -> MCPDomainResolvedTool? {
+        let registry = await MainActor.run {
+            AppDomainRuntimeComposition.shared.runtime.toolRegistry
+        }
+        return await registry.resolve(toolName: toolName, scope: scope)
+    }
+
+    static func isActive(_ handle: MCPDomainToolRegistrationHandle) async -> Bool {
+        let registry = await MainActor.run {
+            AppDomainRuntimeComposition.shared.runtime.toolRegistry
+        }
+        return await registry.isActive(handle)
+    }
+
+    @MainActor
+    private static func registrationID(
+        for service: any Service
+    ) -> MCPDomainToolRegistrationID {
+        let pointer = Unmanaged<AnyObject>.passUnretained(service as AnyObject).toOpaque()
+        return MCPDomainToolRegistrationID(rawValue: UInt(bitPattern: pointer))
+    }
+
+    @MainActor
+    private static func registrationScope(
+        for service: any Service
+    ) -> MCPDomainToolRegistrationScope {
+        if let windowService = service as? WindowScopedService {
+            return .window(id: windowService.windowID)
+        }
+        return .application
     }
 }

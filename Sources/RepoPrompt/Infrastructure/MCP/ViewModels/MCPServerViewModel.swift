@@ -2634,10 +2634,8 @@ final class MCPServerViewModel: ObservableObject {
 
     /// Ensures tools are enabled and the window is joined before agent bootstrap continues.
     func ensureServerReadyForAgentBootstrap() async {
-        let invalidateCatalogBeforeUpdate = !windowToolsEnabled
-            || !ServiceRegistry.services.contains { service in
-                (service as AnyObject) === (windowToolCatalogService as AnyObject)
-            }
+        let catalogIsRegistered = await ServiceRegistry.isRegistered(windowToolCatalogService)
+        let invalidateCatalogBeforeUpdate = !windowToolsEnabled || !catalogIsRegistered
         if !windowToolsEnabled {
             windowToolsEnabled = true
         }
@@ -2684,7 +2682,7 @@ final class MCPServerViewModel: ObservableObject {
         }
 
         if windowToolsEnabled {
-            ServiceRegistry.register(windowToolCatalogService) // idempotent
+            await ServiceRegistry.register(windowToolCatalogService) // idempotent
             do {
                 try await service.join(windowID: windowID)
                 await service.refreshState()
@@ -2692,7 +2690,7 @@ final class MCPServerViewModel: ObservableObject {
                 logger.error("Failed to join MCP: \(error)")
             }
         } else {
-            ServiceRegistry.unregister(windowToolCatalogService)
+            await ServiceRegistry.unregister(windowToolCatalogService)
             await service.leave(windowID: windowID)
             await service.refreshState()
         }

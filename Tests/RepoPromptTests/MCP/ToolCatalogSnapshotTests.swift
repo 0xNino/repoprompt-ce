@@ -1,9 +1,9 @@
-import CryptoKit
 import Darwin
 import Foundation
 import MCP
 import Ontology
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptShared
 import XCTest
 
@@ -240,12 +240,13 @@ final class ToolCatalogSnapshotTests: XCTestCase {
                     let storedAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
                     await window.mcpServer.ensureServerReadyForAgentBootstrap()
                     XCTAssertEqual(GlobalSettingsStore.shared.mcpAutoStart(), storedAutoStart)
-                    XCTAssertTrue(ServiceRegistry.services.contains { service in
-                        (service as AnyObject) === (catalogService as AnyObject)
-                    })
-                    XCTAssertFalse(ServiceRegistry.services.contains { service in
-                        (service as AnyObject) === (window.mcpServer as AnyObject)
-                    })
+                    let catalogIsRegistered = await ServiceRegistry.isRegistered(catalogService)
+                    let catalog = await ServiceRegistry.catalogSnapshot()
+                    XCTAssertTrue(catalogIsRegistered)
+                    XCTAssertEqual(
+                        catalog.activeScopesByToolName[MCPWindowToolName.readFile],
+                        [.window(id: window.windowID)]
+                    )
 
                     let attributes = try FileManager.default.attributesOfItem(atPath: socketURL.path)
                     XCTAssertEqual(attributes[.type] as? FileAttributeType, .typeSocket)
@@ -441,7 +442,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             previousEnabledState: Bool
         ) async throws {
             await window.mcpServer.stopServer()
-            ServiceRegistry.unregister(catalogService)
+            await ServiceRegistry.unregister(catalogService)
             await window.mcpServer.shutdownListener()
 
             let manager = ServerNetworkManager.shared
@@ -517,40 +518,9 @@ final class ToolCatalogSnapshotTests: XCTestCase {
 
     private static func signatures(for tools: [RepoPromptApp.Tool]) throws -> [String] {
         try tools.enumerated().map { index, tool in
-            let schemaValue = try Value(tool.inputSchema)
-            let schemaDigest = try digest(canonicalJSONString(schemaValue))
-            let annotations = annotationSignature(tool.annotations)
-            let descriptionDigest = digest(tool.description)
-            return "\(index)|\(tool.name)|enabled=\(tool.isEnabledByDefault)|ann=\(annotations)|desc=\(descriptionDigest)|schema=\(schemaDigest)"
+            let definition = try tool.domainBinding().definition
+            return try MCPDomainToolFingerprint(definition: definition).goldenSignature(index: index)
         }
-    }
-
-    private static func annotationSignature(_ annotations: MCP.Tool.Annotations) -> String {
-        [
-            "title=\(annotations.title ?? "nil")",
-            "readOnly=\(optionalBool(annotations.readOnlyHint))",
-            "destructive=\(optionalBool(annotations.destructiveHint))",
-            "idempotent=\(optionalBool(annotations.idempotentHint))",
-            "openWorld=\(optionalBool(annotations.openWorldHint))"
-        ].joined(separator: ",")
-    }
-
-    private static func optionalBool(_ value: Bool?) -> String {
-        value.map(String.init) ?? "nil"
-    }
-
-    private static func canonicalJSONString(_ value: Value) throws -> String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let data = try encoder.encode(value)
-        return String(decoding: data, as: UTF8.self)
-    }
-
-    private static func digest(_ string: String) -> String {
-        let data = Data(string.utf8)
-        return SHA256.hash(data: data)
-            .map { String(format: "%02x", $0) }
-            .joined()
     }
 
     private static func renderGolden(_ signatures: [String]) -> String {
