@@ -1057,6 +1057,24 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
             [rootKey, childKey]
         )
 
+        let defaultCollapsedKeys = viewModel.defaultCollapsedSidebarThreadKeys(
+            for: tabs,
+            searchText: ""
+        )
+        XCTAssertEqual(defaultCollapsedKeys, [childKey])
+        XCTAssertTrue(viewModel.defaultCollapsedSidebarThreadKeys(for: tabs, searchText: "Grandchild").isEmpty)
+
+        let revisionBeforeRender = viewModel.ui.sessionSidebar.snapshot.revision
+        let rowsBeforeLifecycleSeed = viewModel.displaySidebarSessions(
+            for: tabs,
+            currentTabID: rootTabID,
+            searchText: ""
+        )
+        XCTAssertEqual(rowsBeforeLifecycleSeed.map(\.tabID), [rootTabID, childTabID, grandchildTabID])
+        XCTAssertEqual(viewModel.ui.sessionSidebar.snapshot.revision, revisionBeforeRender)
+
+        viewModel.seedDefaultCollapsedSidebarThreads(defaultCollapsedKeys)
+        let revisionAfterLifecycleSeed = viewModel.ui.sessionSidebar.snapshot.revision
         let initialRows = viewModel.displaySidebarSessions(
             for: tabs,
             currentTabID: rootTabID,
@@ -1066,6 +1084,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(initialRows.map(\.isThreadCollapsed), [false, true])
         XCTAssertEqual(initialRows.map(\.hiddenThreadDescendantCount), [0, 1])
         XCTAssertEqual(viewModel.ui.sessionSidebar.snapshot.collapsedThreadKeys, [childKey])
+        XCTAssertEqual(viewModel.ui.sessionSidebar.snapshot.revision, revisionAfterLifecycleSeed)
 
         let activeGrandchildRows = viewModel.displaySidebarSessions(
             for: tabs,
@@ -1074,6 +1093,16 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         )
         XCTAssertEqual(activeGrandchildRows.map(\.tabID), [rootTabID, childTabID, grandchildTabID])
         XCTAssertEqual(activeGrandchildRows.map(\.isThreadCollapsed), [false, false, false])
+
+        let effectiveChildRow = try XCTUnwrap(activeGrandchildRows.first { $0.tabID == childTabID })
+        viewModel.requestSidebarThreadDisclosureToggle(for: effectiveChildRow)
+        let rowsAfterSwitchingAway = viewModel.displaySidebarSessions(
+            for: tabs,
+            currentTabID: rootTabID,
+            searchText: ""
+        )
+        XCTAssertEqual(rowsAfterSwitchingAway.map(\.tabID), [rootTabID, childTabID])
+        XCTAssertEqual(rowsAfterSwitchingAway.last?.isThreadCollapsed, true)
 
         let searchRows = viewModel.displaySidebarSessions(
             for: tabs,

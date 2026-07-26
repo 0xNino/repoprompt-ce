@@ -34,6 +34,36 @@ final class AgentModeProviderConversationCleanupTests: XCTestCase {
         XCTAssertEqual(calls.first?.action, .archive)
     }
 
+    func testRestoredCodexSessionWithoutLiveControllerUsesCleanupRegistry() async {
+        let previousAction = GlobalSettingsStore.shared.providerConversationCleanupAction()
+        GlobalSettingsStore.shared.setProviderConversationCleanupAction(.delete, commit: false)
+        defer { GlobalSettingsStore.shared.setProviderConversationCleanupAction(previousAction, commit: false) }
+
+        let recorder = PersistedCleanupRecorder(outcome: .succeeded(message: "registry cleanup"))
+        let viewModel = makeViewModel(
+            persistedProviderConversationCleaner: { handle, action in
+                recorder.record(handle: handle, action: action)
+                return recorder.outcome
+            }
+        )
+        let session = viewModel.session(for: UUID())
+        session.selectedAgent = .codexExec
+        session.providerCleanupHandle = ProviderConversationCleanupHandle(
+            provider: AgentProviderKind.codexExec.rawValue,
+            conversationID: "restored-thread",
+            rolloutPath: "/tmp/restored-rollout.jsonl"
+        )
+
+        let outcome = await viewModel.cleanupProviderConversationForDeletedAgentSession(session)
+
+        XCTAssertEqual(outcome, .succeeded(message: "registry cleanup"))
+        let calls = recorder.calls()
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls.first?.handle.conversationID, "restored-thread")
+        XCTAssertEqual(calls.first?.handle.rolloutPath, "/tmp/restored-rollout.jsonl")
+        XCTAssertEqual(calls.first?.action, .delete)
+    }
+
     func testDeleteSessionCleansLiveProviderConversationOnce() async throws {
         let previousAction = GlobalSettingsStore.shared.providerConversationCleanupAction()
         GlobalSettingsStore.shared.setProviderConversationCleanupAction(.archive, commit: false)

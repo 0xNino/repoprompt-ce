@@ -42,7 +42,7 @@ final class CodexNativeSessionControllerConversationCleanupTests: XCTestCase {
         XCTAssertEqual(requests.last?.params["threadId"] as? String, "thread-from-rollout")
     }
 
-    func testDeleteIsUnsupportedAndDoesNotSendRequest() async {
+    func testDeleteByConversationIDSendsThreadDeleteRequest() async {
         let recorder = CleanupRequestRecorder(result: [:])
         let controller = makeController(recorder: recorder)
 
@@ -54,11 +54,31 @@ final class CodexNativeSessionControllerConversationCleanupTests: XCTestCase {
             action: .delete
         )
 
-        XCTAssertEqual(
-            outcome,
-            .unsupported(message: "Codex app-server does not expose a delete conversation API; archive is supported.")
+        XCTAssertEqual(outcome, .succeeded(message: "Deleted Codex conversation."))
+        XCTAssertEqual(recorder.requests().map(\.method), ["thread/delete"])
+        XCTAssertEqual(recorder.requests().first?.params["threadId"] as? String, "thread-123")
+    }
+
+    func testDeleteByRolloutPathResolvesSummaryThenDeletesThread() async {
+        let recorder = CleanupRequestRecorder(resultsByMethod: [
+            "getConversationSummary": ["summary": ["conversationId": "thread-from-rollout"]],
+            "thread/delete": [:]
+        ])
+        let controller = makeController(recorder: recorder)
+
+        let outcome = await controller.cleanupConversation(
+            ProviderConversationCleanupHandle(
+                provider: AgentProviderKind.codexExec.rawValue,
+                rolloutPath: "/tmp/codex-rollout.jsonl"
+            ),
+            action: .delete
         )
-        XCTAssertTrue(recorder.requests().isEmpty)
+
+        XCTAssertEqual(outcome, .succeeded(message: "Deleted Codex conversation."))
+        let requests = recorder.requests()
+        XCTAssertEqual(requests.map(\.method), ["getConversationSummary", "thread/delete"])
+        XCTAssertEqual(requests.first?.params["rolloutPath"] as? String, "/tmp/codex-rollout.jsonl")
+        XCTAssertEqual(requests.last?.params["threadId"] as? String, "thread-from-rollout")
     }
 
     func testArchiveRequestFailureMapsToFailedOutcome() async {
@@ -75,6 +95,22 @@ final class CodexNativeSessionControllerConversationCleanupTests: XCTestCase {
 
         XCTAssertEqual(outcome.status, "failed")
         XCTAssertEqual(outcome.message, "cleanup rejected")
+    }
+
+    func testCleanupCancellationMapsToCancelledOutcome() async {
+        let recorder = CleanupRequestRecorder(error: CancellationError())
+        let controller = makeController(recorder: recorder)
+
+        let outcome = await controller.cleanupConversation(
+            ProviderConversationCleanupHandle(
+                provider: AgentProviderKind.codexExec.rawValue,
+                conversationID: "thread-cancelled"
+            ),
+            action: .delete
+        )
+
+        XCTAssertEqual(outcome, .cancelled(message: "Codex conversation cleanup was cancelled."))
+        XCTAssertEqual(recorder.requests().map(\.method), ["thread/delete"])
     }
 
     private func makeController(recorder: CleanupRequestRecorder) -> CodexNativeSessionController {

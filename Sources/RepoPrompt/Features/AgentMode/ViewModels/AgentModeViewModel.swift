@@ -15625,7 +15625,7 @@ final class AgentModeViewModel: ObservableObject {
         } else if let provider = session.provider {
             await provider.cleanupConversation(handle, action: action)
         } else {
-            .unsupported(message: "No live provider controller was available for conversation cleanup.")
+            await providerConversationCleanupRegistry.cleanup(handle, action: action)
         }
         logProviderConversationCleanupOutcome(outcome, action: action, handle: handle)
         return outcome
@@ -15826,6 +15826,22 @@ final class AgentModeViewModel: ObservableObject {
         if wasCurrentTab {
             lastProcessedTabID = nil
         }
+        if let sessionID {
+            liveSession?.saveDebounceTask?.cancel()
+            liveSession?.saveDebounceTask = nil
+            liveSession?.saveRequestGeneration &+= 1
+            saveRequestedWhileInFlightSessionIDs.remove(sessionID)
+            do {
+                try await dataService.deleteAgentSession(id: sessionID, for: workspace)
+            } catch {
+                if let liveSession {
+                    liveSession.isDirty = true
+                    scheduleSave(for: tabID)
+                }
+                throw error
+            }
+        }
+
         var providerCleanupOutcome: ProviderConversationCleanupOutcome?
         if let session = liveSession {
             removePendingUIRefresh(for: tabID)
@@ -15849,13 +15865,7 @@ final class AgentModeViewModel: ObservableObject {
             reason: "session_delete"
         )
         let workspaceID = workspace.id
-        var persistedDeletionError: Error?
         if let sessionID {
-            do {
-                try await dataService.deleteAgentSession(id: sessionID, for: workspace)
-            } catch {
-                persistedDeletionError = error
-            }
             removeSessionIndex(sessionID: sessionID)
         } else {
             removeSessionIndex(forTabID: tabID)
@@ -15888,9 +15898,6 @@ final class AgentModeViewModel: ObservableObject {
                 ]
             )
         #endif
-        if let persistedDeletionError {
-            throw persistedDeletionError
-        }
         return providerCleanupOutcome
     }
 

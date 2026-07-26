@@ -9,6 +9,7 @@ struct CodexConversationCleanupService {
 
     static let conversationSummaryMethod = "getConversationSummary"
     static let archiveThreadMethod = "thread/archive"
+    static let deleteThreadMethod = "thread/delete"
 
     let requestExecutor: RequestExecutor
     let timeout: TimeInterval?
@@ -25,23 +26,31 @@ struct CodexConversationCleanupService {
         _ handle: ProviderConversationCleanupHandle,
         action: ProviderConversationCleanupAction
     ) async -> ProviderConversationCleanupOutcome {
+        let method: String
+        let successMessage: String
         switch action {
         case .archive:
-            do {
-                let threadID = try await resolveThreadID(from: handle)
-                _ = try await requestExecutor(
-                    Self.archiveThreadMethod,
-                    ["threadId": threadID],
-                    timeout
-                )
-                return .succeeded(message: "Archived Codex conversation.")
-            } catch let error as CleanupError {
-                return error.outcome
-            } catch {
-                return .failed(message: error.localizedDescription)
-            }
+            method = Self.archiveThreadMethod
+            successMessage = "Archived Codex conversation."
         case .delete:
-            return .unsupported(message: "Codex app-server does not expose a delete conversation API; archive is supported.")
+            method = Self.deleteThreadMethod
+            successMessage = "Deleted Codex conversation."
+        }
+
+        do {
+            let threadID = try await resolveThreadID(from: handle)
+            _ = try await requestExecutor(
+                method,
+                ["threadId": threadID],
+                timeout
+            )
+            return .succeeded(message: successMessage)
+        } catch let error as CleanupError {
+            return error.outcome
+        } catch is CancellationError {
+            return .cancelled(message: "Codex conversation cleanup was cancelled.")
+        } catch {
+            return .failed(message: error.localizedDescription)
         }
     }
 

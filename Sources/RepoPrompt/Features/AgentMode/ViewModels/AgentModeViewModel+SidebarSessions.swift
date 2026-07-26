@@ -431,29 +431,21 @@ extension AgentModeViewModel {
         searchText: String? = nil,
         diagnosticSource: String? = nil
     ) -> [SidebarSession] {
-        let effectiveSearchText = searchText ?? sessionSidebarSearchText
-        if effectiveSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            seedDefaultCollapsedSidebarThreads(
-                for: tabs,
-                currentTabID: currentTabID,
-                diagnosticSource: diagnosticSource.map { "\($0).seedDefaults" } ?? "display.seedDefaults"
-            )
-        }
-        return filteredSidebarSessions(
+        filteredSidebarSessions(
             for: tabs,
             currentTabID: currentTabID,
-            searchText: effectiveSearchText,
+            searchText: searchText ?? sessionSidebarSearchText,
             diagnosticSource: diagnosticSource
         )
     }
 
-    private func seedDefaultCollapsedSidebarThreads(
+    func defaultCollapsedSidebarThreadKeys(
         for tabs: [ComposeTabState],
-        currentTabID _: UUID?,
-        diagnosticSource _: String
-    ) {
+        searchText: String
+    ) -> [AgentSidebarThreadKey] {
+        guard searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
         let rows = sidebarSessions(for: tabs)
-        let eligibleKeys = rows.indices.compactMap { index -> AgentSidebarThreadKey? in
+        return rows.indices.compactMap { index -> AgentSidebarThreadKey? in
             let nextIndex = rows.index(after: index)
             guard rows[index].depth > 0,
                   nextIndex < rows.endIndex,
@@ -461,6 +453,9 @@ extension AgentModeViewModel {
             else { return nil }
             return AgentSidebarThreadKey.key(sessionID: rows[index].sessionID, tabID: rows[index].tabID)
         }
+    }
+
+    func seedDefaultCollapsedSidebarThreads(_ eligibleKeys: [AgentSidebarThreadKey]) {
         ui.sessionSidebar.seedDefaultCollapsedThreads(eligibleKeys: eligibleKeys)
     }
 

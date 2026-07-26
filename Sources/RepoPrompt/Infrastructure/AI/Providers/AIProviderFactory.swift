@@ -258,14 +258,22 @@ enum ProviderConversationCleanupOutcome: Equatable {
     case succeeded(message: String? = nil)
     case unsupported(message: String? = nil)
     case failed(message: String)
+    case cancelled(message: String? = nil)
 
     var isSupported: Bool {
         switch self {
-        case .succeeded, .failed:
+        case .succeeded, .failed, .cancelled:
             true
         case .unsupported:
             false
         }
+    }
+
+    var isCancelled: Bool {
+        if case .cancelled = self {
+            return true
+        }
+        return false
     }
 
     var status: String {
@@ -276,12 +284,14 @@ enum ProviderConversationCleanupOutcome: Equatable {
             "unsupported"
         case .failed:
             "failed"
+        case .cancelled:
+            "cancelled"
         }
     }
 
     var message: String? {
         switch self {
-        case let .succeeded(message), let .unsupported(message):
+        case let .succeeded(message), let .unsupported(message), let .cancelled(message):
             message
         case let .failed(message):
             message

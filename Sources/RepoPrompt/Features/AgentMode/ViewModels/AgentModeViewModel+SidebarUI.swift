@@ -210,6 +210,11 @@ extension AgentModeViewModel {
         ui.sessionSidebar.toggleThreadCollapse(key)
     }
 
+    func requestSidebarThreadDisclosureToggle(for row: SidebarSession) {
+        guard row.hasThreadChildren, let key = row.threadKey else { return }
+        ui.sessionSidebar.setThreadCollapsed(!row.isThreadCollapsed, for: key)
+    }
+
     // MARK: - Sidebar run-state attention
 
     //
