@@ -2959,7 +2959,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
                 let resolvedCatalogService = window.mcpServer.windowMCPToolCatalogService
                 catalogService = resolvedCatalogService
-                await ServiceRegistry.register(resolvedCatalogService)
+                try await ServiceRegistry.register(resolvedCatalogService)
 
                 var socketFDs = [Int32](repeating: -1, count: 2)
                 guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketFDs) == 0 else {
@@ -3506,7 +3506,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             if peerCatalogService == nil {
                 let service = routingGuardWindow.mcpServer.windowMCPToolCatalogService
                 peerCatalogService = service
-                await ServiceRegistry.register(service)
+                try await ServiceRegistry.register(service)
             }
             var socketFDs = [Int32](repeating: -1, count: 2)
             guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketFDs) == 0 else {

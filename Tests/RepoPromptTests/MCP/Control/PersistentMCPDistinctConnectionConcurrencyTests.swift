@@ -1726,7 +1726,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 throw ClientFixtureError.exactAbsoluteCatalogMiss
             }
             let catalogService = window.mcpServer.windowMCPToolCatalogService
-            await ServiceRegistry.register(catalogService)
+            try await ServiceRegistry.register(catalogService)
             return PersistentMCPTestContext(
                 rootURL: rootURL,
                 fileURL: fileURL,

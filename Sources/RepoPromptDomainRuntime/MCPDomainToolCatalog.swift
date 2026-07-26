@@ -82,7 +82,9 @@ package enum MCPToolCapability: String, CaseIterable, Hashable, Sendable {
     case selectionMutate = "selection_mutate"
     case promptMutate = "prompt_mutate"
     case historyRead = "history_read"
-    case statusPublication = "status_publication"
+    // Preserve the legacy agent_manage list_agents wire capability while using the
+    // more precise M1 intent name internally.
+    case statusPublication = "agent_session_control"
     case discovery
     case userInteraction = "user_interaction"
     case agentExternalControl = "agent_external_control"

@@ -536,7 +536,7 @@ import XCTest
         }
 
         @MainActor
-        func testClosingWindowRejectsCapturedDispatchIdentityBeforeOwnershipOperation() async {
+        func testClosingWindowRejectsCapturedDispatchIdentityBeforeOwnershipOperation() async throws {
             let manager = ServerNetworkManager()
             let connectionID = UUID()
             let bodyRan = LimiterTestFlag()
@@ -554,10 +554,7 @@ import XCTest
                 createdAt: .distantPast
             )
             let catalogService = window.mcpServer.windowMCPToolCatalogService
-            guard let catalogHandle = await ServiceRegistry.register(catalogService) else {
-                XCTFail("Window catalog registration failed")
-                return
-            }
+            let catalogHandle = try await ServiceRegistry.register(catalogService).handle
             let identity = ServerNetworkManager.WindowToolDispatchIdentity(
                 windowID: window.windowID,
                 windowStateIdentity: ObjectIdentifier(window),

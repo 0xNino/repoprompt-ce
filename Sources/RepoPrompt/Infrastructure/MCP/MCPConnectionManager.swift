@@ -11505,6 +11505,7 @@ actor ServerNetworkManager {
 
                                 let (windowCount, multiWindowModeEffective) = routingSnapshot
                                 var chosenID: Int?
+                                var singleWindowFallbackResolvedTool: MCPDomainResolvedTool?
                                 let windowStr: String
                                 let observerRunIDForCallbacksFinal: UUID?
                                 do {
@@ -11622,6 +11623,26 @@ actor ServerNetworkManager {
                                             // Store the mapping for this connection
                                             await self.setConnectionWindowMapping(connectionID, windowID: activeID)
                                         }
+                                    }
+
+                                    // Preserve the legacy single-window fallback even when app routing has
+                                    // not published a chosen window yet. The registry succeeds only when one
+                                    // exact window scope owns this tool, so multi-window ambiguity still fails closed.
+                                    if !bypassWindowRouting,
+                                       windowCount == 1,
+                                       chosenID == nil,
+                                       let fallback = await ServiceRegistry.resolveUniqueWindowTool(toolName: toolName),
+                                       case let .window(fallbackWindowID) = fallback.scope
+                                    {
+                                        singleWindowFallbackResolvedTool = fallback
+                                        chosenID = fallbackWindowID
+                                        await self.setConnectionWindowMapping(
+                                            connectionID,
+                                            windowID: fallbackWindowID
+                                        )
+                                        mcpRoutingLog(
+                                            "Auto-routing conn=\(connectionID) to unique registered window=\(fallbackWindowID)"
+                                        )
                                     }
 
                                     // Only require explicit window selection when multi-window mode is effectively active.
@@ -12437,12 +12458,14 @@ actor ServerNetworkManager {
                                         return chosenID.map(MCPDomainToolRegistrationScope.window)
                                     }
                                 }()
-                                if let registrationScope,
-                                   let resolvedTool = await ServiceRegistry.resolve(
-                                       toolName: toolName,
-                                       scope: registrationScope
-                                   )
-                                {
+                                var resolvedTool = singleWindowFallbackResolvedTool
+                                if resolvedTool == nil, let registrationScope {
+                                    resolvedTool = await ServiceRegistry.resolve(
+                                        toolName: toolName,
+                                        scope: registrationScope
+                                    )
+                                }
+                                if let resolvedTool {
                                     let toolDef = resolvedTool.binding.definition
                                     connectionLog("tools/call \(toolName): dispatching exact domain binding scope=\(String(describing: registrationScope))")
 

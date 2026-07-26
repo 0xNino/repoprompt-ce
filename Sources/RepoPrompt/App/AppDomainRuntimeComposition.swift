@@ -1,10 +1,9 @@
 import Foundation
 import RepoPromptDomainRuntime
 
-/// App-process composition for the inert M1 domain runtime.
+/// App-process composition for the M1 domain runtime and live catalog registry.
 /// Workspace/context/provider authority remains app-owned until later milestones.
-@MainActor
-final class AppDomainRuntimeComposition {
+final class AppDomainRuntimeComposition: Sendable {
     static let shared = AppDomainRuntimeComposition()
 
     let runtime: MCPDomainRuntime

@@ -281,6 +281,31 @@ else:
     if domain_runtime_tests.get("path") != "Tests/RepoPromptDomainRuntimeTests": errors.append("RepoPromptDomainRuntimeTests target path drifted")
     if owner_by_name != ["RepoPromptDomainRuntime"] or owner_products != {("MCP", "swift-sdk")} or len(domain_runtime_tests.get("dependencies", [])) != 2:
         errors.append("RepoPromptDomainRuntimeTests must depend only on RepoPromptDomainRuntime and MCP")
+
+def swift_language_modes(target):
+    return [
+        setting.get("kind", {}).get("swiftLanguageMode", {}).get("_0")
+        for setting in target.get("settings", [])
+        if setting.get("kind", {}).get("swiftLanguageMode")
+    ]
+
+def strict_concurrency_features(target):
+    return [
+        setting.get("kind", {}).get("enableExperimentalFeature", {}).get("_0")
+        for setting in target.get("settings", [])
+        if setting.get("kind", {}).get("enableExperimentalFeature")
+    ]
+
+if domain_runtime is not None and domain_runtime_tests is not None:
+    runtime_modes = swift_language_modes(domain_runtime)
+    owner_modes = swift_language_modes(domain_runtime_tests)
+    if runtime_modes != owner_modes:
+        errors.append("RepoPromptDomainRuntime and owner tests must use the same Swift language mode")
+    elif runtime_modes == ["5"]:
+        if strict_concurrency_features(domain_runtime) != ["StrictConcurrency"] or strict_concurrency_features(domain_runtime_tests) != ["StrictConcurrency"]:
+            errors.append("Swift 5 domain runtime and owner tests must retain complete StrictConcurrency checking")
+    elif runtime_modes != ["6"]:
+        errors.append("RepoPromptDomainRuntime and owner tests must be either Swift 5 + StrictConcurrency or Swift 6")
 if app_by_name_dependencies.count("RepoPromptDomainRuntime") != 1:
     errors.append("RepoPromptApp must depend exactly once on RepoPromptDomainRuntime")
 repo_prompt_tests_dependencies = [dependency["byName"][0] for dependency in targets.get("RepoPromptTests", {}).get("dependencies", []) if dependency.get("byName")]

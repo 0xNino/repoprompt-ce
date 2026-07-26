@@ -42,6 +42,46 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertEqual(signatures, Self.expectedSignatures)
     }
 
+    func testServiceRegistryReregistrationPreservesLiveHandleAndSurfacesFailures() async throws {
+        let window = Self.makeWindowWithoutAutoStart()
+        let before = await ServiceRegistry.catalogSnapshot()
+
+        XCTAssertFalse(window.mcpServer.windowToolsEnabled)
+        let serverStarted = await window.mcpServer.startServer()
+        XCTAssertTrue(serverStarted)
+        XCTAssertTrue(window.mcpServer.windowToolsEnabled)
+
+        let resolved = await ServiceRegistry.resolveUniqueWindowTool(toolName: MCPWindowToolName.readFile)
+        let captured = try XCTUnwrap(resolved)
+        let bootstrapReady = await window.mcpServer.ensureServerReadyForAgentBootstrap()
+        let after = await ServiceRegistry.catalogSnapshot()
+
+        XCTAssertTrue(bootstrapReady)
+        let capturedHandleIsActive = await ServiceRegistry.isActive(captured.handle)
+        XCTAssertTrue(capturedHandleIsActive, "An in-flight call handle must survive byte-identical bootstrap re-registration")
+        XCTAssertEqual(after.revision, before.revision + 1)
+
+        let disabling = Task { @MainActor in
+            await window.mcpServer.stopServer()
+        }
+        await Task.yield()
+        let reenabled = await window.mcpServer.startServer()
+        await disabling.value
+        let reenabledTool = await ServiceRegistry.resolveUniqueWindowTool(toolName: MCPWindowToolName.readFile)
+        XCTAssertTrue(reenabled)
+        XCTAssertTrue(window.mcpServer.windowToolsEnabled)
+        XCTAssertNotNil(reenabledTool, "A superseded disable must not remove the newer enable registration")
+
+        do {
+            _ = try await ServiceRegistry.register(UnknownCatalogToolService())
+            XCTFail("Unknown canonical tools must surface registration failure")
+        } catch let error as MCPDomainToolRegistryError {
+            XCTAssertEqual(error, .unknownToolName("unknown_catalog_tool"))
+        }
+
+        await window.mcpServer.stopServer()
+    }
+
     func testAgentRunRespondSchemaAdvertisesCanonicalScalarResponseOnly() async throws {
         let window = Self.makeWindowWithoutAutoStart()
         let tools = await window.mcpServer.windowMCPTools
@@ -345,6 +385,23 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             "amendment"
         ] {
             XCTAssertNil(agentExploreProperties[field], "agent_explore schema must not advertise run-only property \(field)")
+        }
+    }
+
+    private final class UnknownCatalogToolService: Service {
+        let domainRegistrationID = MCPDomainToolRegistrationID()
+
+        var tools: [RepoPromptApp.Tool] {
+            get async {
+                [
+                    RepoPromptApp.Tool(
+                        name: "unknown_catalog_tool",
+                        description: "Registration failure fixture.",
+                        inputSchema: .object(properties: [:]),
+                        returnsValue: { _ in .object([:]) }
+                    )
+                ]
+            }
         }
     }
 

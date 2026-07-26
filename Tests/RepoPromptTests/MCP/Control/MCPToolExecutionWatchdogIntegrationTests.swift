@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptShared
 import XCTest
 
@@ -1784,7 +1785,7 @@ import XCTest
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
                 let probe = MCPWindowIDEffectiveArgumentsService(windowID: fixture.contextA.window.windowID)
                 await ServiceRegistry.unregister(fixture.contextA.catalogService)
-                await ServiceRegistry.register(probe)
+                try await ServiceRegistry.register(probe)
                 do {
                     let endpoint = try fixture.endpointA()
                     let cases: [(label: String, arguments: [String: Any], expectedWindowID: Int)] = [
@@ -2497,7 +2498,7 @@ import XCTest
                     await ToolAvailabilityStore.shared.toggle(MCPGlobalToolName.appSettings, enabled: true)
                 }
                 if scope.ownsService {
-                    await ServiceRegistry.register(scope.service)
+                    try await ServiceRegistry.register(scope.service)
                 }
                 try await scope.waitUntilReady()
                 XCTAssertTrue(ToolAvailabilityStore.shared.isEnabled(MCPGlobalToolName.appSettings))
@@ -2566,6 +2567,7 @@ import XCTest
     }
 
     private final class MCPWindowIDEffectiveArgumentsService: WindowScopedService {
+        let domainRegistrationID = MCPDomainToolRegistrationID()
         let windowID: Int
 
         init(windowID: Int) {

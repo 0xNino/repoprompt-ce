@@ -91,7 +91,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         domainRuntimeStartupTask = Task {
             do {
                 try await domainRuntime.start()
-                await ServiceRegistry.register(appSettingsMCPService)
+                try await ServiceRegistry.register(appSettingsMCPService)
             } catch {
                 assertionFailure("Failed to start inert app domain runtime: \(error)")
             }

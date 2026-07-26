@@ -53,7 +53,7 @@ Capability names below are from the domain-runtime `MCPDomainToolCatalog`; every
 | `agent_run` | agent_external_control | control / lifecycle managed | `MCPAgentControlToolProvider` | manifest + catalog golden | policy/provider errors; session lifecycle | app authoritative / exact later parity |
 | `agent_manage` | agent_external_control | control / bounded | `MCPAgentControlToolProvider` | manifest + catalog golden | ownership/invalid session; bounded cleanup | app authoritative / exact later parity |
 | `share_thoughts` | agent_reasoning_control | control / bounded | `MCPAgentSessionControlToolProvider` | manifest + catalog golden | policy/identity errors; request cancellation | app authoritative / exact later parity |
-| `set_status` | status_publication | control / bounded | `MCPAgentSessionControlToolProvider` | manifest + catalog golden | policy/identity errors; request cancellation | app authoritative / exact later parity |
+| `set_status` | status_publication (`agent_session_control` serialized compatibility name) | control / bounded | `MCPAgentSessionControlToolProvider` | manifest + catalog golden + `list_agents` capability fixture | policy/identity errors; request cancellation | app authoritative / exact later parity |
 | `wait_for_next_user_instruction` | agent_reasoning_control | control / interactive | `MCPAgentSessionControlToolProvider` | manifest + catalog golden | terminal/cancel; interactive lifecycle | app authoritative / exact later parity |
 | `history` | history_read | control / bounded | `MCPHistoryToolProvider` → `HistoryMCPToolService` | manifest + catalog golden | scan budget/invalid params; request cancellation | app authoritative / exact later parity |
 

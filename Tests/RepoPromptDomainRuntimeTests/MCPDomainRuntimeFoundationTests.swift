@@ -24,6 +24,7 @@ final class MCPDomainToolCatalogTests: XCTestCase {
         XCTAssertEqual(MCPDomainToolCatalog.capabilities(for: "read_file"), [.fileRead])
         XCTAssertEqual(MCPDomainToolCatalog.capabilities(for: "file_search"), [.fileSearch])
         XCTAssertEqual(MCPDomainToolCatalog.capabilities(for: "history"), [.historyRead])
+        XCTAssertEqual(MCPToolCapability.statusPublication.externalName, "agent_session_control")
         XCTAssertNil(MCPDomainToolCatalog.admissionClass(for: "unknown"))
         XCTAssertTrue(MCPDomainToolCatalog.capabilities(for: "unknown").isEmpty)
     }
@@ -130,13 +131,13 @@ final class MCPDomainToolRegistryTests: XCTestCase {
         XCTAssertEqual(afterConflict.revision, beforeConflict.revision)
         let firstRemoval = await registry.unregister(firstHandle)
         XCTAssertEqual(firstRemoval, .removed)
-        await assertRegistryError(.conflictingDefinition(toolName: MCPWindowToolName.readFile)) {
-            try await registry.register(
-                registrationID: .init(rawValue: 3),
-                scope: .window(id: 2),
-                bindings: [Self.binding(name: MCPWindowToolName.readFile, description: "changed")]
-            )
-        }
+        let changedAfterRemoval = try await registry.register(
+            registrationID: .init(rawValue: 3),
+            scope: .window(id: 2),
+            bindings: [Self.binding(name: MCPWindowToolName.readFile, description: "changed")]
+        )
+        let changedAfterRemovalIsActive = await registry.isActive(changedAfterRemoval)
+        XCTAssertTrue(changedAfterRemovalIsActive)
     }
 
     func testSnapshotsDeduplicateCanonicalDefinitionsAndResolutionStaysScopeSpecific() async throws {
@@ -161,6 +162,11 @@ final class MCPDomainToolRegistryTests: XCTestCase {
         XCTAssertEqual(snapshot.activeScopesByToolName[MCPWindowToolName.readFile], [.window(id: 1), .window(id: 2)])
         XCTAssertFalse(snapshot.catalogFingerprint.isEmpty)
 
+        let ambiguousWindowResolution = await registry.resolveUniqueWindowTool(
+            toolName: MCPWindowToolName.readFile
+        )
+        XCTAssertNil(ambiguousWindowResolution)
+
         let firstResolution = await registry.resolve(toolName: MCPWindowToolName.readFile, scope: .window(id: 1))
         let secondResolution = await registry.resolve(toolName: MCPWindowToolName.readFile, scope: .window(id: 2))
         let firstTool = try XCTUnwrap(firstResolution)
@@ -175,11 +181,15 @@ final class MCPDomainToolRegistryTests: XCTestCase {
         let firstRemoval = await registry.unregister(first)
         let repeatedRemoval = await registry.unregister(first)
         let retainedResolution = await registry.resolve(toolName: MCPWindowToolName.readFile, scope: .window(id: 2))
+        let uniqueWindowResolution = await registry.resolveUniqueWindowTool(
+            toolName: MCPWindowToolName.readFile
+        )
         let secondIsActive = await registry.isActive(second)
         let globalIsActive = await registry.isActive(global)
         XCTAssertEqual(firstRemoval, .removed)
         XCTAssertEqual(repeatedRemoval, .unchanged)
         XCTAssertNotNil(retainedResolution)
+        XCTAssertEqual(uniqueWindowResolution?.scope, .window(id: 2))
         XCTAssertTrue(secondIsActive)
         XCTAssertTrue(globalIsActive)
     }
@@ -192,11 +202,34 @@ final class MCPDomainToolRegistryTests: XCTestCase {
             scope: .window(id: 1),
             bindings: [Self.binding(name: MCPWindowToolName.readFile, result: "first")]
         )
-        let second = try await registry.register(
+        let identical = try await registry.registerWithResult(
             registrationID: registrationID,
             scope: .window(id: 1),
-            bindings: [Self.binding(name: MCPWindowToolName.readFile, result: "second")]
+            bindings: [Self.binding(name: MCPWindowToolName.readFile, result: "ignored replacement")]
         )
+        let unchangedResolution = await registry.resolve(
+            toolName: MCPWindowToolName.readFile,
+            scope: .window(id: 1)
+        )
+        XCTAssertEqual(identical.disposition, .unchanged)
+        XCTAssertEqual(identical.handle, first)
+        let unchangedBinding = try XCTUnwrap(unchangedResolution)
+        let unchangedValue = try await unchangedBinding.binding([:])
+        XCTAssertEqual(unchangedValue.stringValue, "first")
+        let unchangedSnapshot = await registry.snapshot()
+        XCTAssertEqual(unchangedSnapshot.revision, 1)
+
+        let replacement = try await registry.registerWithResult(
+            registrationID: registrationID,
+            scope: .window(id: 1),
+            bindings: [Self.binding(
+                name: MCPWindowToolName.readFile,
+                description: "actual replacement",
+                result: "second"
+            )]
+        )
+        let second = replacement.handle
+        XCTAssertEqual(replacement.disposition, .replaced)
 
         let firstIsActive = await registry.isActive(first)
         let secondIsActive = await registry.isActive(second)
@@ -338,7 +371,8 @@ final class MCPDomainToolFingerprintTests: XCTestCase {
 
 final class RepoPromptDomainRuntimeLifecycleTests: XCTestCase {
     func testInertRuntimeStartIsIdempotentAndStoppedInstanceCannotRestart() async throws {
-        let directory = URL(fileURLWithPath: "/tmp/runtime-owner-test", isDirectory: true)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("runtime-owner-test-\(UUID().uuidString)", isDirectory: true)
         let runtime = MCPDomainRuntime(
             configuration: .init(
                 mode: .app,

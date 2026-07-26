@@ -82,7 +82,6 @@ package actor MCPDomainRuntime {
 
     private var lifecycle: DomainRuntimeLifecycle = .created
     private var publicationSequence: UInt64 = 0
-    private var snapshotContinuations: [UUID: AsyncStream<DomainRuntimeSnapshot>.Continuation] = [:]
 
     package init(
         configuration: DomainRuntimeConfiguration,
@@ -107,9 +106,9 @@ package actor MCPDomainRuntime {
         switch lifecycle {
         case .created:
             lifecycle = .starting
-            await publishSnapshot()
+            publishSnapshot()
             lifecycle = .ready
-            await publishSnapshot()
+            publishSnapshot()
         case .starting, .ready, .degraded:
             return
         case .draining, .stopped:
@@ -127,13 +126,9 @@ package actor MCPDomainRuntime {
             )
         }
         lifecycle = .draining
-        await publishSnapshot()
+        publishSnapshot()
         lifecycle = .stopped
-        await publishSnapshot()
-        for continuation in snapshotContinuations.values {
-            continuation.finish()
-        }
-        snapshotContinuations.removeAll()
+        publishSnapshot()
         return DomainShutdownResult(
             identity: identity,
             previousLifecycle: previousLifecycle,
@@ -151,30 +146,7 @@ package actor MCPDomainRuntime {
         )
     }
 
-    package func snapshots() -> AsyncStream<DomainRuntimeSnapshot> {
-        let continuationID = UUID()
-        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-            snapshotContinuations[continuationID] = continuation
-            continuation.onTermination = { [weak self] _ in
-                Task {
-                    await self?.removeSnapshotContinuation(continuationID)
-                }
-            }
-            Task {
-                continuation.yield(await self.snapshot())
-            }
-        }
-    }
-
-    private func publishSnapshot() async {
+    private func publishSnapshot() {
         publicationSequence &+= 1
-        let current = await snapshot()
-        for continuation in snapshotContinuations.values {
-            continuation.yield(current)
-        }
-    }
-
-    private func removeSnapshotContinuation(_ id: UUID) {
-        snapshotContinuations.removeValue(forKey: id)
     }
 }

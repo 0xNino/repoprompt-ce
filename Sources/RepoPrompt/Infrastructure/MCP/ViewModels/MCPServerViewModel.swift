@@ -12,6 +12,7 @@ import JSONSchema
 import Logging
 import MCP
 import Ontology
+import RepoPromptDomainRuntime
 import RepoPromptShared
 
 enum ReadFileAutoSelectionCoverageCertificateMissReason: String, CaseIterable, Hashable {
@@ -1021,22 +1022,19 @@ final class MCPServerViewModel: ObservableObject {
     /// This keeps disconnect cleanup from cancelling a newer same-name tool owned by another connection.
     @MainActor
     private var activeToolConnectionID: UUID? = nil
-    /// Whether this window's tools are enabled
-    @Published var windowToolsEnabled: Bool = false {
+    /// Whether this window's tools are registered and available for routing.
+    /// The value becomes true only after domain registration succeeds.
+    @Published private(set) var windowToolsEnabled: Bool = false {
         didSet {
             updateDashboardSubscriptionIfNeeded()
             recomputeCloseSafetyState()
-            #if DEBUG || EDIT_FLOW_PERF
-                Task {
-                    let registrationUpdateWindowToolsEnabledDidSetState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.registrationUpdateWindowToolsEnabledDidSet)
-                    defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.registrationUpdateWindowToolsEnabledDidSet, registrationUpdateWindowToolsEnabledDidSetState) }
-                    await updateToolRegistration()
-                }
-            #else
-                Task { await updateToolRegistration() }
-            #endif
         }
     }
+
+    private var windowToolsRequested = false
+    private var toolRegistrationIntentGeneration: UInt64 = 0
+    private var windowToolTransitionTail: Task<Bool, Never>?
+    private var activeWindowToolRegistrationHandle: MCPDomainToolRegistrationHandle?
 
     /// Controls whether the approval overlay is visible
     @Published var isApprovalOverlayVisible: Bool = false
@@ -2486,7 +2484,9 @@ final class MCPServerViewModel: ObservableObject {
                 #if DEBUG || EDIT_FLOW_PERF
                     let invalidationToolSummariesChangeState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.invalidationToolSummariesChange)
                 #endif
-                self?.invalidateToolsCache()
+                Task { [weak self] in
+                    await self?.refreshRegisteredWindowToolCatalog()
+                }
                 #if DEBUG || EDIT_FLOW_PERF
                     EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.invalidationToolSummariesChange, invalidationToolSummariesChangeState)
                 #endif
@@ -2502,8 +2502,13 @@ final class MCPServerViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
-        // Enable tools based on auto-start setting. CE builds do not license-gate MCP.
-        windowToolsEnabled = GlobalSettingsStore.shared.mcpAutoStart()
+        // Enable tools based on auto-start setting. Publish the enabled state only
+        // after the domain registry owns the complete catalog.
+        if GlobalSettingsStore.shared.mcpAutoStart() {
+            Task { [weak self] in
+                _ = await self?.setWindowToolsEnabled(true)
+            }
+        }
     }
 
     // MARK: – Private helpers
@@ -2628,38 +2633,42 @@ final class MCPServerViewModel: ObservableObject {
 
     /// -----------------------------------------------------------------
     /// Enables tools for this window and awaits MCP readiness for agent bootstrap.
-    func startServer() async {
+    @discardableResult
+    func startServer() async -> Bool {
         await ensureServerReadyForAgentBootstrap()
     }
 
-    /// Ensures tools are enabled and the window is joined before agent bootstrap continues.
-    func ensureServerReadyForAgentBootstrap() async {
+    /// Ensures tools are registered before this window becomes eligible for routing.
+    @discardableResult
+    func ensureServerReadyForAgentBootstrap() async -> Bool {
         let catalogIsRegistered = await ServiceRegistry.isRegistered(windowToolCatalogService)
         let invalidateCatalogBeforeUpdate = !windowToolsEnabled || !catalogIsRegistered
-        if !windowToolsEnabled {
-            windowToolsEnabled = true
-        }
         #if DEBUG || EDIT_FLOW_PERF
-            let registrationUpdateAgentBootstrapState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.registrationUpdateAgentBootstrap)
+            let registrationUpdateAgentBootstrapState = EditFlowPerf.begin(
+                EditFlowPerf.Stage.MCPWindowToolCatalog.registrationUpdateAgentBootstrap
+            )
         #endif
-        await updateToolRegistration(invalidateCatalogBeforeUpdate: invalidateCatalogBeforeUpdate)
+        let ready = await setWindowToolsEnabled(
+            true,
+            invalidateCatalogBeforeUpdate: invalidateCatalogBeforeUpdate
+        )
         #if DEBUG || EDIT_FLOW_PERF
-            EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.registrationUpdateAgentBootstrap, registrationUpdateAgentBootstrapState)
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.MCPWindowToolCatalog.registrationUpdateAgentBootstrap,
+                registrationUpdateAgentBootstrapState
+            )
         #endif
+        return ready
     }
 
     /// Disables tools for this window.
     func stopServer() async {
-        windowToolsEnabled = false
+        _ = await setWindowToolsEnabled(false)
     }
 
     /// Convenience UI toggle.
     func toggle() async {
-        if windowToolsEnabled {
-            windowToolsEnabled = false
-        } else {
-            windowToolsEnabled = true
-        }
+        _ = await setWindowToolsEnabled(!windowToolsRequested)
     }
 
     /// Force a state refresh from the service
@@ -2668,32 +2677,139 @@ final class MCPServerViewModel: ObservableObject {
         await service.refreshState()
     }
 
-    /// Updates tool registration based on windowToolsEnabled state
     @MainActor
-    private func updateToolRegistration(invalidateCatalogBeforeUpdate: Bool = true) async {
+    @discardableResult
+    func setWindowToolsEnabled(
+        _ enabled: Bool,
+        invalidateCatalogBeforeUpdate: Bool = true
+    ) async -> Bool {
+        toolRegistrationIntentGeneration &+= 1
+        let intentGeneration = toolRegistrationIntentGeneration
+        windowToolsRequested = enabled
+        if !enabled {
+            windowToolsEnabled = false
+        }
+
+        // MainActor methods are reentrant at every await. Chain transitions so an
+        // older enable/disable/refresh cannot mutate registration or membership
+        // after a newer request has started.
+        let predecessor = windowToolTransitionTail
+        let transition = Task { @MainActor [weak self] in
+            _ = await predecessor?.value
+            guard let self else { return false }
+            return await performWindowToolsTransition(
+                enabled: enabled,
+                intentGeneration: intentGeneration,
+                invalidateCatalogBeforeUpdate: invalidateCatalogBeforeUpdate
+            )
+        }
+        windowToolTransitionTail = transition
+        return await transition.value
+    }
+
+    @MainActor
+    private func performWindowToolsTransition(
+        enabled: Bool,
+        intentGeneration: UInt64,
+        invalidateCatalogBeforeUpdate: Bool
+    ) async -> Bool {
+        guard intentGeneration == toolRegistrationIntentGeneration else {
+            return windowToolsEnabled
+        }
+
+        guard enabled else {
+            if let handle = activeWindowToolRegistrationHandle {
+                await unregisterWindowToolRegistration(handle)
+            } else {
+                await ServiceRegistry.unregister(windowToolCatalogService)
+            }
+            await service.leave(windowID: windowID)
+            await service.refreshState()
+            return intentGeneration == toolRegistrationIntentGeneration && !windowToolsRequested
+        }
+
         if invalidateCatalogBeforeUpdate {
             #if DEBUG || EDIT_FLOW_PERF
-                let invalidationToolRegistrationUpdateState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.invalidationToolRegistrationUpdate)
+                let invalidationToolRegistrationUpdateState = EditFlowPerf.begin(
+                    EditFlowPerf.Stage.MCPWindowToolCatalog.invalidationToolRegistrationUpdate
+                )
             #endif
             invalidateToolsCache()
             #if DEBUG || EDIT_FLOW_PERF
-                EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.invalidationToolRegistrationUpdate, invalidationToolRegistrationUpdateState)
+                EditFlowPerf.end(
+                    EditFlowPerf.Stage.MCPWindowToolCatalog.invalidationToolRegistrationUpdate,
+                    invalidationToolRegistrationUpdateState
+                )
             #endif
         }
 
-        if windowToolsEnabled {
-            await ServiceRegistry.register(windowToolCatalogService) // idempotent
+        do {
+            let registration = try await ServiceRegistry.register(windowToolCatalogService)
+            guard intentGeneration == toolRegistrationIntentGeneration else {
+                if !windowToolsRequested {
+                    await ServiceRegistry.unregister(registration.handle)
+                }
+                return false
+            }
+
+            activeWindowToolRegistrationHandle = registration.handle
+            windowToolsEnabled = true
             do {
                 try await service.join(windowID: windowID)
+                guard intentGeneration == toolRegistrationIntentGeneration else {
+                    if !windowToolsRequested {
+                        windowToolsEnabled = false
+                        await unregisterWindowToolRegistration(registration.handle)
+                        await service.leave(windowID: windowID)
+                    }
+                    return false
+                }
+
                 await service.refreshState()
+                guard intentGeneration == toolRegistrationIntentGeneration else {
+                    if !windowToolsRequested {
+                        windowToolsEnabled = false
+                        await unregisterWindowToolRegistration(registration.handle)
+                        await service.leave(windowID: windowID)
+                    }
+                    return false
+                }
+                return true
             } catch {
-                logger.error("Failed to join MCP: \(error)")
+                if intentGeneration == toolRegistrationIntentGeneration {
+                    windowToolsRequested = false
+                    windowToolsEnabled = false
+                    await unregisterWindowToolRegistration(registration.handle)
+                } else if !windowToolsRequested {
+                    await unregisterWindowToolRegistration(registration.handle)
+                }
+                logger.error("Failed to join MCP after catalog registration: \(String(reflecting: error))")
+                return false
             }
-        } else {
-            await ServiceRegistry.unregister(windowToolCatalogService)
-            await service.leave(windowID: windowID)
-            await service.refreshState()
+        } catch {
+            if intentGeneration == toolRegistrationIntentGeneration {
+                windowToolsRequested = false
+                windowToolsEnabled = false
+            }
+            logger.error("Failed to register MCP window catalog: \(String(reflecting: error))")
+            return false
         }
+    }
+
+    @MainActor
+    private func unregisterWindowToolRegistration(
+        _ handle: MCPDomainToolRegistrationHandle
+    ) async {
+        await ServiceRegistry.unregister(handle)
+        if activeWindowToolRegistrationHandle == handle {
+            activeWindowToolRegistrationHandle = nil
+        }
+    }
+
+    @MainActor
+    private func refreshRegisteredWindowToolCatalog() async {
+        guard windowToolsRequested else { return }
+        _ = await setWindowToolsEnabled(true)
     }
 
     @MainActor

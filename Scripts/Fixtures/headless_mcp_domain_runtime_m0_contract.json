@@ -237,15 +237,15 @@
       "bounded": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "workspace_context", "prompt", "agent_manage", "share_thoughts", "set_status", "history"]
     },
     "advertisement_profiles": {
-      "discover_restricted_capabilities": ["conversation_send", "agent_conversation_send", "conversation_helper", "file_content_edit", "file_management", "workspace_mutate", "discovery", "app_settings", "worktree_manage", "agent_external_control", "agent_explore_control", "agent_reasoning_control", "status_publication"],
+      "discover_restricted_capabilities": ["conversation_send", "agent_conversation_send", "conversation_helper", "file_content_edit", "file_management", "workspace_mutate", "discovery", "app_settings", "worktree_manage", "agent_external_control", "agent_explore_control", "agent_reasoning_control", "agent_session_control"],
       "discover_granted_capabilities": ["user_interaction"],
       "agent_mode_restricted_capabilities": ["workspace_mutate", "conversation_helper", "conversation_send"],
-      "agent_mode_generic_granted_capabilities": ["user_interaction", "agent_reasoning_control", "status_publication", "agent_conversation_send", "conversation_log"],
-      "policy_gated_capabilities": ["user_interaction", "agent_reasoning_control", "status_publication", "agent_conversation_send", "conversation_log"],
-      "agent_mode_claude_granted_capabilities": ["user_interaction", "status_publication", "agent_conversation_send", "conversation_log"],
-      "agent_mode_codex_granted_capabilities": ["user_interaction", "status_publication", "agent_conversation_send", "conversation_log"],
-      "agent_mode_open_code_granted_capabilities": ["user_interaction", "status_publication", "agent_conversation_send", "conversation_log"],
-      "agent_mode_cursor_granted_capabilities": ["user_interaction", "status_publication", "agent_conversation_send", "conversation_log"]
+      "agent_mode_generic_granted_capabilities": ["user_interaction", "agent_reasoning_control", "agent_session_control", "agent_conversation_send", "conversation_log"],
+      "policy_gated_capabilities": ["user_interaction", "agent_reasoning_control", "agent_session_control", "agent_conversation_send", "conversation_log"],
+      "agent_mode_claude_granted_capabilities": ["user_interaction", "agent_session_control", "agent_conversation_send", "conversation_log"],
+      "agent_mode_codex_granted_capabilities": ["user_interaction", "agent_session_control", "agent_conversation_send", "conversation_log"],
+      "agent_mode_open_code_granted_capabilities": ["user_interaction", "agent_session_control", "agent_conversation_send", "conversation_log"],
+      "agent_mode_cursor_granted_capabilities": ["user_interaction", "agent_session_control", "agent_conversation_send", "conversation_log"]
     },
     "tool_capabilities": {
       "app_settings": ["app_settings"],
@@ -272,7 +272,7 @@
       "agent_run": ["agent_external_control"],
       "agent_manage": ["agent_external_control"],
       "share_thoughts": ["agent_reasoning_control"],
-      "set_status": ["status_publication"],
+      "set_status": ["agent_session_control"],
       "wait_for_next_user_instruction": ["agent_reasoning_control"],
       "history": ["history_read"]
     },

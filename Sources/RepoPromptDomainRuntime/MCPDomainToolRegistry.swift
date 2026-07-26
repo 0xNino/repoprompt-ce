@@ -26,11 +26,23 @@ package enum MCPDomainRegistryRemoval: Equatable, Sendable {
     case unchanged
 }
 
+package enum MCPDomainToolRegistrationDisposition: Equatable, Sendable {
+    case inserted
+    case replaced
+    case unchanged
+}
+
+package struct MCPDomainToolRegistrationResult: Equatable, Sendable {
+    package let handle: MCPDomainToolRegistrationHandle
+    package let disposition: MCPDomainToolRegistrationDisposition
+}
+
 package actor MCPDomainToolRegistry {
     private struct Registration: Sendable {
         let handle: MCPDomainToolRegistrationHandle
         let scope: MCPDomainToolRegistrationScope
         let bindingsByName: [String: MCPDomainToolBinding]
+        let fingerprintsByName: [String: MCPDomainToolFingerprint]
     }
 
     package nonisolated let registryID: UUID
@@ -38,7 +50,6 @@ package actor MCPDomainToolRegistry {
     private var revision: UInt64 = 0
     private var nextGeneration: UInt64 = 0
     private var registrations: [MCPDomainToolRegistrationID: Registration] = [:]
-    private var canonicalFingerprints: [String: MCPDomainToolFingerprint] = [:]
 
     package init(registryID: UUID = UUID()) {
         self.registryID = registryID
@@ -50,6 +61,18 @@ package actor MCPDomainToolRegistry {
         scope: MCPDomainToolRegistrationScope,
         bindings: [MCPDomainToolBinding]
     ) throws -> MCPDomainToolRegistrationHandle {
+        try registerWithResult(
+            registrationID: registrationID,
+            scope: scope,
+            bindings: bindings
+        ).handle
+    }
+
+    package func registerWithResult(
+        registrationID: MCPDomainToolRegistrationID,
+        scope: MCPDomainToolRegistrationScope,
+        bindings: [MCPDomainToolBinding]
+    ) throws -> MCPDomainToolRegistrationResult {
         guard !bindings.isEmpty else {
             throw MCPDomainToolRegistryError.emptyRegistration
         }
@@ -74,20 +97,31 @@ package actor MCPDomainToolRegistry {
                     actual: scope.kind
                 )
             }
-            let fingerprint = try MCPDomainToolFingerprint(definition: binding.definition)
-            if let existing = canonicalFingerprints[name], existing != fingerprint {
-                throw MCPDomainToolRegistryError.conflictingDefinition(toolName: name)
-            }
             proposedBindings[name] = binding
-            proposedFingerprints[name] = fingerprint
+            proposedFingerprints[name] = try MCPDomainToolFingerprint(definition: binding.definition)
         }
 
-        for registration in registrations.values
-            where registration.handle.registrationID != registrationID && registration.scope == scope
-        {
-            if let duplicate = registration.bindingsByName.keys.first(where: { proposedBindings[$0] != nil }) {
+        for (otherID, registration) in registrations where otherID != registrationID {
+            if registration.scope == scope,
+               let duplicate = registration.bindingsByName.keys.first(where: { proposedBindings[$0] != nil })
+            {
                 throw MCPDomainToolRegistryError.bindingAlreadyRegistered(toolName: duplicate, scope: scope)
             }
+            if let conflict = registration.fingerprintsByName.first(where: { entry in
+                proposedFingerprints[entry.key].map { $0 != entry.value } == true
+            }) {
+                throw MCPDomainToolRegistryError.conflictingDefinition(toolName: conflict.key)
+            }
+        }
+
+        if let existing = registrations[registrationID],
+           existing.scope == scope,
+           existing.fingerprintsByName == proposedFingerprints
+        {
+            return MCPDomainToolRegistrationResult(
+                handle: existing.handle,
+                disposition: .unchanged
+            )
         }
 
         nextGeneration &+= 1
@@ -96,14 +130,17 @@ package actor MCPDomainToolRegistry {
             registrationID: registrationID,
             generation: nextGeneration
         )
+        let disposition: MCPDomainToolRegistrationDisposition = registrations[registrationID] == nil
+            ? .inserted
+            : .replaced
         registrations[registrationID] = Registration(
             handle: handle,
             scope: scope,
-            bindingsByName: proposedBindings
+            bindingsByName: proposedBindings,
+            fingerprintsByName: proposedFingerprints
         )
-        canonicalFingerprints.merge(proposedFingerprints) { existing, _ in existing }
         revision &+= 1
-        return handle
+        return MCPDomainToolRegistrationResult(handle: handle, disposition: disposition)
     }
 
     package func unregister(
@@ -142,31 +179,42 @@ package actor MCPDomainToolRegistry {
         toolName: String,
         scope: MCPDomainToolRegistrationScope
     ) -> MCPDomainResolvedTool? {
-        let registration = registrations.values.first {
+        guard let registration = registrations.values.first(where: {
             $0.scope == scope && $0.bindingsByName[toolName] != nil
-        }
-        guard let registration, let binding = registration.bindingsByName[toolName] else {
+        }), let binding = registration.bindingsByName[toolName]
+        else {
             return nil
         }
-        return MCPDomainResolvedTool(
-            handle: registration.handle,
-            scope: scope,
-            binding: binding
-        )
+        return resolvedTool(registration: registration, binding: binding)
+    }
+
+    package func resolveUniqueWindowTool(toolName: String) -> MCPDomainResolvedTool? {
+        let matches = registrations.values.compactMap { registration -> (Registration, MCPDomainToolBinding)? in
+            guard case .window = registration.scope,
+                  let binding = registration.bindingsByName[toolName]
+            else {
+                return nil
+            }
+            return (registration, binding)
+        }
+        guard matches.count == 1, let match = matches.first else { return nil }
+        return resolvedTool(registration: match.0, binding: match.1)
     }
 
     package func snapshot() -> MCPDomainToolCatalogSnapshot {
         var definitionsByName: [String: MCPDomainToolDefinition] = [:]
+        var fingerprintsByName: [String: MCPDomainToolFingerprint] = [:]
         var activeScopes: [String: Set<MCPDomainToolRegistrationScope>] = [:]
         for registration in registrations.values {
             for (name, binding) in registration.bindingsByName {
                 definitionsByName[name] = binding.definition
+                fingerprintsByName[name] = registration.fingerprintsByName[name]
                 activeScopes[name, default: []].insert(registration.scope)
             }
         }
         let definitions = MCPDomainToolCatalog.orderedToolNames.compactMap { definitionsByName[$0] }
         let fingerprints = Dictionary(uniqueKeysWithValues: definitions.compactMap { definition in
-            canonicalFingerprints[definition.name].map { (definition.name, $0) }
+            fingerprintsByName[definition.name].map { (definition.name, $0) }
         })
         let catalogBytes = definitions.compactMap { fingerprints[$0.name]?.digest }.joined(separator: "\n")
         let catalogFingerprint = SHA256.hash(data: Data(catalogBytes.utf8))
@@ -178,6 +226,17 @@ package actor MCPDomainToolRegistry {
             fingerprintsByToolName: fingerprints,
             activeScopesByToolName: activeScopes,
             catalogFingerprint: catalogFingerprint
+        )
+    }
+
+    private func resolvedTool(
+        registration: Registration,
+        binding: MCPDomainToolBinding
+    ) -> MCPDomainResolvedTool {
+        MCPDomainResolvedTool(
+            handle: registration.handle,
+            scope: registration.scope,
+            binding: binding
         )
     }
 }

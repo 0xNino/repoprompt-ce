@@ -90,10 +90,33 @@ package enum MCPDomainToolRegistrationScope: Hashable, Sendable {
 }
 
 package struct MCPDomainToolRegistrationID: Hashable, Sendable {
-    package let rawValue: UInt
+    package let rawValue: UUID
+
+    package init(rawValue: UUID = UUID()) {
+        self.rawValue = rawValue
+    }
 
     package init(rawValue: UInt) {
-        self.rawValue = rawValue
+        let high = UInt64(rawValue)
+        let low = UInt64(rawValue) &* 0x9E37_79B9_7F4A_7C15
+        self.rawValue = UUID(uuid: (
+            UInt8(truncatingIfNeeded: high >> 56),
+            UInt8(truncatingIfNeeded: high >> 48),
+            UInt8(truncatingIfNeeded: high >> 40),
+            UInt8(truncatingIfNeeded: high >> 32),
+            UInt8(truncatingIfNeeded: high >> 24),
+            UInt8(truncatingIfNeeded: high >> 16),
+            UInt8(truncatingIfNeeded: high >> 8),
+            UInt8(truncatingIfNeeded: high),
+            UInt8(truncatingIfNeeded: low >> 56),
+            UInt8(truncatingIfNeeded: low >> 48),
+            UInt8(truncatingIfNeeded: low >> 40),
+            UInt8(truncatingIfNeeded: low >> 32),
+            UInt8(truncatingIfNeeded: low >> 24),
+            UInt8(truncatingIfNeeded: low >> 16),
+            UInt8(truncatingIfNeeded: low >> 8),
+            UInt8(truncatingIfNeeded: low)
+        ))
     }
 }
 

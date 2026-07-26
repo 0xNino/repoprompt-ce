@@ -574,6 +574,43 @@ final class MCPBootstrapLeaseTests: XCTestCase {
 
     func testPIDOwnedAcquireFailsClosedWhenPolicyCannotBeArmed() async throws {
         #if DEBUG
+            do {
+                let runID = UUID()
+                let recorder = PolicyRecorder()
+                await HeadlessAgentConnectionGate.cancelAll()
+                await MCPRoutingWaiter.cleanup(runID: runID)
+
+                let lease = MCPBootstrapLease(
+                    spec: MCPBootstrapLeaseSpec(
+                        runID: runID,
+                        gateID: UUID(),
+                        windowID: 1,
+                        tabID: UUID(),
+                        clientName: "bootstrap-lease-enabler-failure",
+                        restrictedTools: [],
+                        additionalTools: nil,
+                        oneShot: true,
+                        reason: "MCP enabler failure regression",
+                        ttl: 10,
+                        purpose: .agentModeRun,
+                        taskLabelKind: nil,
+                        allowsAgentExternalControlTools: false,
+                        requiresExpectedAgentPID: false
+                    ),
+                    mcpServerEnabler: { false },
+                    policyInstaller: { _ in await recorder.recordInstall() }
+                )
+
+                let acquired = await lease.acquire()
+                let installCount = await recorder.installCount
+                let waiterCount = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
+                let activeGate = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+                XCTAssertFalse(acquired)
+                XCTAssertEqual(installCount, 0)
+                XCTAssertEqual(waiterCount, 0)
+                XCTAssertNil(activeGate)
+            }
+
             let runID = UUID()
             let gateID = UUID()
             let recorder = PolicyRecorder()
@@ -825,7 +862,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                 let loadedRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: rootURL.path)
                 loadedRootID = loadedRoot.id
 
-                await ServiceRegistry.register(catalogService)
+                try await ServiceRegistry.register(catalogService)
                 let routing = try await Self.ensureRoutingService()
                 ownedRoutingService = routing.owned ? routing.service : nil
 
