@@ -20,7 +20,7 @@ Updated: 2026-07-26
 | Highlighting query compatibility and C# coverage (Item 13) | `a8885ac9b4fefb7e3af170b5899ad80d5037d7da` | Swift 6 unchanged | All 14 app-owned highlighting queries compile against their registered grammars; C# completes the 14-language CodeMapCore fixture/golden matrix without changing the existing 13 outputs. |
 | `RepoPromptRegexCore` | extraction `6feead2fcfbbd53bc9d4b9d0255401ec51bfd374`; Item 6 this change | Swift 6 | Production and owner-test targets compile with `-swift-version 6`; eight owner tests and Swift 5 app-consumer linkage pass. |
 | `RepoPromptCodeMapCore` / owner tests | extraction `22bfff1c5904d5f02c0a881055142c94f4783a84`; Item 6 this change | Swift 6 | Production and owner-test targets compile with `-swift-version 6`; 16 owner tests, mixed-mode app tests, and both Swift 5 product builds pass. |
-| `RepoPromptDomainRuntime` / owner tests (M1 foundation) | foundation commit on `feature/headless-runtime-m1-foundation` | Swift 5 + complete checking | AppKit-free runtime/catalog/registry boundary, inert app composition, app/owner consumers, and normalized schema golden forwarding. Complete Swift 5 owner evidence: conductor ticket `a118d193-0e41-4cd9-93f9-721da73880cd` (9 tests); consumer and parity evidence is recorded below before the separate language-mode promotion. |
+| `RepoPromptDomainRuntime` / owner tests (M1 foundation) | Swift 5 foundation `76f3dcae131b2880a37a4c0ef6d1e80b2e784129`; Swift 6 promotion this commit | Swift 6 | AppKit-free runtime/catalog/registry boundary, inert app composition, app/owner consumers, and normalized schema golden forwarding. Complete Swift 5 owner evidence precedes the target-local language promotion; Swift 6 owner and mixed-mode consumer evidence is recorded below. |
 
 ## Item 3 ownership record
 
@@ -82,8 +82,10 @@ No new escape hatch or source annotation was added for Item 6. M1 likewise adds 
 
 - Swift 5 + complete strict-concurrency owner target: conductor ticket `a118d193-0e41-4cd9-93f9-721da73880cd` passed all 9 catalog, per-client visibility/annotation, registry atomicity/generation/concurrency, fingerprint, and inert lifecycle tests with no diagnostics attributed to `Sources/RepoPromptDomainRuntime` or `Tests/RepoPromptDomainRuntimeTests`.
 - Swift 5 consumers: `RepoPrompt` product ticket `ce9039ae-22d8-4a6e-8c83-3e08a682aefa`; `repoprompt-mcp` product ticket `ff33c74a-8d9f-4582-bf7f-7158d01dd773`; both completed successfully before the language-mode change.
+- Target-local Swift 6 promotion: the generated SwiftPM build plan records `-swift-version 6` for `RepoPromptDomainRuntime` and `RepoPromptDomainRuntimeTests`, while `RepoPromptApp` remains `-swift-version 5`; manifest inspection confirms `RepoPromptTests` also retains the package-default Swift 5 mode. Owner ticket `599e517a-6e0b-4e95-ba4c-46b8dc9fa72d` passed all 9 tests after promotion.
+- Swift 6 mixed-mode consumers: `RepoPrompt` product ticket `0e5327fe-cce1-498d-a11d-521288424a9c`; `repoprompt-mcp` product ticket `fb6dff0e-e25c-40af-b48f-667c43bdcab6`; both completed successfully with the package default unchanged.
 - Frozen contract and app adapter parity: M0 contract ticket `cd154249-761a-427f-bd68-9f8045f91265` (3 tests) and catalog/fingerprint/annotation ticket `a654a699-b62d-4ffa-9da2-bbc7de8aa431` (6 tests) passed. The 24 window schema golden signatures are unchanged.
-- Foundation surfaces: strict lint ticket `8a99f8d2-39db-4f41-8e2e-4b8a9b4dd1a8`; 24 generated-Xcode contracts and source/license guardrails passed. No visible app lifecycle command or persisted-state migration was run.
+- Foundation surfaces: Swift 5 strict lint ticket `8a99f8d2-39db-4f41-8e2e-4b8a9b4dd1a8`; Swift 6 promotion lint ticket `d46d3401-2a4e-46ba-9db8-e037ce612e84`; 24 generated-Xcode contracts and source/license guardrails passed after both phases. No visible app lifecycle command or persisted-state migration was run.
 
 ## Item 8 official-source cleanup evidence
 

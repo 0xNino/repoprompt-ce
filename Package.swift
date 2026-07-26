@@ -106,11 +106,6 @@ if benchmarkTestsEnabled {
     repoPromptCodeMapTestSwiftSettings.append(.define("RPCE_BENCHMARK_TESTS"))
 }
 
-let swift5CompleteChecking: [SwiftSetting] = [
-    .swiftLanguageMode(.v5),
-    .enableExperimentalFeature("StrictConcurrency")
-]
-
 let swift6LanguageMode: [SwiftSetting] = [
     .swiftLanguageMode(.v6)
 ]
@@ -135,7 +130,7 @@ let package = Package(
                 .product(name: "MCP", package: "swift-sdk")
             ],
             path: "Sources/RepoPromptDomainRuntime",
-            swiftSettings: swift5CompleteChecking
+            swiftSettings: swift6LanguageMode
         ),
         .target(
             name: "RepoPromptWorkspaceCore",
@@ -201,7 +196,7 @@ let package = Package(
                 .product(name: "MCP", package: "swift-sdk")
             ],
             path: "Tests/RepoPromptDomainRuntimeTests",
-            swiftSettings: swift5CompleteChecking
+            swiftSettings: swift6LanguageMode
         ),
         .testTarget(
             name: "RepoPromptWorkspaceCoreTests",
