@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "milestone": "M0",
+  "recorded_at": "2026-07-26",
+  "scope": {
+    "production_runtime_target_allowed": false,
+    "production_domain_run_launch_token_allowed": false,
+    "later_milestone_implementation_allowed": false
+  },
+  "catalog": {
+    "global_tools": ["app_settings", "bind_context", "manage_workspaces"],
+    "window_tools": [
+      "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search",
+      "workspace_context", "prompt", "apply_edits", "oracle_utils", "ask_oracle", "oracle_send", "oracle_chat_log",
+      "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "agent_run", "agent_manage",
+      "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"
+    ],
+    "normalized_schema_golden": "Tests/RepoPromptTests/MCP/ToolCatalogSnapshotTests.swift",
+    "canonical_action_count": 98,
+    "action_fixture_contract": {
+      "applies_to": "every listed canonical action independently",
+      "success_fixture": {
+        "fixture_id": "canonical_action_success",
+        "request_class": "schema_valid",
+        "outcome": "success",
+        "result_class": "typed_tool_result"
+      },
+      "error_fixture": {
+        "fixture_id": "canonical_action_invalid_params",
+        "request_class": "missing_discriminator_or_action_required_field",
+        "outcome": "error",
+        "error_code": "invalid_params",
+        "mutation_started": false
+      },
+      "wire_envelope_claim": false,
+      "notes": "These sanitized normalized observations freeze outcome classes, not exact JSON-RPC serialization. Provider-specific wire and behavior parity remains a migration-time requirement."
+    },
+    "actions": {
+      "app_settings": ["list", "get", "set", "options"],
+      "bind_context": ["list", "status", "bind"],
+      "manage_workspaces": ["list", "switch", "create", "hide", "unhide", "delete", "add_folder", "remove_folder", "list_tabs", "select_tab", "create_tab", "close_tab"],
+      "manage_selection": ["get", "add", "remove", "set", "clear", "preview", "promote", "demote"],
+      "file_actions": ["create", "delete", "move"],
+      "get_code_structure": ["call"],
+      "get_file_tree": ["call"],
+      "read_file": ["call"],
+      "file_search": ["call"],
+      "workspace_context": ["snapshot", "export", "list_presets", "select_preset"],
+      "prompt": ["get", "set", "append", "clear", "export", "list_presets", "select_preset"],
+      "apply_edits": ["rewrite", "single_replace", "multiple_edits"],
+      "oracle_utils": ["models", "sessions"],
+      "ask_oracle": ["call"],
+      "oracle_send": ["call"],
+      "oracle_chat_log": ["call"],
+      "git": ["status", "diff", "log", "show", "blame"],
+      "manage_worktree": ["list", "show", "create", "bind", "select", "unbind", "preview", "apply", "status", "continue", "abort"],
+      "context_builder": ["call"],
+      "ask_user": ["call"],
+      "agent_explore": ["start", "poll", "wait", "cancel"],
+      "agent_run": ["start", "poll", "wait", "cancel", "steer", "respond"],
+      "agent_manage": ["list_agents", "list_sessions", "get_log", "extract_handoff", "handoff", "create_session", "resume_session", "stop_session", "cleanup_sessions", "list_workflows"],
+      "share_thoughts": ["call"],
+      "set_status": ["call"],
+      "wait_for_next_user_instruction": ["call"],
+      "history": ["list_sessions", "search", "time", "get_session"]
+    }
+  },
+  "policy": {
+    "admission": {
+      "exclusive": ["app_settings", "bind_context", "manage_workspaces", "manage_selection", "file_actions", "workspace_context", "prompt", "apply_edits", "manage_worktree"],
+      "control": ["oracle_utils", "ask_oracle", "oracle_send", "context_builder", "ask_user", "agent_explore", "agent_run", "agent_manage", "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"],
+      "small_read": ["get_code_structure", "get_file_tree", "read_file", "oracle_chat_log"],
+      "git_read": ["git"],
+      "file_search": ["file_search"]
+    },
+    "execution": {
+      "long_synchronous": ["oracle_utils", "ask_oracle", "oracle_send", "oracle_chat_log", "context_builder", "file_search"],
+      "lifecycle_managed": ["agent_explore", "agent_run"],
+      "interactive": ["apply_edits", "ask_user", "wait_for_next_user_instruction"],
+      "workspace_lifecycle": ["bind_context", "manage_workspaces", "git", "manage_worktree"],
+      "bounded": ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "workspace_context", "prompt", "agent_manage", "share_thoughts", "set_status", "history"]
+    },
+    "advertisement_profiles": {
+      "discover_restricted_capabilities": ["conversation_send", "agent_conversation_send", "conversation_helper", "file_content_edit", "file_management", "routing_advanced", "discovery", "app_settings", "worktree_manage", "agent_external_control", "agent_explore_control", "agent_reasoning_control", "agent_session_control"],
+      "discover_granted_capabilities": ["user_interaction"],
+      "agent_mode_restricted_capabilities": ["routing_advanced", "conversation_helper", "conversation_send"],
+      "agent_mode_generic_granted_capabilities": ["user_interaction", "agent_reasoning_control", "agent_session_control", "agent_conversation_send", "conversation_log"],
+      "agent_mode_native_granted_capabilities": ["user_interaction", "agent_session_control", "agent_conversation_send", "conversation_log"],
+      "policy_gated_capabilities": ["user_interaction", "agent_reasoning_control", "agent_session_control", "agent_conversation_send", "conversation_log"]
+    }
+  },
+  "dependencies": {
+    "owner": "MCPWindowToolDependencies",
+    "stored_dependency_count": 84,
+    "stored_dependencies": [
+      "executeOracleUtils", "executeAskOracle", "executeOracleSend", "executeOracleChatLog", "executeAgentExplore", "executeAgentRun", "executeAgentManage",
+      "requireTargetWindow", "requireCurrentTabContext", "requireAgentModeConnection", "resolveAgentModeTabID", "resolveContextBuilderTab", "bindTabForConnection", "buildTabSelectionReply", "sendStageProgress", "makeOracleExportDestination", "resolveDefaultOracleExportPath", "writeGeneratedOracleExportFile", "beforeContextBuilderFinalReviewAuthorization", "didFinalizeContextBuilderReview", "runMCPPlanOrQuestion",
+      "windowID", "promptVM", "workspaceManager", "selectionCoordinator", "applyEditsApprovalStore", "captureRequestMetadata", "resolveImplicitContextBuilderGitTarget", "validateContextBuilderGitArtifactSelection", "resolveTabContextSnapshot", "updateCurrentTabContext", "selectedRecordsForCurrentTabContext", "physicalSelectionForCurrentTabContext", "resolveSelectedFilesForCodeStructure", "boundTabID", "mapFileManagerErrorToMCP", "ensureGitDataRootLoaded", "logDebug", "commitPrimaryGitDiffArtifactsToCurrentTab", "replaceAdvertisedGitArtifactsForCurrentTab", "invalidateAdvertisedGitArtifactsForCurrentTab",
+      "workspaceSearch", "parseManageSelectionInputs", "resolveFileToolLookupContext", "resolveMutationFileToolContext", "stabilizedVirtualSelection", "freezePromptGitReviewContext", "buildCurrentSelectionReply", "buildSelectionPreviewReply", "buildSelectionMutationReply", "buildManageSelectionSetSelection", "resolveManageSelectionArtifactInputs", "validateManageSelectionArtifactFence", "mutatePreResolvedFullFilePaths", "commitManageSelectionArtifactMutation", "addStoredSelectionPaths", "removeStoredSelectionPaths", "promoteStoredSelectionPaths", "demoteStoredSelectionPaths", "computeSelectionSlicesVirtual", "persistResolvedTabContextSnapshot", "makeSelectionHintError",
+      "performFileAction", "buildCodeStructureDTO", "resolveFilesForCodeStructure", "buildStoreBackedFileTreeResult", "readSelectedAuthorizedGitArtifact", "readFile", "enqueueReadFileAutoSelection", "drainReadFileAutoSelection", "enqueueFileSearchAutoSelection", "workspaceContextMessage",
+      "parseCopyPresetSelector", "resolveCopyPreset", "buildTabWorkspaceContext", "selectedFilesWithStats", "selectionCollectionsForCurrentTabContext", "buildCopyPresetContextDTO", "buildCopyPresetsListDTO", "copyPresetDescriptorDTO", "buildExportSelectedFileInfos", "buildTabClipboardContent", "writePromptExportFile", "latestTokenBreakdown"
+    ]
+  },
+  "approval": {
+    "workspace_operations": ["create_workspace", "delete_workspace", "add_folder", "remove_folder"],
+    "terminal_results": ["approved", "denied", "timeout"],
+    "cancellation_result": "denied",
+    "existing_test": "RepoPromptTests.WorkspaceApprovalCancellationTests/testCancellationSettlesPromptExactlyOnceAndResolvesDenied"
+  },
+  "main_actor": {
+    "owners": ["MCPWindowToolCatalogService", "MCPWindowToolRuntime", "ServiceRegistry", "WindowSettingsManager", "GlobalSettingsStore", "WorkspaceApprovalManager", "AgentExternalMCPRunStarter"],
+    "non_main_actors": ["MCPBootstrapLease", "MCPReplayState", "BootstrapSocketMCPTransport"],
+    "request_hops": ["main_actor_scheduled", "main_actor_entered", "main_actor_exited"],
+    "existing_test": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices"
+  },
+  "sdk_stdio": {
+    "package": "https://github.com/repoprompt/swift-sdk.git",
+    "revision": "85dec2fc7a27252bc33dc7728be6af6b3bd398c0",
+    "source_evidence": {
+      "transport": "Sources/MCP/Base/Transports/StdioTransport.swift",
+      "server": "Sources/MCP/Server/Server.swift",
+      "assessment_kind": "pinned_dependency_source_inspection"
+    },
+    "observed_terminal_assessment": {
+      "clean_eof": "message stream finishes normally",
+      "read_failure": "logged then message stream finishes normally",
+      "incomplete_frame_eof": "pending bytes are discarded and message stream finishes normally",
+      "host_visible_error": "none; all three collapse to connectionClosed",
+      "decision": "Keep the pin. M6B must use a bounded RepoPromptMCP-owned stdio transport adapter rather than claim terminal parity from the SDK transport."
+    },
+    "elicitation": {
+      "method": "elicitation/create",
+      "actions": ["accept", "decline", "cancel"],
+      "classification": "SDK-supported and client-negotiated; never assumed"
+    },
+    "fallback_evidence": [
+      "RepoPromptTests.JSONRPCBridgeLedgerTests/testCleanEOFAndEOFWithOutstandingWorkAreDistinguished",
+      "RepoPromptTests.ProcessLauncherDescriptorInheritanceTests/testProcessLauncherDoesNotInheritActiveUnixSocket"
+    ]
+  },
+  "credential_gate": {
+    "packaged_cli_path": "RepoPrompt.app/Contents/MacOS/repoprompt-mcp",
+    "signing_observation": "Scripts/package_app.sh signs the CLI before signing the outer app bundle.",
+    "direct_keychain_measurement": "not_run_approval_required",
+    "evidence_kind": "policy_decision_not_empirical_measurement",
+    "evidence": "Scripts/Fixtures/item0_measurement_record.json:keychain_access_measurement",
+    "reason": "The preserved record says authorization-UI behavior was not probed and startup_scan_approved is false.",
+    "prohibited_claim": "Direct packaged-child Keychain access works.",
+    "prescribed_fallback": "Parent-owned secure storage and a minimum-scope in-memory credential handoff; debug alternate-in-memory storage remains nonpersistent.",
+    "secure_account_catalog_count": 23
+  },
+  "persistence": {
+    "stores": [
+      {"owner": "GlobalSettingsStore", "backing": "file", "path": "~/Library/Application Support/RepoPrompt CE/Settings/globalSettings.json", "classification": "durable_authority"},
+      {"owner": "WindowSettingsManager", "backing": "memory", "classification": "window_overlay_explicit_commit_or_opt_in_auto_persist"},
+      {"owner": "WorkspaceManagerViewModel", "backing": "workspace_documents", "classification": "durable_workspace_authority"},
+      {"owner": "WorkspaceApprovalManager", "backing": "UserDefaults", "classification": "runtime_policy_migration_candidate"},
+      {"owner": "ApplyEditsApprovalStore", "backing": "UserDefaults", "classification": "runtime_policy_migration_candidate"},
+      {"owner": "ToolAvailabilityStore", "backing": "UserDefaults", "classification": "catalog_policy_migration_candidate"},
+      {"owner": "ServerController", "backing": "UserDefaults", "classification": "host_admission_policy_migration_candidate"},
+      {"owner": "SecureStorage", "backing": "Keychain_or_debug_memory", "classification": "parent_owned_secret_authority"}
+    ],
+    "save_source_classification": {
+      "automatic_poll": ["pollTimer", "pollAndSaveState", "pollAndSaveStateAsync"],
+      "lifecycle": ["workspaceSwitchSaveState", "mcpTabContextEndOfRun"],
+      "debounced_automatic": ["workspaceFilesDebouncedSelectionSave"],
+      "explicit_save_api": ["saveWorkspaceAsync"],
+      "mutation_write_through": ["createWorkspace", "renameWorkspace", "setWorkspaceHidden", "setWorkspaceHiddenFromSnapshot", "rootReorder", "rootRemove", "rootAdd", "applyPreset", "createPreset", "createPresetWithPaths", "saveCurrentPreset", "savePresetShortcut", "deletePreset", "renamePreset", "reorderPresets", "updatePromptText", "updateSelectedMetaPromptIDs", "clearActiveAgentSessionIDReferences", "duplicateCleanupPreSwitch", "duplicateCleanupCanonicalMerge", "createDefaultWorkspace", "normalizationWriteback", "refreshWorkspace"],
+      "legacy_unattributed": ["directUnknown"],
+      "debug_only": ["debugWorkspaceSelectionFixtureApply"]
+    },
+    "working_journal_migration_rows": [
+      {"state": "workspace_identity_and_roots", "current_authority": "workspace_document", "dirty_revision_required": true, "saved_revision_required": true, "migration_milestone": "M2"},
+      {"state": "tab_context_selection_prompt", "current_authority": "workspace_document_plus_window_overlay", "dirty_revision_required": true, "saved_revision_required": true, "migration_milestone": "M2"},
+      {"state": "connection_binding", "current_authority": "in_memory_connection_state", "dirty_revision_required": false, "saved_revision_required": false, "migration_milestone": "M2"},
+      {"state": "approval_and_tool_policy", "current_authority": "UserDefaults", "dirty_revision_required": true, "saved_revision_required": true, "migration_milestone": "M4"},
+      {"state": "secure_credentials", "current_authority": "parent_secure_storage", "dirty_revision_required": false, "saved_revision_required": false, "migration_milestone": "never_to_child_disk"}
+    ]
+  },
+  "child_launch": {
+    "current_lease_fields": ["runID", "gateID", "windowID", "tabID", "clientName", "restrictedTools", "additionalTools", "oneShot", "reason", "ttl", "purpose", "taskLabelKind", "allowsAgentExternalControlTools", "requiresExpectedAgentPID"],
+    "private_endpoint_contract": {
+      "transport": "unix_domain_socket",
+      "directory_mode": "0700",
+      "socket_mode": "0600",
+      "addressing": "per_runtime_random_non_well_known_path",
+      "ownership_fence": ["runtime_id", "generation", "owner_pid"],
+      "descriptor_inheritance": "prohibited",
+      "child_environment_key": "REPOPROMPT_MCP_PRIVATE_ENDPOINT",
+      "transmission_boundary": "host_created_launch_scoped_child_environment",
+      "lifetime": "one_child_launch_through_terminal_settlement",
+      "admission": "single_use_expected_child_or_descendant",
+      "cleanup": "identity_fenced_idempotent_settlement",
+      "failure_behavior": "fail_closed_and_revoke_endpoint_and_token"
+    },
+    "domain_run_launch_token_contract": {
+      "status": "frozen_contract_only_not_implemented",
+      "child_material": ["opaque_random_capability"],
+      "host_record_bindings": ["token_id", "secret_digest", "runtime_id", "runtime_generation", "run_id", "expected_child_pid_or_descendant", "workspace_context_identity", "client_principal", "provider", "run_purpose", "restricted_tools", "additional_tools", "issued_at", "expires_at", "nonce"],
+      "rules": ["single_use", "short_lived", "memory_only", "never_logged", "never_persisted", "bound_to_private_endpoint_generation", "revoked_on_terminal_cleanup"],
+      "policy_selection_authority": "host_only",
+      "child_environment_key": "REPOPROMPT_MCP_LAUNCH_TOKEN"
+    },
+    "launch_carriers": [
+      {"family": "Codex", "carrier": "process_environment_or_managed_MCP_config"},
+      {"family": "Claude", "carrier": "process_environment_and_--mcp-config"},
+      {"family": "OpenCode", "carrier": "ACP_process_environment_or_OPENCODE_CONFIG_CONTENT"},
+      {"family": "Cursor", "carrier": "ACP_process_environment_and_session_mcpServers"}
+    ]
+  },
+  "performance_baseline": {
+    "artifact": "docs/spec/headless-mcp-domain-runtime-m0-editflowperf-baseline.json",
+    "required_stages": ["queue", "main_actor", "execution", "persistence", "response"],
+    "live_sample_status": "blocked_by_no_visible_app_lifecycle_constraint"
+  }
+}
