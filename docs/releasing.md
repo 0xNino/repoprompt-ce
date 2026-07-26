@@ -340,7 +340,10 @@ a local-only production app by double-clicking
 in Finder. The Finder launcher requires Python 3, confirms replacement of any
 existing installed app, runs the coordinated developer daemon, and keeps the
 terminal window open so certificate approval prompts and build results remain
-visible.
+visible. Local production packaging requires a full Xcode installation. The
+installer preserves an explicit compatible `DEVELOPER_DIR`; otherwise it uses
+the selected full Xcode or discovers a compatible Xcode app for that process
+without changing the system-wide `xcode-select` setting.
 
 The equivalent command-line path is:
 
