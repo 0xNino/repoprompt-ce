@@ -1682,6 +1682,7 @@ final class MCPServerViewModel: ObservableObject {
         await workspaceManager?.applyStoredSelectionMirrorForReadFileAutoSelection(tabID: key.tabID)
     }
 
+    /// Presentation cache for M3 read-provider compatibility. M2 routing truth lives in domainRoutingCoordinator.
     @MainActor
     var tabContextByConnectionID: [UUID: TabScopedContext] = [:]
     @MainActor
@@ -1708,6 +1709,8 @@ final class MCPServerViewModel: ObservableObject {
     var pendingPolicyRunIDMappingTokenIDByRunID: [UUID: UUID] = [:]
     @MainActor
     var windowIDByConnection: [UUID: Int] = [:]
+    let domainRoutingCoordinator: DomainRoutingCoordinator?
+    let domainWindowGeneration: UInt64
     @MainActor
     var tabContextCancellablesByConnectionID: [UUID: Set<AnyCancellable>] = [:]
     @MainActor
@@ -2478,6 +2481,7 @@ final class MCPServerViewModel: ObservableObject {
             WorkspaceModel,
             WorkspaceManagerViewModel
         ) async throws -> WorkspaceRootRef,
+        domainRoutingCoordinator: DomainRoutingCoordinator? = nil,
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared
     ) {
         self.service = service
@@ -2488,7 +2492,23 @@ final class MCPServerViewModel: ObservableObject {
         self.selectionCoordinator = selectionCoordinator
         self.workspaceSearch = workspaceSearch
         self.ensureGitDataRootLoaded = ensureGitDataRootLoaded
+        self.domainRoutingCoordinator = domainRoutingCoordinator
+        domainWindowGeneration = UInt64.random(in: 1 ... UInt64.max)
         self.applyEditsApprovalStore = applyEditsApprovalStore
+
+        if let domainRoutingCoordinator {
+            let descriptor = DomainWindowDescriptor(
+                windowID: windowID,
+                generation: domainWindowGeneration,
+                activeWorkspaceID: workspaceManager.activeWorkspaceID,
+                activeContextID: workspaceManager.activeWorkspace?.activeComposeTabID,
+                isClosing: false,
+                presentationRevision: 0
+            )
+            Task {
+                _ = await domainRoutingCoordinator.registerWindow(descriptor, operationID: UUID())
+            }
+        }
 
         // Observe service state updates
         observeService()

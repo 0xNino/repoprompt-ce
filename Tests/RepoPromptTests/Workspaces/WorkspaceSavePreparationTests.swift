@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 #if DEBUG
@@ -197,6 +198,33 @@ import XCTest
             let diagnostics = manager.workspaceSaveDiagnosticsForTesting(workspaceID: workspace.id)
             XCTAssertEqual(diagnostics.capturePublicationCount, 1)
             XCTAssertEqual(diagnostics.composeTabReloadCount, 0)
+        }
+
+        func testCompositionUsesExplicitDomainRuntimeOwnershipOnlyWhenInjected() async throws {
+            let legacy = makeComposition(windowID: -989)
+            XCTAssertNil(legacy.domainWorkspacePresentationBridge)
+
+            let root = try temporaryDirectory(named: "DomainOwnership")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "app-bridge-test",
+                storageDirectory: root,
+                eventDirectory: root.appendingPathComponent("events"),
+                temporaryDirectory: root.appendingPathComponent("tmp"),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            let owned = WindowStateCompositionFactory.make(
+                windowID: -990,
+                deferredInitialAgentSystemWorkspaceRefresh: true,
+                sharedMCPService: MCPService(),
+                domainRuntime: runtime,
+                workspaceFileContextStore: WorkspaceFileContextStore()
+            )
+            XCTAssertNotNil(owned.domainWorkspacePresentationBridge)
+            XCTAssertNotNil(owned.mcpServer.domainRoutingCoordinator)
+            _ = await runtime.shutdown()
         }
 
         private func makeComposition(windowID: Int) -> WindowStateComposition {

@@ -1,8 +1,8 @@
 import Foundation
 import RepoPromptDomainRuntime
 
-/// App-process composition for the M1 domain runtime and live catalog registry.
-/// Workspace/context/provider authority remains app-owned until later milestones.
+/// App-process composition for the M2 workspace/context domain authority.
+/// Read providers and protected mutations remain app-owned until later milestones.
 final class AppDomainRuntimeComposition: Sendable {
     static let shared = AppDomainRuntimeComposition()
 
@@ -14,14 +14,26 @@ final class AppDomainRuntimeComposition: Sendable {
             in: .userDomainMask
         ).first ?? FileManager.default.temporaryDirectory
         let root = applicationSupport.appendingPathComponent("RepoPrompt CE", isDirectory: true)
+        var legacyRuntimeDefaults: [String: Data] = [:]
+        let customStoragePath = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL")
+        if let customStoragePath,
+           let bytes = try? JSONEncoder().encode(customStoragePath)
+        {
+            legacyRuntimeDefaults["GlobalCustomStorageURL"] = bytes
+        }
+        let workspaceStorageDirectory = customStoragePath.map {
+            URL(fileURLWithPath: $0, isDirectory: true)
+        } ?? root.appendingPathComponent("Workspaces", isDirectory: true)
         runtime = MCPDomainRuntime(
             configuration: DomainRuntimeConfiguration(
                 mode: .app,
                 profileIdentifier: "default",
                 storageDirectory: root,
+                workspaceStorageDirectory: workspaceStorageDirectory,
                 eventDirectory: root.appendingPathComponent("Events", isDirectory: true),
                 temporaryDirectory: FileManager.default.temporaryDirectory
-                    .appendingPathComponent("RepoPrompt CE", isDirectory: true)
+                    .appendingPathComponent("RepoPrompt CE", isDirectory: true),
+                legacyRuntimeDefaults: legacyRuntimeDefaults
             )
         )
     }

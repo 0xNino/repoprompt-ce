@@ -146,4 +146,6 @@ The SDK stdio assessment, catalog/actions/defaults/typed errors, capability and 
 
 ### Eight-PR boundary preserved
 
-The first PR remains M0 only and added no runtime target, production token type, child listener, credential handoff, persistence journal, provider migration, context migration, or UI authority migration. M1 layers only the AppKit-free `RepoPromptDomainRuntime` foundation and owner tests onto this contract: canonical names/capabilities/admission/client annotation profiles, normalized fingerprints, runtime identity/lifecycle values, and an actor registry. `ServiceRegistry` forwards app bindings to that authority; workspace/context authority, child launch, credentials, and providers remain outside the M1 target.
+The first PR remains M0 only and added no runtime target, production token type, child listener, credential handoff, persistence journal, provider migration, command-surface change, or UI change.
+
+Subsequent implementation status is recorded without changing this frozen baseline: M1 introduced the runtime/catalog foundation in PR #640; the stacked M2 workspace/context authority contract and parity ledger live in [`headless-mcp-domain-runtime-m2-context-authority.md`](headless-mcp-domain-runtime-m2-context-authority.md).

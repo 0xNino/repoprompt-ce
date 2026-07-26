@@ -597,6 +597,9 @@ class WorkspaceManagerViewModel: ObservableObject {
     let fileManager: WorkspaceFilesViewModel
     let promptViewModel: PromptViewModel
     let workspaceSearchService: WorkspaceSearchService
+    /// Non-nil only in production composition; nil is the isolated legacy test owner.
+    private let domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient?
+    private var lastDomainProjectionSequence: UInt64 = 0
     private lazy var checkoutRefreshService = WorkspaceCheckoutRefreshService(
         store: fileManager.workspaceFileContextStore,
         searchService: workspaceSearchService
@@ -1548,6 +1551,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         fileManager: WorkspaceFilesViewModel,
         promptViewModel: PromptViewModel,
         workspaceSearchService: WorkspaceSearchService = WorkspaceSearchService(),
+        domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient? = nil,
         switchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
         performInitialWorkspaceActivation: Bool = true
     ) {
@@ -1557,6 +1561,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         self.fileManager = fileManager
         self.promptViewModel = promptViewModel
         self.workspaceSearchService = workspaceSearchService
+        self.domainWorkspaceAuthorityClient = domainWorkspaceAuthorityClient
         self.switchTimingPolicy = switchTimingPolicy
         self.promptViewModel.attachWorkspaceManager(self)
         self.fileManager.setWorkspaceManager(self)
@@ -1845,12 +1850,14 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private func saveWorkspaceIndex(_ entries: [WorkspaceIndexEntry]) throws {
+        guard domainWorkspaceAuthorityClient == nil else { return }
         try ensureBaseRootExists(at: currentBaseRoot)
         let data = try JSONEncoder().encode(entries)
         try data.write(to: workspaceIndexFileURL, options: .atomic)
     }
 
     private func saveWorkspaceIndexAsync(_ entries: [WorkspaceIndexEntry]) async throws {
+        guard domainWorkspaceAuthorityClient == nil else { return }
         try ensureBaseRootExists(at: currentBaseRoot)
         let data = try JSONEncoder().encode(entries)
         await WorkspaceDiskWriter.shared.enqueue(data: data, url: workspaceIndexFileURL)
@@ -3678,6 +3685,41 @@ class WorkspaceManagerViewModel: ObservableObject {
         selectionCoordinator = coordinator
     }
 
+    /// Projects a runtime publication without turning the active AppKit window into domain authority.
+    /// The current window choice is retained when possible and otherwise resolved locally.
+    private func publishWorkingDocumentToDomainAuthority(_ workspace: WorkspaceModel) {
+        guard let domainWorkspaceAuthorityClient else { return }
+        let fileURL = workspaceFileURL(for: workspace)
+        Task {
+            let outcome = try? await domainWorkspaceAuthorityClient.replaceWorking(workspace, fileURL: fileURL)
+            if let outcome,
+               outcome.disposition != .applied,
+               outcome.disposition != .unchanged,
+               outcome.disposition != .deduplicated
+            {
+                print("💾 Runtime working-state commit rejected: \(outcome.diagnostic ?? outcome.disposition.rawValue)")
+            }
+        }
+    }
+
+    func applyDomainWorkspaceProjection(
+        _ projectedWorkspaces: [WorkspaceModel],
+        preferredActiveWorkspaceID: UUID?,
+        publicationSequence: UInt64
+    ) {
+        guard publicationSequence >= lastDomainProjectionSequence else { return }
+        lastDomainProjectionSequence = publicationSequence
+        workspaces = projectedWorkspaces
+        recordRepoPathBaselines(for: projectedWorkspaces)
+        if let preferredActiveWorkspaceID,
+           projectedWorkspaces.contains(where: { $0.id == preferredActiveWorkspaceID })
+        {
+            activeWorkspaceID = preferredActiveWorkspaceID
+        } else if !projectedWorkspaces.contains(where: { $0.id == activeWorkspaceID }) {
+            activeWorkspaceID = projectedWorkspaces.first?.id
+        }
+    }
+
     func collectComposeTabSnapshot(name: String, base: ComposeTabState? = nil) -> ComposeTabState {
         let resolvedName = name.isEmpty ? (base?.name ?? "Tab") : name
         var snapshot = base ?? ComposeTabState(name: resolvedName)
@@ -4847,6 +4889,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 with: (snapshot.expandedFolders, snapshot.selection, snapshot.promptText, snapshot.selectedMetaPromptIDs)
             )
             workspaces[index] = workspace
+            publishWorkingDocumentToDomainAuthority(workspace)
             #if DEBUG
                 workspaceSaveCapturePublicationCountByWorkspaceIDForTesting[workspace.id, default: 0] += 1
             #endif
@@ -4867,6 +4910,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             let legacy = collectWorkspaceState()
             updateWorkspaceState(&workspace, with: legacy)
             workspaces[index] = workspace
+            publishWorkingDocumentToDomainAuthority(workspace)
             #if DEBUG
                 workspaceSaveCapturePublicationCountByWorkspaceIDForTesting[workspace.id, default: 0] += 1
             #endif
@@ -7294,6 +7338,29 @@ class WorkspaceManagerViewModel: ObservableObject {
         remainingRetryCount: Int = 1
     ) async -> Int? {
         guard !Task.isCancelled else { return nil }
+        if let domainWorkspaceAuthorityClient,
+           let currentIndex = workspaceIndex(for: workspaceID)
+        {
+            do {
+                let outcome = try await domainWorkspaceAuthorityClient.save(
+                    workspaces[currentIndex],
+                    fileURL: fileURL
+                )
+                guard outcome.disposition == .applied
+                    || outcome.disposition == .unchanged
+                    || outcome.disposition == .deduplicated
+                else {
+                    print("💾 Runtime workspace save rejected: \(outcome.diagnostic ?? outcome.disposition.rawValue)")
+                    return nil
+                }
+                let version = stateVersionByWorkspaceID[workspaceID, default: 0]
+                lastSavedVersionByWorkspaceID[workspaceID] = version
+                return version
+            } catch {
+                print("💾 Runtime workspace save failed: \(error)")
+                return nil
+            }
+        }
         await WorkspaceDiskWriter.shared.flush(url: fileURL)
         guard !Task.isCancelled,
               let currentIndex = workspaceIndex(for: workspaceID)
@@ -7433,6 +7500,20 @@ class WorkspaceManagerViewModel: ObservableObject {
         source: WorkspaceSaveSource = .directUnknown
     ) async throws -> URL {
         let targetURL = workspaceFileURL(for: workspace)
+        if let domainWorkspaceAuthorityClient {
+            let outcome = try await domainWorkspaceAuthorityClient.save(workspace, fileURL: targetURL)
+            guard outcome.disposition == .applied
+                || outcome.disposition == .unchanged
+                || outcome.disposition == .deduplicated
+            else {
+                throw NSError(
+                    domain: "RepoPrompt.DomainWorkspaceAuthority",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: outcome.diagnostic ?? outcome.disposition.rawValue]
+                )
+            }
+            return targetURL
+        }
         let capturedStateVersion = stateVersionByWorkspaceID[workspace.id, default: 0]
         await WorkspaceDiskWriter.shared.flush(url: targetURL)
 
@@ -7501,6 +7582,13 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Synchronous workspace write used by focused tests and direct save paths.
     func saveWorkspaceToFile(_ workspace: WorkspaceModel, source: WorkspaceSaveSource = .directUnknown) throws -> URL {
+        guard domainWorkspaceAuthorityClient == nil else {
+            throw NSError(
+                domain: "RepoPrompt.DomainWorkspaceAuthority",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Synchronous workspace writes are disabled for runtime-owned managers"]
+            )
+        }
         // Encode JSON and prepare file path
         let encoded = try JSONEncoder().encode(workspace)
         let folder = try ensureWorkspaceDirectoryExists(for: workspace)

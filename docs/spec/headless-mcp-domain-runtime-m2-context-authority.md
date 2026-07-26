@@ -1,0 +1,57 @@
+# Headless MCP domain runtime — M2 workspace/context authority
+
+Date: 2026-07-26
+Stack base: `feature/headless-runtime-m1-foundation` / PR #640
+Frozen baseline: [`headless-mcp-domain-runtime-m0-contracts.md`](headless-mcp-domain-runtime-m0-contracts.md)
+
+## Ownership boundary
+
+`RepoPromptDomainRuntime` is the canonical mutable owner of workspace documents, compose-tab context metadata, revisions, connection bindings, window-generation routing, and run-launch reservations. `DomainWorkspaceStore`, `DomainContextStore`, and `DomainRoutingCoordinator` expose immutable snapshots and revisioned commands. The app owns only a `@MainActor` projection bridge and active-window presentation resolution.
+
+Production `WorkspaceManagerViewModel` construction receives a `DomainWorkspaceAuthorityClient`. Its workspace/index writers are disabled and its save entry points issue revisioned runtime commands. A nil client is an explicit isolated legacy-test owner. M3 read providers may temporarily consume the app's connection/tab projection cache, but M2 binding transitions are published to `DomainRoutingCoordinator`; new routing and launch decisions use coordinator snapshots and tokens.
+
+## Persistence and migration
+
+The runtime reads existing `Workspaces/workspacesIndex.json` and `workspace.json` bytes without rewriting them at startup. Raw workspace bytes remain the compatibility format. Runtime-owned sidecars live below:
+
+```text
+DomainRuntime/v1/<profile>-<digest>/
+  workspace-catalog.json
+  working-journals/<workspace-id>.json
+  revisions/<workspace-id>.json
+  locks/
+  settings/runtime-policy.json
+  rollback/migration-*/
+```
+
+The first runtime-owned mutation, not startup, performs migration. It atomically writes a canonical sidecar catalog, exact rollback copies of the legacy index/workspace documents, a digest manifest, and copies of runtime-owned legacy defaults. Legacy files/defaults are not deleted. Explicit save atomically replaces the existing `workspace.json`; until then, the durable working journal is restart authority. There is no startup normalization or bulk rewrite.
+
+Each workspace and context carries independent `workingRevision`, `savedRevision`, and optional `dirtyRevision`. Commands carry operation IDs plus optional catalog/workspace/context CAS expectations. Operation results are durably deduplicated; operation-ID reuse with different input fails closed.
+
+N writers coordinate through narrow `flock` files, revision CAS, atomic temp-file/fsync/rename commits, catalog reconciliation, and periodic external reload. Clean external changes become a new saved/working revision. A dirty workspace enters explicit external-conflict state. Corrupt or future documents/journals/catalogs retain the last decodable saved document and make the affected authority read-only rather than silently resetting data.
+
+## Snapshot, routing, and presentation contracts
+
+Workspace subscriptions return an atomic initial snapshot plus monotonic events. Consumers detect sequence gaps and refresh the full snapshot. The app bridge applies immutable documents on `MainActor`, fences echo publications by digest/sequence, and resolves the current window locally without making `NSWindow` or an active view model domain truth.
+
+Connection and window registrations are generation-fenced. Run-scoped bindings are immutable. `DomainRunLaunchToken` material is 256-bit random, host stores only its digest, and redemption is single-use, expiring, runtime-generation/principal/provider/PID checked, and revokes pending routing state on shutdown. Policy contents are not embedded in the token; provider/process handoff remains M3+.
+
+`EditFlow.DomainRuntime.*` metrics carry runtime ID/generation, operation ID, workspace/context revisions, catalog revision, disposition, and byte count across runtime/backend/catalog/commit/projection phases. This milestone does not claim a live app latency delta because implementation was explicitly performed without relaunch.
+
+## Parity and scope ledger
+
+| M0 surface | M2 result | Later milestone boundary |
+|---|---|---|
+| workspace identity, roots, saved workspace JSON | runtime canonical document/catalog plus rollback-preserving lazy migration | protected create/delete/root policy in M4 |
+| compose-tab selection, prompt, preset/bindings metadata | canonical context snapshots and independent revisions | read-provider migration in M3 |
+| connection/window/run routing maps | generation-fenced coordinator; app maps are M3 presentation caches | direct host/backend and provider consumption in M3/M5 |
+| child launch capability | production single-use token authority | provider/process token handoff in M3+ |
+| app UI state | MainActor snapshot projection only | presentation cleanup in M7 |
+| tool admission/approval | unchanged | protected mutation policy in M4 |
+| AI/Agent providers | unchanged | M3/M5 |
+
+Out of scope here: read provider migration, protected mutation policy, AI/Agent provider migration, direct standalone host/backend, child listener/credential handoff, and legacy cleanup.
+
+## Gate evidence
+
+Owner suite: `DomainWorkspaceContextAuthorityTests` covers no-startup-write migration, working/saved/dirty recovery, exact save, dedup/collision, two-writer CAS, clean/dirty external reload, future-journal degraded mode, routing generations, and one-use launch tokens. App construction/product builds protect the presentation bridge and single writer seam. The curated XCTest ledger contains one row per new executable method.

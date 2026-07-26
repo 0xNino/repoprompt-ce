@@ -385,10 +385,14 @@ class WindowState: ObservableObject {
         // ️⃣ Connect to the global WindowStatesManager singleton
         windowStatesManager = manager
 
+        let domainRuntime = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil
+            ? AppDomainRuntimeComposition.shared.runtime
+            : nil
         let composition = WindowStateCompositionFactory.make(
             windowID: windowID,
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,
             sharedMCPService: Self.sharedMCPService,
+            domainRuntime: domainRuntime,
             contextBuilderProviderFactory: contextBuilderProviderFactory,
             workspaceFileContextStore: injectedWorkspaceFileContextStore,
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
