@@ -5721,7 +5721,13 @@ extension ToolOutputFormatter {
             if supportsRespondGuidance {
                 let kindRaw = interaction?["kind"]?.stringValue ?? ""
                 lines.append("### How to respond")
-                lines.append("Use `agent_run` with `op=respond`, `session_id=\"\(sessionID)\"`, and `interaction_id=\"\(interactionID)\"`.")
+                if kindRaw == "approval" {
+                    lines.append(
+                        "- Copyable response: `agent_run op=respond session_id=\"\(sessionID)\" interaction_id=\"\(interactionID)\" response=\"accept\"`"
+                    )
+                } else {
+                    lines.append("Use `agent_run` with `op=respond`, `session_id=\"\(sessionID)\"`, and `interaction_id=\"\(interactionID)\"`.")
+                }
                 switch kindRaw {
                 case "instruction":
                     lines.append("- Provide `response=\"<your instruction text>\"`")
@@ -5735,13 +5741,18 @@ extension ToolOutputFormatter {
                     lines.append("- Provide `response=\"<answer>\"` or `response=\"skip\"` to skip.")
                 case "approval":
                     let options = interaction?["options"]?.arrayValue ?? []
-                    if !options.isEmpty {
-                        let labels = options.compactMap { $0.objectValue?["label"]?.stringValue }
-                        lines.append("- Allowed decisions: \(labels.map { "`\($0)`" }.joined(separator: ", "))")
-                    } else {
-                        lines.append("- Allowed decisions: `accept`, `accept_for_session`, `accept_with_amendment`, `decline`, `cancel`")
+                    let labels = options.compactMap { $0.objectValue?["label"]?.stringValue }
+                    let effectiveLabels = labels.isEmpty
+                        ? ["accept", "accept_for_session", "accept_with_amendment", "decline", "cancel"]
+                        : labels
+                    lines.append(
+                        "- Allowed response values: \(effectiveLabels.map { "`\($0)`" }.joined(separator: ", "))"
+                    )
+                    if effectiveLabels.contains("accept_with_amendment") {
+                        lines.append(
+                            "- For `response=\"accept_with_amendment\"`, also provide `amendment=\"<text>\"`."
+                        )
                     }
-                    lines.append("- For `accept_with_amendment`, also provide `amendment=\"<text>\"`.")
                 case "user_input":
                     let fields = interaction?["fields"]?.arrayValue ?? []
                     if fields.count == 1 {
