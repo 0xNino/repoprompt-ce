@@ -254,7 +254,7 @@ extension AgentModeViewModel {
             let turnKind: CodexTurnKind
             let controllerInstanceID: ObjectIdentifier
             let controllerGeneration: UUID
-            let runID: UUID
+            let runID: UUID?
             let runAttemptID: UUID
         }
 
@@ -263,7 +263,7 @@ extension AgentModeViewModel {
             let turnKind: CodexTurnKind
             let controllerInstanceID: ObjectIdentifier
             let controllerGeneration: UUID
-            let runID: UUID
+            let runID: UUID?
             let runAttemptID: UUID
         }
 
@@ -362,7 +362,7 @@ extension AgentModeViewModel {
             let turnID: String
             let controllerInstanceID: ObjectIdentifier
             let controllerGeneration: UUID
-            let runID: UUID
+            let runID: UUID?
             let runAttemptID: UUID
         }
 
