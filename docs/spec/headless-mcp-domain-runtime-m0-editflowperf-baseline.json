@@ -7,17 +7,18 @@
     "tracked_files": 2341,
     "tracked_source_test_script_files": 1654,
     "tracked_source_test_script_bytes": 42426964,
-    "classification": "representative_large_workspace"
+    "classification": "current_checkout_size_snapshot_not_performance_sample"
   },
   "capture_constraints": {
     "visible_app_lifecycle_allowed": false,
-    "live_mcp_round_trip_status": "blocked_not_run",
-    "reason": "The M0 task explicitly prohibited launching, relaunching, or stopping the visible app.",
+    "live_mcp_round_trip_status": "not_observed_task_prohibited",
+    "reason": "No live command was attempted because the M0 task explicitly prohibited launching, relaunching, or stopping the visible app; this is a constraint record, not an observed blocked execution.",
     "fallback": "Use an already-running CE debug app and make dev-smoke in a separately authorized later measurement; do not infer live wall-clock latency from unit tests."
   },
-  "observed_stage_baseline": [
+  "guarded_stage_contracts": [
     {
       "stage": "queue",
+      "evidence_kind": "executable_contract",
       "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testLimiterDiagnosticsReportPromptQueuedCancellationAndIdleState",
       "observations": {
         "ordinary_connection_capacity": 1,
@@ -29,6 +30,7 @@
     },
     {
       "stage": "main_actor",
+      "evidence_kind": "executable_contract",
       "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
       "observations": {
         "ordered_events": ["MCP.ToolCall.MainActorScheduled", "MCP.ToolCall.MainActorEntered", "MCP.ToolCall.MainActorExited"],
@@ -37,6 +39,7 @@
     },
     {
       "stage": "execution",
+      "evidence_kind": "executable_contract",
       "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
       "observations": {
         "joined_tool_lifecycle_event_count": 14,
@@ -46,6 +49,7 @@
     },
     {
       "stage": "persistence",
+      "evidence_kind": "executable_contract",
       "evidence": "RepoPromptTests.WorkspaceSelectionPersistenceTests/testDiskWriterFlushAndAtomicWriteTelemetryCarryDurabilityAttributionWithoutPaths",
       "observations": {
         "stage_names": ["EditFlow.WorkspaceDurability.FlushWait", "EditFlow.WorkspaceDurability.AtomicWrite"],
@@ -55,6 +59,7 @@
     },
     {
       "stage": "response",
+      "evidence_kind": "executable_contract",
       "evidence": "RepoPromptTests.MCPReadSearchLatencyDiagnosticsGuardTests/testCorrelatedRequestTimelineJoinsAllWI2StagesAndWorkloadMatrices",
       "observations": {
         "ordered_event_count": 7,
@@ -81,5 +86,5 @@
       "cache_hit": false
     }
   },
-  "interpretation": "This is an observed M0 structural and deterministic-work baseline, not a live latency claim. It freezes the five EditFlowPerf boundaries and the exact later-measurement fallback without performing a prohibited app lifecycle action."
+  "interpretation": "This is an M0 structural contract and deterministic-work record, not a live latency baseline. The checkout counts describe only this checkout. Executable guards freeze the five EditFlowPerf boundaries; live latency remains unobserved and must be measured before M2 no-regression decisions."
 }

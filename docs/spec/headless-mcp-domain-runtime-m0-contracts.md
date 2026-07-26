@@ -9,12 +9,15 @@ Machine-readable authority: `Scripts/Fixtures/headless_mcp_domain_runtime_m0_con
 
 This is Milestone 0 of the eight-PR headless runtime plan. It records current authorities, closes bounded evidence questions, and establishes drift guards. It deliberately does **not** add a runtime target, move providers, define a production `DomainRunLaunchToken`, change persistence, or launch a child process.
 
-The normalized catalog fixture contains all 27 public tools and all 98 top-level canonical actions. Its sanitized success/error observations apply independently to each action:
+The normalized catalog fixture contains all 27 public tools. Fifteen tools expose 86 schema-discriminated actions; the other 12 tools are actionless and instead freeze their top-level required properties. M0 does **not** claim that every action was invoked or that a universal success/error envelope exists.
 
-- success: a schema-valid request has the `typed_tool_result` outcome class;
-- error: a missing discriminator or action-specific required field has the `invalid_params` class before mutation.
+Missing-discriminator behavior is frozen per action-bearing tool from implementation source:
 
-These are normalized outcome fixtures, not an exact JSON-RPC wire-envelope claim.
+- defaults are preserved for `manage_selection` (`get`), `workspace_context` (`snapshot`), `prompt` (`get`), `git` (`status`), `agent_run` (`wait`), and `agent_manage` (`list_sessions`);
+- `history` returns the typed `HistoryToolReply.error(HistoryErrorReply)` value;
+- the remaining action-bearing tools have source branches that declare their typed invalid-parameter error for a missing discriminator.
+
+Each row carries a source path, behavior marker, and typed-error marker checked by XCTest; default markers must contain the frozen default value. M0 does not infer mutation ordering beyond what these source branches state. Exact per-action result and JSON-RPC envelope parity is explicitly unmeasured in M0 and must be covered by executable migration fixtures when a tool family moves.
 
 `ToolCatalogSnapshotTests` remains the detailed description/schema-hash golden for the 24 window tools. The M0 manifest adds the three global tools, action coverage, policy normalization, and dependency accounting rather than creating a second schema-hash authority.
 
@@ -43,7 +46,7 @@ Capability names below are from `MCPToolCapabilities`; `none` is intentional for
 | `oracle_send` | conversation_send | control / long synchronous | `MCPOracleToolProvider` | manifest + catalog golden | policy/provider errors; cooperative cancellation | app authoritative / exact later parity |
 | `oracle_chat_log` | conversation_log | small_read / long synchronous | `MCPOracleToolProvider` | manifest + catalog golden | chat/invalid params; cooperative cancellation | app authoritative / exact later parity |
 | `git` | git_read | git_read / workspace lifecycle | `MCPGitToolProvider` | manifest + catalog golden | repo/operation errors; process cleanup | app authoritative / exact later parity |
-| `manage_worktree` | worktree_manage | exclusive / workspace lifecycle | `MCPGitToolProvider` | manifest + catalog golden | preview/approval/conflict; merge lifecycle | app authoritative / exact later parity |
+| `manage_worktree` | worktree_manage | exclusive / workspace lifecycle | `MCPWorktreeToolProvider` | manifest + catalog golden | preview/approval/conflict; merge lifecycle | app authoritative / exact later parity |
 | `context_builder` | discovery | control / long synchronous | `MCPContextBuilderToolProvider` | manifest + catalog golden | policy/provider errors; cooperative cancellation | app authoritative / exact later parity |
 | `ask_user` | user_interaction | control / interactive | `MCPAskUserToolProvider` | manifest + catalog golden | denied/timeout/cancel; interactive lifecycle | app authoritative / exact later parity |
 | `agent_explore` | agent_explore_control | control / lifecycle managed | `MCPAgentControlToolProvider` | manifest + catalog golden | policy/provider errors; session lifecycle | app authoritative / exact later parity |
@@ -52,21 +55,25 @@ Capability names below are from `MCPToolCapabilities`; `none` is intentional for
 | `share_thoughts` | agent_reasoning_control | control / bounded | `MCPAgentSessionControlToolProvider` | manifest + catalog golden | policy/identity errors; request cancellation | app authoritative / exact later parity |
 | `set_status` | agent_session_control | control / bounded | `MCPAgentSessionControlToolProvider` | manifest + catalog golden | policy/identity errors; request cancellation | app authoritative / exact later parity |
 | `wait_for_next_user_instruction` | agent_reasoning_control | control / interactive | `MCPAgentSessionControlToolProvider` | manifest + catalog golden | terminal/cancel; interactive lifecycle | app authoritative / exact later parity |
-| `history` | none | control / bounded | `HistoryMCPToolService` | manifest + catalog golden | scan budget/invalid params; request cancellation | app authoritative / exact later parity |
+| `history` | none | control / bounded | `MCPHistoryToolProvider` → `HistoryMCPToolService` | manifest + catalog golden | scan budget/invalid params; request cancellation | app authoritative / exact later parity |
 
-The normalized advertisement fixtures freeze Discover, generic Agent Mode, and native-provider Agent Mode capability sets. Admission and execution partitions are exhaustive and fail closed: every catalog tool appears exactly once in each partition.
+The manifest freezes the complete tool-to-capability map, including deliberate empty mappings. It also freezes the resolved `tools/list` output—after restricted-tool filtering, policy-gated grants, and role advertisement—for direct, discovery, generic explore, generic engineer, orchestrator engineer, Claude, Codex, OpenCode, and Cursor profiles. XCTest derives every list from `MCPToolCapabilities`, `DiscoverMCPToolPolicy`, `AgentModeMCPToolPolicy`, `MCPPolicyGatedTools`, and `AgentModeMCPToolAdvertisementPolicy`; the JSON is not an independent prose assertion. Admission and execution partitions remain exhaustive and fail closed.
 
 ### Dependency and MainActor boundary
 
-`MCPWindowToolDependencies` is the constructor-time seam. The manifest freezes all 84 stored fields; the guard test extracts those names from source and rejects additions, removals, or silent renames. This is an inventory, not approval to carry the entire app graph into the future runtime.
+`MCPWindowToolDependencies` is the constructor-time seam. The manifest freezes all 84 top-level stored `let`/`var` fields. The guard finds the struct by declaration, balances its braces, and inspects only depth-one stored properties, so moving the first field, adding a `var`, using an underscore/backticked identifier, or appending another top-level declaration cannot silently weaken the inventory. This is an inventory, not approval to carry the entire app graph into the future runtime.
 
-Current `@MainActor` owners are `MCPWindowToolCatalogService`, `MCPWindowToolRuntime`, `ServiceRegistry`, `WindowSettingsManager`, `GlobalSettingsStore`, `WorkspaceApprovalManager`, and `AgentExternalMCPRunStarter`. `MCPBootstrapLease`, `MCPReplayState`, and `BootstrapSocketMCPTransport` are actors rather than MainActor owners. The joined EditFlowPerf request timeline freezes `MainActorScheduled → MainActorEntered → MainActorExited`, provider execution, persistence, and response delivery as separately observable boundaries.
+The migration denominator is every type-level `@MainActor` declaration under `Infrastructure/MCP`: 42 declaration sites, including nested MCPServerViewModel support types, `MCPServerViewModel` itself, every window provider, `MCPWindowToolRuntime`, `WindowRoutingService`, `ToolAvailabilityStore`, Oracle/Agent services, and the worktree merge extension. The test enumerates this set programmatically and compares exact path/kind/symbol triples. Eight external MainActor collaborators on the window-tool hot path are separately frozen (`WindowState`, `WindowStatesManager`, `WorkspaceManagerViewModel`, `PromptViewModel`, `ContextBuilderAgentViewModel`, `GlobalSettingsStore`, `WindowSettingsManager`, and `WorkspaceSelectionCoordinator`).
+
+The manifest records a source-guarded per-tool MainActor prefix. Every window tool includes `MCPServerViewModel → MCPWindowToolRuntime → provider`; the test resolves the provider declaration path and requires that provider source to register the specific tool. Global tools record `GlobalSettingsStore` or `WindowRoutingService`. Notable ownership examples are `git → MCPGitToolProvider`, `manage_worktree → MCPWorktreeToolProvider`, and `history → MCPHistoryToolProvider`. Delegated Oracle/Agent/context-builder service hops are kept separately as `reviewed_non_executable_inventory`: their actor declarations are guarded, but M0 does not claim the complete call graph is mechanically derived. This is the denominator later PRs must reduce or deliberately update, not a claim that M0 moved isolation.
+
+The joined EditFlowPerf request timeline separately freezes `MainActorScheduled → MainActorEntered → MainActorExited`, provider execution, persistence, and response delivery as observable boundaries. `MCPBootstrapLease`, `MCPReplayState`, and `BootstrapSocketMCPTransport` remain non-MainActor actors.
 
 ### Approval
 
 `WorkspaceApprovalManager` currently owns `create_workspace`, `delete_workspace`, `add_folder`, and `remove_folder`. Terminal results are approved (including always-allow), denied, and timeout. Cancellation settles as denied exactly once, guarded by `WorkspaceApprovalCancellationTests`.
 
-## Closed evidence gates
+## Evidence dispositions
 
 ### Pinned SDK stdio
 
@@ -81,9 +88,9 @@ This gate is closed by a negative assessment: keep the pin, but M6B must use a b
 
 The same SDK revision exposes `elicitation/create` with accept, decline, and cancel actions. That is recorded as **SDK-supported, client-negotiated**, never assumed.
 
-### Packaged CLI credentials
+### Packaged CLI credentials — carried forward before M5
 
-`Scripts/package_app.sh` places `repoprompt-mcp` in `RepoPrompt.app/Contents/MacOS` and signs it before the outer app. No Keychain or security command was run for M0. The preserved `item0_measurement_record.json` explicitly says authorization-UI behavior is unmeasured and `startup_scan_approved` is false.
+`Scripts/package_app.sh` places `repoprompt-mcp` in `RepoPrompt.app/Contents/MacOS` and signs it before the outer app. No Keychain or security command was run for M0. The preserved `item0_measurement_record.json` is an unresolved procedure record—not empirical evidence—and explicitly says authorization-UI behavior is unmeasured and `startup_scan_approved` is false.
 
 No empirical credential-access result exists: the measurement is classified `not_run_approval_required`, not as an observed Keychain rejection. The design gate is fail-closed, while the empirical gate remains explicitly unresolved:
 
@@ -106,11 +113,11 @@ The manifest classifies durable files, in-memory window overlays, runtime-policy
 
 `GlobalSettingsStore` is file-backed at `~/Library/Application Support/RepoPrompt CE/Settings/globalSettings.json`. `WindowSettingsManager` is an in-memory overlay that writes only on explicit commit or opt-in auto-persist. Approval, tool availability, apply-edits policy, and host admission UserDefaults are runtime-policy migration candidates, not presentation preferences. Working-journal rows freeze the later M2/M4 migration accounting without implementing it.
 
-### EditFlowPerf representative baseline
+### EditFlowPerf structural contract — carried forward before M2 no-regression decisions
 
-`headless-mcp-domain-runtime-m0-editflowperf-baseline.json` records the current checkout as a representative large workspace (2,341 tracked files; 1,654 source/test/script files; 42,426,964 bytes) and freezes observed queue, MainActor, execution, durability, and response event contracts. It also preserves the historical observed work-count blob `f2c2693e7956c561dced51fc51fa165676a7efbc`.
+`headless-mcp-domain-runtime-m0-editflowperf-baseline.json` records a checkout-size snapshot (2,341 tracked files; 1,654 source/test/script files; 42,426,964 bytes); those counts are not a representative-workspace or latency sample. Executable tests guard queue, MainActor, execution, durability, and response event contracts. The artifact separately preserves the historical observed work-count blob `f2c2693e7956c561dced51fc51fa165676a7efbc`.
 
-This is intentionally not a live latency claim. The task prohibited visible app lifecycle actions, so a live MCP round trip is recorded as blocked-not-run with the exact fallback: use a separately authorized, already-running CE debug app and `make dev-smoke`; never infer that result from XCTest timing.
+No live command was attempted because the task prohibited visible app lifecycle actions. Therefore the live MCP round trip is `not_observed_task_prohibited`, not an observed failure or blocked execution. Before M2 makes no-regression decisions, use a separately authorized, already-running CE debug app and `make dev-smoke`; never infer live latency from XCTest timing.
 
 ### Private child endpoint and launch token
 
@@ -130,4 +137,13 @@ The guard test confirms that neither a production `DomainRunLaunchToken` type no
 
 ## M0 gate result
 
-All bounded M0 design questions have an observed result or an explicit fail-closed fallback. Live end-to-end EditFlowPerf latency is intentionally not sampled because app lifecycle actions were prohibited, and its later measurement recipe is frozen. Direct child Keychain behavior remains the one empirical unresolved gate because the preserved procedure requires separate approval; until that measurement occurs, direct access is excluded and the parent-owned credential fallback is mandatory. Later milestones must update the parity ledger and migration rows deliberately as families move.
+M0 is a **contract freeze complete with two carried-forward evidence gates**, not a declaration that all evidence was observed:
+
+1. packaged-child credential access must be measured before M5 credential transport; until then direct access is excluded and the parent-owned, minimum-scope in-memory handoff is mandatory;
+2. live EditFlowPerf latency must be measured before M2 no-regression decisions using a separately authorized, already-running CE debug app.
+
+The SDK stdio assessment, catalog/actions/defaults/typed errors, capability and resolved discovery profiles, dependency/MainActor inventories, approval semantics, persistence/save classification, and private endpoint/token contract are guarded now. Later milestones must update the parity ledger, per-tool actor denominator, and migration rows deliberately as families move.
+
+### Eight-PR boundary preserved
+
+This first PR remains M0 only. It adds no runtime target, production token type, child listener, credential handoff, persistence journal, provider migration, child launch, CLI reroute, or app cleanup. Those remain obligations of M1–M7 in the established eight-PR sequence; the two carried-forward measurements above are prerequisites for their named decision points, not permission to implement them here.

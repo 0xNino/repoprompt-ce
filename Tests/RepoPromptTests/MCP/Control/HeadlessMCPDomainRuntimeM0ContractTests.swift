@@ -18,16 +18,17 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertEqual(Set(allTools).count, allTools.count)
 
         let actionFixtures = try stringArrays(catalog, key: "actions")
-        XCTAssertEqual(Set(actionFixtures.keys), Set(allTools))
+        let actionlessFixtures = try dictionariesByKey(catalog, key: "actionless_tools")
+        XCTAssertEqual(Set(actionFixtures.keys).union(actionlessFixtures.keys), Set(allTools))
+        XCTAssertTrue(Set(actionFixtures.keys).isDisjoint(with: actionlessFixtures.keys))
         XCTAssertTrue(actionFixtures.values.allSatisfy { !$0.isEmpty })
-        XCTAssertEqual(actionFixtures.values.reduce(0) { $0 + $1.count }, try integer(catalog, key: "canonical_action_count"))
-        let normalizedFixture = try dictionary(catalog, key: "action_fixture_contract")
-        let successFixture = try dictionary(normalizedFixture, key: "success_fixture")
-        let errorFixture = try dictionary(normalizedFixture, key: "error_fixture")
-        XCTAssertEqual(try string(successFixture, key: "result_class"), "typed_tool_result")
-        XCTAssertEqual(try string(errorFixture, key: "error_code"), "invalid_params")
-        XCTAssertEqual(errorFixture["mutation_started"] as? Bool, false)
-        XCTAssertEqual(normalizedFixture["wire_envelope_claim"] as? Bool, false)
+        XCTAssertEqual(actionFixtures.values.reduce(0) { $0 + $1.count }, 86)
+        XCTAssertEqual(try integer(catalog, key: "canonical_discriminated_action_count"), 86)
+        XCTAssertEqual(actionlessFixtures.count, try integer(catalog, key: "actionless_tool_count"))
+
+        let actionEvidence = try dictionary(catalog, key: "action_execution_evidence")
+        XCTAssertEqual(try string(actionEvidence, key: "status"), "explicitly_unmeasured_in_m0")
+        XCTAssertEqual(actionEvidence["wire_envelope_claim"] as? Bool, false)
 
         let window = makeWindowWithoutAutoStart()
         addTeardownBlock { @MainActor in
@@ -37,10 +38,15 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         let liveTools = await window.mcpServer.windowMCPTools
         XCTAssertEqual(liveTools.map(\.name), windows)
         for tool in liveTools {
-            let expected = try XCTUnwrap(actionFixtures[tool.name], tool.name)
-            if expected == ["call"] {
+            if let actionless = actionlessFixtures[tool.name] {
+                let properties = try schemaProperties(for: tool)
+                let required = try schemaRequiredProperties(for: tool)
+                XCTAssertEqual(required, try strings(actionless, key: "required_properties"), tool.name)
+                XCTAssertNil(properties["op"], tool.name)
+                XCTAssertNil(properties["action"], tool.name)
                 continue
             }
+            let expected = try XCTUnwrap(actionFixtures[tool.name], tool.name)
             let properties = try schemaProperties(for: tool)
             if tool.name == MCPWindowToolName.applyEdits {
                 XCTAssertNotNil(properties["rewrite"])
@@ -70,24 +76,51 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
             actionFixtures[MCPGlobalToolName.manageWorkspaces]
         )
 
+        let discriminatorContracts = try dictionaries(catalog, key: "missing_discriminator_contracts")
+        XCTAssertEqual(Set(discriminatorContracts.compactMap { $0["tool"] as? String }), Set(actionFixtures.keys))
+        for contract in discriminatorContracts {
+            let tool = try string(contract, key: "tool")
+            let behavior = try string(contract, key: "behavior")
+            XCTAssertTrue(["defaults_to_action", "source_declares_typed_invalid_params", "source_declares_typed_error_reply"].contains(behavior), tool)
+            let evidence = try dictionary(contract, key: "source_evidence")
+            let sourceText = try source(string(evidence, key: "path"))
+            let marker = try string(evidence, key: "marker")
+            XCTAssertTrue(sourceText.contains(marker), tool)
+            if behavior == "defaults_to_action" {
+                let defaultAction = try string(contract, key: "default_action")
+                XCTAssertTrue(marker.contains("?? \"\(defaultAction)\""), tool)
+            } else {
+                let errorType = try string(contract, key: "error_type")
+                let typeMarker = try string(evidence, key: "type_marker")
+                XCTAssertTrue(sourceText.contains(typeMarker), tool)
+                if behavior == "source_declares_typed_invalid_params" {
+                    XCTAssertEqual(typeMarker, errorType, tool)
+                } else {
+                    XCTAssertTrue(errorType.contains("HistoryToolReply.error"), tool)
+                }
+            }
+        }
+
         let policy = try dictionary(manifest, key: "policy")
         let admissionFixture = try stringArrays(policy, key: "admission")
-        let actualAdmission = Dictionary(grouping: MCPToolAdmissionPolicy.classifications.keys) {
-            MCPToolAdmissionPolicy.classifications[$0]!.rawValue
-        }
-        XCTAssertEqual(actualAdmission.mapValues(Set.init), admissionFixture.mapValues(Set.init))
+        let actualAdmission = Dictionary(grouping: MCPToolAdmissionPolicy.classifications) { $0.value.rawValue }
+            .mapValues { Set($0.map(\.key)) }
+        XCTAssertEqual(actualAdmission, admissionFixture.mapValues(Set.init))
 
         let executionFixture = try stringArrays(policy, key: "execution")
-        let actualExecution = Dictionary(grouping: allTools) { toolName in
-            switch MCPToolExecutionContractCatalog.contract(for: toolName)!.kind {
+        var actualExecution: [String: Set<String>] = [:]
+        for toolName in allTools {
+            let contract = try XCTUnwrap(MCPToolExecutionContractCatalog.contract(for: toolName), toolName)
+            let kind = switch contract.kind {
             case .bounded: "bounded"
             case .longSynchronousCancellable: "long_synchronous"
             case .lifecycleManagedCancellable: "lifecycle_managed"
             case .interactiveCancellable: "interactive"
             case .workspaceLifecycleCancellable: "workspace_lifecycle"
             }
+            actualExecution[kind, default: []].insert(toolName)
         }
-        XCTAssertEqual(actualExecution.mapValues(Set.init), executionFixture.mapValues(Set.init))
+        XCTAssertEqual(actualExecution, executionFixture.mapValues(Set.init))
 
         let profiles = try stringArrays(policy, key: "advertisement_profiles")
         XCTAssertEqual(
@@ -106,20 +139,87 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
             Set(AgentModeMCPToolPolicy.grantedCapabilities.map(\.externalName)),
             try Set(XCTUnwrap(profiles["agent_mode_generic_granted_capabilities"]))
         )
-        XCTAssertEqual(
-            Set(AgentModeMCPToolPolicy.codexNativeGrantedCapabilities.map(\.externalName)),
-            try Set(XCTUnwrap(profiles["agent_mode_native_granted_capabilities"]))
-        )
+        XCTAssertEqual(Set(AgentModeMCPToolPolicy.claudeNativeGrantedCapabilities.map(\.externalName)), try Set(XCTUnwrap(profiles["agent_mode_claude_granted_capabilities"])))
+        XCTAssertEqual(Set(AgentModeMCPToolPolicy.codexNativeGrantedCapabilities.map(\.externalName)), try Set(XCTUnwrap(profiles["agent_mode_codex_granted_capabilities"])))
+        XCTAssertEqual(Set(AgentModeMCPToolPolicy.openCodeGrantedCapabilities.map(\.externalName)), try Set(XCTUnwrap(profiles["agent_mode_open_code_granted_capabilities"])))
+        XCTAssertEqual(Set(AgentModeMCPToolPolicy.cursorGrantedCapabilities.map(\.externalName)), try Set(XCTUnwrap(profiles["agent_mode_cursor_granted_capabilities"])))
         XCTAssertEqual(
             Set(MCPPolicyGatedTools.gatedCapabilities.map(\.externalName)),
             try Set(XCTUnwrap(profiles["policy_gated_capabilities"]))
         )
 
+        let capabilityFixtures = try stringArrays(policy, key: "tool_capabilities")
+        XCTAssertEqual(Set(capabilityFixtures.keys), Set(allTools))
+        for tool in allTools {
+            XCTAssertEqual(
+                Set(MCPToolCapabilities.capabilities(for: tool).map(\.externalName)),
+                try Set(XCTUnwrap(capabilityFixtures[tool])),
+                tool
+            )
+        }
+
+        let resolvedProfiles = try stringArrays(policy, key: "resolved_tools_list")
+        XCTAssertEqual(resolvedProfiles["direct"], resolvedAdvertisedTools(allTools: allTools))
+        XCTAssertEqual(
+            resolvedProfiles["discovery"],
+            resolvedAdvertisedTools(
+                allTools: allTools,
+                restricted: DiscoverMCPToolPolicy.restrictedTools,
+                additional: DiscoverMCPToolPolicy.grantedTools
+            )
+        )
+        XCTAssertEqual(
+            resolvedProfiles["agent_mode_generic_explore"],
+            resolvedAdvertisedTools(
+                allTools: allTools,
+                restricted: AgentModeMCPToolPolicy.restrictedTools,
+                additional: AgentModeMCPToolPolicy.grantedTools,
+                role: .explore
+            )
+        )
+        XCTAssertEqual(
+            resolvedProfiles["agent_mode_generic_engineer"],
+            resolvedAdvertisedTools(
+                allTools: allTools,
+                restricted: AgentModeMCPToolPolicy.restrictedTools,
+                additional: AgentModeMCPToolPolicy.grantedTools,
+                role: .engineer
+            )
+        )
+        XCTAssertEqual(
+            resolvedProfiles["agent_mode_generic_engineer_orchestrator"],
+            resolvedAdvertisedTools(
+                allTools: allTools,
+                restricted: AgentModeMCPToolPolicy.restrictedTools,
+                additional: AgentModeMCPToolPolicy.grantedTools,
+                role: .engineer,
+                allowsAgentExternalControlTools: true
+            )
+        )
+        let nativeProfiles: [(String, Set<String>)] = [
+            ("agent_mode_claude_engineer", AgentModeMCPToolPolicy.claudeNativeGrantedTools),
+            ("agent_mode_codex_engineer", AgentModeMCPToolPolicy.codexNativeGrantedTools),
+            ("agent_mode_open_code_engineer", AgentModeMCPToolPolicy.openCodeGrantedTools),
+            ("agent_mode_cursor_engineer", AgentModeMCPToolPolicy.cursorGrantedTools)
+        ]
+        for (name, granted) in nativeProfiles {
+            XCTAssertEqual(
+                resolvedProfiles[name],
+                resolvedAdvertisedTools(
+                    allTools: allTools,
+                    restricted: AgentModeMCPToolPolicy.restrictedTools,
+                    additional: granted,
+                    role: .engineer
+                ),
+                name
+            )
+        }
+
         let dependencies = try dictionary(manifest, key: "dependencies")
         let expectedDependencies = try strings(dependencies, key: "stored_dependencies")
         let sourceDependencies = try storedPropertyNames(
-            in: source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolDependencies.swift"),
-            startingAt: "    let executeOracleUtils:"
+            inStructNamed: "MCPWindowToolDependencies",
+            source: source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolDependencies.swift")
         )
         XCTAssertEqual(sourceDependencies, expectedDependencies)
         XCTAssertEqual(expectedDependencies.count, try integer(dependencies, key: "stored_dependency_count"))
@@ -152,8 +252,9 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         let credential = try dictionary(manifest, key: "credential_gate")
         let measurement = try loadJSONObject("Scripts/Fixtures/item0_measurement_record.json")
         let keychain = try dictionary(measurement, key: "keychain_access_measurement")
-        XCTAssertEqual(try string(credential, key: "direct_keychain_measurement"), "not_run_approval_required")
-        XCTAssertEqual(try string(credential, key: "evidence_kind"), "policy_decision_not_empirical_measurement")
+        XCTAssertEqual(try string(credential, key: "observation_status"), "not_observed_approval_required")
+        XCTAssertEqual(try string(credential, key: "record_classification"), "unresolved_procedure_record_not_empirical_evidence")
+        XCTAssertEqual(try string(credential, key: "prescribed_measurement_milestone"), "before_M5_credential_transport")
         XCTAssertEqual(try string(keychain, key: "status"), "incomplete")
         XCTAssertEqual(keychain["startup_scan_approved"] as? Bool, false)
         XCTAssertTrue(try string(credential, key: "prescribed_fallback").contains("Parent-owned secure storage"))
@@ -173,7 +274,7 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         let currentLeaseFields = try strings(child, key: "current_lease_fields")
         let leaseSource = try source("Sources/RepoPrompt/Infrastructure/MCP/MCPBootstrapLease.swift")
         XCTAssertEqual(
-            try storedPropertyNames(in: leaseSource, startingAt: "struct MCPBootstrapLeaseSpec", endingAt: "enum MCPBootstrapReadinessError"),
+            try storedPropertyNames(inStructNamed: "MCPBootstrapLeaseSpec", source: leaseSource),
             currentLeaseFields
         )
         let endpoint = try dictionary(child, key: "private_endpoint_contract")
@@ -200,7 +301,10 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         let manifest = try loadJSONObject("Scripts/Fixtures/headless_mcp_domain_runtime_m0_contract.json")
         let persistence = try dictionary(manifest, key: "persistence")
         let classifications = try stringArrays(persistence, key: "save_source_classification")
-        let classifiedSources = classifications.keys.sorted().flatMap { classifications[$0]! }
+        var classifiedSources: [String] = []
+        for key in classifications.keys.sorted() {
+            classifiedSources += try XCTUnwrap(classifications[key], key)
+        }
         let saveSource = try source("Sources/RepoPrompt/Features/Workspaces/ViewModels/WorkspaceSaveDiagnostics.swift")
         let expression = try NSRegularExpression(pattern: #"WorkspaceSaveSource\("([^"]+)"\)"#)
         let range = NSRange(saveSource.startIndex..., in: saveSource)
@@ -225,30 +329,89 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertTrue(approvalManager.contains("continuation.resume(returning: .denied)"))
 
         let actorInventory = try dictionary(manifest, key: "main_actor")
-        let actorSources = [
-            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolCatalogService.swift",
-            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolRuntime.swift",
-            "Sources/RepoPrompt/Infrastructure/MCP/ServiceRegistry.swift",
-            "Sources/RepoPrompt/Features/Settings/Models/WindowSettingsManager.swift",
-            "Sources/RepoPrompt/Features/Settings/Models/GlobalSettingsManager.swift",
-            "Sources/RepoPrompt/Infrastructure/MCP/WorkspaceApproval/WorkspaceApprovalManager.swift",
-            "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentExternalMCPRunStarter.swift"
-        ]
-        XCTAssertEqual(actorSources.count, try strings(actorInventory, key: "owners").count)
-        for path in actorSources {
-            XCTAssertTrue(try source(path).contains("@MainActor"), path)
+        let scannerFixture = """
+        @MainActor final class InlineActor {}
+          @MainActor
+          final class IndentedActor {}
+        @MainActor // retained annotation comment
+        @Observable
+        private final class AttributedActor {}
+        @MainActor
+        extension ExtendedActor {}
+        """
+        let scannerFixtureSites = try mainActorDeclarationSites(in: scannerFixture, path: "fixture.swift")
+        XCTAssertEqual(Set(scannerFixtureSites.compactMap { $0["symbol"] as? String }), ["InlineActor", "IndentedActor", "AttributedActor", "ExtendedActor"])
+
+        let expectedLocalSiteRows = try dictionaries(actorInventory, key: "mcp_local_declaration_sites")
+        let expectedLocalSites = expectedLocalSiteRows.map(mainActorSiteKey).sorted()
+        let actualLocalSites = try mainActorDeclarationSites(
+            under: "Sources/RepoPrompt/Infrastructure/MCP"
+        ).map(mainActorSiteKey).sorted()
+        XCTAssertEqual(actualLocalSites, expectedLocalSites)
+        XCTAssertEqual(actualLocalSites.count, try integer(actorInventory, key: "mcp_local_declaration_count"))
+        XCTAssertEqual(actualLocalSites.count, 42)
+
+        let externalSites = try dictionaries(actorInventory, key: "external_collaborators")
+        for site in externalSites {
+            let path = try string(site, key: "path")
+            let symbol = try string(site, key: "symbol")
+            let declarations = try mainActorDeclarationSites(in: source(path), path: path)
+            XCTAssertTrue(declarations.contains { ($0["symbol"] as? String) == symbol }, "\(symbol) at \(path)")
+        }
+
+        let perToolHops = try stringArrays(actorInventory, key: "per_tool_source_guarded_hops")
+        let allTools = try strings(dictionary(manifest, key: "catalog"), key: "global_tools")
+            + strings(dictionary(manifest, key: "catalog"), key: "window_tools")
+        XCTAssertEqual(Set(perToolHops.keys), Set(allTools))
+        let inventoriedSymbols = Set(expectedLocalSites.map { $0.split(separator: "|").last.map(String.init) ?? "" })
+            .union(externalSites.compactMap { $0["symbol"] as? String })
+        for tool in allTools {
+            let hops = try XCTUnwrap(perToolHops[tool], tool)
+            XCTAssertFalse(hops.isEmpty, tool)
+            XCTAssertTrue(Set(hops).isSubset(of: inventoriedSymbols), tool)
+            if MCPWindowToolGroup.orderedToolNames.contains(tool) {
+                XCTAssertTrue(hops.contains("MCPServerViewModel"), tool)
+                XCTAssertTrue(hops.contains("MCPWindowToolRuntime"), tool)
+                let provider = try XCTUnwrap(hops.first { $0.hasSuffix("ToolProvider") }, tool)
+                let providerPaths = expectedLocalSiteRows.compactMap { site -> String? in
+                    guard (site["symbol"] as? String) == provider else { return nil }
+                    return site["path"] as? String
+                }
+                let marker = "name: MCPWindowToolName.\(swiftToolIdentifier(tool))"
+                XCTAssertTrue(try providerPaths.contains { try source($0).contains(marker) }, "\(tool) owner \(provider)")
+            }
+        }
+        XCTAssertTrue(try XCTUnwrap(perToolHops["manage_worktree"]).contains("MCPWorktreeToolProvider"))
+        XCTAssertFalse(try XCTUnwrap(perToolHops["manage_worktree"]).contains("MCPGitToolProvider"))
+
+        let delegatedInventory = try dictionary(actorInventory, key: "reviewed_delegated_hops")
+        XCTAssertEqual(try string(delegatedInventory, key: "evidence_status"), "reviewed_non_executable_inventory")
+        let delegatedTools = try stringArrays(delegatedInventory, key: "tools")
+        XCTAssertTrue(Set(delegatedTools.keys).isSubset(of: Set(allTools)))
+        for (tool, symbols) in delegatedTools {
+            XCTAssertFalse(symbols.isEmpty, tool)
+            XCTAssertTrue(Set(symbols).isSubset(of: inventoriedSymbols), tool)
         }
 
         let baseline = try loadJSONObject("docs/spec/headless-mcp-domain-runtime-m0-editflowperf-baseline.json")
         let constraints = try dictionary(baseline, key: "capture_constraints")
-        XCTAssertEqual(try string(constraints, key: "live_mcp_round_trip_status"), "blocked_not_run")
+        XCTAssertEqual(try string(constraints, key: "live_mcp_round_trip_status"), "not_observed_task_prohibited")
         XCTAssertTrue(try string(constraints, key: "fallback").contains("already-running CE debug app"))
-        let stages = try dictionaries(baseline, key: "observed_stage_baseline")
+        let stages = try dictionaries(baseline, key: "guarded_stage_contracts")
         XCTAssertEqual(Set(stages.compactMap { $0["stage"] as? String }), ["queue", "main_actor", "execution", "persistence", "response"])
-        XCTAssertTrue(stages.allSatisfy { $0["evidence"] != nil && $0["observations"] != nil })
+        XCTAssertTrue(stages.allSatisfy {
+            $0["evidence"] != nil && $0["observations"] != nil && ($0["evidence_kind"] as? String) == "executable_contract"
+        })
         let checkout = try dictionary(baseline, key: "checkout_baseline")
-        XCTAssertEqual(try string(checkout, key: "classification"), "representative_large_workspace")
+        XCTAssertEqual(try string(checkout, key: "classification"), "current_checkout_size_snapshot_not_performance_sample")
         XCTAssertGreaterThan(try integer(checkout, key: "tracked_files"), 2000)
+
+        let performance = try dictionary(manifest, key: "performance_baseline")
+        XCTAssertEqual(try string(performance, key: "live_sample_status"), "not_observed_task_prohibited")
+        XCTAssertEqual(try string(performance, key: "required_before"), "M2_no_regression_decisions")
+        let result = try dictionary(manifest, key: "milestone_result")
+        XCTAssertEqual(try string(result, key: "status"), "contract_freeze_complete_with_carried_forward_evidence_gates")
+        XCTAssertEqual(try strings(result, key: "carried_forward_gates").count, 2)
     }
 
     private func loadJSONObject(_ relativePath: String) throws -> [String: Any] {
@@ -287,6 +450,10 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         try XCTUnwrap(object[key] as? [String: [String]], key)
     }
 
+    private func dictionariesByKey(_ object: [String: Any], key: String) throws -> [String: [String: Any]] {
+        try XCTUnwrap(object[key] as? [String: [String: Any]], key)
+    }
+
     private func integer(_ object: [String: Any], key: String) throws -> Int {
         try XCTUnwrap((object[key] as? NSNumber)?.intValue, key)
     }
@@ -294,6 +461,29 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
     private func schemaProperties(for tool: RepoPromptApp.Tool) throws -> [String: Value] {
         let schema = try XCTUnwrap(Value(tool.inputSchema).objectValue, tool.name)
         return try XCTUnwrap(schema["properties"]?.objectValue, tool.name)
+    }
+
+    private func schemaRequiredProperties(for tool: RepoPromptApp.Tool) throws -> [String] {
+        let schema = try XCTUnwrap(Value(tool.inputSchema).objectValue, tool.name)
+        return schema["required"]?.arrayValue?.compactMap(\.stringValue) ?? []
+    }
+
+    private func resolvedAdvertisedTools(
+        allTools: [String],
+        restricted: Set<String> = [],
+        additional: Set<String> = [],
+        role: AgentModelCatalog.TaskLabelKind? = nil,
+        allowsAgentExternalControlTools: Bool = false
+    ) -> [String] {
+        allTools.filter { tool in
+            !restricted.contains(tool)
+                && (!MCPPolicyGatedTools.names.contains(tool) || additional.contains(tool))
+                && AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
+                    toolName: tool,
+                    taskLabelKind: role,
+                    allowsAgentExternalControlTools: allowsAgentExternalControlTools
+                )
+        }
     }
 
     private func enumValues(in source: String, after anchor: String, key: String) throws -> [String] {
@@ -313,23 +503,80 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         }
     }
 
-    private func storedPropertyNames(
-        in source: String,
-        startingAt start: String,
-        endingAt end: String? = nil
-    ) throws -> [String] {
-        let startRange = try XCTUnwrap(source.range(of: start), start)
-        let tail = source[startRange.lowerBound...]
-        let bounded: Substring = if let end, let endRange = tail.range(of: end) {
-            tail[..<endRange.lowerBound]
-        } else {
-            tail
+    private func storedPropertyNames(inStructNamed name: String, source: String) throws -> [String] {
+        let declaration = try XCTUnwrap(source.range(of: "struct \(name)"), name)
+        let openingBrace = try XCTUnwrap(source[declaration.upperBound...].firstIndex(of: "{"), name)
+        var depth = 1
+        var index = source.index(after: openingBrace)
+        var lineStart = index
+        var names: [String] = []
+        let propertyExpression = try NSRegularExpression(
+            pattern: #"^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s+)*(?:let|var)\s+`?([A-Za-z_][A-Za-z0-9_]*)`?\s*:"#
+        )
+        while index < source.endIndex, depth > 0 {
+            let character = source[index]
+            if character == "\n" {
+                if depth == 1 {
+                    let line = String(source[lineStart ..< index])
+                    let range = NSRange(line.startIndex..., in: line)
+                    if let match = propertyExpression.firstMatch(in: line, range: range),
+                       let nameRange = Range(match.range(at: 1), in: line)
+                    {
+                        names.append(String(line[nameRange]))
+                    }
+                }
+                lineStart = source.index(after: index)
+            } else if character == "{" {
+                depth += 1
+            } else if character == "}" {
+                depth -= 1
+            }
+            index = source.index(after: index)
         }
-        let text = String(bounded)
-        let expression = try NSRegularExpression(pattern: #"(?m)^\s+let\s+([A-Za-z][A-Za-z0-9]*):"#)
-        return expression.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap { match in
-            guard let range = Range(match.range(at: 1), in: text) else { return nil }
-            return String(text[range])
+        XCTAssertEqual(depth, 0, "unterminated struct \(name)")
+        return names
+    }
+
+    private func swiftToolIdentifier(_ externalName: String) -> String {
+        if externalName == "file_search" { return "search" }
+        if externalName == "wait_for_next_user_instruction" { return "waitForNextInstruction" }
+        let components = externalName.split(separator: "_")
+        guard let first = components.first else { return externalName }
+        return String(first) + components.dropFirst().map { $0.prefix(1).uppercased() + String($0.dropFirst()) }.joined()
+    }
+
+    private func mainActorSiteKey(_ site: [String: Any]) -> String {
+        let path = site["path"] as? String ?? ""
+        let kind = site["kind"] as? String ?? ""
+        let symbol = site["symbol"] as? String ?? ""
+        return "\(path)|\(kind)|\(symbol)"
+    }
+
+    private func mainActorDeclarationSites(under relativeDirectory: String) throws -> [[String: Any]] {
+        let root = try RepoRoot.url()
+        let directory = root.appendingPathComponent(relativeDirectory, isDirectory: true)
+        let enumerator = try XCTUnwrap(FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil))
+        var sites: [[String: Any]] = []
+        for case let url as URL in enumerator where url.pathExtension == "swift" {
+            let relativePath = String(url.path.dropFirst(root.path.count + 1))
+            try sites.append(contentsOf: mainActorDeclarationSites(in: String(contentsOf: url, encoding: .utf8), path: relativePath))
+        }
+        return sites
+    }
+
+    private func mainActorDeclarationSites(in source: String, path: String) throws -> [[String: Any]] {
+        let expression = try NSRegularExpression(
+            pattern: #"(?m)^[ \t]*@MainActor(?:[ \t]+|[^\n]*\n[ \t]*(?:@[A-Za-z_][^\n]*\n[ \t]*)*)(?:(?:public|package|internal|private|fileprivate|open|final)\s+)*(protocol|class|struct|enum|actor|extension)\s+([A-Za-z_][A-Za-z0-9_]*)"#
+        )
+        return expression.matches(in: source, range: NSRange(source.startIndex..., in: source)).compactMap { match in
+            guard let kindRange = Range(match.range(at: 1), in: source),
+                  let symbolRange = Range(match.range(at: 2), in: source)
+            else { return nil }
+            return [
+                "path": path,
+                "kind": String(source[kindRange]),
+                "symbol": String(source[symbolRange])
+            ]
         }
     }
 
