@@ -1685,7 +1685,20 @@ final class MCPServerViewModel: ObservableObject {
                     args: args
                 )
             case "oracle_chat_log":
-                return try await oracleToolProvider.executeDomainOracleChatLog(
+                let oracleExecutionServer: MCPServerViewModel
+                if let targetWindowID = ServerNetworkManager.currentToolDispatchAuthorization?
+                    .windowIdentity?.windowID
+                {
+                    guard let targetServer = await MainActor.run(body: {
+                        WindowStatesManager.shared.window(withID: targetWindowID)?.mcpServer
+                    }) else {
+                        throw MCPError.internalError("Oracle log target window changed before execution")
+                    }
+                    oracleExecutionServer = targetServer
+                } else {
+                    oracleExecutionServer = self
+                }
+                return try await oracleExecutionServer.oracleToolProvider.executeDomainOracleChatLog(
                     context: context,
                     args: args
                 )

@@ -465,6 +465,8 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertTrue(serverViewModel.contains("executionServer.fileToolProvider.executeDomainRead"))
         XCTAssertTrue(serverViewModel.contains("executionServer.promptContextToolProvider.executeDomainRead"))
         XCTAssertTrue(serverViewModel.contains("executionServer.gitToolProvider.executeDomainRead"))
+        XCTAssertTrue(serverViewModel.contains("ServerNetworkManager.currentToolDispatchAuthorization"))
+        XCTAssertTrue(serverViewModel.contains("oracleExecutionServer.oracleToolProvider.executeDomainOracleChatLog"))
         let fileReadBackend = try source(
             "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift"
         )
