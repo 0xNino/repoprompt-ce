@@ -2729,10 +2729,10 @@ final class MCPServerViewModel: ObservableObject {
         }
 
         guard enabled else {
+            // Registration teardown is generation-fenced. Without a retained handle this view model
+            // has no authority to remove a registration that may belong to a newer participant.
             if let handle = activeWindowToolRegistrationHandle {
                 await unregisterWindowToolRegistration(handle)
-            } else {
-                await ServiceRegistry.unregister(windowToolCatalogService)
             }
             await service.leave(windowID: windowID)
             await service.refreshState()

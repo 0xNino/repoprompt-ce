@@ -284,8 +284,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         #if DEBUG
             try await MCPSharedServerTestLease.shared.withLease { _ in
                 let window = Self.makeWindowWithoutAutoStart()
-                let catalogService = window.mcpServer.windowMCPToolCatalogService
-                try await Self.withIsolatedBootstrapSocketNamespace(window: window, catalogService: catalogService) { _ in
+                try await Self.withIsolatedBootstrapSocketNamespace(window: window) { _ in
                     let orderingProbe = ServerControllerRegistrationOrderingProbe()
                     let controller = ServerController(
                         globalRegistrationOperation: { try await orderingProbe.register() },
@@ -388,12 +387,48 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         #endif
     }
 
+    func testWindowStopWithoutOwnedHandlePreservesExternalRegistrationGeneration() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                let window = Self.makeWindowWithoutAutoStart()
+                let registration: MCPDomainToolRegistrationResult
+                do {
+                    registration = try await ServiceRegistry.register(
+                        window.mcpServer.windowMCPToolCatalogService
+                    )
+                } catch {
+                    await window.tearDown()
+                    throw error
+                }
+                guard registration.disposition == .inserted else {
+                    await window.tearDown()
+                    throw ToolCatalogFixtureError.windowCatalogRegistrationWasNotOwned(
+                        String(describing: registration.disposition)
+                    )
+                }
+
+                await window.mcpServer.stopServer()
+                let externalRegistrationIsActive = await ServiceRegistry.isActive(registration.handle)
+                XCTAssertTrue(
+                    externalRegistrationIsActive,
+                    "A window without the generation handle must not unregister an external participant."
+                )
+
+                await ServiceRegistry.unregister(registration.handle)
+                await window.tearDown()
+                let externalRegistrationIsActiveAfterCleanup = await ServiceRegistry.isActive(registration.handle)
+                XCTAssertFalse(externalRegistrationIsActiveAfterCleanup)
+            }
+        #else
+            throw XCTSkip("Window registration ownership inspection is DEBUG-only")
+        #endif
+    }
+
     func testServiceRegistryReregistrationPreservesLiveHandleAndSurfacesFailures() async throws {
         #if DEBUG
             try await MCPSharedServerTestLease.shared.withLease { _ in
                 let window = Self.makeWindowWithoutAutoStart()
-                let catalogService = window.mcpServer.windowMCPToolCatalogService
-                try await Self.withIsolatedBootstrapSocketNamespace(window: window, catalogService: catalogService) { _ in
+                try await Self.withIsolatedBootstrapSocketNamespace(window: window) { _ in
                     let before = await ServiceRegistry.catalogSnapshot()
 
                     XCTAssertFalse(window.mcpServer.windowToolsEnabled)
@@ -712,7 +747,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
                 let window = Self.makeWindowWithoutAutoStart()
                 let catalogService = window.mcpServer.windowMCPToolCatalogService
 
-                try await Self.withIsolatedBootstrapSocketNamespace(window: window, catalogService: catalogService) { socketURL in
+                try await Self.withIsolatedBootstrapSocketNamespace(window: window) { socketURL in
                     let storedAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
                     let started = await window.mcpServer.ensureServerReadyForAgentBootstrap()
                     XCTAssertTrue(started)
@@ -833,6 +868,10 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         }
     }
 
+    private enum ToolCatalogFixtureError: Error {
+        case windowCatalogRegistrationWasNotOwned(String)
+    }
+
     private final class UnknownCatalogToolService: Service {
         let domainRegistrationID = MCPDomainToolRegistrationID()
 
@@ -899,7 +938,6 @@ final class ToolCatalogSnapshotTests: XCTestCase {
 
         private static func withIsolatedBootstrapSocketNamespace(
             window: WindowState,
-            catalogService: MCPWindowToolCatalogService,
             operation: (URL) async throws -> Void
         ) async throws {
             let fixture = try BootstrapSocketNamespaceFixture.make()
@@ -932,7 +970,6 @@ final class ToolCatalogSnapshotTests: XCTestCase {
                 do {
                     try await cleanupIsolatedBootstrapSocketNamespace(
                         window: window,
-                        catalogService: catalogService,
                         fixture: fixture,
                         previousEnabledState: previousEnabledState
                     )
@@ -944,7 +981,6 @@ final class ToolCatalogSnapshotTests: XCTestCase {
 
             try await cleanupIsolatedBootstrapSocketNamespace(
                 window: window,
-                catalogService: catalogService,
                 fixture: fixture,
                 previousEnabledState: previousEnabledState
             )
@@ -952,12 +988,10 @@ final class ToolCatalogSnapshotTests: XCTestCase {
 
         private static func cleanupIsolatedBootstrapSocketNamespace(
             window: WindowState,
-            catalogService: MCPWindowToolCatalogService,
             fixture: BootstrapSocketNamespaceFixture,
             previousEnabledState: Bool
         ) async throws {
             await window.mcpServer.stopServer()
-            await ServiceRegistry.unregister(catalogService)
             await window.mcpServer.shutdownListener()
 
             let manager = ServerNetworkManager.shared

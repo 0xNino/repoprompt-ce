@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 @MainActor
@@ -61,6 +62,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
     func testAgentOwnedExplicitSetPersistsForIndependentCanonicalLookup() async throws {
         #if DEBUG
+            try await simulatePrecedingSharedMCPAvailabilityMutation()
             try await withFixture(agentOwned: true) { fixture in
                 try await runCheckpoint(fixture: fixture, scenario: .agentOwnedExplicitSetIndependentLookup)
             }
@@ -257,24 +259,41 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             gitBacked: Bool = false,
             _ operation: (Fixture) async throws -> Void
         ) async throws {
-            let fixture = try await Fixture.make(
-                agentOwned: agentOwned,
-                inactiveAgentTab: inactiveAgentTab,
-                gitBacked: gitBacked
-            )
-            do {
-                try await operation(fixture)
-                await fixture.cleanup()
-                let pendingAfterCleanup = await fixture.networkManager.debugPendingPolicySnapshot(
-                    for: AgentProviderKind.codexMCPClientID
+            try await MCPSharedServerTestLease.shared.withLease(owner: #function) { _ in
+                try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+                await ServerNetworkManager.shared.setEnabled(true)
+
+                let fixture = try await Fixture.make(
+                    agentOwned: agentOwned,
+                    inactiveAgentTab: inactiveAgentTab,
+                    gitBacked: gitBacked
                 )
-                XCTAssertFalse(pendingAfterCleanup.contains { $0.runID == Fixture.runID })
-                let runPolicyAfterCleanup = await fixture.networkManager.debugRunPolicyState(for: Fixture.runID)
-                XCTAssertNil(runPolicyAfterCleanup)
-            } catch {
-                await fixture.cleanup()
-                throw error
+                do {
+                    try await operation(fixture)
+                    await fixture.cleanup()
+                    let pendingAfterCleanup = await fixture.networkManager.debugPendingPolicySnapshot(
+                        for: AgentProviderKind.codexMCPClientID
+                    )
+                    XCTAssertFalse(pendingAfterCleanup.contains { $0.runID == Fixture.runID })
+                    let runPolicyAfterCleanup = await fixture.networkManager.debugRunPolicyState(for: Fixture.runID)
+                    XCTAssertNil(runPolicyAfterCleanup)
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
             }
+        }
+
+        func simulatePrecedingSharedMCPAvailabilityMutation() async throws {
+            let manager = ServerNetworkManager.shared
+            let baseline = await manager.debugTransportState()
+            try await MCPSharedServerTestLease.shared.withLease(owner: #function) { _ in
+                await manager.setEnabled(!baseline.isEnabled)
+                let mutated = await manager.debugTransportState()
+                XCTAssertEqual(mutated.isEnabled, !baseline.isEnabled)
+            }
+            let restored = await manager.debugTransportState()
+            XCTAssertEqual(restored, baseline, "shared MCP lease must restore the exact transport baseline")
         }
 
         /// Dynamically proves one real retained BootstrapSocketConnectionManager/MCP.Server
@@ -2774,7 +2793,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         let routingGuardWindow: WindowState
         let windowID: Int
         let workspaceID: UUID
-        let catalogService: MCPWindowToolCatalogService
+        let catalogRegistrationHandle: MCPDomainToolRegistrationHandle
         let socketClient: SocketPairJSONRPCClient
         let connectionManager: BootstrapSocketConnectionManager
         let handshakeRecorder = HandshakeRecorder()
@@ -2791,7 +2810,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         private var auxiliaryRootID: UUID?
         private var peerRootID: UUID?
         private var peerTargetStateVersionBeforeSelection: Int?
-        private var peerCatalogService: MCPWindowToolCatalogService?
+        private var peerCatalogRegistrationHandle: MCPDomainToolRegistrationHandle?
         private var cleanedUp = false
 
         private init(
@@ -2802,7 +2821,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             window: WindowState,
             routingGuardWindow: WindowState,
             workspaceID: UUID,
-            catalogService: MCPWindowToolCatalogService,
+            catalogRegistrationHandle: MCPDomainToolRegistrationHandle,
             socketClient: SocketPairJSONRPCClient,
             connectionManager: BootstrapSocketConnectionManager,
             spec: MCPBootstrapLeaseSpec,
@@ -2818,7 +2837,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             self.routingGuardWindow = routingGuardWindow
             windowID = window.windowID
             self.workspaceID = workspaceID
-            self.catalogService = catalogService
+            self.catalogRegistrationHandle = catalogRegistrationHandle
             self.socketClient = socketClient
             self.connectionManager = connectionManager
             self.spec = spec
@@ -2890,7 +2909,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
 
             var rootID: UUID?
-            var catalogService: MCPWindowToolCatalogService?
+            var catalogRegistrationHandle: MCPDomainToolRegistrationHandle?
             var socketClient: SocketPairJSONRPCClient?
             var connectionManager: BootstrapSocketConnectionManager?
             var lease: MCPBootstrapLease?
@@ -2957,8 +2976,13 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 }
 
                 let resolvedCatalogService = window.mcpServer.windowMCPToolCatalogService
-                catalogService = resolvedCatalogService
-                try await ServiceRegistry.register(resolvedCatalogService)
+                let catalogRegistration = try await ServiceRegistry.register(resolvedCatalogService)
+                guard catalogRegistration.disposition == .inserted else {
+                    throw ClientFixtureError.windowCatalogRegistrationWasNotOwned(
+                        String(describing: catalogRegistration.disposition)
+                    )
+                }
+                catalogRegistrationHandle = catalogRegistration.handle
 
                 var socketFDs = [Int32](repeating: -1, count: 2)
                 guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketFDs) == 0 else {
@@ -3059,7 +3083,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     window: window,
                     routingGuardWindow: routingGuardWindow,
                     workspaceID: activeWorkspace.id,
-                    catalogService: resolvedCatalogService,
+                    catalogRegistrationHandle: catalogRegistration.handle,
                     socketClient: resolvedSocketClient,
                     connectionManager: resolvedConnectionManager,
                     spec: spec,
@@ -3103,11 +3127,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     windowID: window.windowID,
                     runID: runID
                 )
+                if let catalogRegistrationHandle {
+                    await ServiceRegistry.unregister(catalogRegistrationHandle)
+                }
                 await window.tearDown()
                 await routingGuardWindow.tearDown()
-                if let catalogService {
-                    await ServiceRegistry.unregister(catalogService)
-                }
                 if let rootID {
                     await window.workspaceFileContextStore.unloadRoot(id: rootID)
                 }
@@ -3499,10 +3523,15 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             guard snapshot.activeScopesByToolName[MCPGlobalToolName.bindContext]?.contains(.application) == true else {
                 throw ClientFixtureError.routingServiceUnavailable
             }
-            if peerCatalogService == nil {
+            if peerCatalogRegistrationHandle == nil {
                 let service = routingGuardWindow.mcpServer.windowMCPToolCatalogService
-                peerCatalogService = service
-                try await ServiceRegistry.register(service)
+                let registration = try await ServiceRegistry.register(service)
+                guard registration.disposition == .inserted else {
+                    throw ClientFixtureError.windowCatalogRegistrationWasNotOwned(
+                        String(describing: registration.disposition)
+                    )
+                }
+                peerCatalogRegistrationHandle = registration.handle
             }
             var socketFDs = [Int32](repeating: -1, count: 2)
             guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketFDs) == 0 else {
@@ -3855,12 +3884,12 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 windowID: windowID,
                 runID: Self.runID
             )
+            await ServiceRegistry.unregister(catalogRegistrationHandle)
+            if let peerCatalogRegistrationHandle {
+                await ServiceRegistry.unregister(peerCatalogRegistrationHandle)
+            }
             await window.tearDown()
             await routingGuardWindow.tearDown()
-            await ServiceRegistry.unregister(catalogService)
-            if let peerCatalogService {
-                await ServiceRegistry.unregister(peerCatalogService)
-            }
             await window.workspaceFileContextStore.unloadRoot(id: rootID)
             if let peerRootID {
                 await routingGuardWindow.workspaceFileContextStore.unloadRoot(id: peerRootID)
@@ -3897,6 +3926,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         case handoverPolicyApplicationFailed(String)
         case liveFixtureTooShort(Int)
         case presentationStateMismatch(String)
+        case windowCatalogRegistrationWasNotOwned(String)
         case syntheticWatcherPublisherIngressUnavailable(UUID)
         case syntheticWatcherStillActive(UUID)
     }
