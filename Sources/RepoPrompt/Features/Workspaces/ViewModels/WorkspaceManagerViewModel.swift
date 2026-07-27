@@ -418,8 +418,13 @@ class WorkspaceManagerViewModel: ObservableObject {
             lastSyncedRepoPathsByWorkspaceID[workspaceID]
         }
 
-        func debugPublishWorkingDocumentToDomainAuthority(_ workspace: WorkspaceModel) {
+        func debugPublishWorkingDocumentToDomainAuthority(_ workspace: WorkspaceModel) async {
             publishWorkingDocumentToDomainAuthority(workspace)
+            await debugAwaitWorkingDocumentCommitToDomainAuthority(workspaceID: workspace.id)
+        }
+
+        func debugAwaitWorkingDocumentCommitToDomainAuthority(workspaceID: UUID) async {
+            await domainWorkingCommitTasks[workspaceID]?.value
         }
 
         func setWorkspaceSavePreparationDidFinishHandlerForTesting(

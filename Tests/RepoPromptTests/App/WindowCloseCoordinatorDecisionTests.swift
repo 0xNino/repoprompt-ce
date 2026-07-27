@@ -59,6 +59,18 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
         XCTAssertEqual(window.promptManager.gitViewModel.test_pendingWindowCloseTaskCount, 0)
     }
 
+    func testPeriodicGitContextRefreshDelayContainsExpectedCancellation() async {
+        let delayTask = Task {
+            await GitViewModel.test_waitForGitContextRefreshInterval(60_000_000_000)
+        }
+        await Task.yield()
+
+        delayTask.cancel()
+
+        let intervalElapsed = await delayTask.value
+        XCTAssertFalse(intervalElapsed)
+    }
+
     func testSuspendedGitContextRefreshDoesNotRetainViewModel() async throws {
         let refreshGate = GitContextRefreshGate()
         var viewModel: GitViewModel? = GitViewModel(

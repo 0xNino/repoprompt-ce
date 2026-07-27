@@ -267,7 +267,7 @@ actor PromptContextAccountingService {
             let selectedPathsStartMS = PromptTokenRecountDiagnostics.start()
             let selectedPathsDebugState = PromptTokenRecountDiagnostics.SelectedPathsState(selectedPathCount: selection.selectedPaths.count)
             let selectedPathsWatchdog = Task {
-                try? await Task.sleep(nanoseconds: 12_000_000_000)
+                guard await TaskCancellationDelay.wait(nanoseconds: 12_000_000_000) else { return }
                 let snapshot = selectedPathsDebugState.snapshot()
                 guard snapshot["finished"] != "true" else { return }
                 PromptTokenRecountDiagnostics.event(

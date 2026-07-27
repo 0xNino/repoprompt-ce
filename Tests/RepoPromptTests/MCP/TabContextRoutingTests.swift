@@ -1732,18 +1732,44 @@ final class TabContextRoutingTests: XCTestCase {
 
     @MainActor
     func testManageSelectionSetPersistsAcrossConnectionRebindAndWorkspaceSerialization() async throws {
+        let authorityRoot = try makeTemporaryDirectory(named: "isolated-domain-authority")
+        let defaults = UserDefaults.standard
+        let priorStoragePath = defaults.string(forKey: "GlobalCustomStorageURL")
+        defaults.set(
+            authorityRoot.appendingPathComponent("Workspaces", isDirectory: true).path,
+            forKey: "GlobalCustomStorageURL"
+        )
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app,
+            profileIdentifier: "tab-context-routing-\(UUID().uuidString)",
+            storageDirectory: authorityRoot,
+            eventDirectory: authorityRoot.appendingPathComponent("events"),
+            temporaryDirectory: authorityRoot.appendingPathComponent("tmp"),
+            externalReloadInterval: nil
+        ))
+        try await runtime.start()
+
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let window = WindowState()
+        let window = WindowState(domainRuntime: runtime)
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        addTeardownBlock { @MainActor in
+            WindowStatesManager.shared.unregisterWindowState(window)
+            await window.tearDown()
+            _ = await runtime.shutdown()
+            if let priorStoragePath {
+                defaults.set(priorStoragePath, forKey: "GlobalCustomStorageURL")
+            } else {
+                defaults.removeObject(forKey: "GlobalCustomStorageURL")
+            }
+            try? FileManager.default.removeItem(at: authorityRoot.deletingLastPathComponent())
+        }
+        await window.workspaceManager.awaitInitialized()
 
         let root = try makeTemporaryDirectory(named: "tool-persistence-root")
-        let storageRoot = try makeTemporaryDirectory(named: "serialized-workspace")
         defer {
             try? FileManager.default.removeItem(at: root.deletingLastPathComponent())
-            try? FileManager.default.removeItem(at: storageRoot.deletingLastPathComponent())
         }
         let sources = root.appendingPathComponent("Sources", isDirectory: true)
         try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
@@ -1815,9 +1841,12 @@ final class TabContextRoutingTests: XCTestCase {
         let canonicalTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
         XCTAssertEqual(canonicalTab.selection.selectedPaths, [selectedFile.path])
 
-        var workspaceToSave = try XCTUnwrap(window.workspaceManager.workspace(withID: workspace.id))
-        workspaceToSave.customStoragePath = storageRoot
-        let savedURL = try window.workspaceManager.saveWorkspaceToFile(workspaceToSave, source: .directUnknown)
+        let workspaceToSave = try XCTUnwrap(window.workspaceManager.workspace(withID: workspace.id))
+        let savedURL = try await window.workspaceManager.saveWorkspaceToFileAsync(
+            workspaceToSave,
+            source: .directUnknown
+        )
+        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: savedURL)
         let serializedWorkspace = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: savedURL))
         let serializedTab = try XCTUnwrap(serializedWorkspace.composeTabs.first { $0.id == tabID })
         XCTAssertEqual(serializedTab.selection.selectedPaths, [selectedFile.path])

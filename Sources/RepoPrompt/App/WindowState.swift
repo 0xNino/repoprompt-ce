@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptDomainRuntime
 import SwiftUI
 
 enum WindowKind: String, Codable {
@@ -365,13 +366,23 @@ class WindowState: ObservableObject {
             )
         }
 
+        convenience init(domainRuntime: MCPDomainRuntime) {
+            self.init(
+                contextBuilderProviderFactory: nil,
+                loadStoredAPISettingsDataOnInit: true,
+                codexModelPollingService: .shared,
+                domainRuntimeOverride: domainRuntime
+            )
+        }
+
     #endif
 
     private init(
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory?,
         loadStoredAPISettingsDataOnInit: Bool,
         codexModelPollingService: CodexModelPollingService,
-        workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil
+        workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
+        domainRuntimeOverride: MCPDomainRuntime? = nil
     ) {
         // Assign a unique window ID
         windowID = WindowState.allocateWindowID()
@@ -385,9 +396,11 @@ class WindowState: ObservableObject {
         // ️⃣ Connect to the global WindowStatesManager singleton
         windowStatesManager = manager
 
-        let domainRuntime = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil
-            ? AppDomainRuntimeComposition.shared.runtime
-            : nil
+        let domainRuntime = domainRuntimeOverride ?? (
+            ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil
+                ? AppDomainRuntimeComposition.shared.runtime
+                : nil
+        )
         let composition = WindowStateCompositionFactory.make(
             windowID: windowID,
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,

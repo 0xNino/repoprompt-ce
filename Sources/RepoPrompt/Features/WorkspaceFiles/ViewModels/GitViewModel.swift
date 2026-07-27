@@ -375,7 +375,7 @@ final class GitViewModel: ObservableObject {
 
         rootUpdateTask?.cancel()
         rootUpdateTask = Task { [weak self, statusActor, rootFolders, rootPaths, standardizedRootPaths, standardizedPathByRootPath, generation, inclusionMode] in
-            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard await TaskCancellationDelay.wait(nanoseconds: 150_000_000) else { return }
             guard !Task.isCancelled else { return }
             let currentInclusionMode = await MainActor.run {
                 self?.gitDiffInclusionMode ?? inclusionMode
@@ -432,6 +432,10 @@ final class GitViewModel: ObservableObject {
         setGitWorktreeContextsByRootPath(contexts)
     }
 
+    private static func waitForGitContextRefreshInterval(_ intervalNanoseconds: UInt64) async -> Bool {
+        await TaskCancellationDelay.wait(nanoseconds: intervalNanoseconds)
+    }
+
     private func updateGitContextRefreshLoop() {
         guard !isPreparingForWindowClose else { return }
         guard !lastVisibleRootRawPaths.isEmpty else {
@@ -445,7 +449,7 @@ final class GitViewModel: ObservableObject {
         gitContextRefreshTask = Task { [weak self, refreshGitContexts] in
             while !Task.isCancelled {
                 if intervalNanoseconds > 0 {
-                    try? await Task.sleep(nanoseconds: intervalNanoseconds)
+                    guard await Self.waitForGitContextRefreshInterval(intervalNanoseconds) else { break }
                 }
                 guard !Task.isCancelled else { break }
                 guard let request = self?.beginPeriodicGitContextRefresh() else {
@@ -500,6 +504,10 @@ final class GitViewModel: ObservableObject {
     }
 
     #if DEBUG
+        static func test_waitForGitContextRefreshInterval(_ intervalNanoseconds: UInt64) async -> Bool {
+            await waitForGitContextRefreshInterval(intervalNanoseconds)
+        }
+
         var test_hasGitContextRefreshTask: Bool {
             gitContextRefreshTask != nil
         }
@@ -653,7 +661,7 @@ final class GitViewModel: ObservableObject {
 
         searchDebounceTask?.cancel()
         searchDebounceTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard await TaskCancellationDelay.wait(nanoseconds: 500_000_000) else { return }
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 self?.isFilteringPaused = false

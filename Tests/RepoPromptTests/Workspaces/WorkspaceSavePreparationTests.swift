@@ -260,6 +260,12 @@ import XCTest
             await manager.awaitInitialized()
             let authoritative = try await waitForDomainWorkspace(runtime)
             let workspaceID = authoritative.document.workspaceID
+            let presentationBridge = try XCTUnwrap(composition.domainWorkspacePresentationBridge)
+            let initialCatalog = await runtime.workspaceStore.snapshot()
+            let initialProjectionCompleted = await presentationBridge.waitUntilProjected(
+                through: initialCatalog.publicationSequence
+            )
+            XCTAssertTrue(initialProjectionCompleted)
             manager.resetWorkspaceSaveDiagnosticsForTesting()
             managersWithSavePreparationHooks.append(manager)
             manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, remainingRetryCount in
@@ -282,12 +288,16 @@ import XCTest
 
             let diagnostics = manager.workspaceSaveDiagnosticsForTesting(workspaceID: workspaceID)
             XCTAssertEqual(diagnostics.attemptCount, 2)
+            XCTAssertEqual(manager.debugRepoPathBaselineForWorkspace(workspaceID), ["/tmp/runtime-baseline"])
+            let savedSnapshot = await runtime.workspaceStore.snapshot()
+            let savedProjectionCompleted = await presentationBridge.waitUntilProjected(
+                through: savedSnapshot.publicationSequence
+            )
+            XCTAssertTrue(savedProjectionCompleted)
             XCTAssertEqual(
                 manager.debugLastSavedVersionForWorkspace(workspaceID),
                 manager.debugStateVersionForWorkspace(workspaceID)
             )
-            XCTAssertEqual(manager.debugRepoPathBaselineForWorkspace(workspaceID), ["/tmp/runtime-baseline"])
-            let savedSnapshot = await runtime.workspaceStore.snapshot()
             let savedDocument = try XCTUnwrap(savedSnapshot.workspaces.first {
                 $0.document.workspaceID == workspaceID
             })
@@ -311,14 +321,28 @@ import XCTest
                 options: .atomic
             )
             manager.reloadWorkspacesFromDisk()
-            try await Task.sleep(for: .milliseconds(100))
-            XCTAssertTrue(manager.workspaces.contains { $0.id == workspaceID })
-            XCTAssertFalse(manager.workspaces.contains { $0.id == staleID })
+            try await waitForCondition("domain projection to ignore stale legacy index") {
+                manager.workspaces.contains { $0.id == workspaceID }
+                    && !manager.workspaces.contains { $0.id == staleID }
+            }
 
             var localDirty = decoded
             localDirty.currentPromptText = "local unresolved state"
-            manager.debugPublishWorkingDocumentToDomainAuthority(localDirty)
-            try await Task.sleep(for: .milliseconds(300))
+            await manager.debugPublishWorkingDocumentToDomainAuthority(localDirty)
+            let dirtySnapshot = try await waitForDomainWorkspace(
+                runtime,
+                workspaceID: workspaceID,
+                description: "dirty working revision publication"
+            ) { snapshot in
+                guard snapshot.revisions.dirtyRevision != nil else { return false }
+                let projected = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                    documentBytes: snapshot.document.documentBytes,
+                    fileURL: snapshot.document.fileURL
+                )
+                return projected.currentPromptText == "local unresolved state"
+            }
+            XCTAssertGreaterThan(dirtySnapshot.revisions.workingRevision, dirtySnapshot.revisions.savedRevision)
+            XCTAssertEqual(dirtySnapshot.revisions.dirtyRevision, dirtySnapshot.revisions.workingRevision)
             var external = decoded
             external.currentPromptText = "external accepted state"
             try JSONEncoder().encode(external).write(
@@ -326,6 +350,17 @@ import XCTest
                 options: .atomic
             )
             await manager.refreshDomainWorkspaceAuthority()
+            let conflictedSnapshot = try await waitForDomainWorkspace(
+                runtime,
+                workspaceID: workspaceID,
+                description: "external conflict classification"
+            ) { snapshot in
+                if case .externalConflict = snapshot.health { return true }
+                return false
+            }
+            guard case .externalConflict = conflictedSnapshot.health else {
+                return XCTFail("Expected an authoritative external conflict")
+            }
             let issue = try XCTUnwrap(manager.domainWorkspaceAuthorityIssue)
             XCTAssertEqual(issue.workspaceID, workspaceID)
             XCTAssertTrue(issue.canResolveExternalConflict)
@@ -335,10 +370,13 @@ import XCTest
             )
             XCTAssertTrue(conflictResolved)
             XCTAssertNil(manager.domainWorkspaceAuthorityIssue)
-            let resolvedSnapshot = await runtime.workspaceStore.snapshot()
-            let resolved = try XCTUnwrap(resolvedSnapshot.workspaces.first {
-                $0.document.workspaceID == workspaceID
-            })
+            let resolved = try await waitForDomainWorkspace(
+                runtime,
+                workspaceID: workspaceID,
+                description: "accepted external conflict resolution"
+            ) { snapshot in
+                snapshot.health == .writable && snapshot.revisions.dirtyRevision == nil
+            }
             XCTAssertEqual(resolved.health, .writable)
             XCTAssertNil(resolved.revisions.dirtyRevision)
             let accepted = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
@@ -348,12 +386,25 @@ import XCTest
             XCTAssertEqual(accepted.currentPromptText, "external accepted state")
 
             let authoritativeURL = resolved.document.fileURL
-            manager.renameWorkspace(accepted, newName: "Runtime Renamed")
-            try await Task.sleep(for: .milliseconds(400))
-            let renamedSnapshot = await runtime.workspaceStore.snapshot()
-            let renamed = try XCTUnwrap(renamedSnapshot.workspaces.first {
-                $0.document.workspaceID == workspaceID
-            })
+            let renameIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspaceID })
+            manager.workspaces[renameIndex].name = "Runtime Renamed"
+            manager.workspaces[renameIndex].dateModified = Date()
+            let renamedURL = try await manager.saveWorkspaceToFileAsync(
+                manager.workspaces[renameIndex],
+                source: .renameWorkspace
+            )
+            XCTAssertEqual(renamedURL, authoritativeURL)
+            let renamed = try await waitForDomainWorkspace(
+                runtime,
+                workspaceID: workspaceID,
+                description: "renamed working document publication"
+            ) { snapshot in
+                let projected = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                    documentBytes: snapshot.document.documentBytes,
+                    fileURL: snapshot.document.fileURL
+                )
+                return projected.name == "Runtime Renamed"
+            }
             XCTAssertEqual(renamed.document.fileURL, authoritativeURL)
             XCTAssertTrue(FileManager.default.fileExists(atPath: authoritativeURL.path))
             let renamedModel = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
@@ -430,18 +481,45 @@ import XCTest
         }
 
         private func waitForDomainWorkspace(
-            _ runtime: MCPDomainRuntime
+            _ runtime: MCPDomainRuntime,
+            workspaceID: UUID? = nil,
+            description: String = "runtime workspace creation",
+            timeout: Duration = .seconds(5),
+            matching predicate: (DomainWorkspaceSnapshot) throws -> Bool = { _ in true }
         ) async throws -> DomainWorkspaceSnapshot {
-            for _ in 0 ..< 100 {
-                if let workspace = await runtime.workspaceStore.snapshot().workspaces.first {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            repeat {
+                let snapshot = await runtime.workspaceStore.snapshot()
+                if let workspace = snapshot.workspaces.first(where: { workspace in
+                    workspaceID == nil || workspace.document.workspaceID == workspaceID
+                }), try predicate(workspace) {
                     return workspace
                 }
                 try await Task.sleep(for: .milliseconds(10))
-            }
+            } while clock.now < deadline
             throw NSError(
                 domain: "WorkspaceSavePreparationTests",
                 code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for runtime workspace creation"]
+                userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for \(description)"]
+            )
+        }
+
+        private func waitForCondition(
+            _ description: String,
+            timeout: Duration = .seconds(5),
+            condition: () -> Bool
+        ) async throws {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            repeat {
+                if condition() { return }
+                try await Task.sleep(for: .milliseconds(10))
+            } while clock.now < deadline
+            throw NSError(
+                domain: "WorkspaceSavePreparationTests",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for \(description)"]
             )
         }
 

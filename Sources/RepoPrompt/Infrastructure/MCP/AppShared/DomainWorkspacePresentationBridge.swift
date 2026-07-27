@@ -162,6 +162,21 @@ final class DomainWorkspacePresentationBridge {
         subscriptionTask?.cancel()
     }
 
+    #if DEBUG
+        func waitUntilProjected(
+            through publicationSequence: UInt64,
+            timeout: Duration = .seconds(5)
+        ) async -> Bool {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            repeat {
+                if lastPublicationSequence >= publicationSequence { return true }
+                guard await TaskCancellationDelay.wait(nanoseconds: 10_000_000) else { return false }
+            } while clock.now < deadline
+            return lastPublicationSequence >= publicationSequence
+        }
+    #endif
+
     func start() {
         guard subscriptionTask == nil else { return }
         subscriptionTask = Task { [weak self, client] in
