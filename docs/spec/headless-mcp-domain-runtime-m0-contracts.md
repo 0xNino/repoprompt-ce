@@ -133,7 +133,7 @@ Current `MCPBootstrapLeaseSpec` has 14 frozen fields in the manifest. The future
 
 The future `DomainRunLaunchToken` child material is one opaque random capability; it does not expose or select policy. A host-only record binds its digest to runtime generation, child/descendant, context, principal, provider, purpose, and tool policy. The capability is single-use, short-lived, memory-only, never logged/persisted, and revoked on idempotent terminal cleanup. Its explicit child carrier is `REPOPROMPT_MCP_LAUNCH_TOKEN`. Codex, Claude, OpenCode, and Cursor launch paths already have environment/config carriers; M0 adds no launch wiring.
 
-The guard test confirms that neither a production `DomainRunLaunchToken` type nor a headless runtime target exists in M0.
+At M0, the guard confirmed that neither a production `DomainRunLaunchToken` type nor a headless runtime target existed. After M2, the same manifest preserves that frozen child-transport contract while its explicit transition row requires the host runtime `DomainRunLaunchToken`, `DomainWorkspaceStore`, and `DomainContextStore`; private endpoint and provider carrier wiring remain deferred.
 
 ## M0 gate result
 

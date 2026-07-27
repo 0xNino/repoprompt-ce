@@ -756,6 +756,11 @@
       "policy_selection_authority": "host_only",
       "child_environment_key": "REPOPROMPT_MCP_LAUNCH_TOKEN"
     },
+    "m2_host_authority_transition": {
+      "status": "implemented_host_runtime_authority_child_transport_deferred",
+      "production_types": ["DomainRunLaunchToken", "DomainWorkspaceStore", "DomainContextStore"],
+      "routing_test": "RepoPromptDomainRuntimeTests.DomainWorkspaceContextAuthorityTests/testRoutingGenerationsAndRunLaunchTokensAreAuthoritativeAndSingleUse"
+    },
     "launch_carriers": [
       {
         "family": "Codex",

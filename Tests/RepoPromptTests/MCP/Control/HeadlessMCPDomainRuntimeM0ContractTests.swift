@@ -303,9 +303,18 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertTrue(packageManifest.contains("name: \"RepoPromptDomainRuntime\""))
         XCTAssertTrue(packageManifest.contains("name: \"RepoPromptDomainRuntimeTests\""))
         let productionSwift = try allSwiftSource()
-        XCTAssertFalse(productionSwift.contains("DomainRunLaunchToken"))
-        XCTAssertFalse(productionSwift.contains("DomainWorkspaceStore"))
-        XCTAssertFalse(productionSwift.contains("DomainContextStore"))
+        let m2Transition = try dictionary(child, key: "m2_host_authority_transition")
+        XCTAssertEqual(
+            try string(m2Transition, key: "status"),
+            "implemented_host_runtime_authority_child_transport_deferred"
+        )
+        XCTAssertEqual(
+            try string(m2Transition, key: "routing_test"),
+            "RepoPromptDomainRuntimeTests.DomainWorkspaceContextAuthorityTests/testRoutingGenerationsAndRunLaunchTokensAreAuthoritativeAndSingleUse"
+        )
+        for typeName in try strings(m2Transition, key: "production_types") {
+            XCTAssertTrue(productionSwift.contains(typeName), typeName)
+        }
     }
 
     func testPersistenceApprovalMainActorAndPerformanceInventoriesRemainComplete() throws {
