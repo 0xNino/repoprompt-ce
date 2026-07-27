@@ -1638,6 +1638,10 @@ class WindowState: ObservableObject {
             }
         }
 
+        // Remove the presentation incarnation before any connection/server teardown. Runtime
+        // shutdown also clears routing state, but explicit unregister keeps ordinary close exact.
+        await mcpServer.unregisterDomainRoutingWindow()
+
         // App-level termination already coordinates agent/session and MCP shutdown.
         // Skip duplicate per-window teardown work on quit so close latency stays bounded.
         if isAppTermination {

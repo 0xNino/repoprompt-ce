@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import os
+import RepoPromptDomainRuntime
 import SwiftUI
 
 /// Free helper function not tied to any actor
@@ -122,11 +123,9 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
 
         let standardizedURL = URL(fileURLWithPath: keyBeforeRead.standardizedPath)
         let data = try Data(contentsOf: standardizedURL)
-        var workspace = try JSONDecoder().decode(WorkspaceModel.self, from: data)
-        let decodedRequiresSave = workspace.normalizationRequiresSave
-        let normalized = workspace.normalizeComposeTabInvariants()
-        let normalizationRequiresSave = decodedRequiresSave || normalized || workspace.normalizationRequiresSave
-        workspace.normalizationRequiresSave = normalizationRequiresSave
+        let decoded = try Self.decodeWorkspace(documentBytes: data)
+        let workspace = decoded.workspace
+        let normalizationRequiresSave = decoded.normalizationRequiresSave
 
         if let keyAfterRead = try? metadataKey(for: fileURL),
            keyAfterRead == keyBeforeRead
@@ -142,6 +141,17 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
             composeTabsNormalized: normalizationRequiresSave,
             cacheKey: keyBeforeRead
         )
+    }
+
+    fileprivate static func decodeWorkspace(
+        documentBytes: Data
+    ) throws -> (workspace: WorkspaceModel, normalizationRequiresSave: Bool) {
+        var workspace = try JSONDecoder().decode(WorkspaceModel.self, from: documentBytes)
+        let decodedRequiresSave = workspace.normalizationRequiresSave
+        let normalized = workspace.normalizeComposeTabInvariants()
+        let normalizationRequiresSave = decodedRequiresSave || normalized || workspace.normalizationRequiresSave
+        workspace.normalizationRequiresSave = normalizationRequiresSave
+        return (workspace, normalizationRequiresSave)
     }
 
     fileprivate func metadataKey(for fileURL: URL) throws -> WorkspaceFileDecodeCacheKey {
@@ -220,6 +230,28 @@ struct WorkspaceMenuQuery {
     var sortMostRecentFirst: Bool = true
 }
 
+struct DomainWorkspaceAuthorityIssue: Equatable, Identifiable {
+    let id: UUID
+    let workspaceID: UUID?
+    let operation: String
+    let message: String
+    let canResolveExternalConflict: Bool
+
+    init(
+        id: UUID = UUID(),
+        workspaceID: UUID?,
+        operation: String,
+        message: String,
+        canResolveExternalConflict: Bool
+    ) {
+        self.id = id
+        self.workspaceID = workspaceID
+        self.operation = operation
+        self.message = message
+        self.canResolveExternalConflict = canResolveExternalConflict
+    }
+}
+
 enum WorkspaceOpenError: LocalizedError {
     case noActiveWorkspace
 
@@ -250,6 +282,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
+    @Published private(set) var domainWorkspaceAuthorityIssue: DomainWorkspaceAuthorityIssue?
+
     @Published private(set) var activeWorkspaceID: UUID? = nil {
         didSet {
             guard oldValue != activeWorkspaceID else { return }
@@ -274,6 +308,9 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     private var stateVersionByWorkspaceID: [UUID: Int] = [:]
     private var lastSavedVersionByWorkspaceID: [UUID: Int] = [:]
+    private var domainWorkingCommitTasks: [UUID: Task<Void, Never>] = [:]
+    private var domainWorkingCommitGeneration: [UUID: UInt64] = [:]
+    private var domainWorkspaceFileURLsByID: [UUID: URL] = [:]
     #if DEBUG
         private var workspaceSavePreparationDidFinishHandlerForTesting:
             (@Sendable (UUID, URL, Int) async -> Void)?
@@ -375,6 +412,14 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         func debugLastSavedVersionForWorkspace(_ workspaceID: UUID) -> Int? {
             lastSavedVersionByWorkspaceID[workspaceID]
+        }
+
+        func debugRepoPathBaselineForWorkspace(_ workspaceID: UUID) -> [String]? {
+            lastSyncedRepoPathsByWorkspaceID[workspaceID]
+        }
+
+        func debugPublishWorkingDocumentToDomainAuthority(_ workspace: WorkspaceModel) {
+            publishWorkingDocumentToDomainAuthority(workspace)
         }
 
         func setWorkspaceSavePreparationDidFinishHandlerForTesting(
@@ -1508,7 +1553,12 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     func workspaceFileURL(for workspace: WorkspaceModel) -> URL {
-        workspaceFileURL(for: workspace, baseRoot: currentBaseRoot)
+        if domainWorkspaceAuthorityClient != nil,
+           let authoritativeURL = domainWorkspaceFileURLsByID[workspace.id]
+        {
+            return authoritativeURL
+        }
+        return workspaceFileURL(for: workspace, baseRoot: currentBaseRoot)
     }
 
     nonisolated func workspaceFileURL(for workspace: WorkspaceModel, baseRoot: URL) -> URL {
@@ -1757,6 +1807,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         reloadWorkspacesTask?.cancel()
         reloadPresetsTask?.cancel()
         composeTabApplyTask?.cancel()
+        domainWorkingCommitTasks.values.forEach { $0.cancel() }
+        domainWorkingCommitTasks.removeAll()
         for tasks in postCatalogRootWorkTasks.values {
             tasks.forEach { $0.cancel() }
         }
@@ -1771,6 +1823,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         reloadPresetsTask = nil
         composeTabApplyTask?.cancel()
         composeTabApplyTask = nil
+        domainWorkingCommitTasks.values.forEach { $0.cancel() }
+        domainWorkingCommitTasks.removeAll()
         postSwitchGitDataLoadTask?.cancel()
         postSwitchGitDataLoadTask = nil
         for tasks in postCatalogRootWorkTasks.values {
@@ -1865,6 +1919,34 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Reloads the workspace list from disk, preserving the active workspace
     func reloadWorkspacesFromDisk() {
+        if let domainWorkspaceAuthorityClient {
+            reloadWorkspacesTask?.cancel()
+            reloadWorkspacesTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                let snapshot = await domainWorkspaceAuthorityClient.snapshot()
+                guard snapshot.isBootstrapped else { return }
+                do {
+                    let loaded = try snapshot.workspaces.map {
+                        try Self.decodeDomainWorkspaceProjection(
+                            documentBytes: $0.document.documentBytes,
+                            fileURL: $0.document.fileURL
+                        )
+                    }
+                    applyDomainWorkspaceProjection(
+                        loaded,
+                        fileURLsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                            ($0.document.workspaceID, $0.document.fileURL)
+                        }),
+                        preferredActiveWorkspaceID: activeWorkspaceID,
+                        publicationSequence: snapshot.publicationSequence
+                    )
+                } catch {
+                    reportDomainProjectionFailure(error)
+                }
+                reloadWorkspacesTask = nil
+            }
+            return
+        }
         let currentActiveID = activeWorkspaceID
         let base = currentBaseRoot
         let indexURL = workspaceIndexFileURL
@@ -2192,7 +2274,17 @@ class WorkspaceManagerViewModel: ObservableObject {
                         )
                     }
                 } catch {
-                    print("Error creating workspace folder/file: \(error)")
+                    if domainWorkspaceAuthorityClient != nil {
+                        reportDomainAuthorityFailure(
+                            error,
+                            workspaceID: newWorkspace.id,
+                            operation: "create_workspace"
+                        )
+                    } else {
+                        Self.logger.error(
+                            "Legacy workspace creation failed: \(error.localizedDescription, privacy: .public)"
+                        )
+                    }
                 }
             }
         } else {
@@ -3685,30 +3777,159 @@ class WorkspaceManagerViewModel: ObservableObject {
         selectionCoordinator = coordinator
     }
 
-    /// Projects a runtime publication without turning the active AppKit window into domain authority.
-    /// The current window choice is retained when possible and otherwise resolved locally.
+    /// Coalesces high-frequency UI captures before issuing one durable working-state command.
     private func publishWorkingDocumentToDomainAuthority(_ workspace: WorkspaceModel) {
         guard let domainWorkspaceAuthorityClient else { return }
+        let workspaceID = workspace.id
+        let generation = domainWorkingCommitGeneration[workspaceID, default: 0] &+ 1
+        domainWorkingCommitGeneration[workspaceID] = generation
+        domainWorkingCommitTasks[workspaceID]?.cancel()
         let fileURL = workspaceFileURL(for: workspace)
-        Task {
-            let outcome = try? await domainWorkspaceAuthorityClient.replaceWorking(workspace, fileURL: fileURL)
-            if let outcome,
-               outcome.disposition != .applied,
-               outcome.disposition != .unchanged,
-               outcome.disposition != .deduplicated
-            {
-                print("💾 Runtime working-state commit rejected: \(outcome.diagnostic ?? outcome.disposition.rawValue)")
+        let operationID = UUID()
+        domainWorkingCommitTasks[workspaceID] = Task { @MainActor [weak self] in
+            defer {
+                if self?.domainWorkingCommitGeneration[workspaceID] == generation {
+                    self?.domainWorkingCommitTasks.removeValue(forKey: workspaceID)
+                }
+            }
+            do {
+                try await Task.sleep(for: .milliseconds(200))
+                guard let self,
+                      domainWorkingCommitGeneration[workspaceID] == generation
+                else { return }
+                let outcome = try await domainWorkspaceAuthorityClient.replaceWorking(
+                    workspace,
+                    fileURL: fileURL,
+                    operationID: operationID
+                )
+                guard !Task.isCancelled, outcome.errorCode != .cancelled else { return }
+                if !Self.isSuccessfulDomainOutcome(outcome) {
+                    reportDomainAuthorityIssue(outcome, operation: "working_commit")
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled else { return }
+                self?.reportDomainAuthorityFailure(
+                    error,
+                    workspaceID: workspaceID,
+                    operation: "working_commit"
+                )
             }
         }
     }
 
+    func runtimeOwnedDefaultWorkspaceCandidate() -> WorkspaceModel? {
+        if let existing = workspaces.first(where: { $0.name == "Default" || $0.isSystemWorkspace }) {
+            return existing
+        }
+        var workspace = WorkspaceModel(name: "Default", repoPaths: [])
+        workspace.isSystemWorkspace = true
+        workspaces.append(workspace)
+        return workspace
+    }
+
+    func reportDomainAuthorityIssue(_ outcome: DomainCommandOutcome, operation: String) {
+        let hasExternalConflict: Bool = if case .externalConflict = outcome.workspace?.health {
+            true
+        } else {
+            outcome.diagnostic?.contains("external") == true
+        }
+        domainWorkspaceAuthorityIssue = DomainWorkspaceAuthorityIssue(
+            workspaceID: outcome.workspace?.document.workspaceID,
+            operation: operation,
+            message: outcome.diagnostic ?? outcome.disposition.rawValue,
+            canResolveExternalConflict: hasExternalConflict
+        )
+        if let workspaceID = outcome.workspace?.document.workspaceID,
+           let workspace = workspace(withID: workspaceID)
+        {
+            WorkspaceSaveTracer.event(
+                "workspaceSave.domain.rejected",
+                metadata: workspaceSaveMetadata(for: workspace, source: .directUnknown),
+                url: workspaceFileURL(for: workspace),
+                extra: [
+                    "operation": operation,
+                    "disposition": outcome.disposition.rawValue,
+                    "errorCode": outcome.errorCode?.rawValue ?? "none"
+                ]
+            )
+        }
+    }
+
+    func reportDomainProjectionFailure(_ error: Error) {
+        reportDomainAuthorityFailure(
+            error,
+            workspaceID: nil,
+            operation: "projection"
+        )
+    }
+
+    func reportDomainAuthorityFailure(
+        _ error: Error,
+        workspaceID: UUID?,
+        operation: String
+    ) {
+        domainWorkspaceAuthorityIssue = DomainWorkspaceAuthorityIssue(
+            workspaceID: workspaceID,
+            operation: operation,
+            message: error.localizedDescription,
+            canResolveExternalConflict: false
+        )
+        Self.logger.error("Domain workspace authority \(operation, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+    }
+
+    @discardableResult
+    func resolveDomainWorkspaceConflict(
+        workspaceID: UUID,
+        acceptExternal: Bool
+    ) async -> Bool {
+        guard let domainWorkspaceAuthorityClient else { return false }
+        let outcome = await domainWorkspaceAuthorityClient.resolveConflict(
+            workspaceID: workspaceID,
+            acceptExternal: acceptExternal
+        )
+        guard Self.isSuccessfulDomainOutcome(outcome) else {
+            reportDomainAuthorityIssue(outcome, operation: "resolve_external_conflict")
+            return false
+        }
+        domainWorkspaceAuthorityIssue = nil
+        return true
+    }
+
+    func refreshDomainWorkspaceAuthority() async {
+        guard let domainWorkspaceAuthorityClient else { return }
+        let snapshot = await domainWorkspaceAuthorityClient.reloadExternalChanges()
+        if let conflict = snapshot.workspaces.first(where: {
+            if case .externalConflict = $0.health { return true }
+            return false
+        }) {
+            domainWorkspaceAuthorityIssue = DomainWorkspaceAuthorityIssue(
+                workspaceID: conflict.document.workspaceID,
+                operation: "external_refresh",
+                message: "The saved workspace changed while local working state is dirty.",
+                canResolveExternalConflict: true
+            )
+        }
+    }
+
+    private static func isSuccessfulDomainOutcome(_ outcome: DomainCommandOutcome) -> Bool {
+        outcome.disposition == .applied
+            || outcome.disposition == .unchanged
+            || outcome.disposition == .deduplicated
+    }
+
     func applyDomainWorkspaceProjection(
         _ projectedWorkspaces: [WorkspaceModel],
+        fileURLsByWorkspaceID: [UUID: URL] = [:],
         preferredActiveWorkspaceID: UUID?,
         publicationSequence: UInt64
     ) {
         guard publicationSequence >= lastDomainProjectionSequence else { return }
         lastDomainProjectionSequence = publicationSequence
+        if domainWorkspaceAuthorityClient != nil {
+            domainWorkspaceFileURLsByID = fileURLsByWorkspaceID
+        }
         workspaces = projectedWorkspaces
         recordRepoPathBaselines(for: projectedWorkspaces)
         if let preferredActiveWorkspaceID,
@@ -6001,41 +6222,52 @@ class WorkspaceManagerViewModel: ObservableObject {
     // MARK: - CRUD
 
     func deleteWorkspace(_ workspace: WorkspaceModel) {
+        Task { @MainActor [weak self] in
+            _ = await self?.deleteWorkspaceAsync(workspace)
+        }
+    }
+
+    @discardableResult
+    func deleteWorkspaceAsync(_ workspace: WorkspaceModel) async -> Bool {
+        if let domainWorkspaceAuthorityClient {
+            let outcome = await domainWorkspaceAuthorityClient.delete(workspaceID: workspace.id)
+            guard Self.isSuccessfulDomainOutcome(outcome) else {
+                reportDomainAuthorityIssue(outcome, operation: "delete_workspace")
+                return false
+            }
+            await finalizeWorkspaceDeletion(workspace, saveLegacyIndex: false)
+            return true
+        }
+        await finalizeWorkspaceDeletion(workspace, saveLegacyIndex: true)
+        return true
+    }
+
+    private func finalizeWorkspaceDeletion(
+        _ workspace: WorkspaceModel,
+        saveLegacyIndex: Bool
+    ) async {
         workspaces.removeAll { $0.id == workspace.id }
         if activeWorkspaceID == workspace.id {
             activeWorkspaceID = nil
         }
-
         let workspaceDir = workspaceDirectory(for: workspace)
-
-        // Always delete git data (even for custom storage workspaces)
-        Task.detached(priority: .utility) {
+        await Task.detached(priority: .utility) {
             await GitDiffDataMaintenance.shared.deleteAllGitData(workspaceDirectory: workspaceDir)
-        }
-
-        if workspace.customStoragePath == nil {
-            // For default storage, delete the entire workspace folder
-            do {
-                if FileManager.default.fileExists(atPath: workspaceDir.path) {
-                    try FileManager.default.removeItem(at: workspaceDir)
-                }
-            } catch {
-                print("Failed to remove workspace folder: \(error)")
+            if workspace.customStoragePath == nil,
+               FileManager.default.fileExists(atPath: workspaceDir.path)
+            {
+                try? FileManager.default.removeItem(at: workspaceDir)
             }
-        }
-
-        // Schedule async index save and notify after completion and flush
-        Task {
+        }.value
+        if saveLegacyIndex {
             await rebuildAndSaveIndexAsync()
             await WorkspaceDiskWriter.shared.flush(url: workspaceIndexFileURL)
-            await MainActor.run {
-                NotificationCenter.default.post(
-                    name: .workspaceListDidChange,
-                    object: nil,
-                    userInfo: ["managerID": instanceID]
-                )
-            }
         }
+        NotificationCenter.default.post(
+            name: .workspaceListDidChange,
+            object: nil,
+            userInfo: ["managerID": instanceID]
+        )
     }
 
     func renameWorkspace(_ workspace: WorkspaceModel, newName: String) {
@@ -6046,7 +6278,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         workspaces[index].name = finalName
         workspaces[index].dateModified = Date()
 
-        if workspaces[index].customStoragePath == nil {
+        if domainWorkspaceAuthorityClient == nil, workspaces[index].customStoragePath == nil {
             // Preserve the original base location (global or default)
             let baseLocation = currentBaseRoot
             // 'workspace' param still holds the old name – use it to locate old folder
@@ -6059,7 +6291,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                     try FileManager.default.moveItem(at: oldFolder, to: newFolder)
                 }
             } catch {
-                print("Failed to rename workspace folder: \(error)")
+                Self.logger.error("Failed to rename legacy workspace folder: \(error.localizedDescription, privacy: .public)")
             }
         }
 
@@ -7338,26 +7570,27 @@ class WorkspaceManagerViewModel: ObservableObject {
         remainingRetryCount: Int = 1
     ) async -> Int? {
         guard !Task.isCancelled else { return nil }
-        if let domainWorkspaceAuthorityClient,
+        if domainWorkspaceAuthorityClient != nil,
            let currentIndex = workspaceIndex(for: workspaceID)
         {
             do {
-                let outcome = try await domainWorkspaceAuthorityClient.save(
+                let result = try await persistWorkspaceThroughDomainAuthority(
                     workspaces[currentIndex],
-                    fileURL: fileURL
+                    targetURL: fileURL,
+                    preserveDiskRepoPathsIfUnchangedSinceBaseline: true,
+                    source: source,
+                    remainingRetryCount: remainingRetryCount
                 )
-                guard outcome.disposition == .applied
-                    || outcome.disposition == .unchanged
-                    || outcome.disposition == .deduplicated
-                else {
-                    print("💾 Runtime workspace save rejected: \(outcome.diagnostic ?? outcome.disposition.rawValue)")
-                    return nil
-                }
-                let version = stateVersionByWorkspaceID[workspaceID, default: 0]
-                lastSavedVersionByWorkspaceID[workspaceID] = version
-                return version
+                lastSavedVersionByWorkspaceID[workspaceID] = result.savedStateVersion
+                return result.savedStateVersion
+            } catch is CancellationError {
+                return nil
             } catch {
-                print("💾 Runtime workspace save failed: \(error)")
+                reportDomainAuthorityFailure(
+                    error,
+                    workspaceID: workspaceID,
+                    operation: "save_workspace"
+                )
                 return nil
             }
         }
@@ -7487,6 +7720,138 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
+    private struct DomainAuthoritySaveResult {
+        let savedStateVersion: Int
+        let fileURL: URL
+    }
+
+    private func persistWorkspaceThroughDomainAuthority(
+        _ workspace: WorkspaceModel,
+        targetURL: URL,
+        preserveDiskRepoPathsIfUnchangedSinceBaseline: Bool,
+        source: WorkspaceSaveSource,
+        remainingRetryCount: Int
+    ) async throws -> DomainAuthoritySaveResult {
+        guard let domainWorkspaceAuthorityClient else {
+            throw NSError(
+                domain: "RepoPrompt.DomainWorkspaceAuthority",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Runtime workspace authority is unavailable"]
+            )
+        }
+        try Task.checkCancellation()
+
+        // An explicit save supersedes a queued presentation capture. Await cancellation so a
+        // delayed working commit cannot land after the saved revision.
+        if let pending = domainWorkingCommitTasks.removeValue(forKey: workspace.id) {
+            pending.cancel()
+            await pending.value
+        }
+
+        let capturedStateVersion = stateVersionByWorkspaceID[workspace.id, default: 0]
+        let lastSyncedRepoPaths = lastSyncedRepoPathsByWorkspaceID[workspace.id]
+        #if DEBUG
+            workspaceSaveAttemptCountByWorkspaceIDForTesting[workspace.id, default: 0] += 1
+        #endif
+
+        let mergeResult = await Task.detached(priority: .utility) {
+            let diskWorkspace: WorkspaceModel? = if FileManager.default.fileExists(atPath: targetURL.path) {
+                try? Self.loadWorkspaceFromFile(at: targetURL)
+            } else {
+                nil
+            }
+            return Self.workspaceForSavePreservingDiskRepoPaths(
+                current: workspace,
+                diskWorkspace: diskWorkspace,
+                lastSyncedRepoPaths: lastSyncedRepoPaths,
+                modificationDate: workspace.dateModified
+            )
+        }.value
+        let workspaceToSave = mergeResult.workspace
+
+        #if DEBUG
+            await workspaceSavePreparationDidFinishHandlerForTesting?(
+                workspace.id,
+                targetURL,
+                remainingRetryCount
+            )
+        #endif
+        try Task.checkCancellation()
+        let latestStateVersion = stateVersionByWorkspaceID[workspace.id, default: 0]
+        if latestStateVersion != capturedStateVersion,
+           let index = workspaceIndex(for: workspace.id)
+        {
+            #if DEBUG
+                WorkspaceRestorePerfLog.event(
+                    "workspaceSave.domain.stalePayload.retry",
+                    fields: [
+                        "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                        "capturedVersion": "\(capturedStateVersion)",
+                        "latestVersion": "\(latestStateVersion)"
+                    ]
+                )
+            #endif
+            guard remainingRetryCount > 0 else { throw CancellationError() }
+            return try await persistWorkspaceThroughDomainAuthority(
+                workspaces[index],
+                targetURL: targetURL,
+                preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
+                source: source,
+                remainingRetryCount: remainingRetryCount - 1
+            )
+        }
+
+        let snapshot = await domainWorkspaceAuthorityClient.snapshot()
+        let exists = snapshot.workspaces.contains {
+            $0.document.workspaceID == workspaceToSave.id
+        }
+        let outcome: DomainCommandOutcome = if exists {
+            try await domainWorkspaceAuthorityClient.save(
+                workspaceToSave,
+                fileURL: targetURL,
+                operationIDs: .init()
+            )
+        } else {
+            try await domainWorkspaceAuthorityClient.create(
+                workspaceToSave,
+                fileURL: targetURL,
+                operationID: UUID()
+            )
+        }
+        guard Self.isSuccessfulDomainOutcome(outcome) else {
+            throw NSError(
+                domain: "RepoPrompt.DomainWorkspaceAuthority",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: outcome.diagnostic ?? outcome.disposition.rawValue]
+            )
+        }
+
+        if let index = workspaceIndex(for: workspaceToSave.id) {
+            var published = workspaces[index]
+            published.name = workspaceToSave.name
+            published.customStoragePath = workspaceToSave.customStoragePath
+            published.isSystemWorkspace = workspaceToSave.isSystemWorkspace
+            published.isHiddenInMenus = workspaceToSave.isHiddenInMenus
+            if mergeResult.preservedDiskRepoPaths {
+                published.repoPaths = workspaceToSave.repoPaths
+            }
+            if published != workspaces[index] {
+                workspaces[index] = published
+            }
+        }
+        WorkspaceFileDecodeCache.shared.invalidate(url: targetURL)
+        recordRepoPathBaseline(for: workspaceToSave)
+        WorkspaceSaveTracer.event(
+            "workspaceSave.domain.committed",
+            metadata: workspaceSaveMetadata(for: workspaceToSave, source: source),
+            url: targetURL
+        )
+        return DomainAuthoritySaveResult(
+            savedStateVersion: capturedStateVersion,
+            fileURL: targetURL
+        )
+    }
+
     // File I/O queue removed - now using async/await for non-blocking operations
 
     /// Persists a workspace to disk and returns the final file URL.
@@ -7500,19 +7865,16 @@ class WorkspaceManagerViewModel: ObservableObject {
         source: WorkspaceSaveSource = .directUnknown
     ) async throws -> URL {
         let targetURL = workspaceFileURL(for: workspace)
-        if let domainWorkspaceAuthorityClient {
-            let outcome = try await domainWorkspaceAuthorityClient.save(workspace, fileURL: targetURL)
-            guard outcome.disposition == .applied
-                || outcome.disposition == .unchanged
-                || outcome.disposition == .deduplicated
-            else {
-                throw NSError(
-                    domain: "RepoPrompt.DomainWorkspaceAuthority",
-                    code: 1,
-                    userInfo: [NSLocalizedDescriptionKey: outcome.diagnostic ?? outcome.disposition.rawValue]
-                )
-            }
-            return targetURL
+        if domainWorkspaceAuthorityClient != nil {
+            let result = try await persistWorkspaceThroughDomainAuthority(
+                workspace,
+                targetURL: targetURL,
+                preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
+                source: source,
+                remainingRetryCount: 1
+            )
+            lastSavedVersionByWorkspaceID[workspace.id] = result.savedStateVersion
+            return result.fileURL
         }
         let capturedStateVersion = stateVersionByWorkspaceID[workspace.id, default: 0]
         await WorkspaceDiskWriter.shared.flush(url: targetURL)
@@ -7607,6 +7969,14 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
 
         return finalURL
+    }
+
+    nonisolated static func decodeDomainWorkspaceProjection(
+        documentBytes: Data,
+        fileURL: URL
+    ) throws -> WorkspaceModel {
+        _ = fileURL
+        return try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes).workspace
     }
 
     nonisolated static func loadWorkspaceFromFileResult(at fileURL: URL) throws -> WorkspaceFileLoadResult {
@@ -8200,11 +8570,35 @@ class WorkspaceManagerViewModel: ObservableObject {
         ws.isSystemWorkspace = true
         workspaces.append(ws)
 
+        if let domainWorkspaceAuthorityClient {
+            let fileURL = workspaceFileURL(for: ws)
+            let operationID = UUID()
+            Task { @MainActor [weak self] in
+                do {
+                    let outcome = try await domainWorkspaceAuthorityClient.create(
+                        ws,
+                        fileURL: fileURL,
+                        operationID: operationID
+                    )
+                    if !Self.isSuccessfulDomainOutcome(outcome) {
+                        self?.reportDomainAuthorityIssue(outcome, operation: "create_default")
+                    }
+                } catch {
+                    self?.reportDomainAuthorityFailure(
+                        error,
+                        workspaceID: ws.id,
+                        operation: "create_default"
+                    )
+                }
+            }
+            return ws
+        }
+
         do {
             _ = try ensureWorkspaceDirectoryExists(for: ws)
             _ = try saveWorkspaceToFile(ws, source: .createDefaultWorkspace)
         } catch {
-            print("Error while creating default workspace: \(error)")
+            Self.logger.error("Error while creating default workspace: \(error.localizedDescription, privacy: .public)")
         }
         rebuildAndSaveIndex()
         return ws

@@ -103,6 +103,7 @@ package actor MCPDomainRuntime {
     private let workspaceAuthority: DomainWorkspaceContextAuthority
     private var lifecycle: DomainRuntimeLifecycle = .created
     private var publicationSequence: UInt64 = 0
+    private var startTask: Task<Void, Never>?
     private var externalReloadTask: Task<Void, Never>?
 
     package init(
@@ -150,16 +151,22 @@ package actor MCPDomainRuntime {
         case .created:
             lifecycle = .starting
             publishSnapshot()
-            await workspaceAuthority.bootstrap()
-            let workspaceSnapshot = await workspaceAuthority.snapshot()
-            lifecycle = workspaceSnapshot.health.acceptsMutations ? .ready : .degraded
-            publishSnapshot()
-            startExternalReloadPollingIfNeeded()
-        case .starting, .ready, .degraded:
+            let authority = workspaceAuthority
+            startTask = Task { await authority.bootstrap() }
+        case .starting:
+            break
+        case .ready, .degraded:
             return
         case .draining, .stopped:
             throw DomainRuntimeLifecycleError.stoppedRuntimeCannotRestart
         }
+        await startTask?.value
+        guard lifecycle == .starting else { return }
+        startTask = nil
+        let workspaceSnapshot = await workspaceAuthority.snapshot()
+        lifecycle = workspaceSnapshot.health.acceptsMutations ? .ready : .degraded
+        publishSnapshot()
+        startExternalReloadPollingIfNeeded()
     }
 
     package func shutdown() async -> DomainShutdownResult {
@@ -172,6 +179,8 @@ package actor MCPDomainRuntime {
             )
         }
         lifecycle = .draining
+        startTask?.cancel()
+        startTask = nil
         publishSnapshot()
         externalReloadTask?.cancel()
         externalReloadTask = nil

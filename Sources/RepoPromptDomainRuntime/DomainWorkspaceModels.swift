@@ -144,6 +144,7 @@ package struct DomainWorkspaceSnapshot: Codable, Equatable, Sendable {
 
 package struct DomainWorkspaceCatalogSnapshot: Equatable, Sendable {
     package let runtimeIdentity: DomainRuntimeIdentity
+    package let isBootstrapped: Bool
     package let publicationSequence: UInt64
     package let catalogRevision: UInt64
     package let health: DomainAuthorityHealth
@@ -151,12 +152,14 @@ package struct DomainWorkspaceCatalogSnapshot: Equatable, Sendable {
 
     package init(
         runtimeIdentity: DomainRuntimeIdentity,
+        isBootstrapped: Bool,
         publicationSequence: UInt64,
         catalogRevision: UInt64,
         health: DomainAuthorityHealth,
         workspaces: [DomainWorkspaceSnapshot]
     ) {
         self.runtimeIdentity = runtimeIdentity
+        self.isBootstrapped = isBootstrapped
         self.publicationSequence = publicationSequence
         self.catalogRevision = catalogRevision
         self.health = health
@@ -166,6 +169,8 @@ package struct DomainWorkspaceCatalogSnapshot: Equatable, Sendable {
 
 package enum DomainWorkspaceEventKind: String, Codable, Sendable {
     case bootstrapped
+    case workspaceCreated
+    case workspaceDeleted
     case workingStateCommitted
     case savedDocumentCommitted
     case externalReloaded

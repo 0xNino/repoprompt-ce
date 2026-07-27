@@ -1,5 +1,11 @@
 import Darwin
 import Foundation
+import os
+
+struct DomainPendingSave: Codable, Sendable {
+    let operationID: UUID
+    let documentDigest: String
+}
 
 struct DomainWorkingJournal: Codable, Sendable {
     static let schemaVersion = 1
@@ -14,6 +20,7 @@ struct DomainWorkingJournal: Codable, Sendable {
     let contextDigests: [UUID: String]
     let contextTombstones: [UUID: UInt64]
     let operations: [DomainRecordedOperation]
+    let pendingSave: DomainPendingSave?
     let updatedAt: Date
 
     init(
@@ -26,6 +33,7 @@ struct DomainWorkingJournal: Codable, Sendable {
         contextDigests: [UUID: String],
         contextTombstones: [UUID: UInt64],
         operations: [DomainRecordedOperation],
+        pendingSave: DomainPendingSave? = nil,
         updatedAt: Date
     ) {
         version = Self.schemaVersion
@@ -38,6 +46,7 @@ struct DomainWorkingJournal: Codable, Sendable {
         self.contextDigests = contextDigests
         self.contextTombstones = contextTombstones
         self.operations = operations
+        self.pendingSave = pendingSave
         self.updatedAt = updatedAt
     }
 }
@@ -62,6 +71,24 @@ struct DomainSavedRevisionRecord: Codable, Sendable {
     }
 }
 
+struct DomainDeletionTombstone: Codable, Sendable {
+    static let schemaVersion = 1
+
+    let version: Int
+    let workspaceID: UUID
+    let fileURL: URL
+    let operation: DomainRecordedOperation
+    let deletedAt: Date
+
+    init(workspaceID: UUID, fileURL: URL, operation: DomainRecordedOperation, deletedAt: Date) {
+        version = Self.schemaVersion
+        self.workspaceID = workspaceID
+        self.fileURL = fileURL
+        self.operation = operation
+        self.deletedAt = deletedAt
+    }
+}
+
 struct DomainPersistenceBootstrap: Sendable {
     struct Workspace: Sendable {
         let document: DomainWorkspaceDocument
@@ -74,16 +101,25 @@ struct DomainPersistenceBootstrap: Sendable {
     }
 
     let workspaces: [Workspace]
+    let deletedOperations: [DomainRecordedOperation]
+    let deletedWorkspaceIDs: Set<UUID>
     let health: DomainAuthorityHealth
     let catalogRevision: UInt64
 }
 
 struct DomainPersistenceWorkingCommit: Sendable {
     let journal: DomainWorkingJournal
+    let catalogRevision: UInt64
 }
 
 struct DomainPersistenceSavedCommit: Sendable {
     let journal: DomainWorkingJournal
+    let catalogRevision: UInt64
+}
+
+struct DomainPersistenceDeleteCommit: Sendable {
+    let catalogRevision: UInt64
+    let tombstone: DomainDeletionTombstone
 }
 
 enum DomainPersistenceError: Error, Equatable, Sendable {
@@ -94,9 +130,47 @@ enum DomainPersistenceError: Error, Equatable, Sendable {
     case operationIDCollision
     case invalidWorkspaceDocument
     case writeFailed(String)
+    case lockTimedOut
+    case cancelled
 }
 
-package actor DomainPersistenceCoordinator {
+private final class DomainBlockingCancellation: Sendable {
+    private let state = OSAllocatedUnfairLock(initialState: false)
+
+    func cancel() {
+        state.withLock { $0 = true }
+    }
+
+    func check() throws {
+        if state.withLock({ $0 }) {
+            throw DomainPersistenceError.cancelled
+        }
+    }
+}
+
+private enum DomainBlockingIO {
+    static func run<T: Sendable>(
+        _ operation: @escaping @Sendable (DomainBlockingCancellation) throws -> T
+    ) async throws -> T {
+        let cancellation = DomainBlockingCancellation()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .utility).async {
+                    do {
+                        try cancellation.check()
+                        continuation.resume(returning: try operation(cancellation))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        } onCancel: {
+            cancellation.cancel()
+        }
+    }
+}
+
+package struct DomainPersistenceCoordinator: Sendable {
     private struct RuntimeWorkspaceCatalog: Codable {
         static let schemaVersion = 1
 
@@ -108,7 +182,22 @@ package actor DomainPersistenceCoordinator {
         let version: Int
         let revision: UInt64
         let entries: [Entry]
+        let deletions: [DomainDeletionTombstone]?
         let updatedAt: Date
+
+        init(
+            version: Int,
+            revision: UInt64,
+            entries: [Entry],
+            deletions: [DomainDeletionTombstone] = [],
+            updatedAt: Date
+        ) {
+            self.version = version
+            self.revision = revision
+            self.entries = entries
+            self.deletions = deletions
+            self.updatedAt = updatedAt
+        }
     }
 
     private struct LegacyWorkspaceIndexEntry: Codable {
@@ -146,21 +235,46 @@ package actor DomainPersistenceCoordinator {
 
     private let configuration: DomainRuntimeConfiguration
     private let identity: DomainRuntimeIdentity
-    private let fileManager: FileManager
-    private let encoder: JSONEncoder
-    private let decoder: JSONDecoder
+    private let cancellation: DomainBlockingCancellation?
 
     package init(
         configuration: DomainRuntimeConfiguration,
-        identity: DomainRuntimeIdentity,
-        fileManager: FileManager = .default
+        identity: DomainRuntimeIdentity
     ) {
         self.configuration = configuration
         self.identity = identity
-        self.fileManager = fileManager
-        encoder = JSONEncoder()
+        cancellation = nil
+    }
+
+    private init(
+        configuration: DomainRuntimeConfiguration,
+        identity: DomainRuntimeIdentity,
+        cancellation: DomainBlockingCancellation
+    ) {
+        self.configuration = configuration
+        self.identity = identity
+        self.cancellation = cancellation
+    }
+
+    private var fileManager: FileManager { .default }
+    private var encoder: JSONEncoder {
+        let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        decoder = JSONDecoder()
+        return encoder
+    }
+
+    private var decoder: JSONDecoder { JSONDecoder() }
+
+    private func blockingWorker(_ cancellation: DomainBlockingCancellation) -> Self {
+        Self(configuration: configuration, identity: identity, cancellation: cancellation)
+    }
+
+    private func withLock<T>(at url: URL, _ body: () throws -> T) throws -> T {
+        try DomainPersistenceLock.withLock(
+            at: url,
+            cancellation: cancellation,
+            body
+        )
     }
 
     private var workspaceRoot: URL {
@@ -182,6 +296,7 @@ package actor DomainPersistenceCoordinator {
 
     private var journalDirectory: URL { runtimeRoot.appendingPathComponent("working-journals", isDirectory: true) }
     private var revisionDirectory: URL { runtimeRoot.appendingPathComponent("revisions", isDirectory: true) }
+    private var deletionDirectory: URL { runtimeRoot.appendingPathComponent("deletion-tombstones", isDirectory: true) }
     private var lockDirectory: URL { runtimeRoot.appendingPathComponent("locks", isDirectory: true) }
     private var settingsDirectory: URL { runtimeRoot.appendingPathComponent("settings", isDirectory: true) }
     private var rollbackRoot: URL { runtimeRoot.appendingPathComponent("rollback", isDirectory: true) }
@@ -197,11 +312,218 @@ package actor DomainPersistenceCoordinator {
         revisionDirectory.appendingPathComponent("\(workspaceID.uuidString).json")
     }
 
+    private func deletionURL(_ workspaceID: UUID) -> URL {
+        deletionDirectory.appendingPathComponent("\(workspaceID.uuidString).json")
+    }
+
     private func lockURL(_ workspaceID: UUID) -> URL {
         lockDirectory.appendingPathComponent("workspace-\(workspaceID.uuidString).lock")
     }
 
-    func bootstrap() -> DomainPersistenceBootstrap {
+    func bootstrap() async -> DomainPersistenceBootstrap {
+        do {
+            return try await DomainBlockingIO.run { cancellation in
+                try cancellation.check()
+                return blockingWorker(cancellation).bootstrapBlocking()
+            }
+        } catch {
+            return DomainPersistenceBootstrap(
+                workspaces: [],
+                deletedOperations: [],
+                deletedWorkspaceIDs: [],
+                health: .degradedReadOnly(reason: "bootstrap_cancelled"),
+                catalogRevision: 0
+            )
+        }
+    }
+
+    func persistCreated(
+        document: DomainWorkspaceDocument,
+        expectedCatalogRevision: UInt64?,
+        operationID: UUID,
+        contextRevisions: [UUID: DomainRevisionState],
+        operation: DomainRecordedOperation,
+        now: Date
+    ) async throws -> DomainPersistenceSavedCommit {
+        try await DomainBlockingIO.run { cancellation in
+            try blockingWorker(cancellation).persistCreatedBlocking(
+                document: document,
+                expectedCatalogRevision: expectedCatalogRevision,
+                operationID: operationID,
+                contextRevisions: contextRevisions,
+                operation: operation,
+                now: now
+            )
+        }
+    }
+
+    func repairRecoveredCreate(
+        document: DomainWorkspaceDocument,
+        now: Date
+    ) async throws -> UInt64 {
+        try await DomainBlockingIO.run { cancellation in
+            try blockingWorker(cancellation).withExistingWorkspaceLocks(document: document, now: now) { revision in
+                revision
+            }
+        }
+    }
+
+    func persistUnchanged(
+        document: DomainWorkspaceDocument,
+        expectedRevision: UInt64,
+        operation: DomainRecordedOperation,
+        now: Date
+    ) async throws -> DomainPersistenceWorkingCommit {
+        try await DomainBlockingIO.run { cancellation in
+            try blockingWorker(cancellation).persistUnchangedBlocking(
+                document: document,
+                expectedRevision: expectedRevision,
+                operation: operation,
+                now: now
+            )
+        }
+    }
+
+    func persistWorking(
+        document: DomainWorkspaceDocument,
+        expectedRevision: UInt64,
+        newRevision: DomainRevisionState,
+        contextRevisions: [UUID: DomainRevisionState],
+        contextTombstones: [UUID: UInt64],
+        operations: [DomainRecordedOperation],
+        now: Date
+    ) async throws -> DomainPersistenceWorkingCommit {
+        try await DomainBlockingIO.run { cancellation in
+            try blockingWorker(cancellation).persistWorkingBlocking(
+                document: document,
+                expectedRevision: expectedRevision,
+                newRevision: newRevision,
+                contextRevisions: contextRevisions,
+                contextTombstones: contextTombstones,
+                operations: operations,
+                now: now
+            )
+        }
+    }
+
+    func persistSaved(
+        document: DomainWorkspaceDocument,
+        expectedWorkingRevision: UInt64,
+        operationID: UUID,
+        contextRevisions: [UUID: DomainRevisionState],
+        contextTombstones: [UUID: UInt64],
+        operations: [DomainRecordedOperation],
+        now: Date
+    ) async throws -> DomainPersistenceSavedCommit {
+        try await DomainBlockingIO.run { cancellation in
+            try blockingWorker(cancellation).persistSavedBlocking(
+                document: document,
+                expectedWorkingRevision: expectedWorkingRevision,
+                operationID: operationID,
+                contextRevisions: contextRevisions,
+                contextTombstones: contextTombstones,
+                operations: operations,
+                now: now
+            )
+        }
+    }
+
+    func persistExternalReload(
+        document: DomainWorkspaceDocument,
+        expectedRevision: UInt64,
+        newRevision: UInt64,
+        contextRevisions: [UUID: DomainRevisionState],
+        contextTombstones: [UUID: UInt64],
+        operations: [DomainRecordedOperation],
+        now: Date
+    ) async throws -> DomainPersistenceSavedCommit {
+        try await DomainBlockingIO.run { cancellation in
+            try blockingWorker(cancellation).persistExternalReloadBlocking(
+                document: document,
+                expectedRevision: expectedRevision,
+                newRevision: newRevision,
+                contextRevisions: contextRevisions,
+                contextTombstones: contextTombstones,
+                operations: operations,
+                now: now
+            )
+        }
+    }
+
+    func persistConflictRebase(
+        document: DomainWorkspaceDocument,
+        externalSavedDigest: String,
+        expectedRevision: UInt64,
+        contextRevisions: [UUID: DomainRevisionState],
+        contextTombstones: [UUID: UInt64],
+        operations: [DomainRecordedOperation],
+        now: Date
+    ) async throws -> DomainPersistenceWorkingCommit {
+        try await DomainBlockingIO.run { cancellation in
+            try blockingWorker(cancellation).persistConflictRebaseBlocking(
+                document: document,
+                externalSavedDigest: externalSavedDigest,
+                expectedRevision: expectedRevision,
+                contextRevisions: contextRevisions,
+                contextTombstones: contextTombstones,
+                operations: operations,
+                now: now
+            )
+        }
+    }
+
+    func persistDeleted(
+        document: DomainWorkspaceDocument,
+        expectedWorkspaceRevision: UInt64,
+        expectedCatalogRevision: UInt64?,
+        operation: DomainRecordedOperation,
+        now: Date
+    ) async throws -> DomainPersistenceDeleteCommit {
+        try await DomainBlockingIO.run { cancellation in
+            try blockingWorker(cancellation).persistDeletedBlocking(
+                document: document,
+                expectedWorkspaceRevision: expectedWorkspaceRevision,
+                expectedCatalogRevision: expectedCatalogRevision,
+                operation: operation,
+                now: now
+            )
+        }
+    }
+
+    func currentCatalogRevision() async throws -> UInt64? {
+        try await DomainBlockingIO.run { cancellation in
+            try cancellation.check()
+            let worker = blockingWorker(cancellation)
+            guard worker.fileManager.fileExists(atPath: worker.catalogURL.path) else { return nil }
+            let data = try Data(contentsOf: worker.catalogURL)
+            let catalog = try worker.decoder.decode(RuntimeWorkspaceCatalog.self, from: data)
+            guard catalog.version <= RuntimeWorkspaceCatalog.schemaVersion else {
+                throw DomainPersistenceError.futureJournal(catalog.version)
+            }
+            return catalog.revision
+        }
+    }
+
+    func externalDocument(
+        for snapshot: DomainWorkspaceSnapshot,
+        savedDigest: String
+    ) async -> Result<DomainWorkspaceDocument?, DomainPersistenceError> {
+        do {
+            return try await DomainBlockingIO.run { cancellation in
+                try cancellation.check()
+                return blockingWorker(cancellation).externalDocumentBlocking(
+                    for: snapshot,
+                    savedDigest: savedDigest
+                )
+            }
+        } catch let error as DomainPersistenceError {
+            return .failure(error)
+        } catch {
+            return .failure(.writeFailed(String(describing: error)))
+        }
+    }
+
+    private func bootstrapBlocking() -> DomainPersistenceBootstrap {
         var globalHealth: DomainAuthorityHealth = .writable
         let catalog: RuntimeWorkspaceCatalog?
         if let data = try? Data(contentsOf: catalogURL) {
@@ -221,15 +543,35 @@ package actor DomainPersistenceCoordinator {
             catalog = nil
         }
 
+        let deletionURLs = (try? fileManager.contentsOfDirectory(
+            at: deletionDirectory,
+            includingPropertiesForKeys: nil
+        )) ?? []
+        let sidecarTombstones = deletionURLs.compactMap { url -> DomainDeletionTombstone? in
+            guard url.pathExtension == "json",
+                  let data = try? Data(contentsOf: url),
+                  let tombstone = try? decoder.decode(DomainDeletionTombstone.self, from: data),
+                  tombstone.version <= DomainDeletionTombstone.schemaVersion
+            else { return nil }
+            return tombstone
+        }
+        let deletionTombstones = Dictionary(
+            (sidecarTombstones + (catalog?.deletions ?? [])).map { ($0.workspaceID, $0) },
+            uniquingKeysWith: { _, latest in latest }
+        ).values.sorted { $0.workspaceID.uuidString < $1.workspaceID.uuidString }
+        let deletedIDs = Set(deletionTombstones.map(\.workspaceID))
+
         let entries: [RuntimeWorkspaceCatalog.Entry]
         if let catalog {
-            entries = catalog.entries
+            entries = catalog.entries.filter { !deletedIDs.contains($0.workspaceID) }
         } else {
             do {
-                entries = try legacyCatalogEntries()
+                entries = try legacyCatalogEntries().filter { !deletedIDs.contains($0.workspaceID) }
             } catch {
                 return DomainPersistenceBootstrap(
                     workspaces: [],
+                    deletedOperations: deletionTombstones.map(\.operation),
+                    deletedWorkspaceIDs: deletedIDs,
                     health: .degradedReadOnly(reason: "workspace_index_decode_failed"),
                     catalogRevision: 0
                 )
@@ -259,6 +601,7 @@ package actor DomainPersistenceCoordinator {
         for journalURL in journalURLs where journalURL.pathExtension == "json" {
             guard let workspaceID = UUID(uuidString: journalURL.deletingPathExtension().lastPathComponent),
                   !loadedIDs.contains(workspaceID),
+                  !deletedIDs.contains(workspaceID),
                   case let .success(journal?) = loadJournal(workspaceID: workspaceID),
                   journal.version <= DomainWorkingJournal.schemaVersion,
                   let result = loadWorkspace(workspaceID: workspaceID, fileURL: journal.fileURL)
@@ -272,6 +615,8 @@ package actor DomainPersistenceCoordinator {
 
         return DomainPersistenceBootstrap(
             workspaces: loaded,
+            deletedOperations: deletionTombstones.map(\.operation),
+            deletedWorkspaceIDs: deletedIDs,
             health: globalHealth,
             catalogRevision: catalog?.revision ?? 0
         )
@@ -308,6 +653,17 @@ package actor DomainPersistenceCoordinator {
                     operations: [],
                     health: .degradedReadOnly(reason: "future_working_journal")
                 ), "future_working_journal")
+            }
+            if let recovered = resolvedPendingSave(journal) {
+                return (.init(
+                    document: recovered.document,
+                    savedDigest: recovered.journal.savedDigest,
+                    revisions: recovered.journal.revisions,
+                    contextRevisions: recovered.journal.contextRevisions,
+                    contextTombstones: recovered.journal.contextTombstones,
+                    operations: recovered.journal.operations,
+                    health: .writable
+                ), nil)
             }
             guard let bytes = journal.workingDocument ?? savedBytes,
                   let document = try? DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
@@ -353,7 +709,179 @@ package actor DomainPersistenceCoordinator {
         }
     }
 
-    func persistWorking(
+    private func persistCreatedBlocking(
+        document: DomainWorkspaceDocument,
+        expectedCatalogRevision: UInt64?,
+        operationID: UUID,
+        contextRevisions: [UUID: DomainRevisionState],
+        operation: DomainRecordedOperation,
+        now: Date
+    ) throws -> DomainPersistenceSavedCommit {
+        try ensureLazyMigration(now: now)
+        return try withLock(at: lockDirectory.appendingPathComponent("workspace-catalog.lock")) {
+            let currentCatalog = try loadCurrentCatalog(now: now)
+            if let expectedCatalogRevision,
+               expectedCatalogRevision != currentCatalog.revision
+            {
+                throw DomainPersistenceError.stateConflict(
+                    expected: expectedCatalogRevision,
+                    actual: currentCatalog.revision
+                )
+            }
+            guard !currentCatalog.entries.contains(where: {
+                $0.workspaceID == document.workspaceID
+            }) else {
+                throw DomainPersistenceError.stateConflict(expected: 0, actual: 1)
+            }
+
+            let cleanRevisions = DomainRevisionState(
+                workingRevision: 1,
+                savedRevision: 1,
+                dirtyRevision: nil
+            )
+            let journal = try withLock(at: lockURL(document.workspaceID)) {
+                if case let .success(existing?) = loadJournal(workspaceID: document.workspaceID) {
+                    throw DomainPersistenceError.stateConflict(
+                        expected: 0,
+                        actual: existing.revisions.workingRevision
+                    )
+                }
+                guard !fileManager.fileExists(atPath: document.fileURL.path) else {
+                    throw DomainPersistenceError.stateConflict(expected: 0, actual: 1)
+                }
+                let pendingRevisions = DomainRevisionState(
+                    workingRevision: 1,
+                    savedRevision: 0,
+                    dirtyRevision: 1
+                )
+                let pending = DomainWorkingJournal(
+                    workspaceID: document.workspaceID,
+                    fileURL: document.fileURL,
+                    revisions: pendingRevisions,
+                    savedDigest: DomainContentDigest.sha256(Data()),
+                    workingDocument: document.documentBytes,
+                    contextRevisions: contextRevisions,
+                    contextDigests: Dictionary(uniqueKeysWithValues: document.metadata.contexts.map {
+                        ($0.identity.contextID, $0.contentDigest)
+                    }),
+                    contextTombstones: [:],
+                    operations: [operation],
+                    pendingSave: DomainPendingSave(
+                        operationID: operationID,
+                        documentDigest: document.contentDigest
+                    ),
+                    updatedAt: now
+                )
+                try DomainPersistenceLock.atomicWrite(
+                    try encoder.encode(pending),
+                    to: journalURL(document.workspaceID)
+                )
+                try DomainPersistenceLock.atomicWrite(document.documentBytes, to: document.fileURL)
+                let committed = DomainWorkingJournal(
+                    workspaceID: document.workspaceID,
+                    fileURL: document.fileURL,
+                    revisions: cleanRevisions,
+                    savedDigest: document.contentDigest,
+                    workingDocument: nil,
+                    contextRevisions: contextRevisions.mapValues { state in
+                        DomainRevisionState(
+                            workingRevision: state.workingRevision,
+                            savedRevision: state.workingRevision,
+                            dirtyRevision: nil
+                        )
+                    },
+                    contextDigests: Dictionary(uniqueKeysWithValues: document.metadata.contexts.map {
+                        ($0.identity.contextID, $0.contentDigest)
+                    }),
+                    contextTombstones: [:],
+                    operations: [operation],
+                    updatedAt: now
+                )
+                try DomainPersistenceLock.atomicWrite(
+                    try encoder.encode(committed),
+                    to: journalURL(document.workspaceID)
+                )
+                try DomainPersistenceLock.atomicWrite(
+                    try encoder.encode(DomainSavedRevisionRecord(
+                        workspaceID: document.workspaceID,
+                        savedRevision: 1,
+                        documentDigest: document.contentDigest,
+                        operationID: operationID,
+                        updatedAt: now
+                    )),
+                    to: revisionURL(document.workspaceID)
+                )
+                return committed
+            }
+
+            var entries = currentCatalog.entries.filter {
+                $0.workspaceID != document.workspaceID
+            }
+            entries.append(.init(
+                workspaceID: document.workspaceID,
+                fileURL: document.fileURL
+            ))
+            let nextCatalog = RuntimeWorkspaceCatalog(
+                version: RuntimeWorkspaceCatalog.schemaVersion,
+                revision: currentCatalog.revision &+ 1,
+                entries: entries.sorted { $0.workspaceID.uuidString < $1.workspaceID.uuidString },
+                deletions: (currentCatalog.deletions ?? []).filter {
+                    $0.workspaceID != document.workspaceID
+                },
+                updatedAt: now
+            )
+            do {
+                try DomainPersistenceLock.atomicWrite(try encoder.encode(nextCatalog), to: catalogURL)
+            } catch {
+                // Catalog publication is the create authority point. Roll back the earlier
+                // intent/document artifacts when publication fails in-process; a process crash
+                // is instead recovered from the create-marked journal on the next mutation.
+                try? fileManager.removeItem(at: journalURL(document.workspaceID))
+                try? fileManager.removeItem(at: revisionURL(document.workspaceID))
+                try? fileManager.removeItem(at: document.fileURL)
+                throw error
+            }
+            return DomainPersistenceSavedCommit(
+                journal: journal,
+                catalogRevision: nextCatalog.revision
+            )
+        }
+    }
+
+    private func persistUnchangedBlocking(
+        document: DomainWorkspaceDocument,
+        expectedRevision: UInt64,
+        operation: DomainRecordedOperation,
+        now: Date
+    ) throws -> DomainPersistenceWorkingCommit {
+        try ensureLazyMigration(now: now)
+        return try withExistingWorkspaceLocks(document: document, now: now) { catalogRevision in
+            let durable = try readCurrentJournalOrSeed(document: document)
+            guard durable.revisions.workingRevision == expectedRevision else {
+                throw DomainPersistenceError.stateConflict(
+                    expected: expectedRevision,
+                    actual: durable.revisions.workingRevision
+                )
+            }
+            let journal = DomainWorkingJournal(
+                workspaceID: durable.workspaceID,
+                fileURL: durable.fileURL,
+                revisions: durable.revisions,
+                savedDigest: durable.savedDigest,
+                workingDocument: durable.workingDocument,
+                contextRevisions: durable.contextRevisions,
+                contextDigests: durable.contextDigests,
+                contextTombstones: durable.contextTombstones,
+                operations: Self.trimmedOperations(durable.operations + [operation], now: now),
+                pendingSave: durable.pendingSave,
+                updatedAt: now
+            )
+            try DomainPersistenceLock.atomicWrite(try encoder.encode(journal), to: journalURL(document.workspaceID))
+            return DomainPersistenceWorkingCommit(journal: journal, catalogRevision: catalogRevision)
+        }
+    }
+
+    private func persistWorkingBlocking(
         document: DomainWorkspaceDocument,
         expectedRevision: UInt64,
         newRevision: DomainRevisionState,
@@ -363,8 +891,7 @@ package actor DomainPersistenceCoordinator {
         now: Date
     ) throws -> DomainPersistenceWorkingCommit {
         try ensureLazyMigration(now: now)
-        try ensureCatalogEntry(for: document, now: now)
-        let result: DomainPersistenceWorkingCommit = try DomainPersistenceLock.withLock(at: lockURL(document.workspaceID)) {
+        return try withExistingWorkspaceLocks(document: document, now: now) { catalogRevision in
             let durable = try readCurrentJournalOrSeed(document: document)
             guard durable.revisions.workingRevision == expectedRevision else {
                 throw DomainPersistenceError.stateConflict(
@@ -387,12 +914,11 @@ package actor DomainPersistenceCoordinator {
                 updatedAt: now
             )
             try DomainPersistenceLock.atomicWrite(try encoder.encode(journal), to: journalURL(document.workspaceID))
-            return DomainPersistenceWorkingCommit(journal: journal)
+            return DomainPersistenceWorkingCommit(journal: journal, catalogRevision: catalogRevision)
         }
-        return result
     }
 
-    func persistSaved(
+    private func persistSavedBlocking(
         document: DomainWorkspaceDocument,
         expectedWorkingRevision: UInt64,
         operationID: UUID,
@@ -402,7 +928,7 @@ package actor DomainPersistenceCoordinator {
         now: Date
     ) throws -> DomainPersistenceSavedCommit {
         try ensureLazyMigration(now: now)
-        return try DomainPersistenceLock.withLock(at: lockURL(document.workspaceID)) {
+        return try withExistingWorkspaceLocks(document: document, now: now) { catalogRevision in
             let durable = try readCurrentJournalOrSeed(document: document)
             guard durable.revisions.workingRevision == expectedWorkingRevision else {
                 throw DomainPersistenceError.stateConflict(
@@ -420,6 +946,28 @@ package actor DomainPersistenceCoordinator {
                 workingRevision: durable.revisions.workingRevision,
                 savedRevision: durable.revisions.workingRevision,
                 dirtyRevision: nil
+            )
+            let pendingJournal = DomainWorkingJournal(
+                workspaceID: document.workspaceID,
+                fileURL: document.fileURL,
+                revisions: durable.revisions,
+                savedDigest: durable.savedDigest,
+                workingDocument: document.documentBytes,
+                contextRevisions: contextRevisions,
+                contextDigests: Dictionary(uniqueKeysWithValues: document.metadata.contexts.map {
+                    ($0.identity.contextID, $0.contentDigest)
+                }),
+                contextTombstones: contextTombstones,
+                operations: Self.trimmedOperations(operations, now: now),
+                pendingSave: DomainPendingSave(
+                    operationID: operationID,
+                    documentDigest: document.contentDigest
+                ),
+                updatedAt: now
+            )
+            try DomainPersistenceLock.atomicWrite(
+                try encoder.encode(pendingJournal),
+                to: journalURL(document.workspaceID)
             )
             try DomainPersistenceLock.atomicWrite(document.documentBytes, to: document.fileURL)
             let revision = DomainSavedRevisionRecord(
@@ -449,13 +997,21 @@ package actor DomainPersistenceCoordinator {
                 operations: Self.trimmedOperations(operations, now: now),
                 updatedAt: now
             )
-            try DomainPersistenceLock.atomicWrite(try encoder.encode(journal), to: journalURL(document.workspaceID))
-            try DomainPersistenceLock.atomicWrite(try encoder.encode(revision), to: revisionURL(document.workspaceID))
-            return DomainPersistenceSavedCommit(journal: journal)
+            // The saved document is the authority point. Final sidecars are recoverable from
+            // the pending journal plus document digest, so a post-document sidecar failure must
+            // not report a false failed commit to a retrying caller.
+            do {
+                try DomainPersistenceLock.atomicWrite(try encoder.encode(journal), to: journalURL(document.workspaceID))
+                try DomainPersistenceLock.atomicWrite(try encoder.encode(revision), to: revisionURL(document.workspaceID))
+            } catch {
+                // Leave the durable pending journal in place. resolvedPendingSave(_:) presents
+                // and persists the same clean revision on the next load/mutation.
+            }
+            return DomainPersistenceSavedCommit(journal: journal, catalogRevision: catalogRevision)
         }
     }
 
-    func persistExternalReload(
+    private func persistExternalReloadBlocking(
         document: DomainWorkspaceDocument,
         expectedRevision: UInt64,
         newRevision: UInt64,
@@ -465,7 +1021,7 @@ package actor DomainPersistenceCoordinator {
         now: Date
     ) throws -> DomainPersistenceSavedCommit {
         try ensureLazyMigration(now: now)
-        return try DomainPersistenceLock.withLock(at: lockURL(document.workspaceID)) {
+        return try withExistingWorkspaceLocks(document: document, now: now) { catalogRevision in
             let current = try readCurrentJournalOrSeed(document: document)
             guard current.revisions.workingRevision == expectedRevision else {
                 throw DomainPersistenceError.stateConflict(
@@ -511,11 +1067,11 @@ package actor DomainPersistenceCoordinator {
                 try encoder.encode(revisionRecord),
                 to: revisionURL(document.workspaceID)
             )
-            return DomainPersistenceSavedCommit(journal: journal)
+            return DomainPersistenceSavedCommit(journal: journal, catalogRevision: catalogRevision)
         }
     }
 
-    func persistConflictRebase(
+    private func persistConflictRebaseBlocking(
         document: DomainWorkspaceDocument,
         externalSavedDigest: String,
         expectedRevision: UInt64,
@@ -524,7 +1080,8 @@ package actor DomainPersistenceCoordinator {
         operations: [DomainRecordedOperation],
         now: Date
     ) throws -> DomainPersistenceWorkingCommit {
-        try DomainPersistenceLock.withLock(at: lockURL(document.workspaceID)) {
+        try ensureLazyMigration(now: now)
+        return try withExistingWorkspaceLocks(document: document, now: now) { catalogRevision in
             let current = try readCurrentJournalOrSeed(document: document)
             guard current.revisions.workingRevision == expectedRevision else {
                 throw DomainPersistenceError.stateConflict(
@@ -547,14 +1104,80 @@ package actor DomainPersistenceCoordinator {
                 updatedAt: now
             )
             try DomainPersistenceLock.atomicWrite(try encoder.encode(journal), to: journalURL(document.workspaceID))
-            return DomainPersistenceWorkingCommit(journal: journal)
+            return DomainPersistenceWorkingCommit(journal: journal, catalogRevision: catalogRevision)
         }
     }
 
-    package func externalDocument(
+    private func persistDeletedBlocking(
+        document: DomainWorkspaceDocument,
+        expectedWorkspaceRevision: UInt64,
+        expectedCatalogRevision: UInt64?,
+        operation: DomainRecordedOperation,
+        now: Date
+    ) throws -> DomainPersistenceDeleteCommit {
+        try ensureLazyMigration(now: now)
+        return try withLock(at: lockDirectory.appendingPathComponent("workspace-catalog.lock")) {
+            let currentCatalog = try loadCurrentCatalog(now: now)
+            if let expectedCatalogRevision,
+               expectedCatalogRevision != currentCatalog.revision
+            {
+                throw DomainPersistenceError.stateConflict(
+                    expected: expectedCatalogRevision,
+                    actual: currentCatalog.revision
+                )
+            }
+            return try withLock(at: lockURL(document.workspaceID)) {
+                let current = try readCurrentJournalOrSeed(document: document)
+                guard current.revisions.workingRevision == expectedWorkspaceRevision else {
+                    throw DomainPersistenceError.stateConflict(
+                        expected: expectedWorkspaceRevision,
+                        actual: current.revisions.workingRevision
+                    )
+                }
+                let tombstone = DomainDeletionTombstone(
+                    workspaceID: document.workspaceID,
+                    fileURL: document.fileURL,
+                    operation: operation,
+                    deletedAt: now
+                )
+                let entries = currentCatalog.entries.filter {
+                    $0.workspaceID != document.workspaceID
+                }
+                var deletions = (currentCatalog.deletions ?? []).filter {
+                    $0.workspaceID != document.workspaceID
+                }
+                deletions.append(tombstone)
+                let next = RuntimeWorkspaceCatalog(
+                    version: RuntimeWorkspaceCatalog.schemaVersion,
+                    revision: currentCatalog.revision &+ 1,
+                    entries: entries,
+                    deletions: deletions,
+                    updatedAt: now
+                )
+                // Catalog deletion is the crash-safe authority point. The sidecar and artifact
+                // cleanup follow while both identity and workspace locks remain held.
+                try DomainPersistenceLock.atomicWrite(try encoder.encode(next), to: catalogURL)
+                // The catalog embeds the full tombstone. Its sidecar is a recoverable
+                // convenience and cannot turn an already-authoritative delete into failure.
+                try? DomainPersistenceLock.atomicWrite(
+                    try encoder.encode(tombstone),
+                    to: deletionURL(document.workspaceID)
+                )
+                try? fileManager.removeItem(at: journalURL(document.workspaceID))
+                try? fileManager.removeItem(at: revisionURL(document.workspaceID))
+                try? fileManager.removeItem(at: document.fileURL)
+                return DomainPersistenceDeleteCommit(
+                    catalogRevision: next.revision,
+                    tombstone: tombstone
+                )
+            }
+        }
+    }
+
+    private func externalDocumentBlocking(
         for snapshot: DomainWorkspaceSnapshot,
         savedDigest: String
-    ) -> Result<DomainWorkspaceDocument?, Error> {
+    ) -> Result<DomainWorkspaceDocument?, DomainPersistenceError> {
         do {
             guard fileManager.fileExists(atPath: snapshot.document.fileURL.path) else {
                 return .success(nil)
@@ -564,8 +1187,44 @@ package actor DomainPersistenceCoordinator {
             guard digest != savedDigest else { return .success(nil) }
             return .success(try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: snapshot.document.fileURL))
         } catch {
-            return .failure(error)
+            return .failure(.invalidWorkspaceDocument)
         }
+    }
+
+    private func resolvedPendingSave(
+        _ journal: DomainWorkingJournal
+    ) -> (journal: DomainWorkingJournal, document: DomainWorkspaceDocument)? {
+        guard let pendingSave = journal.pendingSave,
+              let savedBytes = try? Data(contentsOf: journal.fileURL),
+              DomainContentDigest.sha256(savedBytes) == pendingSave.documentDigest,
+              let document = try? DomainWorkspaceDocument.decode(
+                  documentBytes: savedBytes,
+                  fileURL: journal.fileURL
+              )
+        else { return nil }
+        let cleanRevisions = DomainRevisionState(
+            workingRevision: journal.revisions.workingRevision,
+            savedRevision: journal.revisions.workingRevision,
+            dirtyRevision: nil
+        )
+        return (DomainWorkingJournal(
+            workspaceID: journal.workspaceID,
+            fileURL: journal.fileURL,
+            revisions: cleanRevisions,
+            savedDigest: pendingSave.documentDigest,
+            workingDocument: nil,
+            contextRevisions: journal.contextRevisions.mapValues { state in
+                DomainRevisionState(
+                    workingRevision: state.workingRevision,
+                    savedRevision: state.workingRevision,
+                    dirtyRevision: nil
+                )
+            },
+            contextDigests: journal.contextDigests,
+            contextTombstones: journal.contextTombstones,
+            operations: journal.operations,
+            updatedAt: journal.updatedAt
+        ), document)
     }
 
     private func loadJournal(workspaceID: UUID) -> Result<DomainWorkingJournal?, Error> {
@@ -599,7 +1258,7 @@ package actor DomainPersistenceCoordinator {
             guard journal.version <= DomainWorkingJournal.schemaVersion else {
                 throw DomainPersistenceError.futureJournal(journal.version)
             }
-            return journal
+            return resolvedPendingSave(journal)?.journal ?? journal
         case .success(nil):
             let savedBytes = (try? Data(contentsOf: document.fileURL)) ?? document.documentBytes
             let savedDigest = DomainContentDigest.sha256(savedBytes)
@@ -625,42 +1284,90 @@ package actor DomainPersistenceCoordinator {
         }
     }
 
-    private func ensureCatalogEntry(for document: DomainWorkspaceDocument, now: Date) throws {
-        try DomainPersistenceLock.withLock(at: lockDirectory.appendingPathComponent("workspace-catalog.lock")) {
-            let current: RuntimeWorkspaceCatalog
-            if let data = try? Data(contentsOf: catalogURL) {
-                current = try decoder.decode(RuntimeWorkspaceCatalog.self, from: data)
-                guard current.version <= RuntimeWorkspaceCatalog.schemaVersion else {
-                    throw DomainPersistenceError.futureJournal(current.version)
-                }
-            } else {
-                current = RuntimeWorkspaceCatalog(
-                    version: RuntimeWorkspaceCatalog.schemaVersion,
-                    revision: 0,
-                    entries: try legacyCatalogEntries(),
-                    updatedAt: now
+    private func withExistingWorkspaceLocks<T>(
+        document: DomainWorkspaceDocument,
+        now: Date,
+        _ body: (UInt64) throws -> T
+    ) throws -> T {
+        try withLock(at: lockDirectory.appendingPathComponent("workspace-catalog.lock")) {
+            let catalog = try loadCurrentCatalog(now: now)
+            let isDeleted = (catalog.deletions ?? []).contains {
+                $0.workspaceID == document.workspaceID
+            }
+            guard !isDeleted else {
+                throw DomainPersistenceError.stateConflict(
+                    expected: catalog.revision,
+                    actual: catalog.revision &+ 1
                 )
             }
-            let entry = RuntimeWorkspaceCatalog.Entry(
-                workspaceID: document.workspaceID,
-                fileURL: document.fileURL
-            )
-            guard !current.entries.contains(entry) else { return }
-            var entries = current.entries.filter { $0.workspaceID != document.workspaceID }
-            entries.append(entry)
-            let next = RuntimeWorkspaceCatalog(
-                version: RuntimeWorkspaceCatalog.schemaVersion,
-                revision: current.revision &+ 1,
-                entries: entries.sorted { $0.workspaceID.uuidString < $1.workspaceID.uuidString },
-                updatedAt: now
-            )
-            try DomainPersistenceLock.atomicWrite(try encoder.encode(next), to: catalogURL)
+            return try withLock(at: lockURL(document.workspaceID)) {
+                if let entry = catalog.entries.first(where: {
+                    $0.workspaceID == document.workspaceID
+                }) {
+                    guard entry.fileURL.standardizedFileURL == document.fileURL.standardizedFileURL else {
+                        throw DomainPersistenceError.stateConflict(
+                            expected: catalog.revision,
+                            actual: catalog.revision &+ 1
+                        )
+                    }
+                    return try body(catalog.revision)
+                }
+
+                // A process may die after the create intent/document commit but before catalog
+                // publication. Only that runtime-owned create marker may complete identity here;
+                // an ordinary stale writer can never recreate a deleted/missing catalog entry.
+                let recovered = try readCurrentJournalOrSeed(document: document)
+                guard recovered.fileURL.standardizedFileURL == document.fileURL.standardizedFileURL,
+                      recovered.operations.contains(where: { $0.before == nil })
+                else {
+                    throw DomainPersistenceError.stateConflict(
+                        expected: catalog.revision,
+                        actual: catalog.revision &+ 1
+                    )
+                }
+                var entries = catalog.entries
+                entries.append(.init(
+                    workspaceID: document.workspaceID,
+                    fileURL: document.fileURL
+                ))
+                let repairedCatalog = RuntimeWorkspaceCatalog(
+                    version: RuntimeWorkspaceCatalog.schemaVersion,
+                    revision: catalog.revision &+ 1,
+                    entries: entries.sorted { $0.workspaceID.uuidString < $1.workspaceID.uuidString },
+                    deletions: catalog.deletions ?? [],
+                    updatedAt: now
+                )
+                try DomainPersistenceLock.atomicWrite(
+                    try encoder.encode(repairedCatalog),
+                    to: catalogURL
+                )
+                return try body(repairedCatalog.revision)
+            }
         }
+    }
+
+    private func loadCurrentCatalog(now: Date) throws -> RuntimeWorkspaceCatalog {
+        if fileManager.fileExists(atPath: catalogURL.path) {
+            let current = try decoder.decode(
+                RuntimeWorkspaceCatalog.self,
+                from: Data(contentsOf: catalogURL)
+            )
+            guard current.version <= RuntimeWorkspaceCatalog.schemaVersion else {
+                throw DomainPersistenceError.futureJournal(current.version)
+            }
+            return current
+        }
+        return RuntimeWorkspaceCatalog(
+            version: RuntimeWorkspaceCatalog.schemaVersion,
+            revision: 0,
+            entries: try legacyCatalogEntries(),
+            updatedAt: now
+        )
     }
 
     private func ensureLazyMigration(now: Date) throws {
         guard !fileManager.fileExists(atPath: policyURL.path) else { return }
-        try DomainPersistenceLock.withLock(at: lockDirectory.appendingPathComponent("runtime-policy.lock")) {
+        try withLock(at: lockDirectory.appendingPathComponent("runtime-policy.lock")) {
             guard !fileManager.fileExists(atPath: policyURL.path) else { return }
             let rollbackName = "migration-\(Int(now.timeIntervalSince1970))-\(identity.runtimeID.uuidString)"
             let rollbackDirectory = rollbackRoot.appendingPathComponent(rollbackName, isDirectory: true)
@@ -728,8 +1435,15 @@ package actor DomainPersistenceCoordinator {
     }
 }
 
-enum DomainPersistenceLock {
-    static func withLock<T>(at url: URL, _ body: () throws -> T) throws -> T {
+private enum DomainPersistenceLock {
+    private static let waitTimeoutNanoseconds: UInt64 = 2_000_000_000
+    private static let retryDelayMicroseconds: useconds_t = 10_000
+
+    static func withLock<T>(
+        at url: URL,
+        cancellation: DomainBlockingCancellation?,
+        _ body: () throws -> T
+    ) throws -> T {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
@@ -739,10 +1453,19 @@ enum DomainPersistenceLock {
             throw DomainPersistenceError.writeFailed("lock_open_failed_\(errno)")
         }
         defer { close(descriptor) }
-        guard flock(descriptor, LOCK_EX) == 0 else {
-            throw DomainPersistenceError.writeFailed("lock_acquire_failed_\(errno)")
+        let deadline = DispatchTime.now().uptimeNanoseconds &+ waitTimeoutNanoseconds
+        while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+            guard errno == EWOULDBLOCK || errno == EAGAIN else {
+                throw DomainPersistenceError.writeFailed("lock_acquire_failed_\(errno)")
+            }
+            try cancellation?.check()
+            guard DispatchTime.now().uptimeNanoseconds < deadline else {
+                throw DomainPersistenceError.lockTimedOut
+            }
+            usleep(retryDelayMicroseconds)
         }
         defer { flock(descriptor, LOCK_UN) }
+        try cancellation?.check()
         return try body()
     }
 

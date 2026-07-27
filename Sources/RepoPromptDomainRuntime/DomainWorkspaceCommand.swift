@@ -8,9 +8,10 @@ package enum DomainCommandOrigin: Codable, Equatable, Sendable {
 }
 
 package enum DomainWorkspaceCommand: Codable, Equatable, Sendable {
+    case createWorkspace(DomainWorkspaceDocument)
     case replaceWorkingDocument(DomainWorkspaceDocument)
     case saveWorkspaceDocument(workspaceID: UUID)
-    case removeWorkspace(workspaceID: UUID)
+    case deleteWorkspace(workspaceID: UUID)
     case resolveExternalConflict(workspaceID: UUID, acceptExternal: Bool)
 }
 
@@ -63,6 +64,8 @@ package enum DomainCommandErrorCode: String, Codable, Sendable {
     case workspaceUnavailable = "workspace_unavailable"
     case invalidDocument = "invalid_document"
     case persistenceFailure = "persistence_failure"
+    case lockTimedOut = "lock_timed_out"
+    case cancelled
 }
 
 package struct DomainCommandOutcome: Codable, Equatable, Sendable {

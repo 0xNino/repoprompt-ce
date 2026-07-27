@@ -417,7 +417,7 @@ final class MCPServerViewModel: ObservableObject {
     // ---------------------------------------------------------------------
     let windowID: Int
     private(set) var service: MCPService
-    private let logger = Logger(label: "com.repoprompt.mcp")
+    let logger = Logger(label: "com.repoprompt.mcp")
 
     #if DEBUG
         private var oracleChatSendOverrideForTesting: MCPOracleToolService.SendChat?
@@ -1710,7 +1710,9 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     var windowIDByConnection: [UUID: Int] = [:]
     let domainRoutingCoordinator: DomainRoutingCoordinator?
-    let domainWindowGeneration: UInt64
+    var domainWindowDescriptor: DomainWindowDescriptor?
+    var domainWindowRegistrationTask: Task<DomainWindowDescriptor?, Never>?
+    var domainRoutingWindowIsClosing = false
     @MainActor
     var tabContextCancellablesByConnectionID: [UUID: Set<AnyCancellable>] = [:]
     @MainActor
@@ -2493,22 +2495,13 @@ final class MCPServerViewModel: ObservableObject {
         self.workspaceSearch = workspaceSearch
         self.ensureGitDataRootLoaded = ensureGitDataRootLoaded
         self.domainRoutingCoordinator = domainRoutingCoordinator
-        domainWindowGeneration = UInt64.random(in: 1 ... UInt64.max)
         self.applyEditsApprovalStore = applyEditsApprovalStore
 
-        if let domainRoutingCoordinator {
-            let descriptor = DomainWindowDescriptor(
-                windowID: windowID,
-                generation: domainWindowGeneration,
-                activeWorkspaceID: workspaceManager.activeWorkspaceID,
-                activeContextID: workspaceManager.activeWorkspace?.activeComposeTabID,
-                isClosing: false,
-                presentationRevision: 0
-            )
-            Task {
-                _ = await domainRoutingCoordinator.registerWindow(descriptor, operationID: UUID())
-            }
-        }
+        scheduleDomainWindowRegistration(
+            activeWorkspaceID: workspaceManager.activeWorkspaceID,
+            activeContextID: workspaceManager.activeWorkspace?.activeComposeTabID,
+            presentationRevision: 0
+        )
 
         // Observe service state updates
         observeService()

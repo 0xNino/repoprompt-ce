@@ -161,6 +161,7 @@ package actor DomainRoutingCoordinator {
     private let clock = ContinuousClock()
     private var revision: UInt64 = 0
     private var windows: [Int: DomainWindowDescriptor] = [:]
+    private var nextWindowGeneration: [Int: UInt64] = [:]
     private var connections: [UUID: DomainConnectionBindingSnapshot] = [:]
     private var nextConnectionGeneration: [UUID: UInt64] = [:]
     private var pendingRunContexts: [UUID: DomainContextIdentity] = [:]
@@ -189,6 +190,30 @@ package actor DomainRoutingCoordinator {
         )
     }
 
+    /// Opens a presentation window with a runtime-issued monotonic incarnation.
+    /// Reusing an app window ID after teardown therefore cannot revive stale bindings.
+    package func openWindow(
+        windowID: Int,
+        activeWorkspaceID: UUID?,
+        activeContextID: UUID?,
+        presentationRevision: UInt64,
+        operationID: UUID
+    ) -> DomainRoutingOutcome {
+        if let prior = routingOperations[operationID] { return prior }
+        let generation = nextWindowGeneration[windowID, default: 0] &+ 1
+        nextWindowGeneration[windowID] = generation
+        windows[windowID] = DomainWindowDescriptor(
+            windowID: windowID,
+            generation: generation,
+            activeWorkspaceID: activeWorkspaceID,
+            activeContextID: activeContextID,
+            isClosing: false,
+            presentationRevision: presentationRevision
+        )
+        revision &+= 1
+        return finish(operationID, disposition: .applied, diagnostic: nil)
+    }
+
     package func registerWindow(
         _ descriptor: DomainWindowDescriptor,
         operationID: UUID,
@@ -198,12 +223,25 @@ package actor DomainRoutingCoordinator {
         guard expectedRevision == nil || expectedRevision == revision else {
             return finish(operationID, disposition: .conflict, diagnostic: "routing_revision_mismatch")
         }
-        if let current = windows[descriptor.windowID], current.generation > descriptor.generation {
-            return finish(operationID, disposition: .staleGeneration, diagnostic: "window_generation_stale")
+        if let current = windows[descriptor.windowID] {
+            guard current.generation <= descriptor.generation else {
+                return finish(operationID, disposition: .staleGeneration, diagnostic: "window_generation_stale")
+            }
+            guard current.generation != descriptor.generation
+                || current.presentationRevision <= descriptor.presentationRevision
+            else {
+                return finish(operationID, disposition: .staleGeneration, diagnostic: "window_presentation_revision_stale")
+            }
+        } else if descriptor.generation <= nextWindowGeneration[descriptor.windowID, default: 0] {
+            return finish(operationID, disposition: .staleGeneration, diagnostic: "window_generation_closed")
         }
         if windows[descriptor.windowID] == descriptor {
             return finish(operationID, disposition: .unchanged, diagnostic: nil)
         }
+        nextWindowGeneration[descriptor.windowID] = max(
+            nextWindowGeneration[descriptor.windowID, default: 0],
+            descriptor.generation
+        )
         windows[descriptor.windowID] = descriptor
         revision &+= 1
         return finish(operationID, disposition: .applied, diagnostic: nil)
@@ -248,6 +286,22 @@ package actor DomainRoutingCoordinator {
             ),
             binding: .unbound
         )
+        revision &+= 1
+        return finish(operationID, disposition: .applied, diagnostic: nil)
+    }
+
+    package func unregisterConnection(
+        _ connection: DomainConnectionRegistration,
+        operationID: UUID
+    ) -> DomainRoutingOutcome {
+        if let prior = routingOperations[operationID] { return prior }
+        guard let current = connections[connection.connectionID] else {
+            return finish(operationID, disposition: .unchanged, diagnostic: nil)
+        }
+        guard current.registration == connection else {
+            return finish(operationID, disposition: .staleGeneration, diagnostic: "connection_generation_replaced")
+        }
+        connections.removeValue(forKey: connection.connectionID)
         revision &+= 1
         return finish(operationID, disposition: .applied, diagnostic: nil)
     }
@@ -412,6 +466,8 @@ package actor DomainRoutingCoordinator {
             }
         }
         pendingRunContexts.removeAll()
+        windows.removeAll()
+        connections.removeAll()
         revision &+= 1
     }
 
@@ -427,8 +483,10 @@ package actor DomainRoutingCoordinator {
             diagnostic: diagnostic
         )
         routingOperations[operationID] = outcome
-        if routingOperations.count > 4096 {
-            routingOperations.removeValue(forKey: routingOperations.keys.first!)
+        if routingOperations.count > 4096,
+           let oldestOperationID = routingOperations.keys.first
+        {
+            routingOperations.removeValue(forKey: oldestOperationID)
         }
         return outcome
     }
