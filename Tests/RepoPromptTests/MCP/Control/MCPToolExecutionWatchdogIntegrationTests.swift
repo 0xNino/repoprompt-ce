@@ -1880,7 +1880,17 @@ import XCTest
                     XCTAssertFalse(isTerminal)
 
                     try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
-                    await Self.assertSocketClosed(second)
+                    let didCloseSocket = await Self.waitUntil(timeout: .seconds(2)) {
+                        endpoint.client.isClosedForTesting()
+                    }
+                    XCTAssertTrue(
+                        didCloseSocket,
+                        "Competing expiry force-disconnect must close the underlying client socket"
+                    )
+                    if !didCloseSocket {
+                        endpoint.client.close()
+                    }
+                    await Self.assertSocketClosed(second, request: "second active read")
                     let terminalAfterCompetingExpiry = await manager.debugIsExecutionWatchdogTerminal(
                         connectionID: endpoint.connectionID
                     )
@@ -2442,14 +2452,17 @@ import XCTest
             return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         }
 
-        private static func assertSocketClosed(_ task: Task<PersistentMCPTestRPCResponse, Error>) async {
+        private static func assertSocketClosed(
+            _ task: Task<PersistentMCPTestRPCResponse, Error>,
+            request: String = "request"
+        ) async {
             do {
                 _ = try await task.value
-                XCTFail("Expected socket closure")
+                XCTFail("Expected socket closure for \(request)")
             } catch PersistentMCPTestSocketClient.ClientError.closed {
                 // Expected.
             } catch {
-                XCTFail("Expected socket closure, got \(error)")
+                XCTFail("Expected socket closure for \(request), got \(error)")
             }
         }
     }

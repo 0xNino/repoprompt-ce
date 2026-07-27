@@ -2105,6 +2105,10 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             withStateLock { nextRequestID }
         }
 
+        func isClosedForTesting() -> Bool {
+            withStateLock { isClosed }
+        }
+
         func installResponseInterceptor(
             for requestID: Int,
             interceptor: @escaping @Sendable (String) async throws -> String
