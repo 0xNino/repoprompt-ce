@@ -512,19 +512,19 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.socketURL.path))
     }
 
-    func testFullStopTombstonesPublishedChildListenerBeforeQueuedStartCanBind() async throws {
+    func testFullStopTombstonesRegisteredStartupCandidateBeforeQueuedStartCanBind() async throws {
         #if DEBUG
-            try await Self.withIsolatedManagerSocket(prefix: "published-tombstone") { manager, socketURL in
-                await manager.debugSuspendNextLifecycleFenceCheckpoint(.listenerPublishedBeforeStartInvocation)
+            try await Self.withIsolatedManagerSocket(prefix: "candidate-tombstone") { manager, socketURL in
+                await manager.debugSuspendNextLifecycleFenceCheckpoint(.listenerCandidateRegisteredBeforeStartInvocation)
                 let staleStartTask = Task { await manager.start() }
-                let listenerPublished = await Self.waitUntil {
-                    await manager.debugIsLifecycleFenceCheckpointSuspended(.listenerPublishedBeforeStartInvocation)
+                let candidateRegistered = await Self.waitUntil {
+                    await manager.debugIsLifecycleFenceCheckpointSuspended(.listenerCandidateRegisteredBeforeStartInvocation)
                 }
-                XCTAssertTrue(listenerPublished)
+                XCTAssertTrue(candidateRegistered)
                 XCTAssertFalse(FileManager.default.fileExists(atPath: socketURL.path))
 
                 await manager.stop()
-                await manager.debugResumeLifecycleFenceCheckpoint(.listenerPublishedBeforeStartInvocation)
+                await manager.debugResumeLifecycleFenceCheckpoint(.listenerCandidateRegisteredBeforeStartInvocation)
                 await staleStartTask.value
 
                 let runningAfterStaleStart = await manager.isRunning()
@@ -693,14 +693,45 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
                 XCTAssertNil(staleWaiterResult)
                 XCTAssertEqual(waiterCountAfterStopInvalidation, 0)
 
-                await manager.start()
+                // The replacement start must join ready publication rather than returning
+                // while the stopped predecessor still occupies the ready slot.
+                await manager.debugSuspendNextLifecycleFenceCheckpoint(.listenerStartedBeforeReadyPublication)
+                let replacementStartCompletion = AsyncCounter()
+                let replacementStartTask = Task {
+                    await manager.start()
+                    await replacementStartCompletion.increment()
+                }
+                let replacementLifecycleStarted = await Self.waitUntil {
+                    await manager.debugLifecycleGenerationForLifecycleFenceTest() != initialLifecycleGeneration
+                }
+                XCTAssertTrue(replacementLifecycleStarted)
                 let replacementLifecycleGeneration = await manager.debugLifecycleGenerationForLifecycleFenceTest()
                 XCTAssertNotEqual(replacementLifecycleGeneration, initialLifecycleGeneration)
+                let completionWhilePredecessorOwnsSlot = await replacementStartCompletion.value
+                XCTAssertEqual(completionWhilePredecessorOwnsSlot, 0)
+
+                // The old teardown clears only its own ready slot, then schedules the current
+                // lifecycle's replacement. Hold that replacement after it is accepting but
+                // before ready publication to prove the two states cannot be conflated.
                 await manager.debugResumeLifecycleFenceCheckpoint(.listenerStopReturnedBeforeConditionalClear)
                 await stopTask.value
+                let replacementStarted = await Self.waitUntil {
+                    await manager.debugIsLifecycleFenceCheckpointSuspended(.listenerStartedBeforeReadyPublication)
+                }
+                XCTAssertTrue(replacementStarted)
+                let prematurelyPublished = await manager.debugHasCurrentBootstrapListenerForLifecycleFenceTest()
+                XCTAssertFalse(prematurelyPublished)
+                let completionBeforeReadyPublication = await replacementStartCompletion.value
+                XCTAssertEqual(completionBeforeReadyPublication, 0)
+                try Self.assertUnixSocketExists(at: socketURL)
+                try Self.assertBootstrapAdmissionAccepted(at: socketURL)
 
+                await manager.debugResumeLifecycleFenceCheckpoint(.listenerStartedBeforeReadyPublication)
+                await replacementStartTask.value
                 let replacementListenerReady = await Self.waitForCurrentBootstrapListener(manager, at: socketURL)
                 XCTAssertTrue(replacementListenerReady)
+                let completionAfterReadyPublication = await replacementStartCompletion.value
+                XCTAssertEqual(completionAfterReadyPublication, 1)
                 try Self.assertBootstrapAdmissionAccepted(at: socketURL)
             }
         #else

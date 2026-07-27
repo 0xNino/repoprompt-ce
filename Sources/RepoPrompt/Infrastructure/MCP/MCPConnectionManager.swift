@@ -812,7 +812,10 @@ actor ServerNetworkManager {
     private var lifecycleGeneration: UInt64 = 0
     private var isEnabledState: Bool = true
 
-    // Bootstrap socket server
+    // Bootstrap socket server. Startup candidates remain separate until bind/listen and
+    // accept-source creation succeed; only bootstrapSocketServer is externally ready.
+    private var bootstrapStartingSocketServer: BootstrapSocketServer?
+    private var bootstrapStartingSocketServerLifecycleGeneration: UInt64?
     private var bootstrapSocketServer: BootstrapSocketServer?
     private var bootstrapSocketServerLifecycleGeneration: UInt64?
     private var bootstrapSocketTask: Task<Void, Never>?
@@ -825,6 +828,7 @@ actor ServerNetworkManager {
     private var lastBootstrapRestartAt: Date = .distantPast
     private let bootstrapRestartMinInterval: TimeInterval = 2.0
     private var bootstrapStartFailures: Int = 0
+    private let bootstrapStartupReadinessTimeout: TimeInterval = 5.0
     private var lastBootstrapHealthCheckAt: Date = .distantPast
     private let bootstrapHealthCheckInterval: TimeInterval = 5.0
 
@@ -847,7 +851,8 @@ actor ServerNetworkManager {
         }
 
         enum DebugLifecycleFenceCheckpoint: Hashable {
-            case listenerPublishedBeforeStartInvocation
+            case listenerCandidateRegisteredBeforeStartInvocation
+            case listenerStartedBeforeReadyPublication
             case listenerStopReturnedBeforeConditionalClear
             case restartTaskBeforePerform
         }
@@ -976,6 +981,8 @@ actor ServerNetworkManager {
 
         private func debugRequireFullyStoppedForBootstrapSocketURLOverride() throws {
             guard !isRunningState,
+                  bootstrapStartingSocketServer == nil,
+                  bootstrapStartingSocketServerLifecycleGeneration == nil,
                   bootstrapSocketServer == nil,
                   bootstrapSocketServerLifecycleGeneration == nil,
                   bootstrapSocketTask == nil,
@@ -4224,11 +4231,72 @@ actor ServerNetworkManager {
         bootstrapSocketTask?.cancel()
         await startBootstrapSocketServer(lifecycleGeneration: startLifecycleGeneration)
 
-        // A full shutdown may have run while listener startup awaited another actor.
+        // A full shutdown may have run while listener startup awaited another actor. Joining
+        // authoritative ready publication prevents start() from returning through a stale slot
+        // while its current-generation replacement is still queued behind teardown.
         guard isCurrentLifecycle(startLifecycleGeneration) else { return }
+        let listenerReady = await waitForBootstrapListenerReady(
+            lifecycleGeneration: startLifecycleGeneration,
+            timeout: bootstrapStartupReadinessTimeout
+        )
+        guard isCurrentLifecycle(startLifecycleGeneration) else { return }
+        guard listenerReady else {
+            log.error("Bootstrap listener did not become ready within \(bootstrapStartupReadinessTimeout)s for lifecycle \(startLifecycleGeneration)")
+            return
+        }
 
         // Start periodic maintenance loop for cleanup tasks
         startMaintenanceLoop(lifecycleGeneration: startLifecycleGeneration)
+    }
+
+    /// Bounded join on the ready slot. This is the sole startup-completion probe: the slot
+    /// identity must still be current after cross-actor diagnostics, and all listener
+    /// acceptability invariants must hold. Retry/backoff lets identity-fenced stale teardown
+    /// hand ownership to the replacement without a busy loop or an unbounded startup await.
+    private func waitForBootstrapListenerReady(
+        lifecycleGeneration expectedLifecycleGeneration: UInt64,
+        timeout: TimeInterval
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        var retryDelay: TimeInterval = 0.005
+
+        while isCurrentLifecycle(expectedLifecycleGeneration), !Task.isCancelled {
+            if let server = bootstrapSocketServer,
+               bootstrapSocketServerLifecycleGeneration == expectedLifecycleGeneration
+            {
+                let diagnostics = await server.diagnostics()
+                guard isCurrentLifecycle(expectedLifecycleGeneration) else { return false }
+                if isCurrentBootstrapListener(server, lifecycleGeneration: expectedLifecycleGeneration),
+                   diagnostics.isRunning,
+                   diagnostics.listenFDValid,
+                   diagnostics.ownsSocketPath,
+                   diagnostics.acceptSourceExists
+                {
+                    return true
+                }
+            }
+
+            guard Date() < deadline else { return false }
+            if bootstrapSocketServer == nil,
+               bootstrapStartingSocketServer == nil,
+               !bootstrapStartInProgress,
+               !bootstrapRestartInProgress
+            {
+                await startBootstrapSocketServer(lifecycleGeneration: expectedLifecycleGeneration)
+                continue
+            }
+
+            let remaining = max(0, deadline.timeIntervalSinceNow)
+            let sleepDuration = min(retryDelay, remaining)
+            guard sleepDuration > 0 else { return false }
+            do {
+                try await Task.sleep(for: .seconds(sleepDuration))
+            } catch {
+                return false
+            }
+            retryDelay = min(retryDelay * 2, 0.1)
+        }
+        return false
     }
 
     /// Starts the periodic maintenance loop for cleanup tasks.
@@ -4582,16 +4650,35 @@ actor ServerNetworkManager {
             && bootstrapSocketServerLifecycleGeneration == expectedLifecycleGeneration
     }
 
-    /// Starts the bootstrap socket server for UNIX socket connections.
+    private func isCurrentBootstrapStartingListener(
+        _ server: BootstrapSocketServer,
+        lifecycleGeneration expectedLifecycleGeneration: UInt64
+    ) -> Bool {
+        isCurrentLifecycle(expectedLifecycleGeneration)
+            && bootstrapStartingSocketServer === server
+            && bootstrapStartingSocketServerLifecycleGeneration == expectedLifecycleGeneration
+    }
+
+    private func isCurrentBootstrapAdmissionListener(
+        _ server: BootstrapSocketServer,
+        lifecycleGeneration expectedLifecycleGeneration: UInt64
+    ) -> Bool {
+        isCurrentBootstrapListener(server, lifecycleGeneration: expectedLifecycleGeneration)
+            || isCurrentBootstrapStartingListener(server, lifecycleGeneration: expectedLifecycleGeneration)
+    }
+
+    /// Starts the bootstrap socket server for UNIX socket connections. The candidate slot
+    /// gives full stop identity-fenced ownership before the first cross-actor await, while the
+    /// ready slot is published only after bind/listen and accept-source creation succeed.
     private func startBootstrapSocketServer(lifecycleGeneration expectedLifecycleGeneration: UInt64) async {
         #if DEBUG
             print("[MCPStartup] startBootstrapSocketServer entered running=\(isRunningState) enabled=\(isEnabledState) inProgress=\(bootstrapStartInProgress) generation=\(expectedLifecycleGeneration)")
         #endif
         guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
         guard !bootstrapStartInProgress else { return }
-        // Never overwrite a listener that another lifecycle is still tearing down.
-        // A new lifecycle maintenance tick will retry once identity-fenced teardown clears it.
-        guard bootstrapSocketServer == nil else { return }
+        // Never overwrite a ready listener or startup candidate that another lifecycle is
+        // still tearing down. Identity-fenced teardown schedules the current replacement.
+        guard bootstrapSocketServer == nil, bootstrapStartingSocketServer == nil else { return }
         bootstrapStartInProgress = true
         bootstrapStartLifecycleGeneration = expectedLifecycleGeneration
         defer { clearBootstrapStartIfMatching(lifecycleGeneration: expectedLifecycleGeneration) }
@@ -4600,10 +4687,10 @@ actor ServerNetworkManager {
 
         let socketURL = resolvedBootstrapSocketURL()
         let server = BootstrapSocketServer(socketURL: socketURL, logger: log)
-        bootstrapSocketServer = server
-        bootstrapSocketServerLifecycleGeneration = expectedLifecycleGeneration
+        bootstrapStartingSocketServer = server
+        bootstrapStartingSocketServerLifecycleGeneration = expectedLifecycleGeneration
         #if DEBUG
-            await debugSuspendLifecycleFenceCheckpointIfNeeded(.listenerPublishedBeforeStartInvocation)
+            await debugSuspendLifecycleFenceCheckpointIfNeeded(.listenerCandidateRegisteredBeforeStartInvocation)
         #endif
 
         do {
@@ -4623,10 +4710,35 @@ actor ServerNetworkManager {
                     clientName: clientName
                 )
             }
-            guard isCurrentBootstrapListener(server, lifecycleGeneration: expectedLifecycleGeneration) else {
-                await server.stop()
+            guard isCurrentBootstrapStartingListener(server, lifecycleGeneration: expectedLifecycleGeneration),
+                  bootstrapSocketServer == nil
+            else {
+                await stopBootstrapStartingSocketServer(
+                    server: server,
+                    lifecycleGeneration: expectedLifecycleGeneration
+                )
                 return
             }
+            #if DEBUG
+                await debugSuspendLifecycleFenceCheckpointIfNeeded(.listenerStartedBeforeReadyPublication)
+            #endif
+            guard isCurrentBootstrapStartingListener(server, lifecycleGeneration: expectedLifecycleGeneration),
+                  bootstrapSocketServer == nil
+            else {
+                await stopBootstrapStartingSocketServer(
+                    server: server,
+                    lifecycleGeneration: expectedLifecycleGeneration
+                )
+                return
+            }
+
+            // Publish readiness atomically only after BootstrapSocketServer.start has created
+            // an accepting listener. Admission recognizes this same candidate identity across
+            // the move so queued kernel connections are never rejected during publication.
+            bootstrapStartingSocketServer = nil
+            bootstrapStartingSocketServerLifecycleGeneration = nil
+            bootstrapSocketServer = server
+            bootstrapSocketServerLifecycleGeneration = expectedLifecycleGeneration
             #if DEBUG
                 print("[MCPStartup] BootstrapSocketServer.start succeeded socket=\(socketURL.path) generation=\(expectedLifecycleGeneration)")
             #endif
@@ -4636,13 +4748,10 @@ actor ServerNetworkManager {
             #if DEBUG
                 print("[MCPStartup] BootstrapSocketServer.start failed: \(error)")
             #endif
-            if bootstrapSocketServer === server,
-               bootstrapSocketServerLifecycleGeneration == expectedLifecycleGeneration
-            {
-                bootstrapSocketServer = nil
-                bootstrapSocketServerLifecycleGeneration = nil
-                scheduleBootstrapSocketServerStartForCurrentLifecycleIfNeeded(excluding: expectedLifecycleGeneration)
-            }
+            await stopBootstrapStartingSocketServer(
+                server: server,
+                lifecycleGeneration: expectedLifecycleGeneration
+            )
             guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
             bootstrapStartFailures += 1
             log.error("Failed to start bootstrap socket server: \(error) (failures=\(bootstrapStartFailures))")
@@ -4673,7 +4782,7 @@ actor ServerNetworkManager {
         connectionLog("Bootstrap socket connection: \(connectionID) from '\(clientName ?? "unknown")' (pid=\(clientPid), session=\(sessionToken.prefix(8))...)")
         mcpACPLog("[MCP-ACP] bootstrap connection connection=\(connectionID) bootstrapClientName=\(clientName ?? "unknown") pid=\(clientPid)")
 
-        guard isCurrentBootstrapListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
+        guard isCurrentBootstrapAdmissionListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
             return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
         }
 
@@ -4714,12 +4823,12 @@ actor ServerNetworkManager {
                 errorCode: MCPBootstrapErrorCode.serverNotReady.rawValue
             ))
         }
-        guard isCurrentBootstrapListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
+        guard isCurrentBootstrapAdmissionListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
             return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
         }
         #if DEBUG
             await debugAfterBootstrapPolicyReadinessForTesting?(sessionToken)
-            guard isCurrentBootstrapListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
+            guard isCurrentBootstrapAdmissionListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
                 return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
             }
         #endif
@@ -4762,7 +4871,7 @@ actor ServerNetworkManager {
             return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
         }
 
-        guard isCurrentBootstrapListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
+        guard isCurrentBootstrapAdmissionListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
             releaseBootstrapAdmissionClaim(
                 sessionToken: sessionToken,
                 connectionID: connectionID,
@@ -5615,13 +5724,36 @@ actor ServerNetworkManager {
         scheduleBootstrapSocketServerStartForCurrentLifecycleIfNeeded(excluding: expectedLifecycleGeneration)
     }
 
+    /// Stops one startup candidate without granting stale teardown authority over a newer
+    /// candidate. BootstrapSocketOwnership independently inode-fences pathname removal.
+    private func stopBootstrapStartingSocketServer(
+        server: BootstrapSocketServer?,
+        lifecycleGeneration expectedLifecycleGeneration: UInt64
+    ) async {
+        guard let server,
+              bootstrapStartingSocketServer === server,
+              bootstrapStartingSocketServerLifecycleGeneration == expectedLifecycleGeneration
+        else { return }
+
+        await server.stop()
+
+        guard bootstrapStartingSocketServer === server,
+              bootstrapStartingSocketServerLifecycleGeneration == expectedLifecycleGeneration
+        else { return }
+        bootstrapStartingSocketServer = nil
+        bootstrapStartingSocketServerLifecycleGeneration = nil
+
+        scheduleBootstrapSocketServerStartForCurrentLifecycleIfNeeded(excluding: expectedLifecycleGeneration)
+    }
+
     /// If stale listener teardown or startup failure cleared an older publication after a
     /// cold start began, restore the current lifecycle promptly. Maintenance is the fallback.
     private func scheduleBootstrapSocketServerStartForCurrentLifecycleIfNeeded(excluding staleLifecycleGeneration: UInt64) {
         let replacementLifecycleGeneration = lifecycleGeneration
         guard replacementLifecycleGeneration != staleLifecycleGeneration,
               isCurrentLifecycle(replacementLifecycleGeneration),
-              bootstrapSocketServer == nil
+              bootstrapSocketServer == nil,
+              bootstrapStartingSocketServer == nil
         else { return }
 
         Task { [weak self] in
@@ -5634,6 +5766,9 @@ actor ServerNetworkManager {
         let stoppedLifecycleGeneration = lifecycleGeneration
         let listenerToStop = bootstrapSocketServerLifecycleGeneration == stoppedLifecycleGeneration
             ? bootstrapSocketServer
+            : nil
+        let startingListenerToStop = bootstrapStartingSocketServerLifecycleGeneration == stoppedLifecycleGeneration
+            ? bootstrapStartingSocketServer
             : nil
         let connectionsToStop = connections.compactMap { connectionID, connectionManager -> (UUID, any MCPServerConnection)? in
             guard connectionLifecycleGenerationByID[connectionID] == stoppedLifecycleGeneration else { return nil }
@@ -5741,6 +5876,10 @@ actor ServerNetworkManager {
         }
 
         await stopBootstrapSocketServer(server: listenerToStop, lifecycleGeneration: stoppedLifecycleGeneration)
+        await stopBootstrapStartingSocketServer(
+            server: startingListenerToStop,
+            lifecycleGeneration: stoppedLifecycleGeneration
+        )
 
         // The registry detach above was synchronous; stale resumptions below only stop the
         // captured manager objects and never mutate a replacement lifecycle's registries.
@@ -14492,7 +14631,7 @@ actor ServerNetworkManager {
         case (nil, nil):
             true
         case let (sourceListener?, lifecycleGeneration?):
-            isCurrentBootstrapListener(sourceListener, lifecycleGeneration: lifecycleGeneration)
+            isCurrentBootstrapAdmissionListener(sourceListener, lifecycleGeneration: lifecycleGeneration)
         default:
             false
         }
