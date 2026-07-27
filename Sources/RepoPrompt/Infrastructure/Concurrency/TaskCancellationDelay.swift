@@ -2,9 +2,9 @@ import Foundation
 
 /// A nonthrowing delay for lifecycle-owned tasks that must wake promptly when cancelled.
 ///
-/// `Task.sleep` throws `CancellationError` during ordinary teardown. XCTest can surface that
-/// throw as an issue even when the owner catches it, so long-lived presentation tasks use this
-/// continuation-backed delay to make expected cancellation a value instead of an error.
+/// Cancellation is ordinary control flow for these owned tasks: callers need to distinguish an
+/// elapsed interval from owner shutdown without throwing out of the child task. The underlying
+/// timer is cancelled on every terminal path so teardown does not leave dormant scheduled work.
 enum TaskCancellationDelay {
     static func wait(nanoseconds: UInt64) async -> Bool {
         guard nanoseconds > 0 else { return !Task.isCancelled }
@@ -22,26 +22,27 @@ enum TaskCancellationDelay {
         private let lock = NSLock()
         private var resolution: Bool?
         private var continuation: CheckedContinuation<Bool, Never>?
-        private var workItem: DispatchWorkItem?
+        private var timer: DispatchSourceTimer?
 
         func install(_ continuation: CheckedContinuation<Bool, Never>, nanoseconds: UInt64) {
-            let workItem = DispatchWorkItem { [weak self] in
+            let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+            timer.schedule(deadline: .now() + .nanoseconds(Int(clamping: nanoseconds)))
+            timer.setEventHandler { [weak self] in
                 self?.resolve(elapsed: true)
             }
+
             lock.lock()
             if let resolution {
                 lock.unlock()
+                timer.activate()
+                timer.cancel()
                 continuation.resume(returning: resolution)
                 return
             }
             self.continuation = continuation
-            self.workItem = workItem
+            self.timer = timer
+            timer.activate()
             lock.unlock()
-
-            DispatchQueue.global(qos: .utility).asyncAfter(
-                deadline: .now() + .nanoseconds(Int(clamping: nanoseconds)),
-                execute: workItem
-            )
         }
 
         func resolve(elapsed: Bool) {
@@ -53,13 +54,11 @@ enum TaskCancellationDelay {
             resolution = elapsed
             let continuation = continuation
             self.continuation = nil
-            let workItem = workItem
-            self.workItem = nil
+            let timer = timer
+            self.timer = nil
             lock.unlock()
 
-            if !elapsed {
-                workItem?.cancel()
-            }
+            timer?.cancel()
             continuation?.resume(returning: elapsed)
         }
     }

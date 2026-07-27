@@ -432,10 +432,6 @@ final class GitViewModel: ObservableObject {
         setGitWorktreeContextsByRootPath(contexts)
     }
 
-    private static func waitForGitContextRefreshInterval(_ intervalNanoseconds: UInt64) async -> Bool {
-        await TaskCancellationDelay.wait(nanoseconds: intervalNanoseconds)
-    }
-
     private func updateGitContextRefreshLoop() {
         guard !isPreparingForWindowClose else { return }
         guard !lastVisibleRootRawPaths.isEmpty else {
@@ -449,7 +445,7 @@ final class GitViewModel: ObservableObject {
         gitContextRefreshTask = Task { [weak self, refreshGitContexts] in
             while !Task.isCancelled {
                 if intervalNanoseconds > 0 {
-                    guard await Self.waitForGitContextRefreshInterval(intervalNanoseconds) else { break }
+                    guard await TaskCancellationDelay.wait(nanoseconds: intervalNanoseconds) else { break }
                 }
                 guard !Task.isCancelled else { break }
                 guard let request = self?.beginPeriodicGitContextRefresh() else {
@@ -504,10 +500,6 @@ final class GitViewModel: ObservableObject {
     }
 
     #if DEBUG
-        static func test_waitForGitContextRefreshInterval(_ intervalNanoseconds: UInt64) async -> Bool {
-            await waitForGitContextRefreshInterval(intervalNanoseconds)
-        }
-
         var test_hasGitContextRefreshTask: Bool {
             gitContextRefreshTask != nil
         }

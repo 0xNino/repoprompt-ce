@@ -59,16 +59,31 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
         XCTAssertEqual(window.promptManager.gitViewModel.test_pendingWindowCloseTaskCount, 0)
     }
 
-    func testPeriodicGitContextRefreshDelayContainsExpectedCancellation() async {
-        let delayTask = Task {
-            await GitViewModel.test_waitForGitContextRefreshInterval(60_000_000_000)
-        }
+    func testPeriodicGitContextRefreshLoopCancelsAndDrainsOwnedDelay() async throws {
+        let refreshProbe = GitContextRefreshInvocationProbe()
+        let viewModel = GitViewModel(
+            gitContextRefreshIntervalNanoseconds: 5_000_000_000,
+            refreshGitContexts: { rootPaths in
+                await refreshProbe.record(rootPaths: rootPaths)
+                return []
+            }
+        )
+        let root = FolderViewModel(
+            folder: Folder(name: "root", path: "/tmp/git-refresh-owned-delay", modificationDate: Date()),
+            rootPath: "/tmp/git-refresh-owned-delay"
+        )
+        viewModel.updateRootFolders([root])
+        let refreshTask = try XCTUnwrap(viewModel.test_gitContextRefreshTask)
         await Task.yield()
 
-        delayTask.cancel()
+        viewModel.prepareForWindowClose()
+        await viewModel.shutdownForWindowClose()
 
-        let intervalElapsed = await delayTask.value
-        XCTAssertFalse(intervalElapsed)
+        XCTAssertTrue(refreshTask.isCancelled)
+        XCTAssertFalse(viewModel.test_hasGitContextRefreshTask)
+        XCTAssertEqual(viewModel.test_pendingWindowCloseTaskCount, 0)
+        let invocationCount = await refreshProbe.invocationCount
+        XCTAssertEqual(invocationCount, 0)
     }
 
     func testSuspendedGitContextRefreshDoesNotRetainViewModel() async throws {
@@ -305,6 +320,70 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
 }
 
 @MainActor
+final class TaskCancellationDelayTests: XCTestCase {
+    func testElapsedDelayReturnsTrue() async {
+        let elapsed = await TaskCancellationDelay.wait(nanoseconds: 1_000_000)
+
+        XCTAssertTrue(elapsed)
+    }
+
+    func testPreCancelledDelayReturnsFalse() async {
+        let elapsed = await preCancelledDelayResult(nanoseconds: 5_000_000_000)
+
+        XCTAssertFalse(elapsed)
+    }
+
+    func testZeroIntervalReflectsCancellation() async {
+        let elapsed = await TaskCancellationDelay.wait(nanoseconds: 0)
+        let cancelled = await preCancelledDelayResult(nanoseconds: 0)
+
+        XCTAssertTrue(elapsed)
+        XCTAssertFalse(cancelled)
+    }
+
+    func testCancelFireRaceCompletesEachWaitExactlyOnce() async {
+        let completionProbe = TaskCancellationDelayCompletionProbe()
+        var waits: [Task<Bool, Never>] = []
+        var cancellations: [Task<Void, Never>] = []
+
+        for _ in 0 ..< 64 {
+            let wait = Task {
+                let elapsed = await TaskCancellationDelay.wait(nanoseconds: 1_000_000)
+                await completionProbe.recordCompletion()
+                return elapsed
+            }
+            waits.append(wait)
+            cancellations.append(Task {
+                try? await Task.sleep(nanoseconds: 1_000_000)
+                wait.cancel()
+            })
+        }
+
+        for wait in waits {
+            _ = await wait.value
+        }
+        for cancellation in cancellations {
+            await cancellation.value
+        }
+
+        let completionCount = await completionProbe.completionCount
+        XCTAssertEqual(completionCount, waits.count)
+    }
+
+    private func preCancelledDelayResult(nanoseconds: UInt64) async -> Bool {
+        let gate = TaskCancellationDelayStartGate()
+        let wait = Task {
+            await gate.waitForRelease()
+            return await TaskCancellationDelay.wait(nanoseconds: nanoseconds)
+        }
+        await gate.waitUntilEntered()
+        wait.cancel()
+        await gate.release()
+        return await wait.value
+    }
+}
+
+@MainActor
 final class WindowCloseCoordinatorPolicyTests: XCTestCase {
     func testTerminationAndAuthorizationAllowDespiteOtherwiseBlockingImpact() {
         let otherwiseBlockingSnapshot = makeSnapshot(
@@ -536,6 +615,53 @@ private actor APISettingsProviderValidationProbe {
 
     func recordStart() {
         startCount += 1
+    }
+}
+
+private actor GitContextRefreshInvocationProbe {
+    private(set) var invocationCount = 0
+
+    func record(rootPaths _: [String]) {
+        invocationCount += 1
+    }
+}
+
+private actor TaskCancellationDelayCompletionProbe {
+    private(set) var completionCount = 0
+
+    func recordCompletion() {
+        completionCount += 1
+    }
+}
+
+private actor TaskCancellationDelayStartGate {
+    private var entered = false
+    private var released = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func waitForRelease() async {
+        if !entered {
+            entered = true
+            let waiters = entryWaiters
+            entryWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+        guard !released else { return }
+        await withCheckedContinuation { releaseWaiters.append($0) }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { entryWaiters.append($0) }
+    }
+
+    func release() {
+        guard !released else { return }
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 }
 

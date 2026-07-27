@@ -316,7 +316,8 @@ import XCTest
                 "isSystemWorkspace": false,
                 "isHiddenInMenus": false
             ]]
-            try JSONSerialization.data(withJSONObject: staleIndex).write(
+            let staleIndexData = try JSONSerialization.data(withJSONObject: staleIndex)
+            try staleIndexData.write(
                 to: root.appendingPathComponent("Workspaces/workspacesIndex.json"),
                 options: .atomic
             )
@@ -379,6 +380,11 @@ import XCTest
             }
             XCTAssertEqual(resolved.health, .writable)
             XCTAssertNil(resolved.revisions.dirtyRevision)
+            let resolvedCatalog = await runtime.workspaceStore.snapshot()
+            let resolvedProjectionCompleted = await presentationBridge.waitUntilProjected(
+                through: resolvedCatalog.publicationSequence
+            )
+            XCTAssertTrue(resolvedProjectionCompleted)
             let accepted = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
                 documentBytes: resolved.document.documentBytes,
                 fileURL: resolved.document.fileURL
@@ -386,32 +392,83 @@ import XCTest
             XCTAssertEqual(accepted.currentPromptText, "external accepted state")
 
             let authoritativeURL = resolved.document.fileURL
-            let renameIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspaceID })
-            manager.workspaces[renameIndex].name = "Runtime Renamed"
-            manager.workspaces[renameIndex].dateModified = Date()
-            let renamedURL = try await manager.saveWorkspaceToFileAsync(
-                manager.workspaces[renameIndex],
-                source: .renameWorkspace
-            )
-            XCTAssertEqual(renamedURL, authoritativeURL)
+            let authoritativeDirectory = authoritativeURL.deletingLastPathComponent().standardizedFileURL
+            let indexURL = root.appendingPathComponent("Workspaces/workspacesIndex.json")
+            let renamedNotification = expectation(description: "rename publishes workspace list change after persistence")
+            let renamedObserver = NotificationCenter.default.addObserver(
+                forName: .workspaceListDidChange,
+                object: nil,
+                queue: .main
+            ) { _ in
+                guard
+                    let data = try? Data(contentsOf: authoritativeURL),
+                    let persisted = try? WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                        documentBytes: data,
+                        fileURL: authoritativeURL
+                    ),
+                    persisted.name == "Runtime Renamed"
+                else { return }
+                renamedNotification.fulfill()
+            }
+            defer { NotificationCenter.default.removeObserver(renamedObserver) }
+            manager.renameWorkspace(accepted, newName: "  Runtime Renamed  ")
             let renamed = try await waitForDomainWorkspace(
                 runtime,
                 workspaceID: workspaceID,
-                description: "renamed working document publication"
+                description: "production rename command publication"
             ) { snapshot in
                 let projected = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
                     documentBytes: snapshot.document.documentBytes,
                     fileURL: snapshot.document.fileURL
                 )
                 return projected.name == "Runtime Renamed"
+                    && snapshot.revisions.dirtyRevision == nil
             }
+            await fulfillment(of: [renamedNotification], timeout: 5)
+            NotificationCenter.default.removeObserver(renamedObserver)
+
             XCTAssertEqual(renamed.document.fileURL, authoritativeURL)
+            XCTAssertEqual(
+                renamed.document.fileURL.deletingLastPathComponent().standardizedFileURL,
+                authoritativeDirectory
+            )
             XCTAssertTrue(FileManager.default.fileExists(atPath: authoritativeURL.path))
+            let legacyRenamedDirectory = root
+                .appendingPathComponent("Workspaces", isDirectory: true)
+                .appendingPathComponent("Workspace-Runtime Renamed-\(workspaceID.uuidString)", isDirectory: true)
+                .standardizedFileURL
+            if legacyRenamedDirectory != authoritativeDirectory {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: legacyRenamedDirectory.path))
+            }
             let renamedModel = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
                 documentBytes: renamed.document.documentBytes,
                 fileURL: renamed.document.fileURL
             )
             XCTAssertEqual(renamedModel.name, "Runtime Renamed")
+
+            let indexData = try Data(contentsOf: indexURL)
+            let indexEntries = try JSONDecoder().decode([WorkspaceIndexEntry].self, from: indexData)
+            XCTAssertEqual(indexData, staleIndexData)
+            XCTAssertNil(indexEntries.first { $0.id == workspaceID })
+            XCTAssertTrue(indexEntries.contains { $0.id == staleID })
+
+            let beforeEmptyRename = await runtime.workspaceStore.snapshot()
+            let emptyRenameNotification = expectation(description: "empty rename remains a no-op")
+            emptyRenameNotification.isInverted = true
+            let emptyRenameObserver = NotificationCenter.default.addObserver(
+                forName: .workspaceListDidChange,
+                object: nil,
+                queue: .main
+            ) { _ in
+                emptyRenameNotification.fulfill()
+            }
+            defer { NotificationCenter.default.removeObserver(emptyRenameObserver) }
+            manager.renameWorkspace(renamedModel, newName: "  \t  ")
+            await fulfillment(of: [emptyRenameNotification], timeout: 0.1)
+            NotificationCenter.default.removeObserver(emptyRenameObserver)
+            let afterEmptyRename = await runtime.workspaceStore.snapshot()
+            XCTAssertEqual(afterEmptyRename.publicationSequence, beforeEmptyRename.publicationSequence)
+            XCTAssertEqual(manager.workspace(withID: workspaceID)?.name, "Runtime Renamed")
         }
 
         func testCompositionUsesExplicitDomainRuntimeOwnershipOnlyWhenInjected() async throws {

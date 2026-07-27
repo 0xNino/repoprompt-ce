@@ -1733,12 +1733,9 @@ final class TabContextRoutingTests: XCTestCase {
     @MainActor
     func testManageSelectionSetPersistsAcrossConnectionRebindAndWorkspaceSerialization() async throws {
         let authorityRoot = try makeTemporaryDirectory(named: "isolated-domain-authority")
-        let defaults = UserDefaults.standard
-        let priorStoragePath = defaults.string(forKey: "GlobalCustomStorageURL")
-        defaults.set(
-            authorityRoot.appendingPathComponent("Workspaces", isDirectory: true).path,
-            forKey: "GlobalCustomStorageURL"
-        )
+        // Scope ownership is established before runtime startup can throw. A successful startup
+        // extends it through the teardown block; an early throw releases it via deinit.
+        let storageOverride = ScopedGlobalWorkspaceStorageOverride(authorityRoot: authorityRoot)
         let runtime = MCPDomainRuntime(configuration: .init(
             mode: .app,
             profileIdentifier: "tab-context-routing-\(UUID().uuidString)",
@@ -1758,12 +1755,7 @@ final class TabContextRoutingTests: XCTestCase {
             WindowStatesManager.shared.unregisterWindowState(window)
             await window.tearDown()
             _ = await runtime.shutdown()
-            if let priorStoragePath {
-                defaults.set(priorStoragePath, forKey: "GlobalCustomStorageURL")
-            } else {
-                defaults.removeObject(forKey: "GlobalCustomStorageURL")
-            }
-            try? FileManager.default.removeItem(at: authorityRoot.deletingLastPathComponent())
+            storageOverride.restore()
         }
         await window.workspaceManager.awaitInitialized()
 
@@ -3493,6 +3485,38 @@ final class TabContextRoutingTests: XCTestCase {
         }
     }
 #endif
+
+private final class ScopedGlobalWorkspaceStorageOverride {
+    private let defaults: UserDefaults
+    private let priorStoragePath: String?
+    private let cleanupRoot: URL
+    private var isRestored = false
+
+    init(authorityRoot: URL, defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        priorStoragePath = defaults.string(forKey: "GlobalCustomStorageURL")
+        cleanupRoot = authorityRoot.deletingLastPathComponent()
+        defaults.set(
+            authorityRoot.appendingPathComponent("Workspaces", isDirectory: true).path,
+            forKey: "GlobalCustomStorageURL"
+        )
+    }
+
+    func restore() {
+        guard !isRestored else { return }
+        isRestored = true
+        if let priorStoragePath {
+            defaults.set(priorStoragePath, forKey: "GlobalCustomStorageURL")
+        } else {
+            defaults.removeObject(forKey: "GlobalCustomStorageURL")
+        }
+        try? FileManager.default.removeItem(at: cleanupRoot)
+    }
+
+    deinit {
+        restore()
+    }
+}
 
 private actor TabContextHydrationGate {
     private var isReleased = false
