@@ -1657,9 +1657,20 @@ final class MCPServerViewModel: ObservableObject {
                 throw MCPError.internalError("Window deallocated while executing \(toolName)")
             }
             let appContext = await domainReadAppExecutionContext(for: context)
+            let executionServer: MCPServerViewModel
+            if let appContext {
+                guard let targetServer = await MainActor.run(body: {
+                    WindowStatesManager.shared.window(withID: appContext.targetWindowID)?.mcpServer
+                }) else {
+                    throw MCPError.internalError("Domain read target window changed before execution")
+                }
+                executionServer = targetServer
+            } else {
+                executionServer = self
+            }
             switch toolName {
             case "get_code_structure", "get_file_tree", "read_file", "file_search":
-                return try await fileToolProvider.executeDomainRead(
+                return try await executionServer.fileToolProvider.executeDomainRead(
                     toolName: toolName,
                     context: context,
                     appContext: appContext,
@@ -1667,7 +1678,7 @@ final class MCPServerViewModel: ObservableObject {
                     sideEffects: sideEffects
                 )
             case "workspace_context", "prompt":
-                return try await promptContextToolProvider.executeDomainRead(
+                return try await executionServer.promptContextToolProvider.executeDomainRead(
                     toolName: toolName,
                     context: context,
                     appContext: appContext,
@@ -1684,7 +1695,7 @@ final class MCPServerViewModel: ObservableObject {
                     args: args
                 )
             case "git":
-                return try await gitToolProvider.executeDomainRead(
+                return try await executionServer.gitToolProvider.executeDomainRead(
                     context: context,
                     args: args,
                     sideEffects: sideEffects

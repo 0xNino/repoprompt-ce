@@ -7,6 +7,7 @@ extension MCPServerViewModel {
         let metadata: RequestMetadata
         let resolvedTabContext: ResolvedTabContextSnapshot
         let lookupContext: WorkspaceLookupContext
+        let targetWindowID: Int
     }
 
     @MainActor
@@ -201,10 +202,21 @@ extension MCPServerViewModel {
                 diagnostic: "connection or routing coordinator unavailable"
             )
         }
+        guard let targetWindow = WindowStatesManager.shared.window(withID: context.windowID),
+              !targetWindow.isClosing
+        else {
+            return try domainReadUnavailable(
+                toolName: toolName,
+                requirement: requirement,
+                connectionID: connectionID,
+                diagnostic: "target window unavailable"
+            )
+        }
+        let targetServer = targetWindow.mcpServer
+        let targetWorkspaceManager = targetWindow.workspaceManager
         guard let workspaceID = context.workspaceID,
-              let workspaceManager,
-              let workspace = workspaceManager.workspaces.first(where: { $0.id == workspaceID }),
-              let domainWorkspaceAuthorityClient
+              let workspace = targetWorkspaceManager.workspaces.first(where: { $0.id == workspaceID }),
+              let targetWorkspaceAuthorityClient = targetServer.domainWorkspaceAuthorityClient
         else {
             return try domainReadUnavailable(
                 toolName: toolName,
@@ -215,11 +227,11 @@ extension MCPServerViewModel {
         }
 
         do {
-            // This awaited transient registration closes the debounce race and works for ephemeral
-            // workspaces without writing them to durable storage.
-            _ = try await domainWorkspaceAuthorityClient.registerForRead(
+            // The shared provider may be owned by a different window than the routed tab. Register
+            // against the resolved target window so awaited reads also cover ephemeral workspaces.
+            _ = try await targetWorkspaceAuthorityClient.registerForRead(
                 workspace,
-                fileURL: workspaceManager.workspaceFileURL(for: workspace)
+                fileURL: targetWorkspaceManager.workspaceFileURL(for: workspace)
             )
         } catch {
             return try domainReadUnavailable(
@@ -291,7 +303,8 @@ extension MCPServerViewModel {
             domainReadAppExecutionContexts[invocation.invocationID] = await DomainReadAppExecutionContext(
                 metadata: metadata,
                 resolvedTabContext: resolved,
-                lookupContext: lookupContext(for: context)
+                lookupContext: targetServer.lookupContext(for: context),
+                targetWindowID: context.windowID
             )
             return invocation
         } catch {
@@ -347,10 +360,12 @@ extension MCPServerViewModel {
             connectionID: metadata.connectionID,
             refreshesDomainRouting: false
         )
+        let targetServer = WindowStatesManager.shared.window(withID: context.windowID)?.mcpServer ?? self
         domainReadAppExecutionContexts[invocation.invocationID] = await DomainReadAppExecutionContext(
             metadata: metadata,
             resolvedTabContext: resolved,
-            lookupContext: lookupContext(for: context)
+            lookupContext: targetServer.lookupContext(for: context),
+            targetWindowID: context.windowID
         )
         return invocation
     }

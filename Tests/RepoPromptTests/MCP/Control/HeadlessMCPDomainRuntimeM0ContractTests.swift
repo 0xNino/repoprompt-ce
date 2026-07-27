@@ -455,6 +455,16 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertFalse(domainReadRouting.contains("validateDomainReadContext"))
         XCTAssertTrue(domainReadRouting.contains("domainReadAppExecutionContexts[invocation.invocationID]"))
         XCTAssertTrue(domainReadRouting.contains("releaseDomainReadAppExecutionContext"))
+        XCTAssertTrue(domainReadRouting.contains("WindowStatesManager.shared.window(withID: context.windowID)"))
+        XCTAssertTrue(domainReadRouting.contains("targetWorkspaceAuthorityClient.registerForRead"))
+        XCTAssertTrue(domainReadRouting.contains("lookupContext: targetServer.lookupContext(for: context)"))
+        let serverViewModel = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift"
+        )
+        XCTAssertTrue(serverViewModel.contains("window(withID: appContext.targetWindowID)?.mcpServer"))
+        XCTAssertTrue(serverViewModel.contains("executionServer.fileToolProvider.executeDomainRead"))
+        XCTAssertTrue(serverViewModel.contains("executionServer.promptContextToolProvider.executeDomainRead"))
+        XCTAssertTrue(serverViewModel.contains("executionServer.gitToolProvider.executeDomainRead"))
         let fileReadBackend = try source(
             "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift"
         )
