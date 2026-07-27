@@ -1040,6 +1040,9 @@ final class MCPServerViewModel: ObservableObject {
     private var toolRegistrationIntentGeneration: UInt64 = 0
     private var windowToolTransitionTail: Task<Bool, Never>?
     private var activeWindowToolRegistrationHandle: MCPDomainToolRegistrationHandle?
+    #if DEBUG
+        private var afterWindowToolRegistrationBeforeRetentionForTesting: (@MainActor @Sendable () async -> Void)?
+    #endif
 
     /// Controls whether the approval overlay is visible
     @Published var isApprovalOverlayVisible: Bool = false
@@ -2444,6 +2447,18 @@ final class MCPServerViewModel: ObservableObject {
         func setServiceForTesting(_ service: MCPService) {
             self.service = service
         }
+
+        @MainActor
+        func setAfterWindowToolRegistrationBeforeRetentionForTesting(
+            _ handler: (@MainActor @Sendable () async -> Void)?
+        ) {
+            afterWindowToolRegistrationBeforeRetentionForTesting = handler
+        }
+
+        @MainActor
+        func windowToolRegistrationIntentGenerationForTesting() -> UInt64 {
+            toolRegistrationIntentGeneration
+        }
     #endif
 
     // ---------------------------------------------------------------------
@@ -2730,7 +2745,7 @@ final class MCPServerViewModel: ObservableObject {
 
         guard enabled else {
             // Registration teardown is generation-fenced. Without a retained handle this view model
-            // has no authority to remove a registration that may belong to a newer participant.
+            // has no authority to remove a registration owned outside its transition lifecycle.
             if let handle = activeWindowToolRegistrationHandle {
                 await unregisterWindowToolRegistration(handle)
             }
@@ -2771,14 +2786,18 @@ final class MCPServerViewModel: ObservableObject {
 
         do {
             let registration = try await ServiceRegistry.register(windowToolCatalogService)
+            #if DEBUG
+                await afterWindowToolRegistrationBeforeRetentionForTesting?()
+            #endif
+            // Retain every successful generation before checking for supersession. A queued disable
+            // can then reclaim it by exact handle, while stale handles remain registry-fenced.
+            activeWindowToolRegistrationHandle = registration.handle
             guard intentGeneration == toolRegistrationIntentGeneration else {
                 if !windowToolsRequested {
-                    await ServiceRegistry.unregister(registration.handle)
+                    await unregisterWindowToolRegistration(registration.handle)
                 }
                 return false
             }
-
-            activeWindowToolRegistrationHandle = registration.handle
             do {
                 try await service.join(windowID: windowID)
                 guard intentGeneration == toolRegistrationIntentGeneration else {

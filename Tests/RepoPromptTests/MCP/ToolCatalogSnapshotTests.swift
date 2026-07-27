@@ -387,6 +387,108 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         #endif
     }
 
+    func testSupersededEnableRetainsRegistrationForDisableAndUniqueWindowRouting() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+
+                let supersededWindow = Self.makeWindowWithoutAutoStart()
+                supersededWindow.mcpServer.setServiceForTesting(MCPService(
+                    controllerStartOperation: {},
+                    controllerStopOperation: {},
+                    controllerFullShutdownOperation: {}
+                ))
+                WindowStatesManager.shared.registerWindowState(supersededWindow)
+
+                let registrationGate = AsyncTestGate()
+                supersededWindow.mcpServer.setAfterWindowToolRegistrationBeforeRetentionForTesting {
+                    await registrationGate.arriveAndWait()
+                }
+                let firstEnable = Task { @MainActor in
+                    await supersededWindow.mcpServer.setWindowToolsEnabled(true)
+                }
+                let registrationSuspended = await registrationGate.waitUntilEntered(timeout: .seconds(2))
+                XCTAssertTrue(registrationSuspended, "The first enable must suspend after registering its generation.")
+
+                let supersedingEnable = Task { @MainActor in
+                    await supersededWindow.mcpServer.setWindowToolsEnabled(true)
+                }
+                let secondIntentObserved = await Self.waitForWindowToolIntentGeneration(
+                    2,
+                    window: supersededWindow
+                )
+                XCTAssertTrue(secondIntentObserved)
+
+                let disabling = Task { @MainActor in
+                    await supersededWindow.mcpServer.stopServer()
+                }
+                let disableIntentObserved = await Self.waitForWindowToolIntentGeneration(
+                    3,
+                    window: supersededWindow
+                )
+                XCTAssertTrue(disableIntentObserved)
+
+                await registrationGate.release()
+                let firstEnableResult = await firstEnable.value
+                let supersedingEnableResult = await supersedingEnable.value
+                await disabling.value
+                XCTAssertFalse(firstEnableResult)
+                XCTAssertFalse(supersedingEnableResult)
+                supersededWindow.mcpServer.setAfterWindowToolRegistrationBeforeRetentionForTesting(nil)
+
+                let supersededScope = MCPDomainToolRegistrationScope.window(id: supersededWindow.windowID)
+                let afterDisable = await ServiceRegistry.catalogSnapshot()
+                XCTAssertFalse(
+                    afterDisable.activeScopesByToolName[MCPWindowToolName.readFile]?.contains(supersededScope) == true,
+                    "The disable must reclaim the generation registered by the superseded enable."
+                )
+
+                supersededWindow.beginClose()
+                await supersededWindow.tearDown()
+                WindowStatesManager.shared.unregisterWindowState(supersededWindow)
+
+                let liveWindow = Self.makeWindowWithoutAutoStart()
+                WindowStatesManager.shared.registerWindowState(liveWindow)
+                let liveRegistration: MCPDomainToolRegistrationResult
+                do {
+                    liveRegistration = try await ServiceRegistry.register(
+                        liveWindow.mcpServer.windowMCPToolCatalogService
+                    )
+                } catch {
+                    liveWindow.beginClose()
+                    await liveWindow.tearDown()
+                    WindowStatesManager.shared.unregisterWindowState(liveWindow)
+                    throw error
+                }
+                guard liveRegistration.disposition == .inserted else {
+                    liveWindow.beginClose()
+                    await liveWindow.tearDown()
+                    WindowStatesManager.shared.unregisterWindowState(liveWindow)
+                    throw ToolCatalogFixtureError.windowCatalogRegistrationWasNotOwned(
+                        String(describing: liveRegistration.disposition)
+                    )
+                }
+
+                let uniqueReadFile = await ServiceRegistry.resolveUniqueWindowTool(
+                    toolName: MCPWindowToolName.readFile
+                )
+                XCTAssertEqual(
+                    uniqueReadFile?.handle,
+                    liveRegistration.handle,
+                    "A closed superseded window must not poison single-window routing."
+                )
+
+                // The fixture owns this exact generation; release it before window teardown.
+                await ServiceRegistry.unregister(liveRegistration.handle)
+                liveWindow.beginClose()
+                await liveWindow.tearDown()
+                WindowStatesManager.shared.unregisterWindowState(liveWindow)
+            }
+        #else
+            throw XCTSkip("Window registration supersession inspection is DEBUG-only")
+        #endif
+    }
+
     func testWindowStopWithoutOwnedHandlePreservesExternalRegistrationGeneration() async throws {
         #if DEBUG
             try await MCPSharedServerTestLease.shared.withLease { _ in
@@ -898,6 +1000,21 @@ final class ToolCatalogSnapshotTests: XCTestCase {
     }
 
     #if DEBUG
+        private static func waitForWindowToolIntentGeneration(
+            _ expectedGeneration: UInt64,
+            window: WindowState,
+            timeout: Duration = .seconds(1)
+        ) async -> Bool {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            while window.mcpServer.windowToolRegistrationIntentGenerationForTesting() < expectedGeneration,
+                  clock.now < deadline
+            {
+                try? await clock.sleep(for: .milliseconds(5))
+            }
+            return window.mcpServer.windowToolRegistrationIntentGenerationForTesting() >= expectedGeneration
+        }
+
         private static func waitForTeardownRequestCount(
             _ expectedCount: Int,
             service: MCPService,

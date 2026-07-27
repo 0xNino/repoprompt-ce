@@ -62,7 +62,6 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
     func testAgentOwnedExplicitSetPersistsForIndependentCanonicalLookup() async throws {
         #if DEBUG
-            try await simulatePrecedingSharedMCPAvailabilityMutation()
             try await withFixture(agentOwned: true) { fixture in
                 try await runCheckpoint(fixture: fixture, scenario: .agentOwnedExplicitSetIndependentLookup)
             }
@@ -282,18 +281,6 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     throw error
                 }
             }
-        }
-
-        func simulatePrecedingSharedMCPAvailabilityMutation() async throws {
-            let manager = ServerNetworkManager.shared
-            let baseline = await manager.debugTransportState()
-            try await MCPSharedServerTestLease.shared.withLease(owner: #function) { _ in
-                await manager.setEnabled(!baseline.isEnabled)
-                let mutated = await manager.debugTransportState()
-                XCTAssertEqual(mutated.isEnabled, !baseline.isEnabled)
-            }
-            let restored = await manager.debugTransportState()
-            XCTAssertEqual(restored, baseline, "shared MCP lease must restore the exact transport baseline")
         }
 
         /// Dynamically proves one real retained BootstrapSocketConnectionManager/MCP.Server
@@ -3128,6 +3115,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     runID: runID
                 )
                 if let catalogRegistrationHandle {
+                    // The fixture owns this exact generation; release it before teardown runs stopServer().
                     await ServiceRegistry.unregister(catalogRegistrationHandle)
                 }
                 await window.tearDown()
@@ -3884,6 +3872,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 windowID: windowID,
                 runID: Self.runID
             )
+            // These exact generations are fixture-owned and must be released before window teardown.
             await ServiceRegistry.unregister(catalogRegistrationHandle)
             if let peerCatalogRegistrationHandle {
                 await ServiceRegistry.unregister(peerCatalogRegistrationHandle)

@@ -39,6 +39,35 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         #endif
     }
 
+    func testSharedServerLeaseNestedAcquisitionFailsWithOwnerDiagnostics() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease(owner: "outer-lease") { _ in
+                do {
+                    try await MCPSharedServerTestLease.shared.withLease(
+                        owner: "nested-lease",
+                        acquisitionTimeout: .milliseconds(50)
+                    ) { _ in
+                        XCTFail("A nested shared-server lease must not acquire while its outer owner is active.")
+                    }
+                    XCTFail("A nested shared-server lease must fail with a bounded diagnostic.")
+                } catch {
+                    let description = String(describing: error)
+                    XCTAssertTrue(description.contains("nested-lease"), description)
+                    XCTAssertTrue(description.contains("outer-lease"), description)
+                }
+
+                let waiterCount = await MCPSharedServerTestLease.shared.waiterCountForTesting()
+                XCTAssertEqual(waiterCount, 0)
+            }
+
+            try await withSharedServerLeaseTimeout(timeout: .seconds(2)) {
+                try await MCPSharedServerTestLease.shared.withLease(owner: "post-timeout-successor") { _ in }
+            }
+        #else
+            throw XCTSkip("Shared MCP server lease nesting regression requires DEBUG diagnostics helpers.")
+        #endif
+    }
+
     func testSharedServerLeaseRestoresInheritedTransportState() async throws {
         #if DEBUG
             let manager = ServerNetworkManager.shared
