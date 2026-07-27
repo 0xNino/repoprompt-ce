@@ -1,83 +1,31 @@
 import Foundation
-import JSONSchema
 import MCP
-import Ontology
+import RepoPromptDomainRuntime
 
 @MainActor
-final class MCPPromptContextToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .promptContext
-
-    private let runtime: MCPWindowToolRuntime
+final class MCPPromptContextToolProvider {
     private let dependencies: MCPWindowToolDependencies
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
-        self.runtime = runtime
+    init(runtime _: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
         self.dependencies = dependencies
     }
 
-    func buildTools() -> [Tool] {
-        [workspaceContextTool(), promptTool()]
-    }
-
-    private func workspaceContextTool() -> Tool {
-        runtime.tool(
-            name: MCPWindowToolName.workspaceContext,
-            freshnessPolicy: .providerManaged,
-            description: """
-            Canonical workspace context render/export tool.
-
-            Default behavior returns a snapshot of prompt, selection, code structure, and tokens.
-            Use `op` for render/export helpers, or omit it for the default snapshot.
-
-            **Default includes**: `["prompt","selection","code","tokens"]`
-
-            **Available includes**:
-            - `prompt`: Current prompt text
-            - `selection`: Selected files summary
-            - `code`: Code structure (codemaps) for selection
-            - `files`: Full file contents
-            - `tree`: File tree of selected files
-            - `tokens`: Token breakdown by component
-
-            **Operations**:
-            - `snapshot` (default) — build/render the current workspace context snapshot
-            - `export` — write the rendered export to disk
-            - `list_presets` — list copy presets
-            - `select_preset` — select the active copy preset for the bound tab
-
-            **Options**:
-            - `include`: Array of sections to include for snapshot rendering
-            - `path_display`: "relative" | "full"
-            - `copy_preset`: Override copy preset for token calculation / export rendering
-
-            **Worktree scope**: When an agent session is bound to a Git worktree, displayed paths may remain logical/canonical while filesystem reads/searches use the bound worktree. Responses include `worktree_scope` when this remapping is active.
-
-            **Examples**:
-            - Default snapshot: `{}`
-            - With file contents: `{"include":["prompt","selection","files"]}`
-            - Export: `{"op":"export","path":"context.txt"}`
-            - Preset override: `{"copy_preset":"Plan"}`
-
-            Related: manage_selection, get_file_tree, ask_oracle
-            """,
-            annotations: .repoPromptLocalReadOnly,
-            inputSchema: .object(
-                properties: [
-                    "op": .string(description: "Operation (default: 'snapshot')", enum: ["snapshot", "export", "list_presets", "select_preset"]),
-                    "include": .array(description: "What to include (defaults to prompt, selection, code, tokens)", items: .string(enum: ["prompt", "selection", "code", "files", "tree", "tokens"])),
-                    "path_display": .string(description: "Path display for blocks", enum: ["full", "relative"]),
-                    "path": .string(description: "File path for export operation"),
-                    "preset": .string(description: "Preset UUID, kind, or name"),
-                    "copy_preset": .string(description: "Preset UUID, kind, or name")
-                ],
-                required: []
-            )
-        ) { [self] _, args in
+    func executeDomainRead(
+        toolName: String,
+        context _: DomainReadContextHandle,
+        args: [String: Value]
+    ) async throws -> Value {
+        switch toolName {
+        case MCPWindowToolName.workspaceContext:
             try await executeWorkspaceContext(args: args)
+        case MCPWindowToolName.prompt:
+            try await executePrompt(args: args)
+        default:
+            throw MCPError.invalidParams("Unsupported prompt/context read tool: \(toolName)")
         }
     }
 
-    private func executeWorkspaceContext(args: [String: Value]) async throws -> Value {
+    func executeWorkspaceContext(args: [String: Value]) async throws -> Value {
         let op = (args["op"]?.stringValue ?? "snapshot").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if op != "snapshot" {
             var forwarded = args
@@ -111,51 +59,7 @@ final class MCPPromptContextToolProvider: MCPWindowToolProviding {
         return try Value(dto)
     }
 
-    private func promptTool() -> Tool {
-        runtime.tool(
-            name: MCPWindowToolName.prompt,
-            freshnessPolicy: .providerManaged,
-            description: """
-            Get or modify the shared prompt (instructions/notes).
-
-            **Operations**: get | set | append | clear | export | list_presets | select_preset
-
-            **Parameters by op**:
-            - `set`/`append`: `text` (required)
-            - `export`: `path` (required), `copy_preset` (optional override)
-            - `select_preset`: `preset` (required) - UUID, kind, or name
-
-            **Notes**:
-            - `select_preset` requires an explicitly bound tab context (not available during discovery runs)
-            - `export` writes clipboard content to file so it can be copy/pasted into ChatGPT (or another AI) for a second opinion; use `copy_preset` to override format
-            - `list_presets` returns all available copy presets with configurations
-
-            **Examples**:
-            - Get: `{"op":"get"}`
-            - Set: `{"op":"set","text":"Focus on error handling"}`
-            - Export: `{"op":"export","path":"context.txt"}`
-            - List presets: `{"op":"list_presets"}`
-            - Select preset: `{"op":"select_preset","preset":"Plan"}`
-
-            Related: workspace_context, manage_selection, ask_oracle
-            """,
-            annotations: .repoPromptLocalEphemeralState,
-            inputSchema: .object(
-                properties: [
-                    "op": .string(description: "Operation (default: 'get')", enum: ["get", "set", "append", "clear", "export", "list_presets", "select_preset"]),
-                    "text": .string(description: "Text for set/append"),
-                    "path": .string(description: "File path (required for export)"),
-                    "preset": .string(description: "Preset UUID, kind, or name"),
-                    "copy_preset": .string(description: "Preset UUID, kind, or name")
-                ],
-                required: []
-            )
-        ) { [self] _, args in
-            try await executePrompt(args: args)
-        }
-    }
-
-    private func executePrompt(args: [String: Value]) async throws -> Value {
+    func executePrompt(args: [String: Value]) async throws -> Value {
         try await executePromptBody(args: args)
     }
 

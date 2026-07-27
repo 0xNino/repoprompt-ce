@@ -1609,24 +1609,98 @@ final class MCPServerViewModel: ObservableObject {
         }
     )
 
+    @MainActor
+    private lazy var fileToolProvider = MCPFileToolProvider(
+        runtime: windowToolRuntime,
+        dependencies: windowToolDependencies
+    )
+    @MainActor
+    private lazy var promptContextToolProvider = MCPPromptContextToolProvider(
+        runtime: windowToolRuntime,
+        dependencies: windowToolDependencies
+    )
+    @MainActor
+    private lazy var oracleToolProvider = MCPOracleToolProvider(
+        runtime: windowToolRuntime,
+        dependencies: windowToolDependencies
+    )
+    @MainActor
+    private lazy var gitToolProvider = MCPGitToolProvider(
+        runtime: windowToolRuntime,
+        dependencies: windowToolDependencies
+    )
+    @MainActor
+    private lazy var historyToolProvider = MCPHistoryToolProvider(
+        runtime: windowToolRuntime,
+        dependencies: windowToolDependencies
+    )
+    @MainActor
+    private lazy var domainReadToolProvider = MCPDomainReadToolProvider(
+        resolveContext: { [weak self] toolName in
+            guard let self else {
+                throw MCPError.internalError("Window deallocated while resolving \(toolName) context")
+            }
+            return try await resolveDomainReadContext(toolName: toolName)
+        },
+        backend: MCPDomainReadToolBackend { [weak self] toolName, context, args, sideEffects in
+            guard let self else {
+                throw MCPError.internalError("Window deallocated while executing \(toolName)")
+            }
+            try await validateDomainReadContext(context, toolName: toolName)
+            switch toolName {
+            case "get_code_structure", "get_file_tree", "read_file", "file_search":
+                return try await fileToolProvider.executeDomainRead(
+                    toolName: toolName,
+                    context: context,
+                    args: args,
+                    sideEffects: sideEffects
+                )
+            case "workspace_context", "prompt":
+                return try await promptContextToolProvider.executeDomainRead(
+                    toolName: toolName,
+                    context: context,
+                    args: args
+                )
+            case "oracle_chat_log":
+                return try await oracleToolProvider.executeDomainOracleChatLog(
+                    context: context,
+                    args: args
+                )
+            case "history":
+                return try await historyToolProvider.executeDomainRead(
+                    context: context,
+                    args: args
+                )
+            case "git":
+                return try await gitToolProvider.executeDomainRead(
+                    context: context,
+                    args: args,
+                    sideEffects: sideEffects
+                )
+            default:
+                throw MCPError.internalError("Unsupported domain read tool: \(toolName)")
+            }
+        },
+        sideEffects: domainReadSideEffectCoordinator
+    )
+
     /// Single window-scoped service registered with ServiceRegistry for this window's MCP tool catalog.
     @MainActor
     private lazy var windowToolCatalogService = MCPWindowToolCatalogService(
         windowID: windowID,
         providers: [
             MCPSelectionToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
-            MCPFileToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
-            MCPPromptContextToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
+            fileToolProvider,
             MCPApplyEditsToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
-            MCPOracleToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
-            MCPGitToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
+            oracleToolProvider,
             MCPWorktreeToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPContextBuilderToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPAskUserToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPAgentControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
-            MCPAgentSessionControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
-            MCPHistoryToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies)
-        ]
+            MCPAgentSessionControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies)
+        ],
+        sharedBindings: domainReadToolProvider.bindings,
+        sharedBindingRuntime: windowToolRuntime
     )
     private var cancellables: Set<AnyCancellable> = []
 
@@ -1710,6 +1784,7 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     var windowIDByConnection: [UUID: Int] = [:]
     let domainRoutingCoordinator: DomainRoutingCoordinator?
+    let domainReadSideEffectCoordinator: DomainReadSideEffectCoordinator
     var domainWindowDescriptor: DomainWindowDescriptor?
     var domainWindowRegistrationTask: Task<DomainWindowDescriptor?, Never>?
     var domainRoutingWindowIsClosing = false
@@ -2484,6 +2559,7 @@ final class MCPServerViewModel: ObservableObject {
             WorkspaceManagerViewModel
         ) async throws -> WorkspaceRootRef,
         domainRoutingCoordinator: DomainRoutingCoordinator? = nil,
+        domainReadSideEffectCoordinator: DomainReadSideEffectCoordinator? = nil,
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared
     ) {
         self.service = service
@@ -2495,6 +2571,15 @@ final class MCPServerViewModel: ObservableObject {
         self.workspaceSearch = workspaceSearch
         self.ensureGitDataRootLoaded = ensureGitDataRootLoaded
         self.domainRoutingCoordinator = domainRoutingCoordinator
+        self.domainReadSideEffectCoordinator = domainReadSideEffectCoordinator ?? DomainReadSideEffectCoordinator(
+            identity: DomainRuntimeIdentity(
+                runtimeID: UUID(),
+                lifecycleGeneration: 1,
+                processID: ProcessInfo.processInfo.processIdentifier,
+                mode: .app,
+                createdAt: Date()
+            )
+        )
         self.applyEditsApprovalStore = applyEditsApprovalStore
 
         scheduleDomainWindowRegistration(

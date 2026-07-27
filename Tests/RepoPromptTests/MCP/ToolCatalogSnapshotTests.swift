@@ -42,6 +42,41 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertEqual(signatures, Self.expectedSignatures)
     }
 
+    func testSharedReadBindingRetainsAppRuntimeExecutionEnvelope() async throws {
+        let definition = try XCTUnwrap(
+            MCPDomainReadToolDefinitions.definitions.first { $0.name == MCPWindowToolName.readFile }
+        )
+        let binding = MCPDomainToolBinding(definition: definition) { arguments in
+            .object(["path": arguments["path"] ?? .null])
+        }
+        let recorder = SharedBindingRuntimeRecorder()
+        let runtime = MCPWindowToolRuntime(windowID: 73) { name, freshnessPolicy, arguments, implementation in
+            let providerManaged = if case .providerManaged = freshnessPolicy { true } else { false }
+            await recorder.record(name: name, providerManaged: providerManaged, arguments: arguments)
+            return try await implementation(
+                MCPWindowToolContext(toolName: name, windowID: 73),
+                arguments
+            )
+        }
+        let catalog = MCPWindowToolCatalogService(
+            windowID: 73,
+            providers: [],
+            sharedBindings: [binding],
+            sharedBindingRuntime: runtime
+        )
+
+        let tools = await catalog.tools
+        let tool = try XCTUnwrap(tools.first)
+        let value = try await tool(["path": .string("README.md")])
+        let invocation = await recorder.snapshot()
+
+        XCTAssertEqual(tool.name, MCPWindowToolName.readFile)
+        XCTAssertEqual(value.objectValue?["path"]?.stringValue, "README.md")
+        XCTAssertEqual(invocation?.name, MCPWindowToolName.readFile)
+        XCTAssertEqual(invocation?.providerManaged, true)
+        XCTAssertEqual(invocation?.arguments["path"]?.stringValue, "README.md")
+    }
+
     func testMCPServiceConcurrentColdJoinsAreSingleFlight() async throws {
         #if DEBUG
             let startProbe = ControlledMCPServiceStartProbe(outcomes: [.success])
@@ -1366,5 +1401,27 @@ private actor ServerControllerRegistrationOrderingProbe {
 
     func assertCompleted() throws {
         guard completed else { throw Failure.transportObservedBeforeRegistration }
+    }
+}
+
+private actor SharedBindingRuntimeRecorder {
+    struct Invocation {
+        let name: String
+        let providerManaged: Bool
+        let arguments: [String: Value]
+    }
+
+    private var invocation: Invocation?
+
+    func record(name: String, providerManaged: Bool, arguments: [String: Value]) {
+        invocation = Invocation(
+            name: name,
+            providerManaged: providerManaged,
+            arguments: arguments
+        )
+    }
+
+    func snapshot() -> Invocation? {
+        invocation
     }
 }

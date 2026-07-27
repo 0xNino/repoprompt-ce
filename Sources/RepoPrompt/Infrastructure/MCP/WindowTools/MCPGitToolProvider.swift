@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptDomainRuntime
 
 @MainActor
 private final class MCPGitRequestContext {
@@ -159,6 +160,18 @@ private final class MCPGitRequestContext {
     }
 }
 
+private actor GitArtifactCommitResultBox {
+    private var aliases: [String] = []
+
+    func store(_ aliases: [String]) {
+        self.aliases = aliases
+    }
+
+    func value() -> [String] {
+        aliases
+    }
+}
+
 private struct MCPGitArtifactRepoOutcome {
     typealias Reply = ToolResultDTOs.GitToolReplyDTO
 
@@ -182,15 +195,11 @@ private struct MCPGitDiffRepoOutcome {
 }
 
 @MainActor
-final class MCPGitToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .git
-
-    private let runtime: MCPWindowToolRuntime
+final class MCPGitToolProvider {
     private let dependencies: MCPWindowToolDependencies
     private var stagedAdvertisementsByInvocation: [UUID: [GitDiffPublishedArtifact]] = [:]
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
-        self.runtime = runtime
+    init(runtime _: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
         self.dependencies = dependencies
     }
 
@@ -324,114 +333,30 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         )
     }
 
-    func buildTools() -> [Tool] {
-        [gitTool()]
-    }
-
-    private func gitTool() -> Tool {
-        runtime.tool(
-            name: MCPWindowToolName.git,
-            freshnessPolicy: .providerManaged,
-            description: """
-            Safe, read-only git operations.
-
-            **Operations**: status | diff | log | show | blame
-
-            **Compare specs** (for diff/show):
-            | Spec | Meaning |
-            |------|--------|
-            | `uncommitted` | Working dir vs HEAD (default) |
-            | `staged` | Staged changes vs HEAD |
-            | `unstaged` | Working dir vs staged |
-            | `back:N` | HEAD~N..HEAD |
-            | `mergebase:X` | Working dir vs merge-base with X |
-            | `main` | Working dir vs merge-base with trunk branch (auto-detected) |
-            | `uncommitted:main` | Uncommitted vs merge-base with trunk branch |
-            | `staged:main` | Staged vs merge-base with trunk branch |
-            | `trunk` | Alias for `main` |
-            | `last` | vs CURRENT snapshot |
-            | `<snapshot_id>` | vs specific snapshot |
-            | `<revspec>` | Any git revspec |
-
-            **Detail levels** (for diff/show):
-            - `summary` (default): Totals only
-            - `files`: File list with stats
-            - `patches`: Patch hunks, truncated for safety (~300 lines)
-            - `full`: Patch hunks, untruncated (may be large)
-
-            **Publishing artifacts** (`artifacts=true`):
-            Writes snapshot files to disk for persistent reference. **Required for ask_oracle review mode** to include git diff context.
-            - Creates MAP.txt, files.tsv, and optional patches
-            - Primary review artifacts are auto-selected into context when possible
-            - `mode`: "quick" | "standard" | "deep" (default: "standard")
-            - `scope`: "all" | "selected" — filter to selected files only
-
-            **Repo targeting**:
-            - Generic calls default to the first loaded root's repo; nested Agent Context Builder runs default to their frozen selected repository target
-            - `repo_root`: Target specific repo (path or name)
-            - `repo_roots`: Array for multi-repo operations (status, diff)
-            - Tree specifiers: append `@wt` (explicit worktree), `@main` (main checkout), or `@main:<branch>` to target a worktree by branch (local branch name)
-
-            **Safety**: --no-ext-diff, --no-textconv, --color=never, GIT_TERMINAL_PROMPT=0
-
-            **Examples**:
-            - Status: `{"op":"status"}`
-            - Main checkout status: `{"op":"status","repo_root":"@main"}`
-            - Worktree by branch: `{"op":"status","repo_root":"@main:main"}`
-            - Diff vs trunk: `{"op":"diff","compare":"main"}`
-            - Quick diff: `{"op":"diff","detail":"files"}`
-            - Inline patches: `{"op":"diff","detail":"patches"}`
-            - Full untruncated diff: `{"op":"diff","detail":"full"}`
-            - Publish for review: `{"op":"diff","artifacts":true,"scope":"selected"}`
-            - Recent commits: `{"op":"log","count":5}`
-
-            Note: log/show/blame run on primary repo only with multi-root.
-            """,
-            annotations: .repoPromptLocalReadOnly,
-            inputSchema: .object(
-                properties: [
-                    "op": .string(description: "Operation", enum: ["status", "diff", "log", "show", "blame"]),
-                    "repo_root": .string(description: "Repository root path inside a loaded root, or loaded root name. Generic calls default to the first loaded root; nested Agent Context Builder runs use the frozen selected repository target. Supports @wt, @main, or @main:<branch> to target a worktree by branch (local branch name)."),
-                    "repo_roots": .array(description: "Multiple repository root paths inside loaded roots, or root names (for multi-root operations). Supports @wt, @main, or @main:<branch> suffixes.", items: .string()),
-                    "repo_key": .string(description: "Repository key (optional alternative to repo_root)"),
-                    "compare": .string(description: "Compare spec for diff/show (supports main/trunk aliases)"),
-                    "detail": .string(description: "Detail level for diff/show", enum: ["summary", "files", "patches", "full"]),
-                    "mode": .string(description: "Artifact mode for diff", enum: ["quick", "standard", "deep"]),
-                    "scope": .string(description: "Diff scope", enum: ["all", "selected"]),
-                    "path": .string(description: "Single pathspec"),
-                    "paths": .array(description: "Multiple pathspecs", items: .string()),
-                    "context_lines": .integer(description: "Diff context lines"),
-                    "detect_renames": .boolean(description: "Enable rename detection"),
-                    "artifacts": .boolean(description: "Write snapshot artifacts (diff only); primary review artifacts are auto-selected into context when possible"),
-                    "inline": .object(
-                        properties: [
-                            "map": .boolean(description: "Include MAP excerpt"),
-                            "mode": .string(description: "Inline mode", enum: ["brief", "full"]),
-                            "max_lines": .integer(description: "Max MAP lines")
-                        ],
-                        required: []
-                    ),
-                    "ref": .string(description: "Ref for show operation"),
-                    "count": .integer(description: "Number of commits for log"),
-                    "lines": .string(description: "Line range for blame (e.g., \"45-60\")")
-                ],
-                required: ["op"]
+    func executeDomainRead(
+        context: DomainReadContextHandle,
+        args: [String: Value],
+        sideEffects: MCPDomainReadSideEffectEmitter
+    ) async throws -> Value {
+        let connectionID = context.connectionID
+        let invocationID = UUID()
+        do {
+            let reply = try await executeGitTool(
+                args: args,
+                connectionID: connectionID,
+                advertisementInvocationID: invocationID,
+                sideEffects: sideEffects
             )
-        ) { [self] _, args in
-            let connectionID = ServerNetworkManager.currentConnectionID
-            let invocationID = UUID()
-            do {
-                let reply = try await executeGitTool(
-                    args: args,
-                    connectionID: connectionID,
-                    advertisementInvocationID: invocationID
-                )
-                let encoded = try await MCPProviderProjectionWorker.encode(
-                    reply,
-                    toolName: MCPWindowToolName.git
-                )
-                try Task.checkCancellation()
-                if let advertised = await takeStagedAdvertisement(invocationID: invocationID) {
+            let encoded = try await MCPProviderProjectionWorker.encode(
+                reply,
+                toolName: MCPWindowToolName.git
+            )
+            try Task.checkCancellation()
+            if let advertised = await takeStagedAdvertisement(invocationID: invocationID) {
+                _ = try await sideEffects.submitAndWait(
+                    fingerprint: "git_artifact_advertisement"
+                ) { [weak self] in
+                    guard let self else { throw CancellationError() }
                     do {
                         _ = try await dependencies.replaceAdvertisedGitArtifactsForCurrentTab(
                             MCPWindowToolName.git,
@@ -448,11 +373,11 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                         )
                     }
                 }
-                return encoded
-            } catch {
-                await discardStagedAdvertisement(invocationID: invocationID)
-                throw error
             }
+            return encoded
+        } catch {
+            await discardStagedAdvertisement(invocationID: invocationID)
+            throw error
         }
     }
 
@@ -469,14 +394,16 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
     private func executeGitTool(
         args: [String: Value],
         connectionID: UUID?,
-        advertisementInvocationID: UUID
+        advertisementInvocationID: UUID,
+        sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> ToolResultDTOs.GitToolReplyDTO {
         let operation = args["op"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "status"
         return try await MCPToolWorkCountDiagnostics.withGitInvocation(operation: operation) { [self] in
             try await executeGitToolBody(
                 args: args,
                 connectionID: connectionID,
-                advertisementInvocationID: advertisementInvocationID
+                advertisementInvocationID: advertisementInvocationID,
+                sideEffects: sideEffects
             )
         }
     }
@@ -484,7 +411,8 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
     private func executeGitToolBody(
         args: [String: Value],
         connectionID: UUID?,
-        advertisementInvocationID: UUID
+        advertisementInvocationID: UUID,
+        sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> ToolResultDTOs.GitToolReplyDTO {
         typealias Reply = ToolResultDTOs.GitToolReplyDTO
 
@@ -741,12 +669,19 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             var autoSelectedAliases: [String] = []
             if !readyCandidates.isEmpty {
                 do {
-                    let commit = try await dependencies.commitPrimaryGitDiffArtifactsToCurrentTab(
-                        MCPWindowToolName.git,
-                        readyCandidates,
-                        sourceSelectionForArtifactCommit
-                    )
-                    autoSelectedAliases = commit.autoSelectedAliases
+                    let resultBox = GitArtifactCommitResultBox()
+                    _ = try await sideEffects.submitAndWait(
+                        fingerprint: "git_primary_artifact_auto_selection"
+                    ) { [weak self] in
+                        guard let self else { throw CancellationError() }
+                        let commit = try await dependencies.commitPrimaryGitDiffArtifactsToCurrentTab(
+                            MCPWindowToolName.git,
+                            readyCandidates,
+                            sourceSelectionForArtifactCommit
+                        )
+                        await resultBox.store(commit.autoSelectedAliases)
+                    }
+                    autoSelectedAliases = await resultBox.value()
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
