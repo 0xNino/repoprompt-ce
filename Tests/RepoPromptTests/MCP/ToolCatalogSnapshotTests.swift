@@ -42,6 +42,31 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertEqual(signatures, Self.expectedSignatures)
     }
 
+    func testSharedReadCutoverPreservesUnmigratedFileActionsCatalogProjection() async throws {
+        let window = Self.makeWindowWithoutAutoStart()
+        let tools = await window.mcpServer.windowMCPTools
+        let fileActions = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.fileActions })
+        let projected = try fileActions.domainBinding().definition
+        let schema = try XCTUnwrap(projected.inputSchema.objectValue)
+        let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+        let operationID = try XCTUnwrap(properties["operation_id"]?.objectValue)
+        let required = try XCTUnwrap(schema["required"]?.arrayValue?.compactMap(\.stringValue))
+
+        XCTAssertFalse(
+            MCPDomainReadToolDefinitions.definitions.contains { $0.name == MCPWindowToolName.fileActions },
+            "file_actions must remain an app-owned legacy provider until its mutation milestone."
+        )
+        XCTAssertTrue(projected.description.contains("Create, delete, or move files."))
+        XCTAssertEqual(
+            operationID["description"]?.stringValue,
+            "Optional caller-stable correlation ID echoed in the mutation acknowledgement; not a deduplication or status lookup key"
+        )
+        XCTAssertEqual(Set(required), ["action", "path"])
+        XCTAssertEqual(projected.annotations.readOnlyHint, false)
+        XCTAssertEqual(projected.annotations.destructiveHint, true)
+        XCTAssertEqual(projected.isEnabledByDefault, true)
+    }
+
     func testSharedReadBindingRetainsAppRuntimeExecutionEnvelope() async throws {
         let definition = try XCTUnwrap(
             MCPDomainReadToolDefinitions.definitions.first { $0.name == MCPWindowToolName.readFile }

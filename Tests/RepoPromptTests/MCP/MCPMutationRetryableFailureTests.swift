@@ -162,10 +162,7 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
 
     func testFileActionsOperationIDSchemaDescribesCorrelationWithoutJournalSemantics() throws {
         let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift")
-        let body = try XCTUnwrap(source.slice(
-            from: "    private func fileActionsTool() -> Tool {",
-            to: "    private func getCodeStructureTool() -> Tool"
-        ))
+        let body = try XCTUnwrap(source.privateFunction(named: "fileActionsTool"))
 
         XCTAssertTrue(body.contains("caller-stable correlation ID"))
         XCTAssertTrue(body.contains("not a deduplication or status lookup key"))
@@ -174,10 +171,7 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
 
     func testFileActionsToolConvertsRetryableMutationFailureToStructuredReply() throws {
         let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift")
-        let body = try XCTUnwrap(source.slice(
-            from: "    private func fileActionsTool() -> Tool {",
-            to: "    private func getCodeStructureTool() -> Tool"
-        ))
+        let body = try XCTUnwrap(source.privateFunction(named: "fileActionsTool"))
 
         try Self.assertOrdered([
             "let acknowledgement = try await dependencies.performFileAction(action, path, content, newPath, ifExists, operationID)",
@@ -339,5 +333,14 @@ private extension String {
             return nil
         }
         return String(self[startRange.lowerBound ..< endRange.lowerBound])
+    }
+
+    func privateFunction(named name: String) -> String? {
+        let startMarker = "    private func \(name)"
+        guard let startRange = range(of: startMarker) else { return nil }
+        let nextFunctionMarker = "\n    private func "
+        let nextSearchStart = startRange.upperBound
+        let end = range(of: nextFunctionMarker, range: nextSearchStart ..< endIndex)?.lowerBound ?? endIndex
+        return String(self[startRange.lowerBound ..< end])
     }
 }
