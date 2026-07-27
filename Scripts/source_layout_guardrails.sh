@@ -382,9 +382,9 @@ if [[ -d "$workspace_core_source_dir" ]]; then
   fi
 fi
 
-# RepoPromptDomainRuntime owns Sendable MCP catalog/runtime values plus the M2
-# workspace/context persistence and routing authorities. It remains free of
-# app/UI/provider implementations; later milestones migrate providers deliberately.
+# RepoPromptDomainRuntime owns Sendable MCP catalog/runtime values, the M2
+# workspace/context authorities, and the M3 shared read/discovery provider. Physical
+# app backends remain injected and the owner stays free of UI/provider implementations.
 domain_runtime_source_dir="Sources/RepoPromptDomainRuntime"
 if [[ -d "$domain_runtime_source_dir" ]]; then
   unexpected_domain_runtime_files="$(find "$domain_runtime_source_dir" -type f ! -name '*.swift' -print)"
@@ -398,17 +398,30 @@ if [[ -d "$domain_runtime_source_dir" ]]; then
   print_matches \
     "RepoPromptDomainRuntime declares MainActor ownership" \
     grep -R -n -E '@MainActor' "$domain_runtime_source_dir"
-  domain_runtime_m2_required_files=(
+  domain_runtime_required_files=(
     "DomainPersistence.swift"
     "DomainWorkspaceModels.swift"
     "DomainWorkspaceCommand.swift"
     "DomainWorkspaceContextAuthority.swift"
     "DomainRoutingCoordinator.swift"
     "DomainRuntimeMetrics.swift"
+    "DomainReadContext.swift"
+    "DomainReadSideEffectCoordinator.swift"
+    "MCPDomainReadToolDefinitions.swift"
+    "MCPDomainReadToolProvider.swift"
   )
-  for file in "${domain_runtime_m2_required_files[@]}"; do
+  for file in "${domain_runtime_required_files[@]}"; do
     if [[ ! -f "$domain_runtime_source_dir/$file" ]]; then
-      fail "RepoPromptDomainRuntime M2 authority file missing: $file"
+      fail "RepoPromptDomainRuntime M2/M3 authority file missing: $file"
+    fi
+  done
+  m3_read_tools=(
+    "get_code_structure" "get_file_tree" "read_file" "file_search"
+    "workspace_context" "prompt" "oracle_chat_log" "git" "history"
+  )
+  for tool in "${m3_read_tools[@]}"; do
+    if ! grep -q "name: \"$tool\"" "$domain_runtime_source_dir/MCPDomainReadToolDefinitions.swift"; then
+      fail "M3 shared read definition missing: $tool"
     fi
   done
   print_matches \
@@ -417,6 +430,19 @@ if [[ -d "$domain_runtime_source_dir" ]]; then
   print_matches \
     "RepoPromptDomainRuntime reintroduced random window incarnations" \
     grep -R -n -E 'windowGeneration.*random|UInt64\.random' "$domain_runtime_source_dir"
+
+  m3_legacy_provider_files=(
+    "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift"
+    "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPPromptContextToolProvider.swift"
+    "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPOracleToolProvider.swift"
+    "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPGitToolProvider.swift"
+    "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPHistoryToolProvider.swift"
+  )
+  m3_duplicate_schema_matches="$(grep -n -E 'name:[[:space:]]*MCPWindowToolName\.(getCodeStructure|getFileTree|readFile|search|workspaceContext|prompt|oracleChatLog|git|history)' "${m3_legacy_provider_files[@]}" || true)"
+  if [[ -n "$m3_duplicate_schema_matches" ]]; then
+    fail "M3 read/discovery schema reintroduced in an app provider"
+    printf '%s\n' "$m3_duplicate_schema_matches" >&2
+  fi
 fi
 
 m2_presentation_bridge="Sources/RepoPrompt/Infrastructure/MCP/AppShared/DomainWorkspacePresentationBridge.swift"
@@ -582,8 +608,10 @@ allowed_tracked_docs=(
   "docs/testing.md"
   "docs/spec/headless-mcp-domain-runtime-m0-contracts.md"
   "docs/spec/headless-mcp-domain-runtime-m0-editflowperf-baseline.json"
-  "docs/spec/headless-mcp-domain-runtime-m2-context-authority.md"
-  "docs/spec/history-query-tools.md"
+    "docs/spec/headless-mcp-domain-runtime-m2-context-authority.md"
+    "docs/spec/headless-mcp-domain-runtime-m3-evidence.json"
+    "docs/spec/headless-mcp-domain-runtime-m3-read-discovery.md"
+    "docs/spec/history-query-tools.md"
   "docs/worktrees.md"
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
   "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"

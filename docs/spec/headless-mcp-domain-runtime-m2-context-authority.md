@@ -44,14 +44,14 @@ Connection and window registrations are generation-fenced. Window incarnations a
 | M0 surface | M2 result | Later milestone boundary |
 |---|---|---|
 | workspace identity, roots, saved workspace JSON | runtime canonical document/catalog, explicit create/delete, deletion tombstones, authoritative file URLs across rename, and rollback-preserving lazy migration | protected root/storage-relocation policy in M4 |
-| compose-tab selection, prompt, preset/bindings metadata | canonical context snapshots and independent revisions | read-provider migration in M3 |
-| connection/window/run routing maps | generation-fenced coordinator; app maps are M3 presentation caches | direct host/backend and provider consumption in M3/M5 |
+| compose-tab selection, prompt, preset/bindings metadata | canonical context snapshots and independent revisions | consumed by shared read-provider handles in M3 |
+| connection/window/run routing maps | generation-fenced coordinator; app maps are presentation caches | read-provider consumption completed in M3; direct host/backend remains M6 |
 | child launch capability | production single-use token authority | provider/process token handoff in M3+ |
 | app UI state | MainActor snapshot projection only | presentation cleanup in M7 |
 | tool admission/approval | unchanged | protected mutation policy in M4 |
-| AI/Agent providers | unchanged | M3/M5 |
+| AI/Agent providers | unchanged | M5 |
 
-Out of scope here: read provider migration, protected mutation policy, AI/Agent provider migration, direct standalone host/backend, child listener/credential handoff, and legacy cleanup.
+Out of scope for M2 itself: read provider migration, protected mutation policy, AI/Agent provider migration, direct standalone host/backend, child listener/credential handoff, and UI/cache cleanup. M3 subsequently completes the read-provider consumption boundary without changing the other exclusions.
 
 ## Gate evidence
 

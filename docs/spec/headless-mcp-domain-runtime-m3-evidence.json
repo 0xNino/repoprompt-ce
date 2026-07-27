@@ -1,0 +1,59 @@
+{
+  "milestone": "M3",
+  "stack_base": "feature/headless-runtime-m2-context-authority",
+  "shared_provider": "MCPDomainReadToolProvider",
+  "shared_definition_source": "Sources/RepoPromptDomainRuntime/MCPDomainReadToolDefinitions.swift",
+  "tools": [
+    "get_code_structure",
+    "get_file_tree",
+    "read_file",
+    "file_search",
+    "workspace_context",
+    "prompt",
+    "oracle_chat_log",
+    "git",
+    "history"
+  ],
+  "context_contract": {
+    "type": "DomainReadContextHandle",
+    "contains_window_identity": false,
+    "fences": [
+      "runtime_generation",
+      "connection_generation",
+      "workspace_revision",
+      "context_revision",
+      "routing_revision"
+    ]
+  },
+  "side_effect_contract": {
+    "owner": "DomainReadSideEffectCoordinator",
+    "revision_scope": "domain_context_identity",
+    "same_context_serialized": true,
+    "unrelated_reads_serialized": false,
+    "exact_retry_deduplicated": true,
+    "collision_fails_closed": true,
+    "shutdown_cancels_pending": true
+  },
+  "catalog_parity": {
+    "golden_changed": false,
+    "test": "RepoPromptTests.ToolCatalogSnapshotTests/testWindowToolCatalogSignatureMatchesGolden"
+  },
+  "latency_contention_evidence": {
+    "kind": "deterministic_concurrent_entry",
+    "test": "RepoPromptDomainRuntimeTests.MCPDomainReadToolProviderTests/testIndependentReadBackendsDoNotContendOnSideEffectCoordinator",
+    "expected_maximum_backend_concurrency": 2,
+    "global_read_lock": false
+  },
+  "cancellation_evidence": [
+    "RepoPromptDomainRuntimeTests.MCPDomainReadToolProviderTests/testCancellationPropagatesWithoutSuccessNormalization",
+    "RepoPromptDomainRuntimeTests.DomainReadSideEffectCoordinatorTests/testShutdownRejectsNewEffectsAndCancelsPendingWork"
+  ],
+  "excluded": [
+    "protected_mutation_policy",
+    "ai_sends",
+    "agent_execution",
+    "context_builder_execution",
+    "direct_stdio_host_backend",
+    "m4_plus"
+  ]
+}

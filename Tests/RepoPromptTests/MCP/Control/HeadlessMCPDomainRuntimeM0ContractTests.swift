@@ -419,22 +419,41 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         for file in bridgeReferenceBoundary {
             XCTAssertFalse(file.contents.contains("DomainWorkspacePresentationBridge"), file.path)
         }
+        let m3NonMainActorHops = try strings(actorInventory, key: "m3_non_main_actor_hops")
+        let m3SharedReadTools = try Set(strings(actorInventory, key: "m3_shared_read_tools"))
         let inventoriedSymbols = Set(expectedLocalSites.map { $0.split(separator: "|").last.map(String.init) ?? "" })
             .union(externalSites.compactMap { $0["symbol"] as? String })
+            .union(m3NonMainActorHops)
         for tool in allTools {
             let hops = try XCTUnwrap(perToolHops[tool], tool)
             XCTAssertFalse(hops.isEmpty, tool)
             XCTAssertTrue(Set(hops).isSubset(of: inventoriedSymbols), tool)
             if MCPWindowToolGroup.orderedToolNames.contains(tool) {
                 XCTAssertTrue(hops.contains("MCPServerViewModel"), tool)
-                XCTAssertTrue(hops.contains("MCPWindowToolRuntime"), tool)
-                let provider = try XCTUnwrap(hops.first { $0.hasSuffix("ToolProvider") }, tool)
-                let providerPaths = expectedLocalSiteRows.compactMap { site -> String? in
-                    guard (site["symbol"] as? String) == provider else { return nil }
-                    return site["path"] as? String
-                }
                 let marker = "name: MCPWindowToolName.\(swiftToolIdentifier(tool))"
-                XCTAssertTrue(try providerPaths.contains { try source($0).contains(marker) }, "\(tool) owner \(provider)")
+                if m3SharedReadTools.contains(tool) {
+                    XCTAssertTrue(hops.contains("MCPDomainReadToolProvider"), tool)
+                    XCTAssertTrue(hops.contains("MCPWindowToolRuntime"), tool)
+                    let definitions = try source("Sources/RepoPromptDomainRuntime/MCPDomainReadToolDefinitions.swift")
+                    XCTAssertTrue(definitions.contains("name: \"\(tool)\""), "\(tool) shared schema")
+                    let appProviders = hops.filter { $0.hasSuffix("ToolProvider") && $0 != "MCPDomainReadToolProvider" }
+                    XCTAssertFalse(appProviders.isEmpty, "\(tool) app backend")
+                    for provider in appProviders {
+                        let providerPaths = expectedLocalSiteRows.compactMap { site -> String? in
+                            guard (site["symbol"] as? String) == provider else { return nil }
+                            return site["path"] as? String
+                        }
+                        XCTAssertFalse(try providerPaths.contains { try source($0).contains(marker) }, "\(tool) duplicate schema in \(provider)")
+                    }
+                } else {
+                    XCTAssertTrue(hops.contains("MCPWindowToolRuntime"), tool)
+                    let provider = try XCTUnwrap(hops.first { $0.hasSuffix("ToolProvider") }, tool)
+                    let providerPaths = expectedLocalSiteRows.compactMap { site -> String? in
+                        guard (site["symbol"] as? String) == provider else { return nil }
+                        return site["path"] as? String
+                    }
+                    XCTAssertTrue(try providerPaths.contains { try source($0).contains(marker) }, "\(tool) owner \(provider)")
+                }
             }
         }
         XCTAssertTrue(try XCTUnwrap(perToolHops["manage_worktree"]).contains("MCPWorktreeToolProvider"))
