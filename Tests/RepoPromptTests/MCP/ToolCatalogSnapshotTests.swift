@@ -42,44 +42,88 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertEqual(signatures, Self.expectedSignatures)
     }
 
+    func testMCPServiceJoinRollsBackFailedParticipantAndRetriesStartup() async throws {
+        #if DEBUG
+            let startProbe = MCPServiceStartAttemptProbe()
+            let service = MCPService(controllerStartOperation: {
+                try await startProbe.start()
+            })
+
+            do {
+                try await service.join(windowID: 101)
+                XCTFail("The injected first startup must fail.")
+            } catch MCPServiceStartAttemptProbe.Failure.injected {
+                // Expected.
+            }
+
+            let afterFailureParticipants = await service.participatingWindowIDsForTesting()
+            let afterFailureState = await service.currentState()
+            XCTAssertTrue(afterFailureParticipants.isEmpty)
+            XCTAssertFalse(afterFailureState.isRunning)
+
+            try await service.join(windowID: 202)
+            let afterRetryParticipants = await service.participatingWindowIDsForTesting()
+            let afterRetryState = await service.currentState()
+            let attemptCount = await startProbe.attemptCount
+            XCTAssertEqual(afterRetryParticipants, [202])
+            XCTAssertTrue(afterRetryState.isRunning)
+            XCTAssertEqual(attemptCount, 2, "A retry must run startup instead of succeeding from phantom participation.")
+        #else
+            throw XCTSkip("MCP service participation inspection is DEBUG-only")
+        #endif
+    }
+
     func testServiceRegistryReregistrationPreservesLiveHandleAndSurfacesFailures() async throws {
-        let window = Self.makeWindowWithoutAutoStart()
-        let before = await ServiceRegistry.catalogSnapshot()
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                let window = Self.makeWindowWithoutAutoStart()
+                let catalogService = window.mcpServer.windowMCPToolCatalogService
+                try await Self.withIsolatedBootstrapSocketNamespace(window: window, catalogService: catalogService) { _ in
+                    let before = await ServiceRegistry.catalogSnapshot()
 
-        XCTAssertFalse(window.mcpServer.windowToolsEnabled)
-        let serverStarted = await window.mcpServer.startServer()
-        XCTAssertTrue(serverStarted)
-        XCTAssertTrue(window.mcpServer.windowToolsEnabled)
+                    XCTAssertFalse(window.mcpServer.windowToolsEnabled)
+                    let serverStarted = await window.mcpServer.startServer()
+                    XCTAssertTrue(serverStarted)
+                    XCTAssertTrue(window.mcpServer.windowToolsEnabled)
 
-        let resolved = await ServiceRegistry.resolveUniqueWindowTool(toolName: MCPWindowToolName.readFile)
-        let captured = try XCTUnwrap(resolved)
-        let bootstrapReady = await window.mcpServer.ensureServerReadyForAgentBootstrap()
-        let after = await ServiceRegistry.catalogSnapshot()
+                    let afterInitialStart = await ServiceRegistry.catalogSnapshot()
+                    let resolved = await ServiceRegistry.resolveUniqueWindowTool(toolName: MCPWindowToolName.readFile)
+                    let captured = try XCTUnwrap(resolved)
+                    let bootstrapReady = await window.mcpServer.ensureServerReadyForAgentBootstrap()
+                    let afterRepeat = await ServiceRegistry.catalogSnapshot()
 
-        XCTAssertTrue(bootstrapReady)
-        let capturedHandleIsActive = await ServiceRegistry.isActive(captured.handle)
-        XCTAssertTrue(capturedHandleIsActive, "An in-flight call handle must survive byte-identical bootstrap re-registration")
-        XCTAssertEqual(after.revision, before.revision + 1)
+                    XCTAssertTrue(bootstrapReady)
+                    let capturedHandleIsActive = await ServiceRegistry.isActive(captured.handle)
+                    XCTAssertTrue(capturedHandleIsActive, "An in-flight call handle must survive byte-identical bootstrap re-registration")
+                    XCTAssertGreaterThan(afterInitialStart.revision, before.revision)
+                    XCTAssertEqual(
+                        afterRepeat.revision,
+                        afterInitialStart.revision,
+                        "Byte-identical bootstrap must preserve handles and catalog revision."
+                    )
 
-        let disabling = Task { @MainActor in
-            await window.mcpServer.stopServer()
-        }
-        await Task.yield()
-        let reenabled = await window.mcpServer.startServer()
-        await disabling.value
-        let reenabledTool = await ServiceRegistry.resolveUniqueWindowTool(toolName: MCPWindowToolName.readFile)
-        XCTAssertTrue(reenabled)
-        XCTAssertTrue(window.mcpServer.windowToolsEnabled)
-        XCTAssertNotNil(reenabledTool, "A superseded disable must not remove the newer enable registration")
+                    let disabling = Task { @MainActor in
+                        await window.mcpServer.stopServer()
+                    }
+                    await Task.yield()
+                    let reenabled = await window.mcpServer.startServer()
+                    await disabling.value
+                    let reenabledTool = await ServiceRegistry.resolveUniqueWindowTool(toolName: MCPWindowToolName.readFile)
+                    XCTAssertTrue(reenabled)
+                    XCTAssertTrue(window.mcpServer.windowToolsEnabled)
+                    XCTAssertNotNil(reenabledTool, "A superseded disable must not remove the newer enable registration")
 
-        do {
-            _ = try await ServiceRegistry.register(UnknownCatalogToolService())
-            XCTFail("Unknown canonical tools must surface registration failure")
-        } catch let error as MCPDomainToolRegistryError {
-            XCTAssertEqual(error, .unknownToolName("unknown_catalog_tool"))
-        }
-
-        await window.mcpServer.stopServer()
+                    do {
+                        _ = try await ServiceRegistry.register(UnknownCatalogToolService())
+                        XCTFail("Unknown canonical tools must surface registration failure")
+                    } catch let error as MCPDomainToolRegistryError {
+                        XCTAssertEqual(error, .unknownToolName("unknown_catalog_tool"))
+                    }
+                }
+            }
+        #else
+            throw XCTSkip("Bootstrap socket isolation is DEBUG-only")
+        #endif
     }
 
     func testAppDelegateStartupPublishesGlobalRegistrationBeforeObservationOnlyReadiness() async {
@@ -132,6 +176,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertTrue(globallyReady)
 
         let timeout: TimeInterval = 0.2
+        let readinessRevision = snapshot.revision
         let start = Date()
         let missingWindowReady = await MCPToolCatalogReadiness.shared.awaitReady(
             windowID: Int.min,
@@ -139,6 +184,12 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         )
         let elapsed = Date().timeIntervalSince(start)
         XCTAssertFalse(missingWindowReady, "A missing window must remain fail-closed.")
+        let afterMissingWindowReadiness = await ServiceRegistry.catalogSnapshot()
+        XCTAssertEqual(
+            afterMissingWindowReadiness.revision,
+            readinessRevision,
+            "Observation-only readiness must not mutate or repair registration."
+        )
         XCTAssertGreaterThanOrEqual(elapsed, timeout * 0.85, "Readiness must retain the full recovery window.")
         XCTAssertLessThan(elapsed, timeout + 0.75, "Readiness must remain bounded.")
 
@@ -348,14 +399,23 @@ final class ToolCatalogSnapshotTests: XCTestCase {
 
                 try await Self.withIsolatedBootstrapSocketNamespace(window: window, catalogService: catalogService) { socketURL in
                     let storedAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
-                    await window.mcpServer.ensureServerReadyForAgentBootstrap()
+                    let started = await window.mcpServer.ensureServerReadyForAgentBootstrap()
+                    XCTAssertTrue(started)
                     XCTAssertEqual(GlobalSettingsStore.shared.mcpAutoStart(), storedAutoStart)
                     let catalogIsRegistered = await ServiceRegistry.isRegistered(catalogService)
                     let catalog = await ServiceRegistry.catalogSnapshot()
                     XCTAssertTrue(catalogIsRegistered)
+                    XCTAssertTrue(MCPGlobalToolName.orderedToolNames.allSatisfy { toolName in
+                        catalog.activeScopesByToolName[toolName]?.contains(.application) == true
+                    })
+                    let windowScope = MCPDomainToolRegistrationScope.window(id: window.windowID)
+                    XCTAssertTrue(MCPWindowToolGroup.orderedToolNames.allSatisfy { toolName in
+                        catalog.activeScopesByToolName[toolName]?.contains(windowScope) == true
+                    })
+                    XCTAssertFalse(catalog.definitions.isEmpty)
                     XCTAssertEqual(
                         catalog.activeScopesByToolName[MCPWindowToolName.readFile],
-                        [.window(id: window.windowID)]
+                        [windowScope]
                     )
 
                     let attributes = try FileManager.default.attributesOfItem(atPath: socketURL.path)
@@ -676,5 +736,20 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         return "\n        private static let expectedSignatures: [String] = [\n"
             + body
             + "\n        ]\n"
+    }
+}
+
+private actor MCPServiceStartAttemptProbe {
+    enum Failure: Error {
+        case injected
+    }
+
+    private(set) var attemptCount = 0
+
+    func start() throws {
+        attemptCount += 1
+        if attemptCount == 1 {
+            throw Failure.injected
+        }
     }
 }

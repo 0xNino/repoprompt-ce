@@ -1379,13 +1379,8 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
 
         let previousMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let testMCPService = MCPService()
-        let composition = WindowStateCompositionFactory.make(
-            windowID: -74,
-            deferredInitialAgentSystemWorkspaceRefresh: true,
-            sharedMCPService: testMCPService,
-            contextBuilderProviderFactory: { _, _, _ in providers.next() }
-        )
+        let composition = WindowState(contextBuilderProviderFactory: { _, _, _ in providers.next() })
+        XCTAssertGreaterThan(composition.windowID, 0)
         GlobalSettingsStore.shared.setMCPAutoStart(previousMCPAutoStart, commit: false)
         await composition.workspaceManager.awaitInitialized()
 
@@ -1596,12 +1591,8 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             await HeadlessAgentConnectionGate.cancelAll()
             let previousMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-            let composition = WindowStateCompositionFactory.make(
-                windowID: -75,
-                deferredInitialAgentSystemWorkspaceRefresh: true,
-                sharedMCPService: MCPService(),
-                contextBuilderProviderFactory: { _, _, _ in providers.next() }
-            )
+            let composition = WindowState(contextBuilderProviderFactory: { _, _, _ in providers.next() })
+            XCTAssertGreaterThan(composition.windowID, 0)
             GlobalSettingsStore.shared.setMCPAutoStart(previousMCPAutoStart, commit: false)
             await composition.workspaceManager.awaitInitialized()
             var firstRunID: UUID?

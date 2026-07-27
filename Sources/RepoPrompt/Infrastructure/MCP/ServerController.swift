@@ -387,7 +387,11 @@ final actor ServerController: ObservableObject {
     // MARK: – public API –
 
     /// Request to start (or re-enable) the MCP listener.
-    func startServer() async {
+    /// Application-scoped domain tools must exist before the listener can advertise
+    /// or accept any window-scoped catalog.
+    func startServer() async throws {
+        try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+
         if await networkManager.isRunning() {
             await networkManager.setEnabled(true) // expose tools only
             await networkManager.ensureBootstrapHealthy(force: true)

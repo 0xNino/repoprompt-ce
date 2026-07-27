@@ -2728,6 +2728,23 @@ final class MCPServerViewModel: ObservableObject {
             return intentGeneration == toolRegistrationIntentGeneration && !windowToolsRequested
         }
 
+        do {
+            try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+        } catch {
+            if intentGeneration == toolRegistrationIntentGeneration {
+                windowToolsRequested = false
+                windowToolsEnabled = false
+            }
+            logger.error(
+                "Failed to register application MCP catalog before window \(windowID) activation: \(String(reflecting: error))"
+            )
+            return false
+        }
+
+        guard intentGeneration == toolRegistrationIntentGeneration, windowToolsRequested else {
+            return false
+        }
+
         if invalidateCatalogBeforeUpdate {
             #if DEBUG || EDIT_FLOW_PERF
                 let invalidationToolRegistrationUpdateState = EditFlowPerf.begin(
@@ -2808,7 +2825,10 @@ final class MCPServerViewModel: ObservableObject {
 
     @MainActor
     private func refreshRegisteredWindowToolCatalog() async {
-        guard windowToolsRequested else { return }
+        // Global availability publication can occur while the initial window enable
+        // is awaiting process registration. Only rebuild an already-active window;
+        // otherwise this callback would supersede the in-flight enable intent.
+        guard windowToolsRequested, windowToolsEnabled else { return }
         _ = await setWindowToolsEnabled(true)
     }
 

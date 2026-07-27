@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Logging
 import RepoPromptShared
 import SwiftUI
 
@@ -18,6 +19,8 @@ import SwiftUI
 #else
     private func mcpServiceLog(_ message: @autoclosure () -> String) {}
 #endif
+
+private let mcpServiceLogger = Logger(label: "com.repoprompt.mcp.service")
 
 /// Background actor that manages the single MCP server instance and handles all networking/file I/O operations.
 /// This actor ensures that no long-running network or file-system work ever executes on @MainActor.
@@ -77,6 +80,7 @@ actor MCPService: Sendable {
 
     /// ──────────────────────────────────────────────
     private let controller = ServerController.shared
+    private let controllerStartOperation: @Sendable () async throws -> Void
 
     /// Tracks which windows are participating in MCP
     private var participatingWindows = Set<Int>()
@@ -85,7 +89,12 @@ actor MCPService: Sendable {
     // MARK: - Initialization
 
     /// ──────────────────────────────────────────────
-    init() {
+    init(
+        controllerStartOperation: @escaping @Sendable () async throws -> Void = {
+            try await ServerController.shared.startServer()
+        }
+    ) {
+        self.controllerStartOperation = controllerStartOperation
         // Set up the approval request callback
         Task {
             await controller.setMCPService(self)
@@ -107,7 +116,7 @@ actor MCPService: Sendable {
         // One-time Codex migration: no-op when the RepoPrompt entry or config file is missing.
         _ = MCPIntegrationHelper.ensureCodexToolTimeout()
         mcpServiceLog("Starting MCP listener")
-        await controller.startServer()
+        try await controllerStartOperation()
         state.isRunning = true
         updates.continuation.yield(state)
     }
@@ -124,8 +133,15 @@ actor MCPService: Sendable {
         let inserted = participatingWindows.insert(windowID).inserted
         mcpServiceLog("Window \(windowID) joining MCP (new: \(inserted), total: \(participatingWindows.count))")
 
-        if inserted, participatingWindows.count == 1 {
-            try await start() // start() already yields
+        do {
+            if !state.isRunning {
+                try await start() // start() already yields
+            }
+        } catch {
+            if inserted {
+                participatingWindows.remove(windowID)
+            }
+            throw error
         }
 
         // Always re-broadcast so newly-joined windows get an up-to-date snapshot
@@ -183,11 +199,24 @@ actor MCPService: Sendable {
         // Preserve participation registered while the controller shutdown was suspended.
         // Such a join represents a newer lifecycle and must be made ready again.
         if !participatingWindows.isEmpty {
-            await controller.startServer()
-            state.isRunning = true
+            do {
+                try await controllerStartOperation()
+                state.isRunning = true
+            } catch {
+                state.isRunning = false
+                mcpServiceLogger.error(
+                    "Failed to restart MCP server after superseding window participation: \(String(reflecting: error))"
+                )
+            }
         }
         updates.continuation.yield(state)
     }
+
+    #if DEBUG
+        func participatingWindowIDsForTesting() -> Set<Int> {
+            participatingWindows
+        }
+    #endif
 
     func currentRequestConnectionID() async -> UUID? {
         await ServerNetworkManager.shared.currentConnectionUUID()
