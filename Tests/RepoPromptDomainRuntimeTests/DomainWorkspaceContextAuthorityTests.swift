@@ -467,6 +467,12 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
             operationID: UUID()
         )
         XCTAssertEqual(bound.disposition, .applied)
+        let readHandle = try await runtime.routingCoordinator.resolveReadContext(connection: registration)
+        XCTAssertEqual(readHandle.context, context)
+        XCTAssertEqual(readHandle.runtimeID, runtime.identity.runtimeID)
+        XCTAssertEqual(readHandle.runtimeGeneration, runtime.identity.lifecycleGeneration)
+        XCTAssertEqual(readHandle.connectionID, connectionID)
+        XCTAssertEqual(readHandle.bindingKind, .explicit)
         _ = await runtime.routingCoordinator.registerConnection(connectionID: connectionID, operationID: UUID())
         let stale = await runtime.routingCoordinator.bind(
             connection: registration,

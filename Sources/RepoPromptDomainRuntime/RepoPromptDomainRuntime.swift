@@ -99,6 +99,7 @@ package actor MCPDomainRuntime {
     package nonisolated let workspaceStore: DomainWorkspaceStore
     package nonisolated let contextStore: DomainContextStore
     package nonisolated let routingCoordinator: DomainRoutingCoordinator
+    package nonisolated let readSideEffectCoordinator: DomainReadSideEffectCoordinator
 
     private let workspaceAuthority: DomainWorkspaceContextAuthority
     private var lifecycle: DomainRuntimeLifecycle = .created
@@ -144,6 +145,7 @@ package actor MCPDomainRuntime {
             contextStore: contextStore,
             metrics: configuration.metrics
         )
+        readSideEffectCoordinator = DomainReadSideEffectCoordinator(identity: runtimeIdentity)
     }
 
     package func start() async throws {
@@ -184,6 +186,7 @@ package actor MCPDomainRuntime {
         publishSnapshot()
         externalReloadTask?.cancel()
         externalReloadTask = nil
+        await readSideEffectCoordinator.shutdown()
         await routingCoordinator.shutdown()
         lifecycle = .stopped
         publishSnapshot()
