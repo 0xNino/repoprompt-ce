@@ -382,9 +382,9 @@ if [[ -d "$workspace_core_source_dir" ]]; then
   fi
 fi
 
-  # RepoPromptDomainRuntime owns Sendable MCP catalog/runtime values plus the M2
-  # workspace/context persistence and routing authorities. It remains free of
-  # app/UI/provider implementations; later milestones migrate providers deliberately.
+# RepoPromptDomainRuntime owns Sendable MCP catalog/runtime values plus the M2
+# workspace/context persistence and routing authorities. It remains free of
+# app/UI/provider implementations; later milestones migrate providers deliberately.
 domain_runtime_source_dir="Sources/RepoPromptDomainRuntime"
 if [[ -d "$domain_runtime_source_dir" ]]; then
   unexpected_domain_runtime_files="$(find "$domain_runtime_source_dir" -type f ! -name '*.swift' -print)"
@@ -414,6 +414,21 @@ if [[ -d "$domain_runtime_source_dir" ]]; then
   print_matches \
     "RepoPromptDomainRuntime contains app/UI/provider implementation" \
     grep -R -n -E 'WindowState|ViewModel|AgentProvider|Claude[^[:space:]]*Provider|Codex[^[:space:]]*Provider|OpenCode[^[:space:]]*Provider|Cursor[^[:space:]]*Provider' "$domain_runtime_source_dir"
+  print_matches \
+    "RepoPromptDomainRuntime reintroduced random window incarnations" \
+    grep -R -n -E 'windowGeneration.*random|UInt64\.random' "$domain_runtime_source_dir"
+fi
+
+m2_presentation_bridge="Sources/RepoPrompt/Infrastructure/MCP/AppShared/DomainWorkspacePresentationBridge.swift"
+if [[ ! -f "$m2_presentation_bridge" ]]; then
+  fail "M2 MainActor workspace presentation bridge missing"
+else
+  if ! grep -q 'final class DomainWorkspacePresentationBridge' "$m2_presentation_bridge"; then
+    fail "M2 workspace presentation bridge declaration missing"
+  fi
+  if ! grep -q 'guard subscription.snapshot.isBootstrapped' "$m2_presentation_bridge"; then
+    fail "M2 workspace presentation bridge lost first-projection readiness gate"
+  fi
 fi
 
 service_registry_source="Sources/RepoPrompt/Infrastructure/MCP/ServiceRegistry.swift"

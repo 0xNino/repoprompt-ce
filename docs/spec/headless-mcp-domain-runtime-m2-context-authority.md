@@ -19,22 +19,23 @@ DomainRuntime/v1/<profile>-<digest>/
   workspace-catalog.json
   working-journals/<workspace-id>.json
   revisions/<workspace-id>.json
+  deletion-tombstones/<workspace-id>.json
   locks/
   settings/runtime-policy.json
   rollback/migration-*/
 ```
 
-The first runtime-owned mutation, not startup, performs migration. It atomically writes a canonical sidecar catalog, exact rollback copies of the legacy index/workspace documents, a digest manifest, and copies of runtime-owned legacy defaults. Legacy files/defaults are not deleted. Explicit save atomically replaces the existing `workspace.json`; until then, the durable working journal is restart authority. There is no startup normalization or bulk rewrite.
+The first runtime-owned mutation, not startup, performs migration. It atomically writes a canonical sidecar catalog, exact rollback copies of the legacy index/workspace documents, a digest manifest, and copies of runtime-owned legacy defaults. Legacy files/defaults are not deleted. Workspace creation and deletion are explicit revisioned runtime commands: creation commits an intent journal and document before catalog publication; deletion publishes a catalog tombstone before best-effort artifact pruning, so a stale legacy index cannot resurrect it. Explicit save publishes a pending-save journal before atomically replacing `workspace.json`, then finalizes the clean journal/revision sidecars; restart resolves a matching pending digest as committed and otherwise retains dirty rollback state. There is no startup normalization or bulk rewrite.
 
-Each workspace and context carries independent `workingRevision`, `savedRevision`, and optional `dirtyRevision`. Commands carry operation IDs plus optional catalog/workspace/context CAS expectations. Operation results are durably deduplicated; operation-ID reuse with different input fails closed.
+Each workspace and context carries independent `workingRevision`, `savedRevision`, and optional `dirtyRevision`. Commands carry operation IDs plus optional catalog/workspace/context CAS expectations. Applied and unchanged operation results are durably deduplicated across restart and indexed across the whole profile; exact create retries also finish a crash-recovered catalog publication. Operation-ID reuse with different input fails closed.
 
-N writers coordinate through narrow `flock` files, revision CAS, atomic temp-file/fsync/rename commits, catalog reconciliation, and periodic external reload. Clean external changes become a new saved/working revision. A dirty workspace enters explicit external-conflict state. Corrupt or future documents/journals/catalogs retain the last decodable saved document and make the affected authority read-only rather than silently resetting data.
+N writers coordinate through bounded, cancellable nonblocking `flock` acquisition, durable catalog/workspace/context revision CAS, atomic temp-file/fsync/rename commits, catalog reconciliation, and periodic external reload. Blocking file and lock work runs on a dedicated utility queue rather than the authority actor. External polling probes the catalog revision before doing full catalog recovery and checks each known document digest without publishing when nothing changed. Clean external changes become a new saved/working revision. A dirty workspace enters explicit external-conflict state with app-callable refresh plus accept-external/keep-working resolution. Corrupt or future documents/journals/catalogs retain the last decodable saved document and make the affected authority read-only rather than silently resetting data.
 
 ## Snapshot, routing, and presentation contracts
 
-Workspace subscriptions return an atomic initial snapshot plus monotonic events. Consumers detect sequence gaps and refresh the full snapshot. The app bridge applies immutable documents on `MainActor`, fences echo publications by digest/sequence, and resolves the current window locally without making `NSWindow` or an active view model domain truth.
+Workspace subscriptions bootstrap before returning their atomic initial snapshot and then publish monotonic events. Consumers detect sequence gaps and refresh the full snapshot. The app bridge refuses a pre-bootstrap projection, decodes changed documents through the app's canonical normalization/migration path, retains the previous complete snapshot on decode failure, and applies immutable models on `MainActor`. Working-state capture is coalesced, explicit save supersedes a queued capture, and save preserves stale-state retry, repo-path merge, decode-cache invalidation, and baseline semantics. Active-window choice remains a local presentation resolver rather than `NSWindow` or an active view model becoming domain truth.
 
-Connection and window registrations are generation-fenced. Run-scoped bindings are immutable. `DomainRunLaunchToken` material is 256-bit random, host stores only its digest, and redemption is single-use, expiring, runtime-generation/principal/provider/PID checked, and revokes pending routing state on shutdown. Policy contents are not embedded in the token; provider/process handoff remains M3+.
+Connection and window registrations are generation-fenced. Window incarnations are assigned monotonically by the runtime, connections (including immutable run-scoped bindings) are generation-fenced and explicitly unregistered, windows are unregistered before server teardown, and all routing state is cleared on runtime shutdown. Run-scoped bindings are immutable. `DomainRunLaunchToken` material is 256-bit random, host stores only its digest, and redemption is single-use, expiring, runtime-generation/principal/provider/PID checked, and revokes pending routing state on shutdown. Policy contents are not embedded in the token; provider/process handoff remains M3+.
 
 `EditFlow.DomainRuntime.*` metrics carry runtime ID/generation, operation ID, workspace/context revisions, catalog revision, disposition, and byte count across runtime/backend/catalog/commit/projection phases. This milestone does not claim a live app latency delta because implementation was explicitly performed without relaunch.
 
@@ -42,7 +43,7 @@ Connection and window registrations are generation-fenced. Run-scoped bindings a
 
 | M0 surface | M2 result | Later milestone boundary |
 |---|---|---|
-| workspace identity, roots, saved workspace JSON | runtime canonical document/catalog plus rollback-preserving lazy migration | protected create/delete/root policy in M4 |
+| workspace identity, roots, saved workspace JSON | runtime canonical document/catalog, explicit create/delete, deletion tombstones, authoritative file URLs across rename, and rollback-preserving lazy migration | protected root/storage-relocation policy in M4 |
 | compose-tab selection, prompt, preset/bindings metadata | canonical context snapshots and independent revisions | read-provider migration in M3 |
 | connection/window/run routing maps | generation-fenced coordinator; app maps are M3 presentation caches | direct host/backend and provider consumption in M3/M5 |
 | child launch capability | production single-use token authority | provider/process token handoff in M3+ |
@@ -54,4 +55,4 @@ Out of scope here: read provider migration, protected mutation policy, AI/Agent 
 
 ## Gate evidence
 
-Owner suite: `DomainWorkspaceContextAuthorityTests` covers no-startup-write migration, working/saved/dirty recovery, exact save, dedup/collision, two-writer CAS, clean/dirty external reload, future-journal degraded mode, routing generations, and one-use launch tokens. App construction/product builds protect the presentation bridge and single writer seam. The curated XCTest ledger contains one row per new executable method.
+Owner suite: `DomainWorkspaceContextAuthorityTests` covers bootstrap-gated subscription, no-startup-write migration, explicit create/delete and stale-index tombstones, pending-save crash recovery followed by edit/save, working/saved/dirty recovery, exact save, durable unchanged/applied dedup and collision handling, workspace and durable catalog CAS, context-CAS fail-closed behavior, cancellable off-actor lock contention, clean/dirty external reload, future-journal degraded mode, monotonic window reincarnation, explicit connection teardown, and one-use launch tokens. `WorkspaceSavePreparationTests` covers first-projection preservation, canonical bridge normalization, runtime stale-save retry/baseline behavior, domain-owned reload identity, and app-reachable conflict resolution. Product builds protect the presentation bridge and single-writer seam. The curated XCTest ledger contains one row per new executable method.
