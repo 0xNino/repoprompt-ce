@@ -1339,6 +1339,16 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
     }
 
     func testProductionMCPCancellationResumesBeforeTeardownAndRejectsLateProviderEvent() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await runProductionMCPCancellationResumesBeforeTeardownAndRejectsLateProviderEvent()
+            }
+        #else
+            throw XCTSkip("Shared MCP lifecycle fixture requires DEBUG test ownership.")
+        #endif
+    }
+
+    private func runProductionMCPCancellationResumesBeforeTeardownAndRejectsLateProviderEvent() async throws {
         let configRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("ContextBuilderStaleRunLeaseTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: configRoot, withIntermediateDirectories: true)
@@ -1379,8 +1389,13 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
 
         let previousMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let composition = WindowState(contextBuilderProviderFactory: { _, _, _ in providers.next() })
-        XCTAssertGreaterThan(composition.windowID, 0)
+        let fixtureWindowID = WindowState.reserveWindowIDForTesting()
+        let composition = WindowStateCompositionFactory.make(
+            windowID: fixtureWindowID,
+            deferredInitialAgentSystemWorkspaceRefresh: true,
+            sharedMCPService: MCPService(),
+            contextBuilderProviderFactory: { _, _, _ in providers.next() }
+        )
         GlobalSettingsStore.shared.setMCPAutoStart(previousMCPAutoStart, commit: false)
         await composition.workspaceManager.awaitInitialized()
 
@@ -1572,6 +1587,16 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
 
     func testMCPRoutingFailureAfterImmediateStreamReturnCleansBootstrapAndAllowsImmediateRetry() async throws {
         #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await runMCPRoutingFailureAfterImmediateStreamReturnCleansBootstrapAndAllowsImmediateRetry()
+            }
+        #else
+            throw XCTSkip("Shared MCP lifecycle fixture requires DEBUG test ownership.")
+        #endif
+    }
+
+    private func runMCPRoutingFailureAfterImmediateStreamReturnCleansBootstrapAndAllowsImmediateRetry() async throws {
+        #if DEBUG
             let oldProcess = try makeSleepingProcessTree()
             let retryProcess = try makeSleepingProcessTree()
             defer {
@@ -1591,8 +1616,13 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             await HeadlessAgentConnectionGate.cancelAll()
             let previousMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-            let composition = WindowState(contextBuilderProviderFactory: { _, _, _ in providers.next() })
-            XCTAssertGreaterThan(composition.windowID, 0)
+            let fixtureWindowID = WindowState.reserveWindowIDForTesting()
+            let composition = WindowStateCompositionFactory.make(
+                windowID: fixtureWindowID,
+                deferredInitialAgentSystemWorkspaceRefresh: true,
+                sharedMCPService: MCPService(),
+                contextBuilderProviderFactory: { _, _, _ in providers.next() }
+            )
             GlobalSettingsStore.shared.setMCPAutoStart(previousMCPAutoStart, commit: false)
             await composition.workspaceManager.awaitInitialized()
             var firstRunID: UUID?

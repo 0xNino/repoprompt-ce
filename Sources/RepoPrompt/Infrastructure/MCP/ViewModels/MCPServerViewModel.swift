@@ -1031,7 +1031,12 @@ final class MCPServerViewModel: ObservableObject {
         }
     }
 
+    @Published private(set) var windowToolRegistrationFailureDescription: String?
     private var windowToolsRequested = false
+    var windowToolsAreRequested: Bool {
+        windowToolsRequested
+    }
+
     private var toolRegistrationIntentGeneration: UInt64 = 0
     private var windowToolTransitionTail: Task<Bool, Never>?
     private var activeWindowToolRegistrationHandle: MCPDomainToolRegistrationHandle?
@@ -2434,6 +2439,11 @@ final class MCPServerViewModel: ObservableObject {
         func test_clearActiveToolSlot() {
             clearActiveToolSlot()
         }
+
+        @MainActor
+        func setServiceForTesting(_ service: MCPService) {
+            self.service = service
+        }
     #endif
 
     // ---------------------------------------------------------------------
@@ -2686,6 +2696,7 @@ final class MCPServerViewModel: ObservableObject {
         toolRegistrationIntentGeneration &+= 1
         let intentGeneration = toolRegistrationIntentGeneration
         windowToolsRequested = enabled
+        windowToolRegistrationFailureDescription = nil
         if !enabled {
             windowToolsEnabled = false
         }
@@ -2731,12 +2742,10 @@ final class MCPServerViewModel: ObservableObject {
         do {
             try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
         } catch {
-            if intentGeneration == toolRegistrationIntentGeneration {
-                windowToolsRequested = false
-                windowToolsEnabled = false
-            }
-            logger.error(
-                "Failed to register application MCP catalog before window \(windowID) activation: \(String(reflecting: error))"
+            recordWindowToolRegistrationFailure(
+                phase: "application_catalog",
+                error: error,
+                intentGeneration: intentGeneration
             )
             return false
         }
@@ -2770,7 +2779,6 @@ final class MCPServerViewModel: ObservableObject {
             }
 
             activeWindowToolRegistrationHandle = registration.handle
-            windowToolsEnabled = true
             do {
                 try await service.join(windowID: windowID)
                 guard intentGeneration == toolRegistrationIntentGeneration else {
@@ -2782,6 +2790,8 @@ final class MCPServerViewModel: ObservableObject {
                     return false
                 }
 
+                windowToolsEnabled = true
+                windowToolRegistrationFailureDescription = nil
                 await service.refreshState()
                 guard intentGeneration == toolRegistrationIntentGeneration else {
                     if !windowToolsRequested {
@@ -2794,23 +2804,39 @@ final class MCPServerViewModel: ObservableObject {
                 return true
             } catch {
                 if intentGeneration == toolRegistrationIntentGeneration {
-                    windowToolsRequested = false
                     windowToolsEnabled = false
                     await unregisterWindowToolRegistration(registration.handle)
+                    recordWindowToolRegistrationFailure(
+                        phase: "transport_join",
+                        error: error,
+                        intentGeneration: intentGeneration
+                    )
                 } else if !windowToolsRequested {
                     await unregisterWindowToolRegistration(registration.handle)
                 }
-                logger.error("Failed to join MCP after catalog registration: \(String(reflecting: error))")
                 return false
             }
         } catch {
-            if intentGeneration == toolRegistrationIntentGeneration {
-                windowToolsRequested = false
-                windowToolsEnabled = false
-            }
-            logger.error("Failed to register MCP window catalog: \(String(reflecting: error))")
+            recordWindowToolRegistrationFailure(
+                phase: "window_catalog",
+                error: error,
+                intentGeneration: intentGeneration
+            )
             return false
         }
+    }
+
+    @MainActor
+    private func recordWindowToolRegistrationFailure(
+        phase: String,
+        error: Error,
+        intentGeneration: UInt64
+    ) {
+        guard intentGeneration == toolRegistrationIntentGeneration, windowToolsRequested else { return }
+        windowToolsEnabled = false
+        let description = "\(phase): \(String(reflecting: error))"
+        windowToolRegistrationFailureDescription = description
+        logger.error("MCP window registration failed window=\(windowID) phase=\(phase) error=\(String(reflecting: error))")
     }
 
     @MainActor

@@ -885,6 +885,19 @@ actor ServerNetworkManager {
             resolvedBootstrapSocketURL()
         }
 
+        struct DebugTransportState: Equatable, CustomStringConvertible {
+            let isRunning: Bool
+            let isEnabled: Bool
+
+            var description: String {
+                "running=\(isRunning),enabled=\(isEnabled)"
+            }
+        }
+
+        func debugTransportState() -> DebugTransportState {
+            DebugTransportState(isRunning: isRunningState, isEnabled: isEnabledState)
+        }
+
         func debugIsEnabledForBootstrapSocketURLOverride() -> Bool {
             isEnabledState
         }

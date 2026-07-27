@@ -39,6 +39,21 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         #endif
     }
 
+    func testSharedServerLeaseRestoresInheritedTransportState() async throws {
+        #if DEBUG
+            let manager = ServerNetworkManager.shared
+            try await MCPSharedServerTestLease.shared.withLease(owner: #function) { _ in
+                let inherited = await manager.debugTransportState()
+                await manager.setEnabled(!inherited.isEnabled)
+                let mutated = await manager.debugTransportState()
+                XCTAssertEqual(mutated.isRunning, inherited.isRunning)
+                XCTAssertEqual(mutated.isEnabled, !inherited.isEnabled)
+            }
+        #else
+            throw XCTSkip("Shared MCP transport restoration requires DEBUG diagnostics helpers.")
+        #endif
+    }
+
     func testDistinctConnectionsOverlapWithoutCrossRoutingReadOrSearchResults() async throws {
         #if DEBUG
             try await MCPSharedServerTestLease.shared.withLease { lease in
@@ -1797,9 +1812,10 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 throw ClientFixtureError.routingServiceUnavailable
             }
 
-            // A prior fixture owns a full transport shutdown. This fixture joins the
-            // shared process state but restores only the enabled flag it needs before
-            // direct socketpair requests; it never owns global registration handles.
+            // Direct socketpair requests require advertisement even after an earlier
+            // fixture performed full shutdown. The enclosing shared-server lease records
+            // and restores the inherited transport state; this fixture never owns global
+            // registration handles.
             await ServerNetworkManager.shared.setEnabled(true)
         }
 

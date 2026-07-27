@@ -1,7 +1,7 @@
 import Foundation
 
 #if DEBUG
-    import Foundation
+    @testable import RepoPromptApp
 
     actor MCPSharedServerTestLease {
         struct Ownership {
@@ -15,7 +15,10 @@ import Foundation
         /// without an unstructured `Task { await }` hop.
         private let waiterState = LeaseWaiterState()
 
-        func withLease<T>(_ operation: (Ownership) async throws -> T) async throws -> T {
+        func withLease<T>(
+            owner: String = #function,
+            _ operation: (Ownership) async throws -> T
+        ) async throws -> T {
             var ownsLease = false
             try await acquireLease()
             ownsLease = true
@@ -25,7 +28,94 @@ import Foundation
                     releaseLease()
                 }
             }
-            return try await operation(Ownership())
+
+            let leaseID = UUID()
+            let baseline = await ServerNetworkManager.shared.debugTransportState()
+            let bodyResult: Result<T, Swift.Error>
+            do {
+                bodyResult = try await .success(operation(Ownership()))
+            } catch {
+                bodyResult = .failure(error)
+            }
+
+            do {
+                try await restoreTransportState(
+                    baseline,
+                    owner: owner,
+                    leaseID: leaseID
+                )
+            } catch {
+                switch bodyResult {
+                case let .failure(bodyError):
+                    throw LeaseError.bodyAndRestorationFailed(
+                        owner: owner,
+                        leaseID: leaseID,
+                        body: String(reflecting: bodyError),
+                        restoration: String(reflecting: error)
+                    )
+                case .success:
+                    throw error
+                }
+            }
+
+            return try bodyResult.get()
+        }
+
+        private func restoreTransportState(
+            _ baseline: ServerNetworkManager.DebugTransportState,
+            owner: String,
+            leaseID: UUID
+        ) async throws {
+            let manager = ServerNetworkManager.shared
+            let observed = await manager.debugTransportState()
+            if observed != baseline {
+                print(
+                    "[MCPSharedServerTestLease] owner=\(owner) lease=\(leaseID.uuidString) restoring baseline={\(baseline)} observed={\(observed)}"
+                )
+            }
+
+            if baseline.isRunning {
+                if !observed.isRunning {
+                    await manager.start()
+                }
+                await manager.setEnabled(baseline.isEnabled)
+            } else {
+                if observed.isRunning {
+                    await manager.stop()
+                }
+                await manager.setEnabled(baseline.isEnabled)
+            }
+
+            let restored = await manager.debugTransportState()
+            guard restored == baseline else {
+                throw LeaseError.transportRestorationMismatch(
+                    owner: owner,
+                    leaseID: leaseID,
+                    expected: baseline.description,
+                    observed: observed.description,
+                    actual: restored.description
+                )
+            }
+        }
+
+        private enum LeaseError: Swift.Error, CustomStringConvertible {
+            case bodyAndRestorationFailed(owner: String, leaseID: UUID, body: String, restoration: String)
+            case transportRestorationMismatch(
+                owner: String,
+                leaseID: UUID,
+                expected: String,
+                observed: String,
+                actual: String
+            )
+
+            var description: String {
+                switch self {
+                case let .bodyAndRestorationFailed(owner, leaseID, body, restoration):
+                    "Shared MCP lease owner \(owner) lease=\(leaseID) failed body=\(body) restoration=\(restoration)"
+                case let .transportRestorationMismatch(owner, leaseID, expected, observed, actual):
+                    "Shared MCP lease owner \(owner) lease=\(leaseID) transport restore mismatch expected={\(expected)} observed={\(observed)} actual={\(actual)}"
+                }
+            }
         }
 
         func waiterCountForTesting() -> Int {

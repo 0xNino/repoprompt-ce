@@ -113,7 +113,11 @@ actor MCPToolCatalogReadiness {
         }
 
         if !window.mcpServer.windowToolsEnabled {
-            mcpToolCatalogReadinessLog("Window \(windowID) has tools disabled after global readiness")
+            if window.mcpServer.windowToolsAreRequested {
+                mcpToolCatalogReadinessLog("Window \(windowID) requested tools but registration is not ready")
+                return false
+            }
+            mcpToolCatalogReadinessLog("Window \(windowID) intentionally has tools disabled after global readiness")
             return true
         }
         let requiredScope = MCPDomainToolRegistrationScope.window(id: windowID)
