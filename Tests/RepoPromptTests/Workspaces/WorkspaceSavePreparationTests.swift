@@ -282,6 +282,7 @@ import XCTest
             manager.workspaces[index].repoPaths = ["/tmp/runtime-baseline"]
             manager.workspaces[index].currentPromptText = "captured runtime state"
             manager.markWorkspaceDirty()
+            let stateVersionBeforeRetry = manager.debugStateVersionForWorkspace(workspaceID)
 
             await manager.pollAndSaveStateAsync()
             manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
@@ -289,24 +290,48 @@ import XCTest
             let diagnostics = manager.workspaceSaveDiagnosticsForTesting(workspaceID: workspaceID)
             XCTAssertEqual(diagnostics.attemptCount, 2)
             XCTAssertEqual(manager.debugRepoPathBaselineForWorkspace(workspaceID), ["/tmp/runtime-baseline"])
-            let savedSnapshot = await runtime.workspaceStore.snapshot()
+            let savedStateVersion = try XCTUnwrap(manager.debugLastSavedVersionForWorkspace(workspaceID))
+            XCTAssertGreaterThan(savedStateVersion, stateVersionBeforeRetry)
+            XCTAssertGreaterThanOrEqual(
+                manager.debugStateVersionForWorkspace(workspaceID),
+                savedStateVersion
+            )
+            let savedDocument = try await waitForDomainWorkspace(
+                runtime,
+                workspaceID: workspaceID,
+                description: "authoritative retry winner save"
+            ) { snapshot in
+                guard snapshot.revisions.dirtyRevision == nil,
+                      snapshot.revisions.savedRevision == snapshot.revisions.workingRevision,
+                      snapshot.revisions.workingRevision > authoritative.revisions.workingRevision
+                else { return false }
+                let projected = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                    documentBytes: snapshot.document.documentBytes,
+                    fileURL: snapshot.document.fileURL
+                )
+                return projected.currentPromptText == "newer runtime state"
+                    && projected.repoPaths == ["/tmp/runtime-baseline"]
+            }
+            XCTAssertGreaterThan(
+                savedDocument.revisions.workingRevision,
+                authoritative.revisions.workingRevision
+            )
+            XCTAssertEqual(
+                savedDocument.revisions.savedRevision,
+                savedDocument.revisions.workingRevision
+            )
+            XCTAssertNil(savedDocument.revisions.dirtyRevision)
+            let savedCatalog = await runtime.workspaceStore.snapshot()
             let savedProjectionCompleted = await presentationBridge.waitUntilProjected(
-                through: savedSnapshot.publicationSequence
+                through: savedCatalog.publicationSequence
             )
             XCTAssertTrue(savedProjectionCompleted)
-            XCTAssertEqual(
-                manager.debugLastSavedVersionForWorkspace(workspaceID),
-                manager.debugStateVersionForWorkspace(workspaceID)
-            )
-            let savedDocument = try XCTUnwrap(savedSnapshot.workspaces.first {
-                $0.document.workspaceID == workspaceID
-            })
-            XCTAssertNil(savedDocument.revisions.dirtyRevision)
             let decoded = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
                 documentBytes: savedDocument.document.documentBytes,
                 fileURL: savedDocument.document.fileURL
             )
             XCTAssertEqual(decoded.currentPromptText, "newer runtime state")
+            XCTAssertEqual(decoded.repoPaths, ["/tmp/runtime-baseline"])
 
             let staleID = UUID()
             let staleIndex: [[String: Any]] = [[
