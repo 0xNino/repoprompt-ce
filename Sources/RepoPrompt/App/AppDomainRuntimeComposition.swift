@@ -32,7 +32,31 @@ final class AppDomainRuntimeComposition: Sendable {
 /// and no caller receives a handle it could use to remove another caller's tools.
 @MainActor
 final class AppGlobalMCPServiceComposition {
-    static let shared = AppGlobalMCPServiceComposition()
+    enum RegistrationStatus: Equatable {
+        case idle
+        case registering
+        case registered
+        case failed(String)
+
+        var diagnosticDescription: String {
+            switch self {
+            case .idle:
+                "idle"
+            case .registering:
+                "registering"
+            case .registered:
+                "registered"
+            case let .failed(error):
+                "failed(\(error))"
+            }
+        }
+    }
+
+    static let shared = AppGlobalMCPServiceComposition(
+        runtime: AppDomainRuntimeComposition.shared.runtime,
+        windowStates: .shared,
+        networkManager: .shared
+    )
 
     private struct RegistrationHandles {
         let appSettings: MCPDomainToolRegistrationHandle
@@ -44,11 +68,12 @@ final class AppGlobalMCPServiceComposition {
     private let windowRoutingService: WindowRoutingService
     private var registrationHandles: RegistrationHandles?
     private var registrationTask: Task<RegistrationHandles, Error>?
+    private var status: RegistrationStatus = .idle
 
     private init(
-        runtime: MCPDomainRuntime = AppDomainRuntimeComposition.shared.runtime,
-        windowStates: WindowStatesManager = .shared,
-        networkManager: ServerNetworkManager = .shared
+        runtime: MCPDomainRuntime,
+        windowStates: WindowStatesManager,
+        networkManager: ServerNetworkManager
     ) {
         self.runtime = runtime
         appSettingsService = AppSettingsMCPService()
@@ -58,19 +83,28 @@ final class AppGlobalMCPServiceComposition {
         )
     }
 
+    func registrationStatus() -> RegistrationStatus {
+        status
+    }
+
     func ensureRegistered() async throws {
         if let registrationHandles,
            await ServiceRegistry.isActive(registrationHandles.appSettings),
            await ServiceRegistry.isActive(registrationHandles.windowRouting)
         {
+            await restoreAvailabilityPublicationIfNeeded()
+            status = .registered
             return
         }
 
         if let registrationTask {
             registrationHandles = try await registrationTask.value
+            await restoreAvailabilityPublicationIfNeeded()
+            status = .registered
             return
         }
 
+        status = .registering
         let task = Task { @MainActor [runtime, appSettingsService, windowRoutingService] in
             try await runtime.start()
             let appSettings = try await ServiceRegistry.register(appSettingsService)
@@ -85,9 +119,21 @@ final class AppGlobalMCPServiceComposition {
         do {
             registrationHandles = try await task.value
             registrationTask = nil
+            await restoreAvailabilityPublicationIfNeeded()
+            status = .registered
         } catch {
             registrationTask = nil
+            status = .failed(String(reflecting: error))
             throw error
         }
+    }
+
+    private func restoreAvailabilityPublicationIfNeeded() async {
+        let publishedNames = Set(ToolAvailabilityStore.shared.toolSummaries.map(\.name))
+        guard !publishedNames.isSuperset(of: MCPGlobalToolName.orderedToolNames) else { return }
+
+        let appSettingsTools = await appSettingsService.tools
+        let windowRoutingTools = await windowRoutingService.tools
+        ToolAvailabilityStore.shared.registerTools(appSettingsTools + windowRoutingTools)
     }
 }

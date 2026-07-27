@@ -5536,7 +5536,11 @@ actor ServerNetworkManager {
                             )
                             guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
                             if !ready {
-                                log.warning("Tool catalog not ready for connection \(connectionID) window=\(windowID.map(String.init) ?? "nil") - proceeding anyway")
+                                connectionLog(
+                                    "Tool catalog not ready after handshake for connection \(connectionID) "
+                                        + "window=\(windowID.map(String.init) ?? "nil"); tools/list remains fail-closed"
+                                )
+                                return
                             }
 
                             if let windowID {
@@ -9543,7 +9547,7 @@ actor ServerNetworkManager {
                 windowID: windowID,
                 timeout: 5.0
             )
-            if !isReady, windowID != nil {
+            guard isReady else {
                 throw MCPError.internalError("Tool catalog not ready. Please retry.")
             }
             if let windowID {
@@ -10920,16 +10924,12 @@ actor ServerNetworkManager {
                 windowID: windowID,
                 timeout: 2.0 // Shorter timeout here since handshake should have waited
             )
-            if !isReady {
-                // Only fail closed if we had a specific window to wait for.
-                // If windowID is nil (true multi-window ambiguity), log warning but proceed
-                // with whatever tools are available - the client will need to select a window.
-                if windowID != nil {
-                    log.warning("Tool catalog not ready for tools/list - failing closed for connection \(connectionID) window \(windowID!)")
-                    throw MCPError.internalError("Tool catalog not ready. Please retry.")
-                } else {
-                    connectionLog("Tool catalog readiness skipped for multi-window ambiguous connection \(connectionID)")
-                }
+            guard isReady else {
+                connectionLog(
+                    "Tool catalog not ready for tools/list - failing closed for connection \(connectionID) "
+                        + "window=\(windowID.map(String.init) ?? "ambiguous")"
+                )
+                throw MCPError.internalError("Tool catalog not ready. Please retry.")
             }
 
             // Warm tool cache if we have a bound window

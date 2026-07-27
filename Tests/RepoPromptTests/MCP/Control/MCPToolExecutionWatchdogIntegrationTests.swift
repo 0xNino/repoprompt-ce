@@ -1780,7 +1780,7 @@ import XCTest
             }
         }
 
-        func testWindowIDInjectionAndExplicitValueReachResolvedProviderArguments() throws {
+        func testWindowIDInjectionPrecedenceForDeclaredSchemas() throws {
             let manager = ServerNetworkManager.shared
             let schema = try Value(
                 JSONSchema.object(
@@ -2456,52 +2456,40 @@ import XCTest
 
     @MainActor
     private final class MCPAppSettingsServiceScope {
-        private let service: AppSettingsMCPService
-        private let ownsService: Bool
-        private let baselineRegistered: Bool
-        private let baselineAvailable: Bool
         private let baselineDisabled: Bool
         private var restored = false
 
-        private init() async {
-            service = AppSettingsMCPService()
-            let catalog = await ServiceRegistry.catalogSnapshot()
-            baselineRegistered = catalog.activeScopesByToolName[MCPGlobalToolName.appSettings]?.contains(.application) == true
-            ownsService = !baselineRegistered
-            baselineAvailable = ToolAvailabilityStore.shared.toolSummaries.contains {
-                $0.name == MCPGlobalToolName.appSettings
-            }
-            baselineDisabled = ToolAvailabilityStore.shared.disabledTools.contains(MCPGlobalToolName.appSettings)
+        private init(baselineDisabled: Bool) {
+            self.baselineDisabled = baselineDisabled
         }
 
         static func install() async throws -> MCPAppSettingsServiceScope {
-            let scope = await MCPAppSettingsServiceScope()
-            do {
-                if scope.baselineDisabled {
-                    await ToolAvailabilityStore.shared.toggle(MCPGlobalToolName.appSettings, enabled: true)
-                }
-                if scope.ownsService {
-                    try await ServiceRegistry.register(scope.service)
-                }
-                try await scope.waitUntilReady()
-                XCTAssertTrue(ToolAvailabilityStore.shared.isEnabled(MCPGlobalToolName.appSettings))
-                return scope
-            } catch {
-                await scope.restore()
-                throw error
+            try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+            let baselineDisabled = ToolAvailabilityStore.shared.disabledTools.contains(MCPGlobalToolName.appSettings)
+            let scope = MCPAppSettingsServiceScope(baselineDisabled: baselineDisabled)
+            if baselineDisabled {
+                await ToolAvailabilityStore.shared.toggle(MCPGlobalToolName.appSettings, enabled: true)
             }
+
+            let catalog = await ServiceRegistry.catalogSnapshot()
+            let isRegistered = catalog.activeScopesByToolName[MCPGlobalToolName.appSettings]?.contains(.application) == true
+            let isAvailable = ToolAvailabilityStore.shared.toolSummaries.contains {
+                $0.name == MCPGlobalToolName.appSettings
+            }
+            guard isRegistered, isAvailable else {
+                await scope.restore()
+                throw MCPExecutionWatchdogIntegrationFixtureError.toolAvailabilityDidNotPublish(
+                    MCPGlobalToolName.appSettings
+                )
+            }
+            XCTAssertTrue(ToolAvailabilityStore.shared.isEnabled(MCPGlobalToolName.appSettings))
+            return scope
         }
 
         func restore() async {
             guard !restored else { return }
             restored = true
 
-            if ownsService {
-                await ServiceRegistry.unregister(service)
-            }
-            if !baselineAvailable {
-                ToolAvailabilityStore.shared.unregisterTools([MCPGlobalToolName.appSettings])
-            }
             let isDisabled = ToolAvailabilityStore.shared.disabledTools.contains(MCPGlobalToolName.appSettings)
             if isDisabled != baselineDisabled {
                 await ToolAvailabilityStore.shared.toggle(
@@ -2514,12 +2502,11 @@ import XCTest
         func assertRestored(file: StaticString = #filePath, line: UInt = #line) async {
             let catalog = await ServiceRegistry.catalogSnapshot()
             let isRegistered = catalog.activeScopesByToolName[MCPGlobalToolName.appSettings]?.contains(.application) == true
-            XCTAssertEqual(isRegistered, baselineRegistered, file: file, line: line)
-            XCTAssertEqual(
+            XCTAssertTrue(isRegistered, file: file, line: line)
+            XCTAssertTrue(
                 ToolAvailabilityStore.shared.toolSummaries.contains {
                     $0.name == MCPGlobalToolName.appSettings
                 },
-                baselineAvailable,
                 file: file,
                 line: line
             )
@@ -2528,23 +2515,6 @@ import XCTest
                 baselineDisabled,
                 file: file,
                 line: line
-            )
-        }
-
-        private func waitUntilReady() async throws {
-            for _ in 0 ..< 1000 {
-                let catalog = await ServiceRegistry.catalogSnapshot()
-                let isRegistered = catalog.activeScopesByToolName[MCPGlobalToolName.appSettings]?.contains(.application) == true
-                let isAvailable = ToolAvailabilityStore.shared.toolSummaries.contains {
-                    $0.name == MCPGlobalToolName.appSettings
-                }
-                if isRegistered, isAvailable {
-                    return
-                }
-                await Task.yield()
-            }
-            throw MCPExecutionWatchdogIntegrationFixtureError.toolAvailabilityDidNotPublish(
-                MCPGlobalToolName.appSettings
             )
         }
     }

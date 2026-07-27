@@ -82,34 +82,74 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         await window.mcpServer.stopServer()
     }
 
-    func testGlobalCompositionCoalescesApplicationRegistrationBeforeReadiness() async throws {
-        let registrations = (0 ..< 8).map { _ in
-            Task { @MainActor in
-                try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
-            }
+    func testAppDelegateStartupPublishesGlobalRegistrationBeforeObservationOnlyReadiness() async {
+        let wiringProbe = AppDelegateRegistrationProbe()
+        let wiringDelegate = AppDelegate()
+        wiringDelegate.setGlobalMCPRegistrationOperationForTesting {
+            try await wiringProbe.register()
         }
-        for registration in registrations {
-            try await registration.value
+        let wiringTasks = (0 ..< 8).map { _ in
+            wiringDelegate.startGlobalMCPServiceRegistration()
         }
+        for wiringTask in wiringTasks {
+            await wiringTask.value
+        }
+        XCTAssertEqual(wiringProbe.invocationCount, 1)
+        XCTAssertNil(wiringDelegate.domainRuntimeStartupFailureDescription)
 
-        let ready = await MCPToolCatalogReadiness.shared.awaitReady(windowID: nil, timeout: 1)
+        let failureProbe = AppDelegateRegistrationProbe(failure: .injected)
+        let failureDelegate = AppDelegate()
+        failureDelegate.setGlobalMCPRegistrationOperationForTesting {
+            try await failureProbe.register()
+        }
+        await failureDelegate.startGlobalMCPServiceRegistration().value
+        await failureDelegate.startGlobalMCPServiceRegistration().value
+        XCTAssertEqual(failureProbe.invocationCount, 1, "A stored startup failure must not retry or log per caller.")
+        XCTAssertNotNil(failureDelegate.domainRuntimeStartupFailureDescription)
+
+        let appDelegate = AppDelegate()
+        await appDelegate.startGlobalMCPServiceRegistration().value
+        XCTAssertNil(appDelegate.domainRuntimeStartupFailureDescription)
+        XCTAssertEqual(
+            AppGlobalMCPServiceComposition.shared.registrationStatus(),
+            .registered
+        )
+
         let snapshot = await ServiceRegistry.catalogSnapshot()
-        XCTAssertTrue(ready)
         XCTAssertTrue(
             MCPGlobalToolName.orderedToolNames.allSatisfy { toolName in
                 snapshot.activeScopesByToolName[toolName]?.contains(.application) == true
             },
-            "Composition-owned app settings and routing registrations must exist before readiness succeeds."
+            "AppDelegate startup must publish every application-scoped tool before readiness observes it."
         )
+        XCTAssertTrue(
+            MCPGlobalToolName.orderedToolNames.allSatisfy { toolName in
+                ToolAvailabilityStore.shared.toolSummaries.contains { $0.name == toolName }
+            },
+            "Composition-owned availability must remain published with the canonical catalog."
+        )
+        let globallyReady = await MCPToolCatalogReadiness.shared.awaitReady(windowID: nil, timeout: 1)
+        XCTAssertTrue(globallyReady)
 
-        let stableRevision = snapshot.revision
-        try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
-        let afterRepeatedEnsure = await ServiceRegistry.catalogSnapshot()
-        XCTAssertEqual(
-            afterRepeatedEnsure.revision,
-            stableRevision,
-            "Joining an existing global registration must not recreate or replace its handles."
+        let timeout: TimeInterval = 0.2
+        let start = Date()
+        let missingWindowReady = await MCPToolCatalogReadiness.shared.awaitReady(
+            windowID: Int.min,
+            timeout: timeout
         )
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertFalse(missingWindowReady, "A missing window must remain fail-closed.")
+        XCTAssertGreaterThanOrEqual(elapsed, timeout * 0.85, "Readiness must retain the full recovery window.")
+        XCTAssertLessThan(elapsed, timeout + 0.75, "Readiness must remain bounded.")
+
+        let cancellationStart = Date()
+        let cancelledReadiness = Task {
+            await MCPToolCatalogReadiness.shared.awaitReady(windowID: Int.min, timeout: 5)
+        }
+        cancelledReadiness.cancel()
+        let cancelledReady = await cancelledReadiness.value
+        XCTAssertFalse(cancelledReady)
+        XCTAssertLessThan(Date().timeIntervalSince(cancellationStart), 0.5, "Cancellation must not consume the timeout window.")
     }
 
     func testAgentRunRespondSchemaAdvertisesCanonicalScalarResponseOnly() async throws {
@@ -565,6 +605,25 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             }
         }
     #endif
+
+    @MainActor
+    private final class AppDelegateRegistrationProbe {
+        enum Failure: Error {
+            case injected
+        }
+
+        private let failure: Failure?
+        private(set) var invocationCount = 0
+
+        init(failure: Failure? = nil) {
+            self.failure = failure
+        }
+
+        func register() async throws {
+            invocationCount += 1
+            if let failure { throw failure }
+        }
+    }
 
     private static func schemaProperties(
         for tool: RepoPromptApp.Tool,

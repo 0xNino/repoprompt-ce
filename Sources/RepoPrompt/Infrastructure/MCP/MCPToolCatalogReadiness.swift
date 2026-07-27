@@ -7,29 +7,7 @@
 //
 
 import Foundation
-import Logging
 import RepoPromptDomainRuntime
-
-private let log = Logger(label: "com.repoprompt.mcp.readiness")
-
-private actor MCPGlobalRegistrationReadinessState {
-    enum Outcome {
-        case pending
-        case succeeded
-        case failed(String)
-    }
-
-    private var outcome: Outcome = .pending
-
-    func complete(_ outcome: Outcome) {
-        guard case .pending = self.outcome else { return }
-        self.outcome = outcome
-    }
-
-    func snapshot() -> Outcome {
-        outcome
-    }
-}
 
 #if DEBUG
     private var mcpToolCatalogReadinessDebugLoggingEnabled = false
@@ -60,41 +38,34 @@ actor MCPToolCatalogReadiness {
     ///   - timeout: Maximum time to wait
     /// - Returns: true if ready, false if timeout
     func awaitReady(windowID: Int?, timeout: TimeInterval = defaultTimeout) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        let registrationState = MCPGlobalRegistrationReadinessState()
-        Task {
-            do {
-                try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
-                await registrationState.complete(.succeeded)
-            } catch {
-                await registrationState.complete(.failed(String(reflecting: error)))
-            }
-        }
-        let pollInterval: TimeInterval = 0.05 // 50ms
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(max(0, timeout)))
+        var pollInterval: TimeInterval = 0.025
 
-        while Date() < deadline {
-            if case let .failed(error) = await registrationState.snapshot() {
-                log.error("Global MCP domain registration failed before readiness: \(error)")
-                return false
-            }
+        while true {
+            if Task.isCancelled { return false }
+            guard clock.now < deadline else { break }
 
-            // Check if required services are registered
             let isReady = await checkServicesReady(windowID: windowID)
-
+            if Task.isCancelled { return false }
+            guard clock.now <= deadline else { break }
             if isReady {
                 mcpToolCatalogReadinessLog("Tool catalog ready for window \(windowID.map(String.init) ?? "nil")")
                 return true
             }
 
-            // Wait a bit before checking again
+            let nextPoll = min(
+                clock.now.advanced(by: .seconds(pollInterval)),
+                deadline
+            )
             do {
-                try await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
+                try await clock.sleep(until: nextPoll, tolerance: .milliseconds(2))
             } catch {
-                return false // Task cancelled
+                return false
             }
+            pollInterval = min(pollInterval * 2, 0.2)
         }
 
-        log.warning("Tool catalog readiness timeout for window \(windowID.map(String.init) ?? "nil")")
         return false
     }
 
@@ -126,28 +97,25 @@ actor MCPToolCatalogReadiness {
     /// Check if required services are ready (MainActor)
     @MainActor
     private func checkServicesReady(windowID: Int?) async -> Bool {
-        if let windowID {
-            // Check if the window exists
-            guard let window = WindowStatesManager.shared.window(withID: windowID) else {
-                mcpToolCatalogReadinessLog("Window \(windowID) not found during readiness check")
-                return false
-            }
-
-            // If tools are disabled for this window, that's a valid ready state even before registration.
-            if !window.mcpServer.windowToolsEnabled {
-                mcpToolCatalogReadinessLog("Window \(windowID) has tools disabled - considered ready")
-                return true
-            }
-        }
-
         let snapshot = await ServiceRegistry.catalogSnapshot()
-        let globalNames = Set(snapshot.toolNames)
-        guard globalNames.isSuperset(of: MCPGlobalToolName.orderedToolNames) else {
-            mcpToolCatalogReadinessLog("Global domain tool registrations are not ready")
+        let globalCatalogReady = MCPGlobalToolName.orderedToolNames.allSatisfy { toolName in
+            snapshot.activeScopesByToolName[toolName]?.contains(.application) == true
+        }
+        guard globalCatalogReady else {
+            mcpToolCatalogReadinessLog("Application-scoped global domain registrations are not ready")
             return false
         }
 
         guard let windowID else { return true }
+        guard let window = WindowStatesManager.shared.window(withID: windowID) else {
+            mcpToolCatalogReadinessLog("Window \(windowID) not found during readiness check")
+            return false
+        }
+
+        if !window.mcpServer.windowToolsEnabled {
+            mcpToolCatalogReadinessLog("Window \(windowID) has tools disabled after global readiness")
+            return true
+        }
         let requiredScope = MCPDomainToolRegistrationScope.window(id: windowID)
         let windowCatalogReady = MCPWindowToolGroup.orderedToolNames.allSatisfy { toolName in
             snapshot.activeScopesByToolName[toolName]?.contains(requiredScope) == true

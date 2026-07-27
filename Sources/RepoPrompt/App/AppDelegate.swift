@@ -1,8 +1,11 @@
 import Cocoa
 import Combine
 import Darwin
+import Logging
 import Sparkle
 import SwiftUI
+
+private let appDelegateLog = Logger(label: "com.repoprompt.app.delegate")
 
 #if DEBUG
     private var appDelegateDebugLoggingEnabled = false
@@ -16,12 +19,17 @@ import SwiftUI
 
 @MainActor
 class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
+    typealias GlobalMCPRegistrationOperation = @MainActor @Sendable () async throws -> Void
     /// Prevents re-entrant termination (Cmd+Q twice, menu + dock quit, etc.)
     private var terminationInProgress = false
     private let dockMenuController = DockMenuController()
 
-    /// Global runtime/catalog startup remains joined for the app lifetime.
+    /// App startup owns one explicit registration attempt; readiness only observes it.
     private var domainRuntimeStartupTask: Task<Void, Never>?
+    private(set) var domainRuntimeStartupFailureDescription: String?
+    private var globalMCPRegistrationOperation: GlobalMCPRegistrationOperation = {
+        try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+    }
 
     // MARK: - Global references
 
@@ -63,6 +71,38 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         super.init()
     }
 
+    // MARK: - Global MCP startup
+
+    /// The production startup seam for process-owned application registrations.
+    /// Repeated callers join the one app-lifetime attempt instead of retrying or logging.
+    @discardableResult
+    func startGlobalMCPServiceRegistration() -> Task<Void, Never> {
+        if let domainRuntimeStartupTask { return domainRuntimeStartupTask }
+
+        domainRuntimeStartupFailureDescription = nil
+        let registrationOperation = globalMCPRegistrationOperation
+        let task = Task { @MainActor [weak self, registrationOperation] in
+            do {
+                try await registrationOperation()
+            } catch {
+                let description = String(reflecting: error)
+                self?.domainRuntimeStartupFailureDescription = description
+                appDelegateLog.error("Global MCP domain service registration failed: \(description)")
+            }
+        }
+        domainRuntimeStartupTask = task
+        return task
+    }
+
+    #if DEBUG
+        func setGlobalMCPRegistrationOperationForTesting(
+            _ operation: @escaping GlobalMCPRegistrationOperation
+        ) {
+            precondition(domainRuntimeStartupTask == nil, "Registration operation must be injected before startup")
+            globalMCPRegistrationOperation = operation
+        }
+    #endif
+
     // MARK: - NSApplicationDelegate
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -82,15 +122,9 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         AppearanceController.shared.applyFromGlobalSettings()
 
         // ───────────────────────────────────────────────────
-        // Start the runtime and publish both application-scoped MCP services as
-        // one composition-owned operation. Readiness joins this same task.
-        domainRuntimeStartupTask = Task {
-            do {
-                try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
-            } catch {
-                assertionFailure("Failed to register global MCP domain services: \(error)")
-            }
-        }
+        // Start the runtime and publish both application-scoped MCP services before
+        // any connection can report a complete catalog. Readiness is observation-only.
+        startGlobalMCPServiceRegistration()
         if !launchConfiguration.suppressesNonessentialLaunchSideEffects {
             // Request notification authorization
             Task {
