@@ -438,10 +438,61 @@ if [[ -d "$domain_runtime_source_dir" ]]; then
     "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPGitToolProvider.swift"
     "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPHistoryToolProvider.swift"
   )
-  m3_duplicate_schema_matches="$(grep -n -E 'name:[[:space:]]*MCPWindowToolName\.(getCodeStructure|getFileTree|readFile|search|workspaceContext|prompt|oracleChatLog|git|history)' "${m3_legacy_provider_files[@]}" || true)"
+  m3_duplicate_schema_matches="$(grep -n -E 'name:[[:space:]]*(MCPWindowToolName\.(getCodeStructure|getFileTree|readFile|search|workspaceContext|prompt|oracleChatLog|git|history)|"(get_code_structure|get_file_tree|read_file|file_search|workspace_context|prompt|oracle_chat_log|git|history)")' "${m3_legacy_provider_files[@]}" || true)"
   if [[ -n "$m3_duplicate_schema_matches" ]]; then
     fail "M3 read/discovery schema reintroduced in an app provider"
     printf '%s\n' "$m3_duplicate_schema_matches" >&2
+  fi
+
+  m3_domain_provider="$domain_runtime_source_dir/MCPDomainReadToolProvider.swift"
+  for requirement in 'case workspaceIndependent' 'case workspaceOptional' 'case workspaceRequired'; do
+    if ! grep -q "$requirement" "$m3_domain_provider"; then
+      fail "M3 per-family context requirement missing: $requirement"
+    fi
+  done
+  if ! grep -q 'case "history", "oracle_chat_log"' "$m3_domain_provider" \
+    || ! grep -q 'case "get_file_tree", "git"' "$m3_domain_provider"; then
+    fail "M3 historical workspace-independent/optional family mapping changed"
+  fi
+
+  m3_app_read_routing="Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+DomainRouting.swift"
+  if ! grep -q 'registerForRead' "$m3_app_read_routing"; then
+    fail "M3 awaited transient read authority registration missing"
+  fi
+  if grep -q 'validateDomainReadContext' "$m3_app_read_routing"; then
+    fail "M3 read path reintroduced repeated MainActor authority capture"
+  fi
+  m3_read_resolver="$(sed -n '/func resolveDomainReadContext/,/Runs before the server is stopped/p' "$m3_app_read_routing")"
+  if grep -q -E 'registerWindow|publishDomainRoutingBinding' <<<"$m3_read_resolver"; then
+    fail "M3 read resolution mutates shared presentation routing"
+  fi
+  if ! grep -q 'domainReadAppExecutionContexts\[invocation.invocationID\]' "$m3_app_read_routing" \
+    || ! grep -q 'releaseDomainReadAppExecutionContext' "$m3_app_read_routing" \
+    || ! grep -q 'registerFallbackDomainReadContext' "$m3_app_read_routing" \
+    || ! grep -q 'domainRoutingConnectionIDs' "$m3_app_read_routing"; then
+    fail "M3 invocation snapshot, fallback authority, or connection-lifecycle seam missing"
+  fi
+  if ! grep -q 'context.handle == nil' "$m3_domain_provider"; then
+    fail "M3 required read authority no longer fails closed"
+  fi
+  m3_file_backend="Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift"
+  m3_prompt_backend="Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPPromptContextToolProvider.swift"
+  if ! grep -q 'readAuthority(appContext)' "$m3_file_backend" \
+    || ! grep -q 'selectionRefreshedContext(appContext.resolvedTabContext)' "$m3_prompt_backend" \
+    || grep -q 'resolveTabContextSnapshot' <<<"$(sed -n '/func selectionRefreshedContext/,/private func simplePromptReply/p' "$m3_prompt_backend")"; then
+    fail "M3 app backend stopped consuming captured authority or repeated heavyweight routing"
+  fi
+
+  m3_side_effects="$domain_runtime_source_dir/DomainReadSideEffectCoordinator.swift"
+  if ! grep -q 'case selection' "$m3_side_effects" || ! grep -q 'case gitArtifacts' "$m3_side_effects"; then
+    fail "M3 independent selection/Git effect classes missing"
+  fi
+  if ! grep -q 'await previous.result' "$m3_side_effects"; then
+    fail "M3 side-effect chain no longer recovers after an earlier failure"
+  fi
+  if ! grep -q 'expiredOperationIDs' "$m3_side_effects" \
+    || ! grep -q 'receiptUnavailable' "$m3_side_effects"; then
+    fail "M3 exact side-effect receipts no longer fail closed after bounded-ledger expiry"
   fi
 fi
 
@@ -608,10 +659,10 @@ allowed_tracked_docs=(
   "docs/testing.md"
   "docs/spec/headless-mcp-domain-runtime-m0-contracts.md"
   "docs/spec/headless-mcp-domain-runtime-m0-editflowperf-baseline.json"
-    "docs/spec/headless-mcp-domain-runtime-m2-context-authority.md"
-    "docs/spec/headless-mcp-domain-runtime-m3-evidence.json"
-    "docs/spec/headless-mcp-domain-runtime-m3-read-discovery.md"
-    "docs/spec/history-query-tools.md"
+  "docs/spec/headless-mcp-domain-runtime-m2-context-authority.md"
+  "docs/spec/headless-mcp-domain-runtime-m3-evidence.json"
+  "docs/spec/headless-mcp-domain-runtime-m3-read-discovery.md"
+  "docs/spec/history-query-tools.md"
   "docs/worktrees.md"
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
   "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"

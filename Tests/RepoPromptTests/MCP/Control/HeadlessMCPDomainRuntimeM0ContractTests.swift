@@ -421,6 +421,49 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         }
         let m3NonMainActorHops = try strings(actorInventory, key: "m3_non_main_actor_hops")
         let m3SharedReadTools = try Set(strings(actorInventory, key: "m3_shared_read_tools"))
+        let m3ContextRequirements = try stringArrays(actorInventory, key: "m3_context_requirements")
+        XCTAssertEqual(try Set(XCTUnwrap(m3ContextRequirements["workspace_independent"])), ["history", "oracle_chat_log"])
+        XCTAssertEqual(try Set(XCTUnwrap(m3ContextRequirements["workspace_optional"])), ["get_file_tree", "git"])
+        XCTAssertEqual(
+            try Set(XCTUnwrap(m3ContextRequirements["workspace_required"])),
+            ["get_code_structure", "read_file", "file_search", "workspace_context", "prompt"]
+        )
+        let m3CaptureContract = try dictionary(actorInventory, key: "m3_main_actor_capture_contract")
+        XCTAssertEqual(try integer(m3CaptureContract, key: "scoped_authority_captures_per_invocation"), 1)
+        XCTAssertEqual(try integer(m3CaptureContract, key: "workspace_independent_authority_captures_per_invocation"), 0)
+        XCTAssertEqual(m3CaptureContract["refresh_runs_on_main_actor"] as? Bool, false)
+        XCTAssertEqual(m3CaptureContract["read_mutates_presentation_descriptor"] as? Bool, false)
+        XCTAssertEqual(m3CaptureContract["app_execution_snapshot_registered_and_released"] as? Bool, true)
+        XCTAssertEqual(m3CaptureContract["required_context_allows_nil_handle"] as? Bool, false)
+        XCTAssertEqual(m3CaptureContract["direct_test_fallback_uses_domain_handle"] as? Bool, true)
+        XCTAssertEqual(
+            m3CaptureContract["post_drain_refresh"] as? String,
+            "bound_workspace_tab_selection_and_revision_only"
+        )
+        let domainReadRouting = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+DomainRouting.swift"
+        )
+        let resolverStart = try XCTUnwrap(domainReadRouting.range(of: "func resolveDomainReadContext"))
+        let resolverEnd = try XCTUnwrap(
+            domainReadRouting.range(of: "/// Runs before the server is stopped", range: resolverStart.upperBound ..< domainReadRouting.endIndex)
+        )
+        let resolver = domainReadRouting[resolverStart.lowerBound ..< resolverEnd.lowerBound]
+        XCTAssertTrue(resolver.contains("requirement != .workspaceIndependent"))
+        XCTAssertTrue(resolver.contains("registerForRead"))
+        XCTAssertFalse(resolver.contains("registerWindow"))
+        XCTAssertFalse(resolver.contains("publishDomainRoutingBinding"))
+        XCTAssertFalse(domainReadRouting.contains("validateDomainReadContext"))
+        XCTAssertTrue(domainReadRouting.contains("domainReadAppExecutionContexts[invocation.invocationID]"))
+        XCTAssertTrue(domainReadRouting.contains("releaseDomainReadAppExecutionContext"))
+        let fileReadBackend = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift"
+        )
+        XCTAssertTrue(fileReadBackend.contains("readAuthority(appContext)"))
+        let promptReadBackend = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPPromptContextToolProvider.swift"
+        )
+        XCTAssertTrue(promptReadBackend.contains("appContext.resolvedTabContext"))
+        XCTAssertTrue(promptReadBackend.contains("simplePromptReply(tabContext.promptText"))
         let inventoriedSymbols = Set(expectedLocalSites.map { $0.split(separator: "|").last.map(String.init) ?? "" })
             .union(externalSites.compactMap { $0["symbol"] as? String })
             .union(m3NonMainActorHops)
