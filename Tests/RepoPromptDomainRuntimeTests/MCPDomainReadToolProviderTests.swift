@@ -104,6 +104,38 @@ final class MCPDomainReadToolProviderTests: XCTestCase {
         XCTAssertEqual(refreshCount, 1)
     }
 
+    func testRequiredContextCannotExecuteUnfencedAndReleasesInvocation() async throws {
+        let identity = makeIdentity()
+        let backendInvocations = InvocationRecorder()
+        let releases = StringRecorder()
+        let provider = MCPDomainReadToolProvider(
+            resolveContext: { _, _ in
+                DomainReadInvocationContext(handle: nil, connectionID: UUID())
+            },
+            releaseContext: { context in
+                await releases.append(context.invocationID.uuidString)
+            },
+            backend: MCPDomainReadToolBackend { name, context, arguments, _ in
+                await backendInvocations.record(name: name, context: context, arguments: arguments)
+                return .string("unexpected")
+            },
+            sideEffects: DomainReadSideEffectCoordinator(identity: identity)
+        )
+        let read = try XCTUnwrap(provider.binding(named: "read_file"))
+
+        do {
+            _ = try await read(["path": .string("file.swift")])
+            XCTFail("Expected required authority failure")
+        } catch let error as MCPError {
+            XCTAssertTrue(String(describing: error).contains("Required domain authority is unavailable"))
+        }
+
+        let invocations = await backendInvocations.snapshot()
+        XCTAssertTrue(invocations.isEmpty)
+        let released = await releases.snapshot()
+        XCTAssertEqual(released.count, 1)
+    }
+
     func testCancellationPropagatesWithoutSuccessNormalization() async throws {
         let identity = makeIdentity()
         let handle = makeHandle(identity: identity)
@@ -150,7 +182,7 @@ final class MCPDomainReadToolProviderTests: XCTestCase {
         XCTAssertEqual(committed, ["committed"])
     }
 
-    func testM0EquivalentVersusM3ProviderOrchestrationLatencyIsBounded() async throws {
+    func testDirectBackendVersusM3ProviderWrapperLatencyIsBounded() async throws {
         let identity = makeIdentity()
         let handle = makeHandle(identity: identity)
         let context = DomainReadInvocationContext(handle: handle, connectionID: handle.connectionID)
@@ -184,10 +216,10 @@ final class MCPDomainReadToolProviderTests: XCTestCase {
         let overheadPerCall = max(0, m3Nanoseconds - baselineNanoseconds) / Int64(iterations)
         print(
             "M3_READ_LATENCY iterations=\(iterations) "
-                + "m0_equivalent_ns=\(baselineNanoseconds) "
-                + "m3_provider_ns=\(m3Nanoseconds) overhead_per_call_ns=\(overheadPerCall)"
+                + "direct_backend_ns=\(baselineNanoseconds) "
+                + "provider_wrapper_ns=\(m3Nanoseconds) overhead_per_call_ns=\(overheadPerCall)"
         )
-        XCTAssertLessThan(overheadPerCall, 1_000_000)
+        XCTAssertLessThan(overheadPerCall, 100_000)
     }
 
     func testProviderNormalizesTopLevelInvalidParametersBeforeBackend() async throws {

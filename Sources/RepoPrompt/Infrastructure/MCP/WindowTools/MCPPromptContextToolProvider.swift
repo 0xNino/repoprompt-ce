@@ -13,26 +13,30 @@ final class MCPPromptContextToolProvider {
     func executeDomainRead(
         toolName: String,
         context _: DomainReadInvocationContext,
+        appContext: MCPServerViewModel.DomainReadAppExecutionContext?,
         args: [String: Value]
     ) async throws -> Value {
         switch toolName {
         case MCPWindowToolName.workspaceContext:
-            try await executeWorkspaceContext(args: args)
+            try await executeWorkspaceContext(args: args, appContext: appContext)
         case MCPWindowToolName.prompt:
-            try await executePrompt(args: args)
+            try await executePrompt(args: args, appContext: appContext)
         default:
             throw MCPError.invalidParams("Unsupported prompt/context read tool: \(toolName)")
         }
     }
 
-    func executeWorkspaceContext(args: [String: Value]) async throws -> Value {
+    func executeWorkspaceContext(
+        args: [String: Value],
+        appContext: MCPServerViewModel.DomainReadAppExecutionContext? = nil
+    ) async throws -> Value {
         let op = (args["op"]?.stringValue ?? "snapshot").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if op != "snapshot" {
             var forwarded = args
             forwarded["op"] = .string(op)
             switch op {
             case "export", "list_presets", "select_preset":
-                return try await executePrompt(args: forwarded)
+                return try await executePrompt(args: forwarded, appContext: appContext)
             default:
                 throw MCPError.invalidParams("Unsupported workspace_context op '\(op)'. Use snapshot, export, list_presets, or select_preset.")
             }
@@ -40,15 +44,30 @@ final class MCPPromptContextToolProvider {
         let includeArr = args["include"]?.arrayValue?.compactMap { $0.stringValue?.lowercased() } ?? ["prompt", "selection", "code", "tokens"]
         let display: FilePathDisplay = ((args["path_display"]?.stringValue ?? "relative").lowercased() == "full") ? .full : .relative
         let overridePreset = try await resolveCopyPresetOverride(args["copy_preset"])
-        let metadata = await dependencies.captureRequestMetadata()
+        let metadata: MCPServerViewModel.RequestMetadata
+        let lookupContext: WorkspaceLookupContext
+        if let appContext {
+            metadata = appContext.metadata
+            lookupContext = appContext.lookupContext
+        } else {
+            metadata = await dependencies.captureRequestMetadata()
+            lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+        }
         guard await dependencies.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics) == .completed else {
             throw CancellationError()
         }
-        let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
         if includeArr.contains("files") {
             _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
         }
-        let resolvedTabContext = try await dependencies.resolveTabContextSnapshot(metadata, MCPWindowToolName.workspaceContext, .allowLegacyImplicitRouting)
+        let resolvedTabContext: MCPServerViewModel.ResolvedTabContextSnapshot = if let appContext {
+            selectionRefreshedContext(appContext.resolvedTabContext)
+        } else {
+            try await dependencies.resolveTabContextSnapshot(
+                metadata,
+                MCPWindowToolName.workspaceContext,
+                .allowLegacyImplicitRouting
+            )
+        }
         let dto = try await dependencies.buildTabWorkspaceContext(
             resolvedTabContext.snapshot,
             Set(includeArr),
@@ -59,22 +78,40 @@ final class MCPPromptContextToolProvider {
         return try Value(dto)
     }
 
-    func executePrompt(args: [String: Value]) async throws -> Value {
-        try await executePromptBody(args: args)
+    func executePrompt(
+        args: [String: Value],
+        appContext: MCPServerViewModel.DomainReadAppExecutionContext? = nil
+    ) async throws -> Value {
+        try await executePromptBody(args: args, appContext: appContext)
     }
 
-    private func executePromptBody(args: [String: Value]) async throws -> Value {
+    private func executePromptBody(
+        args: [String: Value],
+        appContext: MCPServerViewModel.DomainReadAppExecutionContext?
+    ) async throws -> Value {
         let op = (args["op"]?.stringValue ?? "get").lowercased()
         if op == "list_presets" {
             return try Value(ToolResultDTOs.PromptToolEnvelope.forPresetsList(dependencies.buildCopyPresetsListDTO()))
         }
-        let metadata = await dependencies.captureRequestMetadata()
+        let metadata: MCPServerViewModel.RequestMetadata = if let appContext {
+            appContext.metadata
+        } else {
+            await dependencies.captureRequestMetadata()
+        }
         if op == "export" {
             guard await dependencies.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics) == .completed else {
                 throw CancellationError()
             }
         }
-        let resolvedContext = try await dependencies.resolveTabContextSnapshot(metadata, MCPWindowToolName.prompt, .allowLegacyImplicitRouting)
+        let resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot = if let appContext {
+            selectionRefreshedContext(appContext.resolvedTabContext)
+        } else {
+            try await dependencies.resolveTabContextSnapshot(
+                metadata,
+                MCPWindowToolName.prompt,
+                .allowLegacyImplicitRouting
+            )
+        }
         if !resolvedContext.usesActiveTabCompatibility {
             return try await executeTabScopedPrompt(op: op, args: args, resolvedContext: resolvedContext)
         }
@@ -108,8 +145,7 @@ final class MCPPromptContextToolProvider {
         let tabContext = resolvedContext.snapshot
         switch op {
         case "get":
-            let context = try await dependencies.requireCurrentTabContext(MCPWindowToolName.prompt)
-            return try Value(simplePromptReply(context.promptText, op: op))
+            return try Value(simplePromptReply(tabContext.promptText, op: op))
         case "set":
             guard let text = args["text"]?.stringValue else { throw MCPError.invalidParams("text required for set") }
             try await dependencies.updateCurrentTabContext(MCPWindowToolName.prompt) { $0.promptText = text }
@@ -137,6 +173,30 @@ final class MCPPromptContextToolProvider {
         default:
             throw MCPError.invalidParams("Unsupported op '\(op)' for prompt when tab context is active")
         }
+    }
+
+    /// Refreshes only the exact canonical selection consumed after the legacy selection queue
+    /// drains. Routing, prompt, worktree, and lookup authority remain the invocation snapshot;
+    /// this avoids a second heavyweight tab-routing resolution on MainActor.
+    private func selectionRefreshedContext(
+        _ captured: MCPServerViewModel.ResolvedTabContextSnapshot
+    ) -> MCPServerViewModel.ResolvedTabContextSnapshot {
+        guard let workspaceID = captured.snapshot.workspaceID,
+              let manager = dependencies.workspaceManager,
+              let tab = manager.composeTab(for: WorkspaceSelectionIdentity(
+                  workspaceID: workspaceID,
+                  tabID: captured.snapshot.tabID
+              ))
+        else { return captured }
+        let revision = manager.selectionRevisionForMCP(
+            workspaceID: workspaceID,
+            tabID: tab.id
+        )
+        guard revision >= captured.snapshot.selectionRevision else { return captured }
+        var refreshed = captured
+        refreshed.snapshot.selection = tab.selection
+        refreshed.snapshot.selectionRevision = revision
+        return refreshed
     }
 
     private func simplePromptReply(_ text: String, op: String) -> ToolResultDTOs.PromptToolEnvelope {

@@ -146,6 +146,7 @@ enum WindowStateCompositionFactory {
             domainRoutingCoordinator: domainRuntime?.routingCoordinator,
             domainWorkspaceAuthorityClient: domainWorkspaceClient,
             domainReadSideEffectCoordinator: domainRuntime?.readSideEffectCoordinator,
+            domainReadRuntimeIdentity: domainRuntime?.identity,
             applyEditsApprovalStore: applyEditsApprovalStore
         )
         let closeCoordinator = WindowCloseCoordinator()

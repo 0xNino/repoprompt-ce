@@ -46,16 +46,21 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         let stillRegistered = await runtime.contextStore.workspaceSnapshot(fixture.workspaceID)
         XCTAssertNotNil(stillRegistered)
 
-        // The transient overlay does not collide with a later canonical create.
+        // A different newer canonical document supersedes the transient overlay.
+        let canonicalDocument = try fixture.document(prompt: "canonical")
         let created = await runtime.workspaceStore.execute(.init(
             operationID: UUID(),
             expectedCatalogRevision: 0,
             expectedWorkspaceRevision: 0,
             origin: .standalone,
-            command: .createWorkspace(document)
+            command: .createWorkspace(canonicalDocument)
         ))
         XCTAssertEqual(created.disposition, .applied)
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.workspaceFile.path))
+        let registeredCanonicalSnapshot = await runtime.contextStore.workspaceSnapshot(fixture.workspaceID)
+        let canonicalSnapshot = try XCTUnwrap(registeredCanonicalSnapshot)
+        XCTAssertEqual(canonicalSnapshot.document.contentDigest, canonicalDocument.contentDigest)
+        XCTAssertNotEqual(canonicalSnapshot.document.contentDigest, document.contentDigest)
     }
 
     func testSubscriptionBootstrapsBeforePublishingFirstProjection() async throws {

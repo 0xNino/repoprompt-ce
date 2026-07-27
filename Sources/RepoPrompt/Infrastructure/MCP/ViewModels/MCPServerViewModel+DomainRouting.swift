@@ -3,6 +3,12 @@ import MCP
 import RepoPromptDomainRuntime
 
 extension MCPServerViewModel {
+    struct DomainReadAppExecutionContext {
+        let metadata: RequestMetadata
+        let resolvedTabContext: ResolvedTabContextSnapshot
+        let lookupContext: WorkspaceLookupContext
+    }
+
     @MainActor
     func scheduleDomainWindowRegistration(
         activeWorkspaceID: UUID?,
@@ -103,6 +109,7 @@ extension MCPServerViewModel {
                 }?.registration
             }
             guard let registration else { return }
+            domainRoutingConnectionIDs.insert(connectionID)
             let bound = await coordinator.bind(
                 connection: registration,
                 binding: binding,
@@ -116,12 +123,18 @@ extension MCPServerViewModel {
 
     @MainActor
     func publishDomainRoutingRelease(connectionID: UUID) {
-        guard let coordinator = domainRoutingCoordinator else { return }
+        guard let coordinator = domainRoutingCoordinator else {
+            domainRoutingConnectionIDs.remove(connectionID)
+            return
+        }
         Task {
             let snapshot = await coordinator.snapshot()
             guard let registration = snapshot.connections.first(where: {
                 $0.registration.connectionID == connectionID
-            })?.registration else { return }
+            })?.registration else {
+                domainRoutingConnectionIDs.remove(connectionID)
+                return
+            }
             let released = await coordinator.unregisterConnection(
                 registration,
                 operationID: UUID()
@@ -131,6 +144,7 @@ extension MCPServerViewModel {
                     "Domain routing release rejected: \(released.diagnostic ?? String(describing: released.disposition))"
                 )
             }
+            domainRoutingConnectionIDs.remove(connectionID)
         }
     }
 
@@ -147,11 +161,6 @@ extension MCPServerViewModel {
 
         let metadata = await captureRequestMetadata()
         let connectionID = metadata.connectionID
-        guard let coordinator = domainRoutingCoordinator,
-              let connectionID
-        else {
-            return DomainReadInvocationContext(handle: nil, connectionID: connectionID)
-        }
 
         // App compatibility remains the physical fallback for graceful/no-workspace tools and
         // focused tests. Routing errors must not preempt their historical backend diagnostics.
@@ -163,15 +172,46 @@ extension MCPServerViewModel {
                 policy: .allowLegacyImplicitRouting
             )
         } catch {
-            return DomainReadInvocationContext(handle: nil, connectionID: connectionID)
+            return try domainReadUnavailable(
+                toolName: toolName,
+                requirement: requirement,
+                connectionID: connectionID,
+                diagnostic: "tab context unavailable: \(error.localizedDescription)"
+            )
         }
         let context = resolved.snapshot
+        if domainRoutingCoordinator == nil
+            || connectionID == nil
+            || domainWorkspaceAuthorityClient == nil
+        {
+            return try await registerFallbackDomainReadContext(
+                toolName: toolName,
+                requirement: requirement,
+                metadata: metadata,
+                resolved: resolved
+            )
+        }
+        guard let coordinator = domainRoutingCoordinator,
+              let connectionID
+        else {
+            return try domainReadUnavailable(
+                toolName: toolName,
+                requirement: requirement,
+                connectionID: connectionID,
+                diagnostic: "connection or routing coordinator unavailable"
+            )
+        }
         guard let workspaceID = context.workspaceID,
               let workspaceManager,
               let workspace = workspaceManager.workspaces.first(where: { $0.id == workspaceID }),
               let domainWorkspaceAuthorityClient
         else {
-            return DomainReadInvocationContext(handle: nil, connectionID: connectionID)
+            return try domainReadUnavailable(
+                toolName: toolName,
+                requirement: requirement,
+                connectionID: connectionID,
+                diagnostic: "workspace authority unavailable"
+            )
         }
 
         do {
@@ -182,14 +222,19 @@ extension MCPServerViewModel {
                 fileURL: workspaceManager.workspaceFileURL(for: workspace)
             )
         } catch {
-            logger.debug("Domain read registration fell back to app authority for \(toolName): \(error.localizedDescription)")
-            return DomainReadInvocationContext(handle: nil, connectionID: connectionID)
+            return try domainReadUnavailable(
+                toolName: toolName,
+                requirement: requirement,
+                connectionID: connectionID,
+                diagnostic: "transient authority registration failed: \(error.localizedDescription)"
+            )
         }
 
         let routing = await coordinator.snapshot()
-        var registration = routing.connections.first {
+        let existingConnection = routing.connections.first {
             $0.registration.connectionID == connectionID
-        }?.registration
+        }
+        var registration = existingConnection?.registration
         if registration == nil {
             let registered = await coordinator.registerConnection(
                 connectionID: connectionID,
@@ -200,40 +245,147 @@ extension MCPServerViewModel {
             }?.registration
         }
         guard let registration else {
-            return DomainReadInvocationContext(handle: nil, connectionID: connectionID)
-        }
-        let binding: DomainBinding = if let runID = context.runID {
-            .runScoped(
-                runID: runID,
-                context: DomainContextIdentity(workspaceID: workspaceID, contextID: context.tabID)
-            )
-        } else {
-            .context(
-                DomainContextIdentity(workspaceID: workspaceID, contextID: context.tabID),
-                explicit: context.explicitlyBound
+            return try domainReadUnavailable(
+                toolName: toolName,
+                requirement: requirement,
+                connectionID: connectionID,
+                diagnostic: "connection registration unavailable"
             )
         }
-        let bound = await coordinator.bind(
-            connection: registration,
-            binding: binding,
-            operationID: UUID()
+        domainRoutingConnectionIDs.insert(connectionID)
+        let targetContext = DomainContextIdentity(
+            workspaceID: workspaceID,
+            contextID: context.tabID
         )
-        guard bound.disposition == .applied || bound.disposition == .unchanged else {
-            return DomainReadInvocationContext(handle: nil, connectionID: connectionID)
+        let binding: DomainBinding = if let runID = context.runID {
+            .runScoped(runID: runID, context: targetContext)
+        } else {
+            .context(targetContext, explicit: context.explicitlyBound)
+        }
+        if existingConnection == nil || existingConnection?.binding == .unbound {
+            let bound = await coordinator.bind(
+                connection: registration,
+                binding: binding,
+                operationID: UUID()
+            )
+            guard bound.disposition == .applied || bound.disposition == .unchanged else {
+                return try domainReadUnavailable(
+                    toolName: toolName,
+                    requirement: requirement,
+                    connectionID: connectionID,
+                    diagnostic: bound.diagnostic ?? "context binding rejected"
+                )
+            }
         }
         do {
             let handle = try await coordinator.resolveReadContext(connection: registration)
-            return DomainReadInvocationContext(handle: handle, connectionID: connectionID)
+            guard handle.context == targetContext else {
+                return try domainReadUnavailable(
+                    toolName: toolName,
+                    requirement: requirement,
+                    connectionID: connectionID,
+                    diagnostic: "bound context changed before execution"
+                )
+            }
+            let invocation = DomainReadInvocationContext(handle: handle, connectionID: connectionID)
+            domainReadAppExecutionContexts[invocation.invocationID] = await DomainReadAppExecutionContext(
+                metadata: metadata,
+                resolvedTabContext: resolved,
+                lookupContext: lookupContext(for: context)
+            )
+            return invocation
         } catch {
-            logger.debug("Domain read routing fell back to app authority for \(toolName): \(error.localizedDescription)")
+            return try domainReadUnavailable(
+                toolName: toolName,
+                requirement: requirement,
+                connectionID: connectionID,
+                diagnostic: "domain context resolution failed: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    @MainActor
+    private func registerFallbackDomainReadContext(
+        toolName: String,
+        requirement: DomainReadContextRequirement,
+        metadata: RequestMetadata,
+        resolved: ResolvedTabContextSnapshot
+    ) async throws -> DomainReadInvocationContext {
+        let context = resolved.snapshot
+        guard let identity = domainReadFallbackRuntimeIdentity,
+              let workspaceID = context.workspaceID
+        else {
+            return try domainReadUnavailable(
+                toolName: toolName,
+                requirement: requirement,
+                connectionID: metadata.connectionID,
+                diagnostic: "registered fallback authority unavailable"
+            )
+        }
+        let connectionID = metadata.connectionID ?? UUID()
+        let revision = max(context.selectionRevision, 1)
+        let bindingKind: DomainReadBindingKind = if let runID = context.runID {
+            .runScoped(runID: runID)
+        } else if context.explicitlyBound {
+            .explicit
+        } else {
+            .appPresentation
+        }
+        let handle = DomainReadContextHandle(
+            runtimeID: identity.runtimeID,
+            runtimeGeneration: identity.lifecycleGeneration,
+            connectionID: connectionID,
+            connectionGeneration: 1,
+            context: DomainContextIdentity(workspaceID: workspaceID, contextID: context.tabID),
+            workspaceRevision: revision,
+            contextRevision: revision,
+            routingRevision: 0,
+            bindingKind: bindingKind
+        )
+        let invocation = DomainReadInvocationContext(
+            handle: handle,
+            connectionID: metadata.connectionID,
+            refreshesDomainRouting: false
+        )
+        domainReadAppExecutionContexts[invocation.invocationID] = await DomainReadAppExecutionContext(
+            metadata: metadata,
+            resolvedTabContext: resolved,
+            lookupContext: lookupContext(for: context)
+        )
+        return invocation
+    }
+
+    @MainActor
+    func domainReadAppExecutionContext(
+        for invocation: DomainReadInvocationContext
+    ) -> DomainReadAppExecutionContext? {
+        domainReadAppExecutionContexts[invocation.invocationID]
+    }
+
+    @MainActor
+    func releaseDomainReadAppExecutionContext(
+        for invocation: DomainReadInvocationContext
+    ) {
+        domainReadAppExecutionContexts.removeValue(forKey: invocation.invocationID)
+    }
+
+    private func domainReadUnavailable(
+        toolName: String,
+        requirement: DomainReadContextRequirement,
+        connectionID: UUID?,
+        diagnostic: String
+    ) throws -> DomainReadInvocationContext {
+        guard requirement == .workspaceRequired else {
             return DomainReadInvocationContext(handle: nil, connectionID: connectionID)
         }
+        throw MCPError.internalError("Domain authority unavailable for \(toolName): \(diagnostic)")
     }
 
     /// Runs before the server is stopped so no presentation binding can outlive its window.
     @MainActor
     func unregisterDomainRoutingWindow() async {
         domainRoutingWindowIsClosing = true
+        domainReadAppExecutionContexts.removeAll()
         domainWindowRegistrationTask?.cancel()
         if domainWindowDescriptor == nil,
            let registrationTask = domainWindowRegistrationTask
@@ -245,7 +397,9 @@ extension MCPServerViewModel {
               let descriptor = domainWindowDescriptor
         else { return }
         let routing = await coordinator.snapshot()
-        for connection in routing.connections where windowIDByConnection[connection.registration.connectionID] == descriptor.windowID {
+        let ownedConnectionIDs = domainRoutingConnectionIDs
+        domainRoutingConnectionIDs.removeAll()
+        for connection in routing.connections where ownedConnectionIDs.contains(connection.registration.connectionID) {
             _ = await coordinator.unregisterConnection(
                 connection.registration,
                 operationID: UUID()

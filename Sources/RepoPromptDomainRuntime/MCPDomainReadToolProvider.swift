@@ -11,12 +11,21 @@ package enum DomainReadContextRequirement: Equatable, Sendable {
 /// fallbacks) without manufacturing a domain identity. Scoped reads carry the exact authority
 /// handle and connection consumed by the backend.
 package struct DomainReadInvocationContext: Sendable {
+    package let invocationID: UUID
     package var handle: DomainReadContextHandle?
     package let connectionID: UUID?
+    package let refreshesDomainRouting: Bool
 
-    package init(handle: DomainReadContextHandle?, connectionID: UUID?) {
+    package init(
+        invocationID: UUID = UUID(),
+        handle: DomainReadContextHandle?,
+        connectionID: UUID?,
+        refreshesDomainRouting: Bool = true
+    ) {
+        self.invocationID = invocationID
         self.handle = handle
         self.connectionID = connectionID
+        self.refreshesDomainRouting = refreshesDomainRouting
     }
 }
 
@@ -87,20 +96,26 @@ package struct MCPDomainReadToolProvider: Sendable {
     package typealias RefreshContext = @Sendable (
         _ handle: DomainReadContextHandle
     ) async throws -> DomainReadContextHandle
+    package typealias ReleaseContext = @Sendable (
+        _ context: DomainReadInvocationContext
+    ) async -> Void
 
     private let resolveContext: ResolveContext
     private let refreshContext: RefreshContext
+    private let releaseContext: ReleaseContext
     private let backend: MCPDomainReadToolBackend
     private let sideEffects: DomainReadSideEffectCoordinator
 
     package init(
         resolveContext: @escaping ResolveContext,
         refreshContext: @escaping RefreshContext = { $0 },
+        releaseContext: @escaping ReleaseContext = { _ in },
         backend: MCPDomainReadToolBackend,
         sideEffects: DomainReadSideEffectCoordinator
     ) {
         self.resolveContext = resolveContext
         self.refreshContext = refreshContext
+        self.releaseContext = releaseContext
         self.backend = backend
         self.sideEffects = sideEffects
     }
@@ -127,9 +142,33 @@ package struct MCPDomainReadToolProvider: Sendable {
         try Task.checkCancellation()
         // Historical parameter failures must win over unrelated routing/workspace failures.
         try validateTopLevelArguments(toolName: toolName, arguments: arguments)
-        var context = try await resolveContext(toolName, contextRequirement(toolName))
-        try Task.checkCancellation()
+        let requirement = contextRequirement(toolName)
+        let context = try await resolveContext(toolName, requirement)
+        do {
+            try Task.checkCancellation()
+            if requirement == .workspaceRequired, context.handle == nil {
+                throw MCPError.internalError("Required domain authority is unavailable for \(toolName)")
+            }
 
+            let value = try await executeResolved(
+                toolName: toolName,
+                arguments: arguments,
+                context: context
+            )
+            await releaseContext(context)
+            return value
+        } catch {
+            await releaseContext(context)
+            throw error
+        }
+    }
+
+    private func executeResolved(
+        toolName: String,
+        arguments: [String: Value],
+        context initialContext: DomainReadInvocationContext
+    ) async throws -> Value {
+        var context = initialContext
         if let handle = context.handle,
            requiresSelectionSideEffectDrain(toolName: toolName, arguments: arguments)
         {
@@ -146,7 +185,9 @@ package struct MCPDomainReadToolProvider: Sendable {
 
         // Refresh solely through the domain actor. This verifies the consumed connection/entity
         // binding and adopts its latest revisions without a second heavyweight MainActor capture.
-        if let handle = context.handle {
+        if let handle = context.handle,
+           context.refreshesDomainRouting
+        {
             context.handle = try await refreshContext(handle)
         }
         try Task.checkCancellation()

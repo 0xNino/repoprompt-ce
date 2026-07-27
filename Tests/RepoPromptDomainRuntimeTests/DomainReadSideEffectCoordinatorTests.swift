@@ -151,6 +151,86 @@ final class DomainReadSideEffectCoordinatorTests: XCTestCase {
         XCTAssertEqual(completedEffects, ["artifact", "selection-1", "selection-2"])
     }
 
+    func testExpiredFailedReceiptAndRetryFailClosed() async throws {
+        enum ExpectedFailure: Error { case failed }
+        let identity = makeIdentity()
+        let handle = makeHandle(identity: identity)
+        let coordinator = DomainReadSideEffectCoordinator(identity: identity)
+        let operationID = UUID()
+        let failed = try await coordinator.submit(
+            handle: handle,
+            effectClass: .selection,
+            operationID: operationID,
+            fingerprint: "expired-failure"
+        ) {
+            throw ExpectedFailure.failed
+        }
+
+        for index in 0 ..< 40 {
+            let receipt = try await coordinator.submit(
+                handle: handle,
+                effectClass: .selection,
+                operationID: UUID(),
+                fingerprint: "advance-\(index)"
+            ) {}
+            try await coordinator.wait(handle: handle, receipt: receipt)
+            await Task.yield()
+        }
+
+        do {
+            try await coordinator.wait(handle: handle, receipt: failed)
+            XCTFail("An expired failure must never normalize to success")
+        } catch let error as DomainReadSideEffectError {
+            XCTAssertEqual(error, .receiptUnavailable)
+        }
+        do {
+            _ = try await coordinator.submit(
+                handle: handle,
+                effectClass: .selection,
+                operationID: operationID,
+                fingerprint: "expired-failure"
+            ) {}
+            XCTFail("An expired retry must not re-execute")
+        } catch let error as DomainReadSideEffectError {
+            XCTAssertEqual(error, .receiptUnavailable)
+        }
+    }
+
+    func testCancellingDrainDoesNotWaitForOrCancelSharedEffect() async throws {
+        let identity = makeIdentity()
+        let handle = makeHandle(identity: identity)
+        let coordinator = DomainReadSideEffectCoordinator(identity: identity)
+        let gate = AsyncGate()
+        let receipt = try await coordinator.submit(
+            handle: handle,
+            effectClass: .selection,
+            operationID: UUID(),
+            fingerprint: "shared-blocked"
+        ) {
+            try await gate.wait()
+        }
+        while !(await gate.hasEntered()) { await Task.yield() }
+
+        let drainer = Task {
+            try await coordinator.drain(
+                handle: handle,
+                effectClass: .selection,
+                through: receipt.revision
+            )
+        }
+        await Task.yield()
+        drainer.cancel()
+        do {
+            try await drainer.value
+            XCTFail("Expected prompt drain cancellation")
+        } catch is CancellationError {}
+
+        let sharedEffectStillBlocked = await gate.hasEntered()
+        XCTAssertTrue(sharedEffectStillBlocked, "drain cancellation must not cancel shared work")
+        await gate.release()
+        try await coordinator.wait(handle: handle, receipt: receipt)
+    }
+
     func testShutdownRejectsNewEffectsAndCancelsPendingWork() async throws {
         let identity = makeIdentity()
         let handle = makeHandle(identity: identity)

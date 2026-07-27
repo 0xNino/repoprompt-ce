@@ -309,18 +309,20 @@ actor DomainWorkspaceContextAuthority {
         case let .deleteWorkspace(workspaceID):
             outcome = await deleteWorkspace(workspaceID, envelope: envelope, fingerprint: fingerprint)
         }
-        // Keep the read overlay available while persistence is suspended/re-entrant. Only a
-        // completed canonical transition may replace it; a failed command must not reopen the race.
-        if outcome.disposition == .applied
-            || outcome.disposition == .unchanged
-            || outcome.disposition == .deduplicated
+        // Keep the read overlay while persistence is suspended/re-entrant. Any completed canonical
+        // transition supersedes it, including a different newer document. A failed command must not
+        // reopen the publication race.
+        if let workspaceID,
+           let registration = readRegistrations[workspaceID]
         {
-            if let workspaceID,
-               let registration = readRegistrations[workspaceID],
-               outcome.resultingDigest == nil
-                || outcome.resultingDigest == registration.document.contentDigest
-            {
+            switch outcome.disposition {
+            case .applied, .deduplicated:
                 readRegistrations.removeValue(forKey: workspaceID)
+            case .unchanged where outcome.resultingDigest == nil
+                || outcome.resultingDigest == registration.document.contentDigest:
+                readRegistrations.removeValue(forKey: workspaceID)
+            default:
+                break
             }
         }
         return outcome

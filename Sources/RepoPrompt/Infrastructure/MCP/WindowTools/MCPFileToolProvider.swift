@@ -23,29 +23,44 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
     func executeDomainRead(
         toolName: String,
         context _: DomainReadInvocationContext,
+        appContext: MCPServerViewModel.DomainReadAppExecutionContext?,
         args: [String: Value],
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> Value {
         switch toolName {
         case MCPWindowToolName.getCodeStructure:
-            try await executeGetCodeStructure(args: args)
+            try await executeGetCodeStructure(args: args, appContext: appContext)
         case MCPWindowToolName.getFileTree:
-            try await executeGetFileTree(args: args)
+            try await executeGetFileTree(args: args, appContext: appContext)
         case MCPWindowToolName.readFile:
-            try await executeReadFile(args: args, sideEffects: sideEffects)
+            try await executeReadFile(args: args, appContext: appContext, sideEffects: sideEffects)
         case MCPWindowToolName.search:
-            try await executeFileSearchToolValue(args: args, sideEffects: sideEffects)
+            try await executeFileSearchToolValue(args: args, appContext: appContext, sideEffects: sideEffects)
         default:
             throw MCPError.invalidParams("Unsupported file read tool: \(toolName)")
         }
     }
 
+    private func readAuthority(
+        _ appContext: MCPServerViewModel.DomainReadAppExecutionContext?
+    ) async -> (
+        metadata: MCPServerViewModel.RequestMetadata,
+        lookupContext: WorkspaceLookupContext
+    ) {
+        if let appContext {
+            return (appContext.metadata, appContext.lookupContext)
+        }
+        let metadata = await dependencies.captureRequestMetadata()
+        return await (metadata, dependencies.resolveFileToolLookupContext(metadata))
+    }
+
     private func withActiveWorktreeStartupBenchmarkTag<T>(
+        appContext: MCPServerViewModel.DomainReadAppExecutionContext?,
         _ operation: () async throws -> T
     ) async rethrows -> T {
         #if DEBUG
-            let metadata = await dependencies.captureRequestMetadata()
-            let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+            let authority = await readAuthority(appContext)
+            let lookupContext = authority.lookupContext
             let tag = lookupContext.bindingProjection.map(\.sessionID).flatMap {
                 WorktreeStartupBenchmarkDiagnostics.shared.activeBenchmarkMetricTag(
                     agentSessionID: $0
@@ -139,8 +154,11 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
     }
 
-    private func executeGetCodeStructure(args: [String: Value]) async throws -> Value {
-        try await withActiveWorktreeStartupBenchmarkTag {
+    private func executeGetCodeStructure(
+        args: [String: Value],
+        appContext: MCPServerViewModel.DomainReadAppExecutionContext?
+    ) async throws -> Value {
+        try await withActiveWorktreeStartupBenchmarkTag(appContext: appContext) {
             try await MCPToolWorkCountDiagnostics.withGitInvocation(
                 operation: MCPWindowToolName.getCodeStructure
             ) {
@@ -212,9 +230,10 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 )
 
                 await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureSeedResolution)
-                let metadata = await dependencies.captureRequestMetadata()
+                let authority = await readAuthority(appContext)
+                let metadata = authority.metadata
                 try Task.checkCancellation()
-                let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+                let lookupContext = authority.lookupContext
                 try Task.checkCancellation()
                 _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(
                     rootScope: lookupContext.rootScope
@@ -277,14 +296,16 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
     }
 
-    private func executeGetFileTree(args: [String: Value]) async throws -> Value {
-        try await withActiveWorktreeStartupBenchmarkTag {
+    private func executeGetFileTree(
+        args: [String: Value],
+        appContext: MCPServerViewModel.DomainReadAppExecutionContext?
+    ) async throws -> Value {
+        try await withActiveWorktreeStartupBenchmarkTag(appContext: appContext) {
             let type = args["type"]?.stringValue ?? "files"
             switch type {
             case "roots":
                 let filePathDisplay = await MainActor.run { dependencies.promptVM.filePathDisplayOption }
-                let metadata = await dependencies.captureRequestMetadata()
-                let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+                let lookupContext = await readAuthority(appContext).lookupContext
                 _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
                 let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
                 let snapshot = await dependencies.promptVM.workspaceFileContextStore.makeFileTreeSelectionSnapshot(
@@ -309,8 +330,9 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 } else {
                     maxDepth = nil
                 }
-                let metadata = await dependencies.captureRequestMetadata()
-                let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+                let authority = await readAuthority(appContext)
+                let metadata = authority.metadata
+                let lookupContext = authority.lookupContext
                 _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
                 if mode.lowercased() == "selected" {
                     guard await dependencies.drainReadFileAutoSelection(metadata, .canonicalSelection) == .completed else {
@@ -335,13 +357,15 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
 
     private func executeReadFile(
         args: [String: Value],
+        appContext: MCPServerViewModel.DomainReadAppExecutionContext?,
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> Value {
-        try await executeReadFileBody(args: args, sideEffects: sideEffects)
+        try await executeReadFileBody(args: args, appContext: appContext, sideEffects: sideEffects)
     }
 
     private func executeReadFileBody(
         args: [String: Value],
+        appContext: MCPServerViewModel.DomainReadAppExecutionContext?,
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> Value {
         try Task.checkCancellation()
@@ -359,12 +383,13 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             let limit = args["limit"]?.intValue ?? args["limit"]?.stringValue.flatMap(Int.init)
             return (path, startLine1Based, limit)
         }
-        let metadata = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerRequestMetadata) {
-            await dependencies.captureRequestMetadata()
+        let authority = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerRequestMetadata) {
+            await readAuthority(appContext)
         }
+        let metadata = authority.metadata
         try Task.checkCancellation()
-        let lookupContext = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerLookupContextResolution) {
-            await dependencies.resolveFileToolLookupContext(metadata)
+        let lookupContext = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerLookupContextResolution) {
+            authority.lookupContext
         }
         try Task.checkCancellation()
         let (worktreeScope, resolvedPath) = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerPathTranslation) {
@@ -461,12 +486,17 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
 
     private func executeFileSearchToolValue(
         args: [String: Value],
+        appContext: MCPServerViewModel.DomainReadAppExecutionContext?,
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> Value {
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerEntered)
         let providerTotal = EditFlowPerf.begin(EditFlowPerf.Stage.Search.providerTotal)
         defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.providerTotal, providerTotal) }
-        let reply = try await executeFileSearch(args: args, sideEffects: sideEffects)
+        let reply = try await executeFileSearch(
+            args: args,
+            appContext: appContext,
+            sideEffects: sideEffects
+        )
 
         try Task.checkCancellation()
         let value = try EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerValueEncoding) {
@@ -478,6 +508,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
 
     private func executeFileSearch(
         args: [String: Value],
+        appContext: MCPServerViewModel.DomainReadAppExecutionContext?,
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> ToolResultDTOs.SearchResultDTO {
         try Task.checkCancellation()
@@ -509,15 +540,16 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
 
         let mode = SearchMode(rawValue: modeRaw) ?? .auto
-        let metadata = await EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerRequestMetadata) {
-            await dependencies.captureRequestMetadata()
+        let authority = await EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerRequestMetadata) {
+            await readAuthority(appContext)
         }
+        let metadata = authority.metadata
         try Task.checkCancellation()
-        let lookupContext = await EditFlowPerf.measure(
+        let lookupContext = EditFlowPerf.measure(
             EditFlowPerf.Stage.Search.providerLookupContextResolution,
             EditFlowPerf.Dimensions(searchMode: mode.rawValue, countOnly: countOnly)
         ) {
-            await dependencies.resolveFileToolLookupContext(metadata)
+            authority.lookupContext
         }
         try Task.checkCancellation()
         let usesWorktreeProjection = lookupContext.bindingProjection != nil

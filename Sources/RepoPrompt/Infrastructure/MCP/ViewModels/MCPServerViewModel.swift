@@ -1649,15 +1649,20 @@ final class MCPServerViewModel: ObservableObject {
             guard let domainRoutingCoordinator else { return handle }
             return try await domainRoutingCoordinator.refreshReadContext(handle)
         },
+        releaseContext: { [weak self] context in
+            await self?.releaseDomainReadAppExecutionContext(for: context)
+        },
         backend: MCPDomainReadToolBackend { [weak self] toolName, context, args, sideEffects in
             guard let self else {
                 throw MCPError.internalError("Window deallocated while executing \(toolName)")
             }
+            let appContext = await domainReadAppExecutionContext(for: context)
             switch toolName {
             case "get_code_structure", "get_file_tree", "read_file", "file_search":
                 return try await fileToolProvider.executeDomainRead(
                     toolName: toolName,
                     context: context,
+                    appContext: appContext,
                     args: args,
                     sideEffects: sideEffects
                 )
@@ -1665,6 +1670,7 @@ final class MCPServerViewModel: ObservableObject {
                 return try await promptContextToolProvider.executeDomainRead(
                     toolName: toolName,
                     context: context,
+                    appContext: appContext,
                     args: args
                 )
             case "oracle_chat_log":
@@ -1792,6 +1798,9 @@ final class MCPServerViewModel: ObservableObject {
     let domainRoutingCoordinator: DomainRoutingCoordinator?
     let domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient?
     let domainReadSideEffectCoordinator: DomainReadSideEffectCoordinator
+    let domainReadFallbackRuntimeIdentity: DomainRuntimeIdentity?
+    var domainReadAppExecutionContexts: [UUID: DomainReadAppExecutionContext] = [:]
+    var domainRoutingConnectionIDs: Set<UUID> = []
     var domainWindowDescriptor: DomainWindowDescriptor?
     var domainWindowRegistrationTask: Task<DomainWindowDescriptor?, Never>?
     var domainRoutingWindowIsClosing = false
@@ -2568,6 +2577,7 @@ final class MCPServerViewModel: ObservableObject {
         domainRoutingCoordinator: DomainRoutingCoordinator? = nil,
         domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient? = nil,
         domainReadSideEffectCoordinator: DomainReadSideEffectCoordinator? = nil,
+        domainReadRuntimeIdentity: DomainRuntimeIdentity? = nil,
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared
     ) {
         self.service = service
@@ -2580,15 +2590,20 @@ final class MCPServerViewModel: ObservableObject {
         self.ensureGitDataRootLoaded = ensureGitDataRootLoaded
         self.domainRoutingCoordinator = domainRoutingCoordinator
         self.domainWorkspaceAuthorityClient = domainWorkspaceAuthorityClient
-        self.domainReadSideEffectCoordinator = domainReadSideEffectCoordinator ?? DomainReadSideEffectCoordinator(
-            identity: DomainRuntimeIdentity(
+        if let domainReadSideEffectCoordinator {
+            self.domainReadSideEffectCoordinator = domainReadSideEffectCoordinator
+            domainReadFallbackRuntimeIdentity = domainReadRuntimeIdentity
+        } else {
+            let fallbackIdentity = DomainRuntimeIdentity(
                 runtimeID: UUID(),
                 lifecycleGeneration: 1,
                 processID: ProcessInfo.processInfo.processIdentifier,
                 mode: .app,
                 createdAt: Date()
             )
-        )
+            self.domainReadSideEffectCoordinator = DomainReadSideEffectCoordinator(identity: fallbackIdentity)
+            domainReadFallbackRuntimeIdentity = fallbackIdentity
+        }
         self.applyEditsApprovalStore = applyEditsApprovalStore
 
         scheduleDomainWindowRegistration(

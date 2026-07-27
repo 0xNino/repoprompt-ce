@@ -3,6 +3,7 @@ import Foundation
 package enum DomainReadSideEffectError: Error, Equatable, Sendable {
     case runtimeMismatch
     case operationCollision
+    case receiptUnavailable
     case stopped
 }
 
@@ -53,6 +54,7 @@ package actor DomainReadSideEffectCoordinator {
         var terminalRevision: UInt64 = 0
         var tasks: [UInt64: Task<Void, Error>] = [:]
         var operations: [UUID: RecordedOperation] = [:]
+        var expiredOperationIDs: [UUID] = []
     }
 
     private let identity: DomainRuntimeIdentity
@@ -87,6 +89,9 @@ package actor DomainReadSideEffectCoordinator {
                 throw DomainReadSideEffectError.operationCollision
             }
             return recorded.receipt
+        }
+        guard !state.expiredOperationIDs.contains(operationID) else {
+            throw DomainReadSideEffectError.receiptUnavailable
         }
 
         let revision = state.acceptedRevision &+ 1
@@ -127,14 +132,11 @@ package actor DomainReadSideEffectCoordinator {
         try validate(handle)
         let key = LaneKey(context: handle.context, effectClass: receipt.effectClass)
         guard receipt.context == handle.context,
-              let task = states[key]?.tasks[receipt.revision]
-        else { return }
-        try await withTaskCancellationHandler {
-            try await task.value
-            try Task.checkCancellation()
-        } onCancel: {
-            task.cancel()
-        }
+              let state = states[key],
+              state.operations[receipt.operationID]?.receipt == receipt,
+              let task = state.tasks[receipt.revision]
+        else { throw DomainReadSideEffectError.receiptUnavailable }
+        try await awaitCompletion(of: task, cancelUnderlyingOnCancellation: true)
     }
 
     /// Waits until the lane has reached a revision. Historical effect failures are terminal and
@@ -150,8 +152,18 @@ package actor DomainReadSideEffectCoordinator {
         let key = LaneKey(context: handle.context, effectClass: effectClass)
         guard let state = states[key] else { return }
         if state.terminalRevision >= revision { return }
-        guard let task = state.tasks[revision] else { return }
-        _ = await task.result
+        guard let task = state.tasks[revision] else {
+            throw DomainReadSideEffectError.receiptUnavailable
+        }
+        // A drain observes ordering, not the earlier submitter's failure. It must still be promptly
+        // cancellable without canceling shared work owned by another request.
+        do {
+            try await awaitCompletion(of: task, cancelUnderlyingOnCancellation: false)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            // Earlier terminal failures belong only to their exact submitters.
+        }
         try Task.checkCancellation()
     }
 
@@ -160,6 +172,32 @@ package actor DomainReadSideEffectCoordinator {
         for state in states.values {
             for task in state.tasks.values { task.cancel() }
         }
+    }
+
+    private func awaitCompletion(
+        of task: Task<Void, Error>,
+        cancelUnderlyingOnCancellation: Bool
+    ) async throws {
+        let stream = AsyncThrowingStream<Void, Error> { continuation in
+            let observer = Task {
+                switch await task.result {
+                case .success:
+                    continuation.finish()
+                case let .failure(error):
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { termination in
+                observer.cancel()
+                if cancelUnderlyingOnCancellation,
+                   case .cancelled = termination
+                {
+                    task.cancel()
+                }
+            }
+        }
+        for try await _ in stream {}
+        try Task.checkCancellation()
     }
 
     private func validate(_ handle: DomainReadContextHandle) throws {
@@ -176,7 +214,12 @@ package actor DomainReadSideEffectCoordinator {
         if state.terminalRevision > 32 {
             let floor = state.terminalRevision - 32
             state.tasks = state.tasks.filter { $0.key >= floor }
+            let expired = state.operations.filter { $0.value.receipt.revision < floor }.map(\.key)
             state.operations = state.operations.filter { $0.value.receipt.revision >= floor }
+            state.expiredOperationIDs.append(contentsOf: expired)
+            if state.expiredOperationIDs.count > 32 {
+                state.expiredOperationIDs.removeFirst(state.expiredOperationIDs.count - 32)
+            }
         }
         states[key] = state
     }
