@@ -1858,6 +1858,22 @@ import XCTest
                             arguments: arguments
                         )
                     }
+                    let capacityWaiterRegistered = await Self.waitUntil {
+                        let snapshot = await manager.connectionLimiterSnapshotForTesting(
+                            connectionID: endpoint.connectionID,
+                            lane: .smallRead
+                        )
+                        return snapshot?.activePermitCount == MCPToolAdmissionPolicy.smallReadPerWindowLimit
+                            && snapshot?.waiterCount == 1
+                    }
+                    XCTAssertTrue(capacityWaiterRegistered)
+                    let queuedLimiter = await manager.connectionLimiterSnapshotForTesting(
+                        connectionID: endpoint.connectionID,
+                        lane: .smallRead
+                    )
+                    XCTAssertEqual(queuedLimiter?.activePermitCount, MCPToolAdmissionPolicy.smallReadPerWindowLimit)
+                    XCTAssertEqual(queuedLimiter?.waiterCount, 1)
+
                     try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
                     try await clock.waitForSleeperCount(2)
                     try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolExecutionDeadline)
@@ -1880,7 +1896,7 @@ import XCTest
                     XCTAssertFalse(isTerminal)
 
                     try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
-                    let didCloseSocket = await Self.waitUntil(timeout: .seconds(2)) {
+                    let didCloseSocket = await Self.waitUntil {
                         endpoint.client.isClosedForTesting()
                     }
                     XCTAssertTrue(
