@@ -37,7 +37,7 @@ Workspace subscriptions bootstrap before returning their atomic initial snapshot
 
 Connection and window registrations are generation-fenced. Window incarnations are assigned monotonically by the runtime, connections (including immutable run-scoped bindings) are generation-fenced and explicitly unregistered, windows are unregistered before server teardown, and all routing state is cleared on runtime shutdown. Run-scoped bindings are immutable. `DomainRunLaunchToken` material is 256-bit random, host stores only its digest, and redemption is single-use, expiring, runtime-generation/principal/provider/PID checked, and revokes pending routing state on shutdown. Policy contents are not embedded in the token; provider/process handoff remains M3+.
 
-`EditFlow.DomainRuntime.*` metrics carry runtime ID/generation, operation ID, workspace/context revisions, catalog revision, disposition, and byte count across runtime/backend/catalog/commit/projection phases. This milestone does not claim a live app latency delta because implementation was explicitly performed without relaunch.
+`EditFlow.DomainRuntime.*` metrics carry runtime ID/generation, operation ID, workspace/context revisions, catalog revision, disposition, and byte count across runtime/backend/catalog/commit/projection phases. Bounded live validation exercised the projection/routing seam with diagnostics enabled, but this milestone does not claim a latency delta because the authorized relaunch was not a controlled performance benchmark.
 
 ## Parity and scope ledger
 
