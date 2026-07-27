@@ -526,6 +526,26 @@ enum MCPRunRouteAuthorityDecision: Equatable {
     case revocationFenced
 }
 
+/// Monotonic timing and sleep dependencies for bootstrap readiness and restart policy.
+/// Production uses system uptime; focused lifecycle tests inject deterministic time.
+struct MCPBootstrapLifecycleTiming {
+    let readinessTimeout: TimeInterval
+    let monotonicNow: @Sendable () -> TimeInterval
+    let readinessSleep: @Sendable (TimeInterval) async throws -> Void
+    let restartSleep: @Sendable (TimeInterval) async throws -> Void
+
+    static let production = MCPBootstrapLifecycleTiming(
+        readinessTimeout: 5.0,
+        monotonicNow: { ProcessInfo.processInfo.systemUptime },
+        readinessSleep: { delay in
+            try await Task.sleep(for: .seconds(delay))
+        },
+        restartSleep: { delay in
+            try await Task.sleep(for: .seconds(delay))
+        }
+    )
+}
+
 /// Manages all MCP connections using the bootstrap UNIX-domain socket.
 /// TCP/Bonjour transport has been removed.
 actor ServerNetworkManager {
@@ -533,6 +553,34 @@ actor ServerNetworkManager {
     /// active client connections.  Use this when you need to reference the
     /// MCP listener from anywhere in the app.
     static let shared = ServerNetworkManager()
+
+    enum StartDegradedReason: String, Equatable {
+        case readinessTimedOut
+        case readinessWaitCancelled
+
+        var statusDescription: String {
+            switch self {
+            case .readinessTimedOut:
+                "bootstrap listener readiness timed out; maintenance recovery active"
+            case .readinessWaitCancelled:
+                "bootstrap listener readiness wait cancelled; maintenance recovery active"
+            }
+        }
+    }
+
+    enum StartOutcome: Equatable {
+        case ready
+        case degraded(StartDegradedReason)
+        case superseded
+    }
+
+    private enum BootstrapReadinessWaitOutcome: Equatable {
+        case ready
+        case timedOut
+        case cancelled
+        case superseded
+    }
+
     private static let repoCLIPrefix = "RepoPrompt CLI"
     private static let toolNameAliases: [String: String] = [
         "discover_manage_selection": "manage_selection",
@@ -808,9 +856,14 @@ actor ServerNetworkManager {
         return "all except \(describeToolList(restricted))"
     }
 
+    private let bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming
     private var isRunningState: Bool = false
     private var lifecycleGeneration: UInt64 = 0
     private var isEnabledState: Bool = true
+
+    init(bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming = .production) {
+        self.bootstrapLifecycleTiming = bootstrapLifecycleTiming
+    }
 
     // Bootstrap socket server. Startup candidates remain separate until bind/listen and
     // accept-source creation succeed; only bootstrapSocketServer is externally ready.
@@ -825,11 +878,10 @@ actor ServerNetworkManager {
     private var bootstrapRestartInProgress: Bool = false
     private var bootstrapRestartToken: UUID?
     private var bootstrapRestartLifecycleGeneration: UInt64?
-    private var lastBootstrapRestartAt: Date = .distantPast
+    private var lastBootstrapRestartAt: TimeInterval = -.infinity
     private let bootstrapRestartMinInterval: TimeInterval = 2.0
     private var bootstrapStartFailures: Int = 0
-    private let bootstrapStartupReadinessTimeout: TimeInterval = 5.0
-    private var lastBootstrapHealthCheckAt: Date = .distantPast
+    private var lastBootstrapHealthCheckAt: TimeInterval = -.infinity
     private let bootstrapHealthCheckInterval: TimeInterval = 5.0
 
     private func resolvedBootstrapSocketURL() -> URL {
@@ -949,13 +1001,25 @@ actor ServerNetworkManager {
             connectionWaiters.count
         }
 
+        func debugHasMaintenanceTaskForLifecycleFenceTest() -> Bool {
+            isRunningState && maintenanceTask != nil
+        }
+
+        func debugBootstrapStartFailureCountForLifecycleFenceTest() -> Int {
+            bootstrapStartFailures
+        }
+
+        func debugRunMaintenanceTickForLifecycleFenceTest() async {
+            await maintenanceTick(lifecycleGeneration: lifecycleGeneration)
+        }
+
         func debugHasCurrentBootstrapListenerForLifecycleFenceTest() -> Bool {
             guard let bootstrapSocketServer else { return false }
             return isCurrentBootstrapListener(bootstrapSocketServer, lifecycleGeneration: lifecycleGeneration)
         }
 
         func debugScheduleDelayedBootstrapRestartForLifecycleFenceTest(delay: TimeInterval) -> Bool {
-            lastBootstrapRestartAt = .distantPast
+            lastBootstrapRestartAt = -.infinity
             let tokenBeforeRestart = bootstrapRestartToken
             restartBootstrapSocketServer(
                 reason: "DEBUG lifecycle fence test",
@@ -4214,7 +4278,8 @@ actor ServerNetworkManager {
         await waitForNewConnection(clientName: Optional(clientName), timeout: timeout)
     }
 
-    func start() async {
+    @discardableResult
+    func start() async -> StartOutcome {
         #if DEBUG
             print("[MCPStartup] ServerNetworkManager.start entered")
         #endif
@@ -4231,72 +4296,87 @@ actor ServerNetworkManager {
         bootstrapSocketTask?.cancel()
         await startBootstrapSocketServer(lifecycleGeneration: startLifecycleGeneration)
 
-        // A full shutdown may have run while listener startup awaited another actor. Joining
-        // authoritative ready publication prevents start() from returning through a stale slot
-        // while its current-generation replacement is still queued behind teardown.
-        guard isCurrentLifecycle(startLifecycleGeneration) else { return }
-        let listenerReady = await waitForBootstrapListenerReady(
-            lifecycleGeneration: startLifecycleGeneration,
-            timeout: bootstrapStartupReadinessTimeout
-        )
-        guard isCurrentLifecycle(startLifecycleGeneration) else { return }
-        guard listenerReady else {
-            log.error("Bootstrap listener did not become ready within \(bootstrapStartupReadinessTimeout)s for lifecycle \(startLifecycleGeneration)")
-            return
-        }
+        // Full stop synchronously invalidates the lifecycle before its first await. Never
+        // install maintenance or report degradation for a generation that is no longer running.
+        guard isCurrentLifecycle(startLifecycleGeneration) else { return .superseded }
 
-        // Start periodic maintenance loop for cleanup tasks
+        // Maintenance ownership belongs to every running lifecycle, including one whose caller
+        // cancels or whose initial readiness join expires. It is cancelled only by full stop or
+        // replaced by a same-generation start, so degraded startup can self-heal later.
         startMaintenanceLoop(lifecycleGeneration: startLifecycleGeneration)
+
+        let readinessOutcome = await waitForBootstrapListenerReady(
+            lifecycleGeneration: startLifecycleGeneration,
+            timeout: bootstrapLifecycleTiming.readinessTimeout
+        )
+        guard isCurrentLifecycle(startLifecycleGeneration) else { return .superseded }
+
+        switch readinessOutcome {
+        case .ready:
+            return .ready
+        case .timedOut:
+            log.error("Bootstrap listener did not become ready within \(bootstrapLifecycleTiming.readinessTimeout)s for lifecycle \(startLifecycleGeneration); maintenance recovery remains active")
+            return .degraded(.readinessTimedOut)
+        case .cancelled:
+            log.warning("Bootstrap listener readiness wait cancelled for lifecycle \(startLifecycleGeneration); maintenance recovery remains active")
+            return .degraded(.readinessWaitCancelled)
+        case .superseded:
+            return .superseded
+        }
     }
 
     /// Bounded join on the ready slot. This is the sole startup-completion probe: the slot
     /// identity must still be current after cross-actor diagnostics, and all listener
-    /// acceptability invariants must hold. Retry/backoff lets identity-fenced stale teardown
-    /// hand ownership to the replacement without a busy loop or an unbounded startup await.
+    /// acceptability invariants must hold. Every failed retry sleeps with exponential backoff;
+    /// injected monotonic timing keeps lifecycle tests independent of production deadlines.
     private func waitForBootstrapListenerReady(
         lifecycleGeneration expectedLifecycleGeneration: UInt64,
         timeout: TimeInterval
-    ) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
+    ) async -> BootstrapReadinessWaitOutcome {
+        let deadline = bootstrapLifecycleTiming.monotonicNow() + timeout
         var retryDelay: TimeInterval = 0.005
 
-        while isCurrentLifecycle(expectedLifecycleGeneration), !Task.isCancelled {
+        while true {
+            guard isCurrentLifecycle(expectedLifecycleGeneration) else { return .superseded }
+            guard !Task.isCancelled else { return .cancelled }
+
             if let server = bootstrapSocketServer,
                bootstrapSocketServerLifecycleGeneration == expectedLifecycleGeneration
             {
                 let diagnostics = await server.diagnostics()
-                guard isCurrentLifecycle(expectedLifecycleGeneration) else { return false }
+                guard isCurrentLifecycle(expectedLifecycleGeneration) else { return .superseded }
+                guard !Task.isCancelled else { return .cancelled }
                 if isCurrentBootstrapListener(server, lifecycleGeneration: expectedLifecycleGeneration),
                    diagnostics.isRunning,
                    diagnostics.listenFDValid,
                    diagnostics.ownsSocketPath,
                    diagnostics.acceptSourceExists
                 {
-                    return true
+                    return .ready
                 }
             }
 
-            guard Date() < deadline else { return false }
-            if bootstrapSocketServer == nil,
-               bootstrapStartingSocketServer == nil,
-               !bootstrapStartInProgress,
-               !bootstrapRestartInProgress
-            {
-                await startBootstrapSocketServer(lifecycleGeneration: expectedLifecycleGeneration)
-                continue
+            let now = bootstrapLifecycleTiming.monotonicNow()
+            guard now < deadline else { return .timedOut }
+            let shouldAttemptStart = bootstrapSocketServer == nil
+                && bootstrapStartingSocketServer == nil
+                && !bootstrapStartInProgress
+                && !bootstrapRestartInProgress
+            let sleepDuration = min(retryDelay, deadline - now)
+            guard sleepDuration > 0 else { return .timedOut }
+            do {
+                try await bootstrapLifecycleTiming.readinessSleep(sleepDuration)
+            } catch {
+                return isCurrentLifecycle(expectedLifecycleGeneration) ? .cancelled : .superseded
             }
 
-            let remaining = max(0, deadline.timeIntervalSinceNow)
-            let sleepDuration = min(retryDelay, remaining)
-            guard sleepDuration > 0 else { return false }
-            do {
-                try await Task.sleep(for: .seconds(sleepDuration))
-            } catch {
-                return false
+            guard isCurrentLifecycle(expectedLifecycleGeneration) else { return .superseded }
+            guard !Task.isCancelled else { return .cancelled }
+            if shouldAttemptStart {
+                await startBootstrapSocketServer(lifecycleGeneration: expectedLifecycleGeneration)
             }
             retryDelay = min(retryDelay * 2, 0.1)
         }
-        return false
     }
 
     /// Starts the periodic maintenance loop for cleanup tasks.
@@ -4506,8 +4586,8 @@ actor ServerNetworkManager {
         guard !bootstrapStartInProgress else { return }
         guard !bootstrapRestartInProgress else { return }
 
-        let now = Date()
-        if !force, now.timeIntervalSince(lastBootstrapHealthCheckAt) < bootstrapHealthCheckInterval {
+        let now = bootstrapLifecycleTiming.monotonicNow()
+        if !force, now - lastBootstrapHealthCheckAt < bootstrapHealthCheckInterval {
             return
         }
         lastBootstrapHealthCheckAt = now
@@ -4565,8 +4645,8 @@ actor ServerNetworkManager {
         guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
         guard !bootstrapRestartInProgress else { return }
 
-        let now = Date()
-        guard now.timeIntervalSince(lastBootstrapRestartAt) >= bootstrapRestartMinInterval else { return }
+        let now = bootstrapLifecycleTiming.monotonicNow()
+        guard now - lastBootstrapRestartAt >= bootstrapRestartMinInterval else { return }
 
         bootstrapRestartInProgress = true
         lastBootstrapRestartAt = now
@@ -4574,9 +4654,10 @@ actor ServerNetworkManager {
         bootstrapRestartToken = token
         bootstrapRestartLifecycleGeneration = expectedLifecycleGeneration
 
+        let restartSleep = bootstrapLifecycleTiming.restartSleep
         Task { [weak self] in
             if delay > 0 {
-                try? await Task.sleep(for: .seconds(delay))
+                try? await restartSleep(delay)
             }
             #if DEBUG
                 await self?.debugSuspendLifecycleFenceCheckpointIfNeeded(.restartTaskBeforePerform)

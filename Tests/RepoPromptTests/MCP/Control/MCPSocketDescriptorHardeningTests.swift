@@ -668,9 +668,165 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         #endif
     }
 
+    func testReadinessTimeoutReportsDegradedKeepsMaintenanceAndLaterSelfHeals() async throws {
+        #if DEBUG
+            let clock = BootstrapLifecycleTestClock()
+            let restartGate = BootstrapRestartSleepGate()
+            let timing = MCPBootstrapLifecycleTiming(
+                readinessTimeout: 0.035,
+                monotonicNow: { clock.now() },
+                readinessSleep: { delay in
+                    clock.advance(by: delay)
+                    await Task.yield()
+                },
+                restartSleep: { _ in await restartGate.waitUntilReleased() }
+            )
+            try await Self.withIsolatedManagerSocket(
+                prefix: "readiness-timeout",
+                bootstrapLifecycleTiming: timing
+            ) { manager, socketURL in
+                let blocker = BootstrapSocketServer(socketURL: socketURL)
+                try await blocker.start { _, _, _, _ in .reject() }
+
+                let outcome = await manager.start()
+                XCTAssertEqual(outcome, .degraded(.readinessTimedOut))
+                let degradedStatus = ServerController.runningStatus(for: outcome)
+                XCTAssertEqual(
+                    degradedStatus,
+                    "Running (Degraded: bootstrap listener readiness timed out; maintenance recovery active)"
+                )
+                XCTAssertNotEqual(degradedStatus, "Running")
+                let maintenanceAfterTimeout = await manager.debugHasMaintenanceTaskForLifecycleFenceTest()
+                XCTAssertTrue(maintenanceAfterTimeout)
+
+                // A repeated start/enable join must preserve degradation until diagnostics are
+                // actually ready; it may replace, but never drop, same-generation maintenance.
+                let repeatedOutcome = await manager.start()
+                XCTAssertEqual(repeatedOutcome, .degraded(.readinessTimedOut))
+                XCTAssertNotEqual(ServerController.runningStatus(for: repeatedOutcome), "Running")
+                let maintenanceAfterRepeatedStart = await manager.debugHasMaintenanceTaskForLifecycleFenceTest()
+                XCTAssertTrue(maintenanceAfterRepeatedStart)
+                let boundedFailureCount = await manager.debugBootstrapStartFailureCountForLifecycleFenceTest()
+                XCTAssertGreaterThanOrEqual(boundedFailureCount, 1)
+                XCTAssertLessThanOrEqual(boundedFailureCount, 2)
+
+                await blocker.stop()
+                await restartGate.release()
+                let recovered = await Self.waitForCurrentBootstrapListener(manager, at: socketURL)
+                XCTAssertTrue(recovered)
+                try Self.assertBootstrapAdmissionAccepted(at: socketURL)
+
+                // Exercise the same maintenance tick owned by the live task after a later path
+                // loss. Monotonic advancement clears health/restart throttles deterministically.
+                clock.advance(by: 10)
+                XCTAssertEqual(Darwin.unlink(socketURL.path), 0)
+                await manager.debugRunMaintenanceTickForLifecycleFenceTest()
+                let selfHealed = await Self.waitForCurrentBootstrapListener(manager, at: socketURL)
+                XCTAssertTrue(selfHealed)
+                let maintenanceAfterSelfHeal = await manager.debugHasMaintenanceTaskForLifecycleFenceTest()
+                XCTAssertTrue(maintenanceAfterSelfHeal)
+                try Self.assertBootstrapAdmissionAccepted(at: socketURL)
+            }
+        #else
+            throw XCTSkip("Bootstrap manager lifecycle timing seams are DEBUG-only")
+        #endif
+    }
+
+    func testCancelledReadinessWaitReportsDegradedUntilStopInvalidatesMaintenanceGeneration() async throws {
+        #if DEBUG
+            let clock = BootstrapLifecycleTestClock()
+            let restartGate = BootstrapRestartSleepGate()
+            let timing = MCPBootstrapLifecycleTiming(
+                readinessTimeout: 0.02,
+                monotonicNow: { clock.now() },
+                readinessSleep: { _ in try await Task.sleep(for: .milliseconds(1)) },
+                restartSleep: { _ in await restartGate.waitUntilReleased() }
+            )
+            try await Self.withIsolatedManagerSocket(
+                prefix: "readiness-cancel",
+                bootstrapLifecycleTiming: timing
+            ) { manager, socketURL in
+                let blocker = BootstrapSocketServer(socketURL: socketURL)
+                try await blocker.start { _, _, _, _ in .reject() }
+
+                let startTask = Task { await manager.start() }
+                let maintenanceStarted = await Self.waitUntil {
+                    await manager.debugHasMaintenanceTaskForLifecycleFenceTest()
+                }
+                XCTAssertTrue(maintenanceStarted)
+                startTask.cancel()
+                let outcome = await startTask.value
+                XCTAssertEqual(outcome, .degraded(.readinessWaitCancelled))
+                let maintenanceAfterCancellation = await manager.debugHasMaintenanceTaskForLifecycleFenceTest()
+                XCTAssertTrue(maintenanceAfterCancellation)
+
+                let runningGeneration = await manager.debugLifecycleGenerationForLifecycleFenceTest()
+                await manager.stop()
+                let stoppedGeneration = await manager.debugLifecycleGenerationForLifecycleFenceTest()
+                XCTAssertGreaterThan(stoppedGeneration, runningGeneration)
+                let runningAfterStop = await manager.isRunning()
+                let maintenanceAfterStop = await manager.debugHasMaintenanceTaskForLifecycleFenceTest()
+                XCTAssertFalse(runningAfterStop)
+                XCTAssertFalse(maintenanceAfterStop)
+
+                await blocker.stop()
+                await restartGate.release()
+                await Task.yield()
+                let listenerAfterStaleRestart = await manager.debugHasCurrentBootstrapListenerForLifecycleFenceTest()
+                XCTAssertFalse(listenerAfterStaleRestart)
+            }
+        #else
+            throw XCTSkip("Bootstrap manager lifecycle timing seams are DEBUG-only")
+        #endif
+    }
+
+    func testReadinessFailureRetriesRemainBackedOffAndBounded() async throws {
+        #if DEBUG
+            let clock = BootstrapLifecycleTestClock(readIncrement: 0.001)
+            let timing = MCPBootstrapLifecycleTiming(
+                readinessTimeout: 0.04,
+                monotonicNow: { clock.now() },
+                readinessSleep: { delay in
+                    clock.recordSleepAndAdvance(by: delay)
+                    await Task.yield()
+                },
+                restartSleep: { _ in await Task.yield() }
+            )
+            try await Self.withIsolatedManagerSocket(
+                prefix: "readiness-backoff",
+                bootstrapLifecycleTiming: timing
+            ) { manager, socketURL in
+                let blocker = BootstrapSocketServer(socketURL: socketURL)
+                try await blocker.start { _, _, _, _ in .reject() }
+
+                let outcome = await manager.start()
+                XCTAssertEqual(outcome, .degraded(.readinessTimedOut))
+                let failureCount = await manager.debugBootstrapStartFailureCountForLifecycleFenceTest()
+                XCTAssertLessThanOrEqual(failureCount, 6)
+                XCTAssertGreaterThanOrEqual(clock.sleepCount(), 1)
+                let maintenanceAfterBoundedRetries = await manager.debugHasMaintenanceTaskForLifecycleFenceTest()
+                XCTAssertTrue(maintenanceAfterBoundedRetries)
+
+                await blocker.stop()
+            }
+        #else
+            throw XCTSkip("Bootstrap manager lifecycle timing seams are DEBUG-only")
+        #endif
+    }
+
     func testFullStopResolvesOldConnectionWaitersBeforeOverlappingReplacementLifecycleStarts() async throws {
         #if DEBUG
-            try await Self.withIsolatedManagerSocket(prefix: "stale-waiter") { manager, socketURL in
+            let clock = BootstrapLifecycleTestClock()
+            let timing = MCPBootstrapLifecycleTiming(
+                readinessTimeout: 0.02,
+                monotonicNow: { clock.now() },
+                readinessSleep: { _ in try await Task.sleep(for: .milliseconds(1)) },
+                restartSleep: { delay in try await Task.sleep(for: .seconds(delay)) }
+            )
+            try await Self.withIsolatedManagerSocket(
+                prefix: "stale-waiter",
+                bootstrapLifecycleTiming: timing
+            ) { manager, socketURL in
                 await manager.start()
                 let initialLifecycleGeneration = await manager.debugLifecycleGenerationForLifecycleFenceTest()
                 let waiterTask = Task {
@@ -1040,11 +1196,12 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
 
         private static func withIsolatedManagerSocket(
             prefix: String,
+            bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming = .production,
             operation: (ServerNetworkManager, URL) async throws -> Void
         ) async throws {
             let fixture = try TemporarySocketFixture.make(prefix: prefix)
             defer { fixture.removeOwnedDirectory() }
-            let manager = ServerNetworkManager()
+            let manager = ServerNetworkManager(bootstrapLifecycleTiming: bootstrapLifecycleTiming)
             try await manager.debugInstallBootstrapSocketURLOverride(fixture.socketURL)
 
             func stopAndRestoreManager() async throws {
@@ -1303,6 +1460,65 @@ private final class SynchronousFDRecorder: @unchecked Sendable {
         descriptors.forEach { Darwin.close($0) }
     }
 }
+
+#if DEBUG
+    private final class BootstrapLifecycleTestClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var time: TimeInterval = 0
+        private var sleeps = 0
+        private let readIncrement: TimeInterval
+
+        init(readIncrement: TimeInterval = 0) {
+            self.readIncrement = readIncrement
+        }
+
+        func now() -> TimeInterval {
+            lock.lock()
+            time += readIncrement
+            let value = time
+            lock.unlock()
+            return value
+        }
+
+        func advance(by duration: TimeInterval) {
+            lock.lock()
+            time += duration
+            lock.unlock()
+        }
+
+        func recordSleepAndAdvance(by duration: TimeInterval) {
+            lock.lock()
+            sleeps += 1
+            time += duration
+            lock.unlock()
+        }
+
+        func sleepCount() -> Int {
+            lock.lock()
+            let value = sleeps
+            lock.unlock()
+            return value
+        }
+    }
+
+    private actor BootstrapRestartSleepGate {
+        private var released = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func waitUntilReleased() async {
+            guard !released else { return }
+            await withCheckedContinuation { continuation in
+                waiters.append(continuation)
+            }
+        }
+
+        func release() {
+            released = true
+            waiters.forEach { $0.resume() }
+            waiters.removeAll()
+        }
+    }
+#endif
 
 private actor OptionalBoolRecorder {
     private(set) var value: Bool?

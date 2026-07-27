@@ -458,20 +458,26 @@ final actor ServerController: ObservableObject {
             try await beforeTransportActivationOperation()
             try requireCurrentStart(generation)
 
+            let startOutcome: ServerNetworkManager.StartOutcome
             if await networkManager.isRunning() {
                 try requireCurrentStart(generation)
                 await networkManager.setEnabled(true) // expose tools only
                 try requireCurrentStart(generation)
+                startOutcome = await networkManager.start()
+                try requireCurrentStart(generation)
                 await networkManager.ensureBootstrapHealthy(force: true)
             } else {
                 try requireCurrentStart(generation)
-                await networkManager.start() // cold start once
+                startOutcome = await networkManager.start() // cold start once
                 try requireCurrentStart(generation)
                 await networkManager.ensureBootstrapHealthy(force: true)
             }
             try requireCurrentStart(generation)
+            guard let runningStatus = Self.runningStatus(for: startOutcome) else {
+                throw LifecycleError.startSuperseded
+            }
             beginPowerActivity()
-            updateServerStatus("Running")
+            updateServerStatus(runningStatus)
         } catch LifecycleError.startSuperseded {
             await reconcileSupersededStart()
             throw LifecycleError.startSuperseded
@@ -525,13 +531,18 @@ final actor ServerController: ObservableObject {
         await networkManager.setEnabled(enabled)
         guard generation == lifecycleGeneration else { return }
         if enabled {
-            beginPowerActivity()
-            await networkManager.ensureBootstrapHealthy(force: true)
+            let startOutcome = await networkManager.start()
             guard generation == lifecycleGeneration, desiredTransportState == .running else { return }
+            await networkManager.ensureBootstrapHealthy(force: true)
+            guard generation == lifecycleGeneration, desiredTransportState == .running,
+                  let runningStatus = Self.runningStatus(for: startOutcome)
+            else { return }
+            beginPowerActivity()
+            updateServerStatus(runningStatus)
         } else {
             endPowerActivity()
+            updateServerStatus("Disabled")
         }
-        updateServerStatus(enabled ? "Running" : "Disabled")
     }
 
     // This is no longer needed as there are no individual service toggles.
@@ -540,6 +551,17 @@ final actor ServerController: ObservableObject {
     // }
 
     // MARK: – helpers ––––––––––––––––––––––––––––––––––––––––––––––––––
+
+    nonisolated static func runningStatus(for outcome: ServerNetworkManager.StartOutcome) -> String? {
+        switch outcome {
+        case .ready:
+            "Running"
+        case let .degraded(reason):
+            "Running (Degraded: \(reason.statusDescription))"
+        case .superseded:
+            nil
+        }
+    }
 
     /// Timeout for approval dialogs (auto-deny after this duration)
     private let approvalTimeout: TimeInterval = 300
