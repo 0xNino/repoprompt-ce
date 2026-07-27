@@ -136,46 +136,58 @@ extension MCPServerViewModel {
 
     @MainActor
     func resolveDomainReadContext(
-        toolName: String
-    ) async throws -> DomainReadContextHandle {
-        guard let coordinator = domainRoutingCoordinator else {
-            throw MCPError.internalError("Domain routing unavailable while executing \(toolName)")
+        toolName: String,
+        requirement: DomainReadContextRequirement
+    ) async throws -> DomainReadInvocationContext {
+        // History and oracle transcript lookup have always been workspace-independent. Do not even
+        // capture MainActor routing metadata for them.
+        guard requirement != .workspaceIndependent else {
+            return DomainReadInvocationContext(handle: nil, connectionID: nil)
         }
-        let metadata = await captureRequestMetadata()
-        guard let connectionID = metadata.connectionID else {
-            throw MCPError.invalidParams("\(toolName) requires an active MCP connection")
-        }
-        let resolved = try resolveTabContextSnapshot(
-            from: metadata,
-            toolName: toolName,
-            policy: .allowLegacyImplicitRouting
-        )
-        let context = resolved.snapshot
-        guard let workspaceID = context.workspaceID else {
-            throw MCPError.invalidParams("\(toolName) requires a loaded workspace context")
-        }
-        guard let descriptor = await ensureDomainWindowRegistered(
-            activeWorkspaceID: workspaceID,
-            activeContextID: context.tabID,
-            presentationRevision: context.selectionRevision
-        ) else {
-            throw MCPError.internalError("Domain window registration unavailable while executing \(toolName)")
-        }
-        let updatedDescriptor = DomainWindowDescriptor(
-            windowID: descriptor.windowID,
-            generation: descriptor.generation,
-            activeWorkspaceID: workspaceID,
-            activeContextID: context.tabID,
-            isClosing: false,
-            presentationRevision: context.selectionRevision
-        )
-        let routed = await coordinator.registerWindow(updatedDescriptor, operationID: UUID())
-        guard routed.disposition != .staleGeneration else {
-            throw MCPError.internalError("Domain window generation became stale while executing \(toolName)")
-        }
-        domainWindowDescriptor = routed.snapshot.windows.first { $0.windowID == descriptor.windowID }
 
-        var registration = routed.snapshot.connections.first {
+        let metadata = await captureRequestMetadata()
+        let connectionID = metadata.connectionID
+        guard let coordinator = domainRoutingCoordinator,
+              let connectionID
+        else {
+            return DomainReadInvocationContext(handle: nil, connectionID: connectionID)
+        }
+
+        // App compatibility remains the physical fallback for graceful/no-workspace tools and
+        // focused tests. Routing errors must not preempt their historical backend diagnostics.
+        let resolved: ResolvedTabContextSnapshot
+        do {
+            resolved = try resolveTabContextSnapshot(
+                from: metadata,
+                toolName: toolName,
+                policy: .allowLegacyImplicitRouting
+            )
+        } catch {
+            return DomainReadInvocationContext(handle: nil, connectionID: connectionID)
+        }
+        let context = resolved.snapshot
+        guard let workspaceID = context.workspaceID,
+              let workspaceManager,
+              let workspace = workspaceManager.workspaces.first(where: { $0.id == workspaceID }),
+              let domainWorkspaceAuthorityClient
+        else {
+            return DomainReadInvocationContext(handle: nil, connectionID: connectionID)
+        }
+
+        do {
+            // This awaited transient registration closes the debounce race and works for ephemeral
+            // workspaces without writing them to durable storage.
+            _ = try await domainWorkspaceAuthorityClient.registerForRead(
+                workspace,
+                fileURL: workspaceManager.workspaceFileURL(for: workspace)
+            )
+        } catch {
+            logger.debug("Domain read registration fell back to app authority for \(toolName): \(error.localizedDescription)")
+            return DomainReadInvocationContext(handle: nil, connectionID: connectionID)
+        }
+
+        let routing = await coordinator.snapshot()
+        var registration = routing.connections.first {
             $0.registration.connectionID == connectionID
         }?.registration
         if registration == nil {
@@ -188,7 +200,7 @@ extension MCPServerViewModel {
             }?.registration
         }
         guard let registration else {
-            throw MCPError.internalError("Domain connection registration unavailable while executing \(toolName)")
+            return DomainReadInvocationContext(handle: nil, connectionID: connectionID)
         }
         let binding: DomainBinding = if let runID = context.runID {
             .runScoped(
@@ -207,30 +219,14 @@ extension MCPServerViewModel {
             operationID: UUID()
         )
         guard bound.disposition == .applied || bound.disposition == .unchanged else {
-            throw MCPError.internalError(
-                "Domain context binding rejected while executing \(toolName): \(bound.diagnostic ?? String(describing: bound.disposition))"
-            )
+            return DomainReadInvocationContext(handle: nil, connectionID: connectionID)
         }
-        return try await coordinator.resolveReadContext(connection: registration)
-    }
-
-    @MainActor
-    func validateDomainReadContext(
-        _ handle: DomainReadContextHandle,
-        toolName: String
-    ) async throws {
-        let current = try await resolveDomainReadContext(toolName: toolName)
-        guard current.runtimeID == handle.runtimeID,
-              current.runtimeGeneration == handle.runtimeGeneration,
-              current.connectionID == handle.connectionID,
-              current.connectionGeneration == handle.connectionGeneration,
-              current.context == handle.context,
-              current.workspaceRevision == handle.workspaceRevision,
-              current.contextRevision == handle.contextRevision,
-              current.routingRevision == handle.routingRevision,
-              current.bindingKind == handle.bindingKind
-        else {
-            throw MCPError.internalError("Domain read context changed while executing \(toolName)")
+        do {
+            let handle = try await coordinator.resolveReadContext(connection: registration)
+            return DomainReadInvocationContext(handle: handle, connectionID: connectionID)
+        } catch {
+            logger.debug("Domain read routing fell back to app authority for \(toolName): \(error.localizedDescription)")
+            return DomainReadInvocationContext(handle: nil, connectionID: connectionID)
         }
     }
 

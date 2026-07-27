@@ -21,6 +21,15 @@ struct DomainWorkspaceAuthorityClient {
         await store.snapshot()
     }
 
+    /// Awaited read-registration seam for current app state. Unlike create/replace/save, this is
+    /// transient and therefore also supports ephemeral and focused-test workspaces.
+    func registerForRead(
+        _ workspace: WorkspaceModel,
+        fileURL: URL
+    ) async throws -> DomainWorkspaceSnapshot {
+        try await store.registerReadDocument(document(for: workspace, fileURL: fileURL))
+    }
+
     func create(
         _ workspace: WorkspaceModel,
         fileURL: URL,

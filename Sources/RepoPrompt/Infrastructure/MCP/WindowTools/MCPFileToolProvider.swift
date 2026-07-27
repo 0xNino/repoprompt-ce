@@ -22,7 +22,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
 
     func executeDomainRead(
         toolName: String,
-        context _: DomainReadContextHandle,
+        context _: DomainReadInvocationContext,
         args: [String: Value],
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> Value {
@@ -418,7 +418,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         ) {
             if readResult.shouldAutoSelect {
                 let reply = readResult.reply
-                _ = try await sideEffects.submit(fingerprint: "read_file_auto_selection") { [weak self] in
+                try await sideEffects.submitAndWait(fingerprint: "read_file_auto_selection") { [weak self] in
                     guard let self else { throw CancellationError() }
                     try await applyReadFileSideEffect(
                         reply: reply,
@@ -828,7 +828,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             EditFlowPerf.Stage.Search.providerAutoSelection,
             EditFlowPerf.Dimensions(searchMode: mode.rawValue, contextLines: contextLines)
         ) {
-            _ = try await sideEffects.submit(fingerprint: "file_search_auto_selection") { [weak self] in
+            try await sideEffects.submitAndWait(fingerprint: "file_search_auto_selection") { [weak self] in
                 guard let self else { throw CancellationError() }
                 try await applyFileSearchSideEffect(
                     mode: mode,
@@ -855,12 +855,9 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             resolvedPath,
             metadata
         )
-        guard await dependencies.drainReadFileAutoSelection(
-            metadata,
-            .mirroredSelectionAndMetrics
-        ) == .completed else {
-            throw CancellationError()
-        }
+        // Historical read_file completion guaranteed queue admission, not completion of the
+        // deferred presentation mirror. Legacy consumers can now drain immediately after reply.
+        try Task.checkCancellation()
     }
 
     private func applyFileSearchSideEffect(
@@ -877,12 +874,9 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             resolvedPhysicalPaths,
             metadata
         )
-        guard await dependencies.drainReadFileAutoSelection(
-            metadata,
-            .mirroredSelectionAndMetrics
-        ) == .completed else {
-            throw CancellationError()
-        }
+        // Match read_file: publish admission before reply without serializing the response on UI
+        // mirroring/metrics work.
+        try Task.checkCancellation()
     }
 
     static func searchRetryableFailureDTO(

@@ -1,49 +1,69 @@
 import Foundation
 import MCP
 
+package enum DomainReadContextRequirement: Equatable, Sendable {
+    case workspaceIndependent
+    case workspaceOptional
+    case workspaceRequired
+}
+
+/// The shared provider may execute historically unscoped reads (history, graceful tree/Git
+/// fallbacks) without manufacturing a domain identity. Scoped reads carry the exact authority
+/// handle and connection consumed by the backend.
+package struct DomainReadInvocationContext: Sendable {
+    package var handle: DomainReadContextHandle?
+    package let connectionID: UUID?
+
+    package init(handle: DomainReadContextHandle?, connectionID: UUID?) {
+        self.handle = handle
+        self.connectionID = connectionID
+    }
+}
+
 package struct MCPDomainReadSideEffectEmitter: Sendable {
     private let submitOperation: @Sendable (
+        _ effectClass: DomainReadSideEffectClass,
         _ operationID: UUID,
         _ fingerprint: String,
+        _ waitForCommit: Bool,
         _ operation: @Sendable @escaping () async throws -> Void
-    ) async throws -> DomainReadSideEffectReceipt
-    private let drainOperation: @Sendable (_ revision: UInt64) async throws -> Void
+    ) async throws -> Void
 
     init(
         submit: @Sendable @escaping (
+            _ effectClass: DomainReadSideEffectClass,
             _ operationID: UUID,
             _ fingerprint: String,
+            _ waitForCommit: Bool,
             _ operation: @Sendable @escaping () async throws -> Void
-        ) async throws -> DomainReadSideEffectReceipt,
-        drain: @Sendable @escaping (_ revision: UInt64) async throws -> Void
+        ) async throws -> Void
     ) {
         submitOperation = submit
-        drainOperation = drain
     }
 
     package func submit(
+        effectClass: DomainReadSideEffectClass = .selection,
         operationID: UUID = UUID(),
         fingerprint: String,
         operation: @Sendable @escaping () async throws -> Void
-    ) async throws -> DomainReadSideEffectReceipt {
-        try await submitOperation(operationID, fingerprint, operation)
+    ) async throws {
+        try await submitOperation(effectClass, operationID, fingerprint, false, operation)
     }
 
     package func submitAndWait(
+        effectClass: DomainReadSideEffectClass = .selection,
         operationID: UUID = UUID(),
         fingerprint: String,
         operation: @Sendable @escaping () async throws -> Void
-    ) async throws -> DomainReadSideEffectReceipt {
-        let receipt = try await submitOperation(operationID, fingerprint, operation)
-        try await drainOperation(receipt.revision)
-        return receipt
+    ) async throws {
+        try await submitOperation(effectClass, operationID, fingerprint, true, operation)
     }
 }
 
 package struct MCPDomainReadToolBackend: Sendable {
     package typealias Execute = @Sendable (
         _ toolName: String,
-        _ context: DomainReadContextHandle,
+        _ context: DomainReadInvocationContext,
         _ arguments: [String: Value],
         _ sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> Value
@@ -58,20 +78,29 @@ package struct MCPDomainReadToolBackend: Sendable {
 /// Sole provider/schema implementation for M3 read/discovery families.
 ///
 /// Concrete app and standalone compositions inject physical backends, but both execute the same
-/// definitions, context fencing, cancellation boundaries, drain semantics, and effect revisions.
+/// definitions, cancellation boundaries, scoped authority refresh, and effect revision semantics.
 package struct MCPDomainReadToolProvider: Sendable {
-    package typealias ResolveContext = @Sendable (_ toolName: String) async throws -> DomainReadContextHandle
+    package typealias ResolveContext = @Sendable (
+        _ toolName: String,
+        _ requirement: DomainReadContextRequirement
+    ) async throws -> DomainReadInvocationContext
+    package typealias RefreshContext = @Sendable (
+        _ handle: DomainReadContextHandle
+    ) async throws -> DomainReadContextHandle
 
     private let resolveContext: ResolveContext
+    private let refreshContext: RefreshContext
     private let backend: MCPDomainReadToolBackend
     private let sideEffects: DomainReadSideEffectCoordinator
 
     package init(
         resolveContext: @escaping ResolveContext,
+        refreshContext: @escaping RefreshContext = { $0 },
         backend: MCPDomainReadToolBackend,
         sideEffects: DomainReadSideEffectCoordinator
     ) {
         self.resolveContext = resolveContext
+        self.refreshContext = refreshContext
         self.backend = backend
         self.sideEffects = sideEffects
     }
@@ -96,36 +125,72 @@ package struct MCPDomainReadToolProvider: Sendable {
         arguments: [String: Value]
     ) async throws -> Value {
         try Task.checkCancellation()
+        // Historical parameter failures must win over unrelated routing/workspace failures.
         try validateTopLevelArguments(toolName: toolName, arguments: arguments)
-        var handle = try await resolveContext(toolName)
+        var context = try await resolveContext(toolName, contextRequirement(toolName))
         try Task.checkCancellation()
 
-        if requiresReadSideEffectDrain(toolName: toolName, arguments: arguments) {
-            let revision = try await sideEffects.highWaterRevision(for: handle)
-            try await sideEffects.drain(handle: handle, through: revision)
-            try Task.checkCancellation()
-            // A drain may publish a new canonical selection/context revision. Resolve a fresh
-            // authority handle rather than carrying the pre-drain revision into the backend.
-            handle = try await resolveContext(toolName)
+        if let handle = context.handle,
+           requiresSelectionSideEffectDrain(toolName: toolName, arguments: arguments)
+        {
+            let revision = try await sideEffects.highWaterRevision(
+                for: handle,
+                effectClass: .selection
+            )
+            try await sideEffects.drain(
+                handle: handle,
+                effectClass: .selection,
+                through: revision
+            )
         }
 
-        let resolvedHandle = handle
-        let emitter = MCPDomainReadSideEffectEmitter(
-            submit: { operationID, fingerprint, operation in
-                try await sideEffects.submit(
-                    handle: resolvedHandle,
+        // Refresh solely through the domain actor. This verifies the consumed connection/entity
+        // binding and adopts its latest revisions without a second heavyweight MainActor capture.
+        if let handle = context.handle {
+            context.handle = try await refreshContext(handle)
+        }
+        try Task.checkCancellation()
+
+        let resolvedContext = context
+        let emitter = MCPDomainReadSideEffectEmitter { effectClass, operationID, fingerprint, waitForCommit, operation in
+            guard let handle = resolvedContext.handle else {
+                // Historical unscoped/test execution has no synthetic identity. Commit inline.
+                try Task.checkCancellation()
+                try await operation()
+                try Task.checkCancellation()
+                return
+            }
+            let receipt: DomainReadSideEffectReceipt
+            do {
+                receipt = try await sideEffects.submit(
+                    handle: handle,
+                    effectClass: effectClass,
                     operationID: operationID,
                     fingerprint: fingerprint,
                     operation: operation
                 )
-            },
-            drain: { revision in
-                try await sideEffects.drain(handle: resolvedHandle, through: revision)
+            } catch DomainReadSideEffectError.stopped {
+                // Runtime shutdown is the cancellation boundary for an in-flight read.
+                throw CancellationError()
             }
-        )
-        let value = try await backend.execute(toolName, resolvedHandle, arguments, emitter)
+            if waitForCommit {
+                try await sideEffects.wait(handle: handle, receipt: receipt)
+            }
+        }
+        let value = try await backend.execute(toolName, resolvedContext, arguments, emitter)
         try Task.checkCancellation()
         return value
+    }
+
+    private func contextRequirement(_ toolName: String) -> DomainReadContextRequirement {
+        switch toolName {
+        case "history", "oracle_chat_log":
+            .workspaceIndependent
+        case "get_file_tree", "git":
+            .workspaceOptional
+        default:
+            .workspaceRequired
+        }
     }
 
     private func validateTopLevelArguments(
@@ -133,6 +198,11 @@ package struct MCPDomainReadToolProvider: Sendable {
         arguments: [String: Value]
     ) throws {
         switch toolName {
+        case "get_code_structure":
+            let allowedKeys: Set = ["paths", "expand", "depth", "signatures", "size"]
+            guard Set(arguments.keys).isSubset(of: allowedKeys) else {
+                throw MCPError.invalidParams("unknown get_code_structure parameter")
+            }
         case "read_file":
             guard arguments["path"]?.stringValue != nil else {
                 throw MCPError.invalidParams("missing path")
@@ -148,7 +218,7 @@ package struct MCPDomainReadToolProvider: Sendable {
         }
     }
 
-    private func requiresReadSideEffectDrain(
+    private func requiresSelectionSideEffectDrain(
         toolName: String,
         arguments: [String: Value]
     ) -> Bool {

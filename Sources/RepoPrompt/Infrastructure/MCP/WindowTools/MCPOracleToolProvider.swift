@@ -140,7 +140,7 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
     }
 
     func executeDomainOracleChatLog(
-        context _: DomainReadContextHandle,
+        context _: DomainReadInvocationContext,
         args: [String: Value]
     ) async throws -> Value {
         try await dependencies.executeOracleChatLog(args)

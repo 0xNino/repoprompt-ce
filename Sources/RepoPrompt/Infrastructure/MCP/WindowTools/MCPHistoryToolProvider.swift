@@ -16,7 +16,7 @@ final class MCPHistoryToolProvider {
     }
 
     func executeDomainRead(
-        context _: DomainReadContextHandle,
+        context _: DomainReadInvocationContext,
         args: [String: Value]
     ) async throws -> Value {
         try await execute(args: args)

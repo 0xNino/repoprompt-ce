@@ -61,17 +61,7 @@ final class HistoryMCPToolProviderTests: XCTestCase {
         XCTAssertNotNil(timeObject["groups"])
     }
 
-    private static func makeDomainContext() -> DomainReadContextHandle {
-        DomainReadContextHandle(
-            runtimeID: UUID(),
-            runtimeGeneration: 1,
-            connectionID: UUID(),
-            connectionGeneration: 1,
-            context: DomainContextIdentity(workspaceID: UUID(), contextID: UUID()),
-            workspaceRevision: 1,
-            contextRevision: 1,
-            routingRevision: 1,
-            bindingKind: .explicit
-        )
+    private static func makeDomainContext() -> DomainReadInvocationContext {
+        DomainReadInvocationContext(handle: nil, connectionID: nil)
     }
 }

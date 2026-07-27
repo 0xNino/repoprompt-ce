@@ -22,6 +22,15 @@ package struct DomainWorkspaceStore: Sendable {
     package func reloadExternalChanges() async {
         await authority.reloadExternalChanges()
     }
+
+    /// Registers the app's current in-memory document as an awaited read authority.
+    ///
+    /// This compatibility seam is intentionally transient: it makes newly created and ephemeral
+    /// workspaces immediately routable without waiting for debounced durable publication, while
+    /// leaving the normal command/persistence path authoritative for mutations.
+    package func registerReadDocument(_ document: DomainWorkspaceDocument) async -> DomainWorkspaceSnapshot {
+        await authority.registerReadDocument(document)
+    }
 }
 
 package struct DomainContextStore: Sendable {
@@ -56,6 +65,9 @@ actor DomainWorkspaceContextAuthority {
     private let persistence: DomainPersistenceCoordinator
     private let metrics: DomainRuntimeMetricsSink
     private var records: [UUID: WorkspaceRecord] = [:]
+    /// Awaited in-memory registrations used only by read routing. They are not catalog entries and
+    /// never persist ephemeral/test workspaces. A later command invalidates the overlay.
+    private var readRegistrations: [UUID: DomainWorkspaceSnapshot] = [:]
     private var globalOperations: [UUID: DomainRecordedOperation] = [:]
     private var health: DomainAuthorityHealth = .writable
     private var catalogRevision: UInt64 = 0
@@ -136,20 +148,59 @@ actor DomainWorkspaceContextAuthority {
     }
 
     func workspaceSnapshot(_ workspaceID: UUID) -> DomainWorkspaceSnapshot? {
-        records[workspaceID].map(makeSnapshot)
+        readRegistrations[workspaceID] ?? records[workspaceID].map(makeSnapshot)
     }
 
     func contextSnapshot(_ identity: DomainContextIdentity) -> DomainContextSnapshot? {
-        guard let record = records[identity.workspaceID],
-              let metadata = record.document.metadata.contexts.first(where: {
-                  $0.identity.contextID == identity.contextID
-              })
-        else { return nil }
-        return DomainContextSnapshot(
-            metadata: metadata,
-            revisions: record.contextRevisions[identity.contextID] ?? record.revisions,
-            health: record.health
+        workspaceSnapshot(identity.workspaceID)?.contexts.first {
+            $0.metadata.identity.contextID == identity.contextID
+        }
+    }
+
+    func registerReadDocument(_ document: DomainWorkspaceDocument) async -> DomainWorkspaceSnapshot {
+        await bootstrap()
+        let previous = readRegistrations[document.workspaceID]
+            ?? records[document.workspaceID].map(makeSnapshot)
+        if let previous, previous.document.contentDigest == document.contentDigest {
+            return previous
+        }
+
+        let before = previous?.revisions ?? .initial
+        let nextWorking = before.workingRevision &+ 1
+        let revisions = DomainRevisionState(
+            workingRevision: nextWorking,
+            savedRevision: before.savedRevision,
+            dirtyRevision: nextWorking
         )
+        let contextRevisions: [UUID: DomainRevisionState]
+        if let previous {
+            contextRevisions = Self.updatedContextRevisions(
+                previousDocument: previous.document,
+                nextDocument: document,
+                previousRevisions: Dictionary(uniqueKeysWithValues: previous.contexts.map {
+                    ($0.metadata.identity.contextID, $0.revisions)
+                }),
+                workspaceRevision: revisions
+            ).revisions
+        } else {
+            contextRevisions = Dictionary(uniqueKeysWithValues: document.metadata.contexts.map {
+                ($0.identity.contextID, revisions)
+            })
+        }
+        let registration = DomainWorkspaceSnapshot(
+            document: document,
+            revisions: revisions,
+            health: .writable,
+            contexts: document.metadata.contexts.map { metadata in
+                DomainContextSnapshot(
+                    metadata: metadata,
+                    revisions: contextRevisions[metadata.identity.contextID] ?? revisions,
+                    health: .writable
+                )
+            }
+        )
+        readRegistrations[document.workspaceID] = registration
+        return registration
     }
 
     func readySnapshot() async -> DomainWorkspaceCatalogSnapshot {
@@ -240,23 +291,39 @@ actor DomainWorkspaceContextAuthority {
             )
         }
 
+        let outcome: DomainCommandOutcome
         switch envelope.command {
         case let .createWorkspace(document):
-            return await createWorkspace(document, envelope: envelope, fingerprint: fingerprint)
+            outcome = await createWorkspace(document, envelope: envelope, fingerprint: fingerprint)
         case let .replaceWorkingDocument(document):
-            return await replaceWorkingDocument(document, envelope: envelope, fingerprint: fingerprint)
+            outcome = await replaceWorkingDocument(document, envelope: envelope, fingerprint: fingerprint)
         case let .saveWorkspaceDocument(workspaceID):
-            return await saveWorkspace(workspaceID, envelope: envelope, fingerprint: fingerprint)
+            outcome = await saveWorkspace(workspaceID, envelope: envelope, fingerprint: fingerprint)
         case let .resolveExternalConflict(workspaceID, acceptExternal):
-            return await resolveExternalConflict(
+            outcome = await resolveExternalConflict(
                 workspaceID,
                 acceptExternal: acceptExternal,
                 envelope: envelope,
                 fingerprint: fingerprint
             )
         case let .deleteWorkspace(workspaceID):
-            return await deleteWorkspace(workspaceID, envelope: envelope, fingerprint: fingerprint)
+            outcome = await deleteWorkspace(workspaceID, envelope: envelope, fingerprint: fingerprint)
         }
+        // Keep the read overlay available while persistence is suspended/re-entrant. Only a
+        // completed canonical transition may replace it; a failed command must not reopen the race.
+        if outcome.disposition == .applied
+            || outcome.disposition == .unchanged
+            || outcome.disposition == .deduplicated
+        {
+            if let workspaceID,
+               let registration = readRegistrations[workspaceID],
+               outcome.resultingDigest == nil
+                || outcome.resultingDigest == registration.document.contentDigest
+            {
+                readRegistrations.removeValue(forKey: workspaceID)
+            }
+        }
+        return outcome
     }
 
     func reloadExternalChanges() async {

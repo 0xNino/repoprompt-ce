@@ -1636,17 +1636,23 @@ final class MCPServerViewModel: ObservableObject {
     )
     @MainActor
     private lazy var domainReadToolProvider = MCPDomainReadToolProvider(
-        resolveContext: { [weak self] toolName in
+        resolveContext: { [weak self] toolName, requirement in
             guard let self else {
                 throw MCPError.internalError("Window deallocated while resolving \(toolName) context")
             }
-            return try await resolveDomainReadContext(toolName: toolName)
+            return try await resolveDomainReadContext(
+                toolName: toolName,
+                requirement: requirement
+            )
+        },
+        refreshContext: { [domainRoutingCoordinator] handle in
+            guard let domainRoutingCoordinator else { return handle }
+            return try await domainRoutingCoordinator.refreshReadContext(handle)
         },
         backend: MCPDomainReadToolBackend { [weak self] toolName, context, args, sideEffects in
             guard let self else {
                 throw MCPError.internalError("Window deallocated while executing \(toolName)")
             }
-            try await validateDomainReadContext(context, toolName: toolName)
             switch toolName {
             case "get_code_structure", "get_file_tree", "read_file", "file_search":
                 return try await fileToolProvider.executeDomainRead(
@@ -1784,6 +1790,7 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     var windowIDByConnection: [UUID: Int] = [:]
     let domainRoutingCoordinator: DomainRoutingCoordinator?
+    let domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient?
     let domainReadSideEffectCoordinator: DomainReadSideEffectCoordinator
     var domainWindowDescriptor: DomainWindowDescriptor?
     var domainWindowRegistrationTask: Task<DomainWindowDescriptor?, Never>?
@@ -2559,6 +2566,7 @@ final class MCPServerViewModel: ObservableObject {
             WorkspaceManagerViewModel
         ) async throws -> WorkspaceRootRef,
         domainRoutingCoordinator: DomainRoutingCoordinator? = nil,
+        domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient? = nil,
         domainReadSideEffectCoordinator: DomainReadSideEffectCoordinator? = nil,
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared
     ) {
@@ -2571,6 +2579,7 @@ final class MCPServerViewModel: ObservableObject {
         self.workspaceSearch = workspaceSearch
         self.ensureGitDataRootLoaded = ensureGitDataRootLoaded
         self.domainRoutingCoordinator = domainRoutingCoordinator
+        self.domainWorkspaceAuthorityClient = domainWorkspaceAuthorityClient
         self.domainReadSideEffectCoordinator = domainReadSideEffectCoordinator ?? DomainReadSideEffectCoordinator(
             identity: DomainRuntimeIdentity(
                 runtimeID: UUID(),

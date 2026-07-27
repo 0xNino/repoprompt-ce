@@ -12,7 +12,7 @@ final class MCPPromptContextToolProvider {
 
     func executeDomainRead(
         toolName: String,
-        context _: DomainReadContextHandle,
+        context _: DomainReadInvocationContext,
         args: [String: Value]
     ) async throws -> Value {
         switch toolName {

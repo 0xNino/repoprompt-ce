@@ -19,9 +19,9 @@ final class MCPDomainReadToolProviderTests: XCTestCase {
         let recorder = InvocationRecorder()
         let handle = makeHandle(identity: identity)
         let provider = MCPDomainReadToolProvider(
-            resolveContext: { _ in handle },
+            resolveContext: { _, _ in DomainReadInvocationContext(handle: handle, connectionID: handle.connectionID) },
             backend: MCPDomainReadToolBackend { name, received, arguments, _ in
-                await recorder.record(name: name, handle: received, arguments: arguments)
+                await recorder.record(name: name, context: received, arguments: arguments)
                 return .object(["tool": .string(name)])
             },
             sideEffects: coordinator
@@ -41,7 +41,7 @@ final class MCPDomainReadToolProviderTests: XCTestCase {
 
         let invocations = await recorder.snapshot()
         XCTAssertEqual(invocations.map(\.name), MCPDomainReadToolDefinitions.migratedToolNames)
-        XCTAssertTrue(invocations.allSatisfy { $0.handle == handle })
+        XCTAssertTrue(invocations.allSatisfy { $0.context.handle == handle })
     }
 
     func testIndependentReadBackendsDoNotContendOnSideEffectCoordinator() async throws {
@@ -49,7 +49,7 @@ final class MCPDomainReadToolProviderTests: XCTestCase {
         let handle = makeHandle(identity: identity)
         let barrier = ConcurrentEntryBarrier(target: 2)
         let provider = MCPDomainReadToolProvider(
-            resolveContext: { _ in handle },
+            resolveContext: { _, _ in DomainReadInvocationContext(handle: handle, connectionID: handle.connectionID) },
             backend: MCPDomainReadToolBackend { name, _, _, _ in
                 await barrier.arriveAndWait()
                 return .string(name)
@@ -68,11 +68,47 @@ final class MCPDomainReadToolProviderTests: XCTestCase {
         XCTAssertEqual(maximumConcurrency, 2)
     }
 
+    func testContextRequirementsPreserveUnscopedAndOptionalFamilies() async throws {
+        let identity = makeIdentity()
+        let handle = makeHandle(identity: identity)
+        let resolutions = ContextResolutionRecorder()
+        let provider = MCPDomainReadToolProvider(
+            resolveContext: { toolName, requirement in
+                await resolutions.record(toolName, requirement: requirement)
+                return if requirement == .workspaceRequired {
+                    DomainReadInvocationContext(handle: handle, connectionID: handle.connectionID)
+                } else {
+                    DomainReadInvocationContext(handle: nil, connectionID: nil)
+                }
+            },
+            refreshContext: { received in
+                await resolutions.recordRefresh()
+                return received
+            },
+            backend: MCPDomainReadToolBackend { name, _, _, _ in .string(name) },
+            sideEffects: DomainReadSideEffectCoordinator(identity: identity)
+        )
+
+        _ = try await XCTUnwrap(provider.binding(named: "history"))(["op": .string("list_sessions")])
+        _ = try await XCTUnwrap(provider.binding(named: "get_file_tree"))([:])
+        _ = try await XCTUnwrap(provider.binding(named: "git"))(["op": .string("status")])
+        _ = try await XCTUnwrap(provider.binding(named: "read_file"))(["path": .string("file.swift")])
+
+        let recorded = await resolutions.snapshot()
+        XCTAssertEqual(recorded.map(\.toolName), ["history", "get_file_tree", "git", "read_file"])
+        XCTAssertEqual(
+            recorded.map(\.requirement),
+            [.workspaceIndependent, .workspaceOptional, .workspaceOptional, .workspaceRequired]
+        )
+        let refreshCount = await resolutions.refreshCount()
+        XCTAssertEqual(refreshCount, 1)
+    }
+
     func testCancellationPropagatesWithoutSuccessNormalization() async throws {
         let identity = makeIdentity()
         let handle = makeHandle(identity: identity)
         let provider = MCPDomainReadToolProvider(
-            resolveContext: { _ in handle },
+            resolveContext: { _, _ in DomainReadInvocationContext(handle: handle, connectionID: handle.connectionID) },
             backend: MCPDomainReadToolBackend { _, _, _, _ in
                 try await Task.sleep(for: .seconds(30))
                 return .object([:])
@@ -89,14 +125,83 @@ final class MCPDomainReadToolProviderTests: XCTestCase {
         } catch is CancellationError {}
     }
 
+    func testSideEffectCommitCompletesBeforeSuccessfulResponse() async throws {
+        let identity = makeIdentity()
+        let handle = makeHandle(identity: identity)
+        let effects = StringRecorder()
+        let provider = MCPDomainReadToolProvider(
+            resolveContext: { _, _ in
+                DomainReadInvocationContext(handle: handle, connectionID: handle.connectionID)
+            },
+            backend: MCPDomainReadToolBackend { _, _, _, emitter in
+                try await emitter.submitAndWait(fingerprint: "commit-before-response") {
+                    await effects.append("committed")
+                }
+                return .string("success")
+            },
+            sideEffects: DomainReadSideEffectCoordinator(identity: identity)
+        )
+        let read = try XCTUnwrap(provider.binding(named: "read_file"))
+
+        let value = try await read(["path": .string("file.swift")])
+
+        XCTAssertEqual(value.stringValue, "success")
+        let committed = await effects.snapshot()
+        XCTAssertEqual(committed, ["committed"])
+    }
+
+    func testM0EquivalentVersusM3ProviderOrchestrationLatencyIsBounded() async throws {
+        let identity = makeIdentity()
+        let handle = makeHandle(identity: identity)
+        let context = DomainReadInvocationContext(handle: handle, connectionID: handle.connectionID)
+        let backend = MCPDomainReadToolBackend { _, _, _, _ in .string("ok") }
+        let emitter = MCPDomainReadSideEffectEmitter { _, _, _, _, operation in
+            try await operation()
+        }
+        let arguments: [String: Value] = ["path": .string("file.swift")]
+        let iterations = 1_000
+        let clock = ContinuousClock()
+
+        let baselineStart = clock.now
+        for _ in 0 ..< iterations {
+            _ = try await backend.execute("read_file", context, arguments, emitter)
+        }
+        let baseline = baselineStart.duration(to: clock.now)
+
+        let provider = MCPDomainReadToolProvider(
+            resolveContext: { _, _ in context },
+            backend: backend,
+            sideEffects: DomainReadSideEffectCoordinator(identity: identity)
+        )
+        let read = try XCTUnwrap(provider.binding(named: "read_file"))
+        let providerStart = clock.now
+        for _ in 0 ..< iterations {
+            _ = try await read(arguments)
+        }
+        let m3 = providerStart.duration(to: clock.now)
+        let baselineNanoseconds = Self.nanoseconds(baseline)
+        let m3Nanoseconds = Self.nanoseconds(m3)
+        let overheadPerCall = max(0, m3Nanoseconds - baselineNanoseconds) / Int64(iterations)
+        print(
+            "M3_READ_LATENCY iterations=\(iterations) "
+                + "m0_equivalent_ns=\(baselineNanoseconds) "
+                + "m3_provider_ns=\(m3Nanoseconds) overhead_per_call_ns=\(overheadPerCall)"
+        )
+        XCTAssertLessThan(overheadPerCall, 1_000_000)
+    }
+
     func testProviderNormalizesTopLevelInvalidParametersBeforeBackend() async throws {
         let identity = makeIdentity()
         let recorder = InvocationRecorder()
+        let resolutions = ContextResolutionRecorder()
         let handle = makeHandle(identity: identity)
         let provider = MCPDomainReadToolProvider(
-            resolveContext: { _ in handle },
+            resolveContext: { toolName, requirement in
+                await resolutions.record(toolName, requirement: requirement)
+                return DomainReadInvocationContext(handle: handle, connectionID: handle.connectionID)
+            },
             backend: MCPDomainReadToolBackend { name, handle, arguments, _ in
-                await recorder.record(name: name, handle: handle, arguments: arguments)
+                await recorder.record(name: name, context: handle, arguments: arguments)
                 return .object([:])
             },
             sideEffects: DomainReadSideEffectCoordinator(identity: identity)
@@ -117,8 +222,24 @@ final class MCPDomainReadToolProviderTests: XCTestCase {
         } catch let error as MCPError {
             XCTAssertTrue(String(describing: error).contains("pattern cannot be empty"))
         }
+        let structure = try XCTUnwrap(provider.binding(named: "get_code_structure"))
+        do {
+            _ = try await structure(["bogus": .bool(true)])
+            XCTFail("Expected invalid parameters")
+        } catch let error as MCPError {
+            XCTAssertTrue(String(describing: error).contains("unknown get_code_structure parameter"))
+        }
+
         let invocations = await recorder.snapshot()
         XCTAssertTrue(invocations.isEmpty)
+        let resolutionCount = await resolutions.snapshot().count
+        XCTAssertEqual(resolutionCount, 0, "argument validation must precede unrelated routing")
+    }
+
+    private static func nanoseconds(_ duration: Duration) -> Int64 {
+        let components = duration.components
+        return components.seconds * 1_000_000_000
+            + components.attoseconds / 1_000_000_000
     }
 
     private func makeIdentity() -> DomainRuntimeIdentity {
@@ -175,17 +296,41 @@ private actor ConcurrentEntryBarrier {
     func maximumConcurrency() -> Int { maximum }
 }
 
+private actor StringRecorder {
+    private var values: [String] = []
+    func append(_ value: String) { values.append(value) }
+    func snapshot() -> [String] { values }
+}
+
+private actor ContextResolutionRecorder {
+    struct Resolution: Sendable {
+        let toolName: String
+        let requirement: DomainReadContextRequirement
+    }
+
+    private var resolutions: [Resolution] = []
+    private var refreshes = 0
+
+    func record(_ toolName: String, requirement: DomainReadContextRequirement) {
+        resolutions.append(Resolution(toolName: toolName, requirement: requirement))
+    }
+
+    func recordRefresh() { refreshes += 1 }
+    func snapshot() -> [Resolution] { resolutions }
+    func refreshCount() -> Int { refreshes }
+}
+
 private actor InvocationRecorder {
     struct Invocation: Sendable {
         let name: String
-        let handle: DomainReadContextHandle
+        let context: DomainReadInvocationContext
         let arguments: [String: Value]
     }
 
     private var invocations: [Invocation] = []
 
-    func record(name: String, handle: DomainReadContextHandle, arguments: [String: Value]) {
-        invocations.append(Invocation(name: name, handle: handle, arguments: arguments))
+    func record(name: String, context: DomainReadInvocationContext, arguments: [String: Value]) {
+        invocations.append(Invocation(name: name, context: context, arguments: arguments))
     }
 
     func snapshot() -> [Invocation] { invocations }

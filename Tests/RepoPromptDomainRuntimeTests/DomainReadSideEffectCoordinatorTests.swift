@@ -11,6 +11,7 @@ final class DomainReadSideEffectCoordinatorTests: XCTestCase {
 
         let first = try await coordinator.submit(
             handle: handle,
+            effectClass: .selection,
             operationID: UUID(),
             fingerprint: "first"
         ) {
@@ -18,6 +19,7 @@ final class DomainReadSideEffectCoordinatorTests: XCTestCase {
         }
         let second = try await coordinator.submit(
             handle: handle,
+            effectClass: .selection,
             operationID: UUID(),
             fingerprint: "second"
         ) {
@@ -26,7 +28,7 @@ final class DomainReadSideEffectCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(first.revision, 1)
         XCTAssertEqual(second.revision, 2)
-        try await coordinator.drain(handle: handle, through: second.revision)
+        try await coordinator.drain(handle: handle, effectClass: .selection, through: second.revision)
         let effects = await recorder.snapshot()
         XCTAssertEqual(effects, ["first", "second"])
     }
@@ -39,11 +41,13 @@ final class DomainReadSideEffectCoordinatorTests: XCTestCase {
 
         let first = try await coordinator.submit(
             handle: handle,
+            effectClass: .selection,
             operationID: operationID,
             fingerprint: "same"
         ) {}
         let retry = try await coordinator.submit(
             handle: handle,
+            effectClass: .selection,
             operationID: operationID,
             fingerprint: "same"
         ) {
@@ -54,6 +58,7 @@ final class DomainReadSideEffectCoordinatorTests: XCTestCase {
         do {
             _ = try await coordinator.submit(
                 handle: handle,
+                effectClass: .selection,
                 operationID: operationID,
                 fingerprint: "different"
             ) {}
@@ -63,6 +68,89 @@ final class DomainReadSideEffectCoordinatorTests: XCTestCase {
         }
     }
 
+    func testFailedEffectDoesNotPoisonLaterCalls() async throws {
+        enum ExpectedFailure: Error { case failed }
+        let identity = makeIdentity()
+        let handle = makeHandle(identity: identity)
+        let coordinator = DomainReadSideEffectCoordinator(identity: identity)
+        let recorder = EffectRecorder()
+
+        let failed = try await coordinator.submit(
+            handle: handle,
+            effectClass: .selection,
+            operationID: UUID(),
+            fingerprint: "failed"
+        ) {
+            throw ExpectedFailure.failed
+        }
+        do {
+            try await coordinator.wait(handle: handle, receipt: failed)
+            XCTFail("Expected exact submitter to observe failure")
+        } catch is ExpectedFailure {}
+
+        let recovered = try await coordinator.submit(
+            handle: handle,
+            effectClass: .selection,
+            operationID: UUID(),
+            fingerprint: "recovered"
+        ) {
+            await recorder.append("recovered")
+        }
+        try await coordinator.wait(handle: handle, receipt: recovered)
+        try await coordinator.drain(
+            handle: handle,
+            effectClass: .selection,
+            through: recovered.revision
+        )
+        let recoveredEffects = await recorder.snapshot()
+        XCTAssertEqual(recoveredEffects, ["recovered"])
+    }
+
+    func testSameContextSerializesSelectionButDoesNotBlockGitArtifacts() async throws {
+        let identity = makeIdentity()
+        let handle = makeHandle(identity: identity)
+        let coordinator = DomainReadSideEffectCoordinator(identity: identity)
+        let gate = AsyncGate()
+        let recorder = EffectRecorder()
+
+        let blockedSelection = try await coordinator.submit(
+            handle: handle,
+            effectClass: .selection,
+            operationID: UUID(),
+            fingerprint: "blocked-selection"
+        ) {
+            try await gate.wait()
+            await recorder.append("selection-1")
+        }
+        while !(await gate.hasEntered()) { await Task.yield() }
+
+        let laterSelection = try await coordinator.submit(
+            handle: handle,
+            effectClass: .selection,
+            operationID: UUID(),
+            fingerprint: "later-selection"
+        ) {
+            await recorder.append("selection-2")
+        }
+        let artifact = try await coordinator.submit(
+            handle: handle,
+            effectClass: .gitArtifacts,
+            operationID: UUID(),
+            fingerprint: "artifact"
+        ) {
+            await recorder.append("artifact")
+        }
+        try await coordinator.wait(handle: handle, receipt: artifact)
+        let unblockedEffects = await recorder.snapshot()
+        XCTAssertEqual(unblockedEffects, ["artifact"])
+
+        await gate.release()
+        try await coordinator.wait(handle: handle, receipt: blockedSelection)
+        try await coordinator.wait(handle: handle, receipt: laterSelection)
+        let completedEffects = await recorder.snapshot()
+        XCTAssertEqual(completedEffects, ["artifact", "selection-1", "selection-2"])
+    }
+
     func testShutdownRejectsNewEffectsAndCancelsPendingWork() async throws {
         let identity = makeIdentity()
         let handle = makeHandle(identity: identity)
@@ -70,6 +158,7 @@ final class DomainReadSideEffectCoordinatorTests: XCTestCase {
         let gate = AsyncGate()
         let receipt = try await coordinator.submit(
             handle: handle,
+            effectClass: .selection,
             operationID: UUID(),
             fingerprint: "pending"
         ) {
@@ -77,13 +166,14 @@ final class DomainReadSideEffectCoordinatorTests: XCTestCase {
         }
         await coordinator.shutdown()
         do {
-            try await coordinator.drain(handle: handle, through: receipt.revision)
+            try await coordinator.wait(handle: handle, receipt: receipt)
             XCTFail("Expected cancellation")
         } catch is CancellationError {}
 
         do {
             _ = try await coordinator.submit(
                 handle: handle,
+                effectClass: .selection,
                 operationID: UUID(),
                 fingerprint: "late"
             ) {}
@@ -126,8 +216,10 @@ private actor EffectRecorder {
 
 private actor AsyncGate {
     private var continuation: CheckedContinuation<Void, Error>?
+    private var entered = false
 
     func wait() async throws {
+        entered = true
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 self.continuation = continuation
@@ -135,6 +227,13 @@ private actor AsyncGate {
         } onCancel: {
             Task { await self.cancel() }
         }
+    }
+
+    func hasEntered() -> Bool { entered }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
     }
 
     private func cancel() {

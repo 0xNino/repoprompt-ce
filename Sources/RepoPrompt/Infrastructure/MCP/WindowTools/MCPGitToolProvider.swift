@@ -334,7 +334,7 @@ final class MCPGitToolProvider {
     }
 
     func executeDomainRead(
-        context: DomainReadContextHandle,
+        context: DomainReadInvocationContext,
         args: [String: Value],
         sideEffects: MCPDomainReadSideEffectEmitter
     ) async throws -> Value {
@@ -353,7 +353,8 @@ final class MCPGitToolProvider {
             )
             try Task.checkCancellation()
             if let advertised = await takeStagedAdvertisement(invocationID: invocationID) {
-                _ = try await sideEffects.submitAndWait(
+                try await sideEffects.submitAndWait(
+                    effectClass: .gitArtifacts,
                     fingerprint: "git_artifact_advertisement"
                 ) { [weak self] in
                     guard let self else { throw CancellationError() }
@@ -670,14 +671,17 @@ final class MCPGitToolProvider {
             if !readyCandidates.isEmpty {
                 do {
                     let resultBox = GitArtifactCommitResultBox()
-                    _ = try await sideEffects.submitAndWait(
+                    let candidatesToCommit = readyCandidates
+                    let sourceSelection = sourceSelectionForArtifactCommit
+                    try await sideEffects.submitAndWait(
+                        effectClass: .gitArtifacts,
                         fingerprint: "git_primary_artifact_auto_selection"
                     ) { [weak self] in
                         guard let self else { throw CancellationError() }
                         let commit = try await dependencies.commitPrimaryGitDiffArtifactsToCurrentTab(
                             MCPWindowToolName.git,
-                            readyCandidates,
-                            sourceSelectionForArtifactCommit
+                            candidatesToCommit,
+                            sourceSelection
                         )
                         await resultBox.store(commit.autoSelectedAliases)
                     }

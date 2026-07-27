@@ -144,6 +144,7 @@ enum WindowStateCompositionFactory {
                 )
             },
             domainRoutingCoordinator: domainRuntime?.routingCoordinator,
+            domainWorkspaceAuthorityClient: domainWorkspaceClient,
             domainReadSideEffectCoordinator: domainRuntime?.readSideEffectCoordinator,
             applyEditsApprovalStore: applyEditsApprovalStore
         )

@@ -4,6 +4,60 @@ import Foundation
 import XCTest
 
 final class DomainWorkspaceContextAuthorityTests: XCTestCase {
+    func testAwaitedReadRegistrationRoutesMissingWorkspaceWithoutPersistence() async throws {
+        let fixture = try Fixture.make(includeWorkspace: false)
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+        try await runtime.start()
+        let document = try fixture.document(prompt: "ephemeral")
+
+        let registered = await runtime.workspaceStore.registerReadDocument(document)
+        XCTAssertEqual(registered.document.contentDigest, document.contentDigest)
+        XCTAssertEqual(registered.contexts.first?.metadata.identity.contextID, fixture.contextID)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.workspaceFile.path))
+        let catalog = await runtime.workspaceStore.snapshot()
+        XCTAssertTrue(catalog.workspaces.isEmpty)
+
+        let connectionID = UUID()
+        let registrationOutcome = await runtime.routingCoordinator.registerConnection(
+            connectionID: connectionID,
+            operationID: UUID()
+        )
+        let registration = try XCTUnwrap(registrationOutcome.snapshot.connections.first?.registration)
+        let bound = await runtime.routingCoordinator.bind(
+            connection: registration,
+            binding: .context(
+                DomainContextIdentity(workspaceID: fixture.workspaceID, contextID: fixture.contextID),
+                explicit: true
+            ),
+            operationID: UUID()
+        )
+        XCTAssertEqual(bound.disposition, .applied)
+        let handle = try await runtime.routingCoordinator.resolveReadContext(connection: registration)
+        XCTAssertEqual(handle.workspaceRevision, registered.revisions.workingRevision)
+        XCTAssertEqual(handle.contextRevision, registered.contexts.first?.revisions.workingRevision)
+
+        let rejectedReplace = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            origin: .standalone,
+            command: .replaceWorkingDocument(document)
+        ))
+        XCTAssertEqual(rejectedReplace.disposition, .invalid)
+        let stillRegistered = await runtime.contextStore.workspaceSnapshot(fixture.workspaceID)
+        XCTAssertNotNil(stillRegistered)
+
+        // The transient overlay does not collide with a later canonical create.
+        let created = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedCatalogRevision: 0,
+            expectedWorkspaceRevision: 0,
+            origin: .standalone,
+            command: .createWorkspace(document)
+        ))
+        XCTAssertEqual(created.disposition, .applied)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.workspaceFile.path))
+    }
+
     func testSubscriptionBootstrapsBeforePublishingFirstProjection() async throws {
         let fixture = try Fixture.make()
         defer { fixture.remove() }
@@ -473,6 +527,20 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         XCTAssertEqual(readHandle.runtimeGeneration, runtime.identity.lifecycleGeneration)
         XCTAssertEqual(readHandle.connectionID, connectionID)
         XCTAssertEqual(readHandle.bindingKind, .explicit)
+
+        _ = await runtime.routingCoordinator.openWindow(
+            windowID: 99,
+            activeWorkspaceID: nil,
+            activeContextID: nil,
+            presentationRevision: 1,
+            operationID: UUID()
+        )
+        let refreshed = try await runtime.routingCoordinator.refreshReadContext(readHandle)
+        XCTAssertEqual(refreshed.context, readHandle.context)
+        XCTAssertEqual(refreshed.workspaceRevision, readHandle.workspaceRevision)
+        XCTAssertEqual(refreshed.contextRevision, readHandle.contextRevision)
+        XCTAssertNotEqual(refreshed.routingRevision, readHandle.routingRevision)
+
         _ = await runtime.routingCoordinator.registerConnection(connectionID: connectionID, operationID: UUID())
         let stale = await runtime.routingCoordinator.bind(
             connection: registration,
@@ -576,7 +644,7 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
             operationID: UUID()
         )
         XCTAssertEqual(latePublication.disposition, .staleGeneration)
-        XCTAssertTrue(latePublication.snapshot.windows.isEmpty)
+        XCTAssertFalse(latePublication.snapshot.windows.contains { $0.windowID == 7 })
 
         let replay = await runtime.routingCoordinator.redeemLaunchToken(
             material: token.material,
