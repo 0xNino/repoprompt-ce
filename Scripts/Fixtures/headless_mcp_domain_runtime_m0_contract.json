@@ -311,7 +311,7 @@
     "existing_test": "RepoPromptTests.WorkspaceApprovalCancellationTests/testCancellationSettlesPromptExactlyOnceAndResolvesDenied"
   },
   "main_actor": {
-    "mcp_local_declaration_count": 41,
+    "mcp_local_declaration_count": 42,
     "mcp_local_declaration_sites": [
       {
         "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentExploreMCPToolService.swift",
@@ -352,6 +352,15 @@
         "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/MCPAgentRoleDefaultsService.swift",
         "kind": "protocol",
         "symbol": "MCPAgentRoleDefaultsStoring"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/AppShared/DomainWorkspacePresentationBridge.swift",
+        "kind": "class",
+        "symbol": "DomainWorkspacePresentationBridge",
+        "actor_boundary_classification": "presentation_only",
+        "presentation_role": "snapshot_projection_and_default_bootstrap_command_client",
+        "mutable_domain_authority": false,
+        "executable_tool_hop": false
       },
       {
         "path": "Sources/RepoPrompt/Infrastructure/MCP/MCPExternalEventsMonitor.swift",

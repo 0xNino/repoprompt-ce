@@ -354,13 +354,30 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertEqual(Set(scannerFixtureSites.compactMap { $0["symbol"] as? String }), ["InlineActor", "IndentedActor", "AttributedActor", "ExtendedActor"])
 
         let expectedLocalSiteRows = try dictionaries(actorInventory, key: "mcp_local_declaration_sites")
+        let presentationOnlySites = expectedLocalSiteRows.filter {
+            $0["actor_boundary_classification"] != nil
+        }
+        XCTAssertEqual(
+            presentationOnlySites.map(mainActorSiteKey),
+            [
+                "Sources/RepoPrompt/Infrastructure/MCP/AppShared/DomainWorkspacePresentationBridge.swift|class|DomainWorkspacePresentationBridge"
+            ]
+        )
+        let presentationBridge = try XCTUnwrap(presentationOnlySites.first)
+        XCTAssertEqual(presentationBridge["actor_boundary_classification"] as? String, "presentation_only")
+        XCTAssertEqual(
+            presentationBridge["presentation_role"] as? String,
+            "snapshot_projection_and_default_bootstrap_command_client"
+        )
+        XCTAssertEqual(presentationBridge["mutable_domain_authority"] as? Bool, false)
+        XCTAssertEqual(presentationBridge["executable_tool_hop"] as? Bool, false)
         let expectedLocalSites = expectedLocalSiteRows.map(mainActorSiteKey).sorted()
         let actualLocalSites = try mainActorDeclarationSites(
             under: "Sources/RepoPrompt/Infrastructure/MCP"
         ).map(mainActorSiteKey).sorted()
         XCTAssertEqual(actualLocalSites, expectedLocalSites)
         XCTAssertEqual(actualLocalSites.count, try integer(actorInventory, key: "mcp_local_declaration_count"))
-        XCTAssertEqual(actualLocalSites.count, 41)
+        XCTAssertEqual(actualLocalSites.count, 42)
 
         let externalSites = try dictionaries(actorInventory, key: "external_collaborators")
         for site in externalSites {
@@ -374,6 +391,18 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         let allTools = try strings(dictionary(manifest, key: "catalog"), key: "global_tools")
             + strings(dictionary(manifest, key: "catalog"), key: "window_tools")
         XCTAssertEqual(Set(perToolHops.keys), Set(allTools))
+        let executableHopSymbols = Set(perToolHops.values.flatMap(\.self))
+        let presentationOnlySymbols = Set(presentationOnlySites.compactMap { $0["symbol"] as? String })
+        XCTAssertTrue(executableHopSymbols.isDisjoint(with: presentationOnlySymbols))
+        let localExecutableHopPaths = Set(expectedLocalSiteRows.compactMap { site -> String? in
+            guard let symbol = site["symbol"] as? String,
+                  executableHopSymbols.contains(symbol)
+            else { return nil }
+            return site["path"] as? String
+        })
+        for path in localExecutableHopPaths {
+            XCTAssertFalse(try source(path).contains("DomainWorkspacePresentationBridge"), path)
+        }
         let inventoriedSymbols = Set(expectedLocalSites.map { $0.split(separator: "|").last.map(String.init) ?? "" })
             .union(externalSites.compactMap { $0["symbol"] as? String })
         for tool in allTools {
