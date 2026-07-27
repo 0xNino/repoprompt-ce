@@ -1441,7 +1441,6 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         let rootURL: URL
         let contextA: PersistentMCPTestContext
         let contextB: PersistentMCPTestContext
-        let ownedRoutingService: WindowRoutingService?
         private var firstPersistentMCPTestEndpoint: PersistentMCPTestEndpoint?
         private var secondPersistentMCPTestEndpoint: PersistentMCPTestEndpoint?
         private var queuedSearchPersistentMCPTestEndpoint: PersistentMCPTestEndpoint?
@@ -1453,13 +1452,11 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         private init(
             rootURL: URL,
             contextA: PersistentMCPTestContext,
-            contextB: PersistentMCPTestContext,
-            ownedRoutingService: WindowRoutingService?
+            contextB: PersistentMCPTestContext
         ) {
             self.rootURL = rootURL
             self.contextA = contextA
             self.contextB = contextB
-            self.ownedRoutingService = ownedRoutingService
         }
 
         static func make(
@@ -1489,7 +1486,6 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
 
             var contextA: PersistentMCPTestContext?
             var contextB: PersistentMCPTestContext?
-            var ownedRoutingService: WindowRoutingService?
             var constructedFixture: PersistentMCPTestFixture?
             do {
                 contextA = try await makeContext(
@@ -1510,13 +1506,11 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                     label: "B",
                     searchFileCount: 1
                 )
-                let routing = try await ensureRoutingService()
-                ownedRoutingService = routing.owned ? routing.service : nil
+                try await ensureRoutingService()
                 let fixture = try PersistentMCPTestFixture(
                     rootURL: rootURL,
                     contextA: XCTUnwrap(contextA),
-                    contextB: XCTUnwrap(contextB),
-                    ownedRoutingService: ownedRoutingService
+                    contextB: XCTUnwrap(contextB)
                 )
                 constructedFixture = fixture
                 fixture.firstPersistentMCPTestEndpoint = try await PersistentMCPTestEndpoint.make(label: "a", networkManager: fixture.networkManager)
@@ -1531,7 +1525,6 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 } else {
                     if let contextB { await cleanupContext(contextB) }
                     if let contextA { await cleanupContext(contextA) }
-                    if let ownedRoutingService { await ServiceRegistry.unregister(ownedRoutingService) }
                     WindowStatesManager.shared.unregisterWindowState(windowB)
                     WindowStatesManager.shared.unregisterWindowState(windowA)
                     try? FileManager.default.removeItem(at: rootURL)
@@ -1649,7 +1642,6 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             contextA.window.workspaceManager.workspaces.removeAll { $0.id == contextA.workspaceID }
             WindowStatesManager.shared.unregisterWindowState(contextB.window)
             WindowStatesManager.shared.unregisterWindowState(contextA.window)
-            if let ownedRoutingService { await ServiceRegistry.unregister(ownedRoutingService) }
             try? FileManager.default.removeItem(at: rootURL)
         }
 
@@ -1740,18 +1732,12 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             )
         }
 
-        private static func ensureRoutingService() async throws -> (service: WindowRoutingService, owned: Bool) {
-            let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
-            for _ in 0 ..< 100 {
-                let registered = await ServiceRegistry.isRegistered(service)
-                let names = await service.tools.map(\.name)
-                if registered, names.contains(MCPGlobalToolName.bindContext) {
-                    return (service, true)
-                }
-                try await Task.sleep(for: .milliseconds(10))
+        private static func ensureRoutingService() async throws {
+            try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+            let snapshot = await ServiceRegistry.catalogSnapshot()
+            guard snapshot.activeScopesByToolName[MCPGlobalToolName.bindContext]?.contains(.application) == true else {
+                throw ClientFixtureError.routingServiceUnavailable
             }
-            await ServiceRegistry.unregister(service)
-            throw ClientFixtureError.routingServiceUnavailable
         }
 
         private static func cleanupContext(_ context: PersistentMCPTestContext) async {

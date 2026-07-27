@@ -801,7 +801,6 @@ final class MCPBootstrapLeaseTests: XCTestCase {
             await window.workspaceManager.awaitInitialized()
 
             let catalogService = window.mcpServer.windowMCPToolCatalogService
-            var ownedRoutingService: WindowRoutingService?
             var lease: MCPBootstrapLease?
             var loadedRootID: UUID?
 
@@ -824,9 +823,6 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                 await MCPRoutingWaiter.cleanup(runID: runID)
                 await HeadlessAgentConnectionGate.cancelAll()
                 await ServiceRegistry.unregister(catalogService)
-                if let ownedRoutingService {
-                    await ServiceRegistry.unregister(ownedRoutingService)
-                }
                 if let loadedRootID {
                     await window.workspaceFileContextStore.unloadRoot(id: loadedRootID)
                 }
@@ -863,8 +859,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                 loadedRootID = loadedRoot.id
 
                 try await ServiceRegistry.register(catalogService)
-                let routing = try await Self.ensureRoutingService()
-                ownedRoutingService = routing.owned ? routing.service : nil
+                try await Self.ensureRoutingService()
 
                 let cursorAdditionalTools = AgentModeMCPPolicyInstaller.additionalTools(for: .cursor)
                 XCTAssertTrue(cursorAdditionalTools.contains(MCPWindowToolName.oracleChatLog))
@@ -1263,18 +1258,12 @@ private extension MCPBootstrapLeaseTests {
     #endif
 
     @MainActor
-    static func ensureRoutingService() async throws -> (service: WindowRoutingService, owned: Bool) {
-        let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
-        for _ in 0 ..< 100 {
-            let registered = await ServiceRegistry.isRegistered(service)
-            let names = await service.tools.map(\.name)
-            if registered, names.contains(MCPGlobalToolName.bindContext) {
-                return (service, true)
-            }
-            try await Task.sleep(for: .milliseconds(10))
+    static func ensureRoutingService() async throws {
+        try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+        let snapshot = await ServiceRegistry.catalogSnapshot()
+        guard snapshot.activeScopesByToolName[MCPGlobalToolName.bindContext]?.contains(.application) == true else {
+            throw MCPBootstrapLeaseTestError.routingServiceUnavailable
         }
-        await ServiceRegistry.unregister(service)
-        throw MCPBootstrapLeaseTestError.routingServiceUnavailable
     }
 }
 

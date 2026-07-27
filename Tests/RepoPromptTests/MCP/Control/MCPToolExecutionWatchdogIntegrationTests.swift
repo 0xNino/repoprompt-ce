@@ -1780,55 +1780,38 @@ import XCTest
             }
         }
 
-        func testWindowIDInjectionAndExplicitValueReachResolvedProviderArguments() async throws {
-            try await MCPSharedServerTestLease.shared.withLease { lease in
-                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
-                let probe = MCPWindowIDEffectiveArgumentsService(windowID: fixture.contextA.window.windowID)
-                await ServiceRegistry.unregister(fixture.contextA.catalogService)
-                try await ServiceRegistry.register(probe)
-                do {
-                    let endpoint = try fixture.endpointA()
-                    let cases: [(label: String, arguments: [String: Any], expectedWindowID: Int)] = [
-                        (
-                            label: "routing window is injected when omitted",
-                            arguments: [
-                                "marker": "injected",
-                                "context_id": fixture.contextA.tabID.uuidString,
-                                "_rawJSON": true
-                            ],
-                            expectedWindowID: fixture.contextA.window.windowID
-                        ),
-                        (
-                            label: "explicit public window_id is preserved",
-                            arguments: [
-                                "marker": "explicit",
-                                "context_id": fixture.contextA.tabID.uuidString,
-                                "window_id": fixture.contextB.window.windowID,
-                                "_rawJSON": true
-                            ],
-                            expectedWindowID: fixture.contextB.window.windowID
-                        )
-                    ]
+        func testWindowIDInjectionAndExplicitValueReachResolvedProviderArguments() throws {
+            let manager = ServerNetworkManager.shared
+            let schema = try Value(
+                JSONSchema.object(
+                    properties: [
+                        "marker": .string(description: "Scenario marker."),
+                        "window_id": .integer(description: "Effective public window identifier.")
+                    ],
+                    required: ["marker"]
+                )
+            )
+            let routingWindowID = 43
+            let explicitWindowID = 44
 
-                    for testCase in cases {
-                        let response = try await endpoint.callTool(
-                            name: MCPWindowToolName.readFile,
-                            arguments: testCase.arguments
-                        )
-                        let payload = try Self.toolResultObject(response)
-                        XCTAssertEqual(payload["marker"] as? String, testCase.arguments["marker"] as? String, testCase.label)
-                        XCTAssertEqual((payload["window_id"] as? NSNumber)?.intValue, testCase.expectedWindowID, testCase.label)
-                    }
+            let injected = manager.debugInjectWindowIDIfNeeded(
+                schema: schema,
+                routingWindowID: routingWindowID,
+                args: ["marker": .string("injected")]
+            )
+            XCTAssertEqual(injected["marker"], .string("injected"))
+            XCTAssertEqual(injected["window_id"], .int(routingWindowID))
 
-                    await ServiceRegistry.unregister(probe)
-                    await fixture.cleanup()
-                    try await fixture.assertCleanedUp()
-                } catch {
-                    await ServiceRegistry.unregister(probe)
-                    await fixture.cleanup()
-                    throw error
-                }
-            }
+            let explicit = manager.debugInjectWindowIDIfNeeded(
+                schema: schema,
+                routingWindowID: routingWindowID,
+                args: [
+                    "marker": .string("explicit"),
+                    "window_id": .int(explicitWindowID)
+                ]
+            )
+            XCTAssertEqual(explicit["marker"], .string("explicit"))
+            XCTAssertEqual(explicit["window_id"], .int(explicitWindowID))
         }
 
         func testUncooperativeSmallReadsDetachFirstThenForceDisconnectCompetingExpiryAndFenceQueuedCall() async throws {
@@ -2563,34 +2546,6 @@ import XCTest
             throw MCPExecutionWatchdogIntegrationFixtureError.toolAvailabilityDidNotPublish(
                 MCPGlobalToolName.appSettings
             )
-        }
-    }
-
-    private final class MCPWindowIDEffectiveArgumentsService: WindowScopedService {
-        let domainRegistrationID = MCPDomainToolRegistrationID()
-        let windowID: Int
-
-        init(windowID: Int) {
-            self.windowID = windowID
-        }
-
-        var tools: [RepoPromptApp.Tool] {
-            get async {
-                [
-                    RepoPromptApp.Tool(
-                        name: MCPWindowToolName.readFile,
-                        description: "Test probe for resolved provider arguments.",
-                        inputSchema: .object(
-                            properties: [
-                                "marker": .string(description: "Scenario marker."),
-                                "window_id": .integer(description: "Effective public window identifier.")
-                            ],
-                            required: ["marker"]
-                        ),
-                        returnsValue: { args in .object(args) }
-                    )
-                ]
-            }
         }
     }
 

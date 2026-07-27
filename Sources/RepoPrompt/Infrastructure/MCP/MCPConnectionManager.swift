@@ -6844,6 +6844,20 @@ actor ServerNetworkManager {
         return props.keys.contains("window_id")
     }
 
+    #if DEBUG
+        nonisolated func debugInjectWindowIDIfNeeded(
+            schema: Value,
+            routingWindowID: Int?,
+            args: [String: Value]
+        ) -> [String: Value] {
+            injectWindowIDIfNeeded(
+                schemaDeclaresWindowID: schemaDeclaresWindowID(schema: schema),
+                routingWindowID: routingWindowID,
+                args: args
+            )
+        }
+    #endif
+
     /// Injects `window_id` into tool arguments if:
     /// 1. The tool schema declares a `window_id` parameter
     /// 2. The caller provided `_windowID` for routing

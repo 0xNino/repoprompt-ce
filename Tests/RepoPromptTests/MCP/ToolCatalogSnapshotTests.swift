@@ -82,6 +82,36 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         await window.mcpServer.stopServer()
     }
 
+    func testGlobalCompositionCoalescesApplicationRegistrationBeforeReadiness() async throws {
+        let registrations = (0 ..< 8).map { _ in
+            Task { @MainActor in
+                try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+            }
+        }
+        for registration in registrations {
+            try await registration.value
+        }
+
+        let ready = await MCPToolCatalogReadiness.shared.awaitReady(windowID: nil, timeout: 1)
+        let snapshot = await ServiceRegistry.catalogSnapshot()
+        XCTAssertTrue(ready)
+        XCTAssertTrue(
+            MCPGlobalToolName.orderedToolNames.allSatisfy { toolName in
+                snapshot.activeScopesByToolName[toolName]?.contains(.application) == true
+            },
+            "Composition-owned app settings and routing registrations must exist before readiness succeeds."
+        )
+
+        let stableRevision = snapshot.revision
+        try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+        let afterRepeatedEnsure = await ServiceRegistry.catalogSnapshot()
+        XCTAssertEqual(
+            afterRepeatedEnsure.revision,
+            stableRevision,
+            "Joining an existing global registration must not recreate or replace its handles."
+        )
+    }
+
     func testAgentRunRespondSchemaAdvertisesCanonicalScalarResponseOnly() async throws {
         let window = Self.makeWindowWithoutAutoStart()
         let tools = await window.mcpServer.windowMCPTools

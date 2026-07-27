@@ -12,6 +12,25 @@ import RepoPromptDomainRuntime
 
 private let log = Logger(label: "com.repoprompt.mcp.readiness")
 
+private actor MCPGlobalRegistrationReadinessState {
+    enum Outcome {
+        case pending
+        case succeeded
+        case failed(String)
+    }
+
+    private var outcome: Outcome = .pending
+
+    func complete(_ outcome: Outcome) {
+        guard case .pending = self.outcome else { return }
+        self.outcome = outcome
+    }
+
+    func snapshot() -> Outcome {
+        outcome
+    }
+}
+
 #if DEBUG
     private var mcpToolCatalogReadinessDebugLoggingEnabled = false
     private func mcpToolCatalogReadinessLog(_ message: @autoclosure () -> String) {
@@ -42,9 +61,23 @@ actor MCPToolCatalogReadiness {
     /// - Returns: true if ready, false if timeout
     func awaitReady(windowID: Int?, timeout: TimeInterval = defaultTimeout) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
+        let registrationState = MCPGlobalRegistrationReadinessState()
+        Task {
+            do {
+                try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+                await registrationState.complete(.succeeded)
+            } catch {
+                await registrationState.complete(.failed(String(reflecting: error)))
+            }
+        }
         let pollInterval: TimeInterval = 0.05 // 50ms
 
         while Date() < deadline {
+            if case let .failed(error) = await registrationState.snapshot() {
+                log.error("Global MCP domain registration failed before readiness: \(error)")
+                return false
+            }
+
             // Check if required services are registered
             let isReady = await checkServicesReady(windowID: windowID)
 

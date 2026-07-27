@@ -341,17 +341,15 @@ final class WindowRoutingService: Service {
     ) {
         self.windowStates = windowStates
         self.networkMgr = networkMgr
+    }
 
-        // Definitions are static in M1. Disabled-tool and window-count changes are
-        // consumed by policy/routing snapshots and must not rebuild a second catalog.
-        Task {
-            await updateCachedTools()
-            do {
-                try await ServiceRegistry.register(self)
-            } catch {
-                routingLog("Window routing catalog registration failed: \(String(reflecting: error))")
-            }
-        }
+    /// Materializes and registers the static M1 routing definitions. The process
+    /// composition owns the returned handle; constructing a service is inert.
+    @MainActor
+    @discardableResult
+    func registerDomainTools() async throws -> MCPDomainToolRegistrationResult {
+        await updateCachedTools()
+        return try await ServiceRegistry.register(self)
     }
 
     // ---------------------------------------------------------------------

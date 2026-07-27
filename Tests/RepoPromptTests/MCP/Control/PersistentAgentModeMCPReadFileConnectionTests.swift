@@ -2792,7 +2792,6 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         private var peerRootID: UUID?
         private var peerTargetStateVersionBeforeSelection: Int?
         private var peerCatalogService: MCPWindowToolCatalogService?
-        private var ownedRoutingService: WindowRoutingService?
         private var cleanedUp = false
 
         private init(
@@ -3495,13 +3494,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
 
         func makeIndependentPeerConnection() async throws -> IndependentConnection {
-            let routingService = WindowRoutingService(windowStates: .shared, networkMgr: networkManager)
-            ownedRoutingService = routingService
-            for _ in 0 ..< 100 {
-                let registered = await ServiceRegistry.isRegistered(routingService)
-                let names = await routingService.tools.map(\.name)
-                if registered, names.contains(MCPGlobalToolName.bindContext) { break }
-                try await Task.sleep(for: .milliseconds(10))
+            try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+            let snapshot = await ServiceRegistry.catalogSnapshot()
+            guard snapshot.activeScopesByToolName[MCPGlobalToolName.bindContext]?.contains(.application) == true else {
+                throw ClientFixtureError.routingServiceUnavailable
             }
             if peerCatalogService == nil {
                 let service = routingGuardWindow.mcpServer.windowMCPToolCatalogService
@@ -3865,9 +3861,6 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             if let peerCatalogService {
                 await ServiceRegistry.unregister(peerCatalogService)
             }
-            if let ownedRoutingService {
-                await ServiceRegistry.unregister(ownedRoutingService)
-            }
             await window.workspaceFileContextStore.unloadRoot(id: rootID)
             if let peerRootID {
                 await routingGuardWindow.workspaceFileContextStore.unloadRoot(id: peerRootID)
@@ -3899,6 +3892,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
     private enum ClientFixtureError: Error {
         case exactAbsoluteCatalogMiss
         case leaseAcquisitionFailed
+        case routingServiceUnavailable
         case parentAffinitySeedFailed(String)
         case handoverPolicyApplicationFailed(String)
         case liveFixtureTooShort(Int)

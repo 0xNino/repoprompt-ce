@@ -20,9 +20,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     private var terminationInProgress = false
     private let dockMenuController = DockMenuController()
 
-    // New global routing/settings services (kept alive by the AppDelegate)
-    private var windowRoutingService: WindowRoutingService?
-    private var appSettingsMCPService: AppSettingsMCPService?
+    /// Global runtime/catalog startup remains joined for the app lifetime.
     private var domainRuntimeStartupTask: Task<Void, Never>?
 
     // MARK: - Global references
@@ -84,24 +82,15 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         AppearanceController.shared.applyFromGlobalSettings()
 
         // ───────────────────────────────────────────────────
-        // Register global MCP app-wide helpers
-        let appSettingsMCPService = AppSettingsMCPService()
-        self.appSettingsMCPService = appSettingsMCPService
-        let domainRuntime = AppDomainRuntimeComposition.shared.runtime
+        // Start the runtime and publish both application-scoped MCP services as
+        // one composition-owned operation. Readiness joins this same task.
         domainRuntimeStartupTask = Task {
             do {
-                try await domainRuntime.start()
-                try await ServiceRegistry.register(appSettingsMCPService)
+                try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
             } catch {
-                assertionFailure("Failed to start inert app domain runtime: \(error)")
+                assertionFailure("Failed to register global MCP domain services: \(error)")
             }
         }
-
-        // Register global MCP window-routing helpers
-        windowRoutingService = WindowRoutingService(
-            windowStates: WindowStatesManager.shared,
-            networkMgr: ServerNetworkManager.shared
-        )
         if !launchConfiguration.suppressesNonessentialLaunchSideEffects {
             // Request notification authorization
             Task {
