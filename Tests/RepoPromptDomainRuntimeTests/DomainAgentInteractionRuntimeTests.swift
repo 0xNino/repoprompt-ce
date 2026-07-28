@@ -108,13 +108,21 @@ final class DomainAgentRunSessionStoreTests: XCTestCase {
         while await store.test_waiterCount(registration: registration) == 0 {
             await Task.yield()
         }
+        let cancellationFence = CancellationFence()
         await store.installCancellationHandler(registration: registration) {
-            try? await Task.sleep(for: .milliseconds(80))
+            await cancellationFence.holdUntilCancelled()
         }
 
         let shutdown = Task {
             await store.shutdown(deadline: .milliseconds(20))
         }
+        let clock = ContinuousClock()
+        let startDeadline = clock.now.advanced(by: .seconds(1))
+        while !(await cancellationFence.hasStarted()), clock.now < startDeadline {
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        let handlerStarted = await cancellationFence.hasStarted()
+        XCTAssertTrue(handlerStarted)
         while await store.hasActiveRegistration(sessionID: sessionID) {
             await Task.yield()
         }
@@ -136,7 +144,14 @@ final class DomainAgentRunSessionStoreTests: XCTestCase {
         await ingest
         await wake
         let shutdownResult = await shutdown.value
+        let cancellationDeadline = clock.now.advanced(by: .seconds(1))
+        while !(await cancellationFence.observedCancellation()), clock.now < cancellationDeadline {
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        let handlerWasCancelled = await cancellationFence.observedCancellation()
+        await cancellationFence.release()
         let waiterCount = await store.test_waiterCount(registration: registration)
+        XCTAssertTrue(handlerWasCancelled)
         XCTAssertEqual(waiterDisposition, .cancelled)
         XCTAssertEqual(drainWait, .cancelled)
         XCTAssertEqual(publicationResult, .rejected(reason: "stale_activation"))
@@ -1111,6 +1126,32 @@ private actor InteractionAdapterRecorder {
             presentationRequestID: presentedRequestID,
             cancellationRequestIDs: cancelledRequestIDs
         )
+    }
+}
+
+private actor CancellationFence {
+    private var started = false
+    private var wasCancelled = false
+    private var released = false
+
+    func holdUntilCancelled() async {
+        started = true
+        while !Task.isCancelled, !released {
+            await Task.yield()
+        }
+        wasCancelled = Task.isCancelled
+    }
+
+    func hasStarted() -> Bool {
+        started
+    }
+
+    func observedCancellation() -> Bool {
+        wasCancelled
+    }
+
+    func release() {
+        released = true
     }
 }
 
