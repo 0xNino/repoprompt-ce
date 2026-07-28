@@ -2760,6 +2760,21 @@ import XCTest
             context: MCPServerViewModel.TabContextSnapshot,
             fixture: PersistentMCPTestFixture
         ) async throws {
+            let workspaceID = try XCTUnwrap(context.workspaceID)
+            let authorityContext = try XCTUnwrap(
+                [fixture.contextA, fixture.contextB].first { $0.workspaceID == workspaceID }
+            )
+            let workspace = try XCTUnwrap(
+                authorityContext.window.workspaceManager.workspaces.first { $0.id == workspaceID }
+            )
+            let authorityClient = DomainWorkspaceAuthorityClient(
+                store: AppDomainRuntimeComposition.shared.runtime.workspaceStore,
+                windowID: context.windowID
+            )
+            _ = try await authorityClient.registerForRead(
+                workspace,
+                fileURL: authorityContext.rootURL.appendingPathComponent("fixture.repoprompt-workspace")
+            )
             _ = try await endpoint.callTool(
                 name: "bind_context",
                 arguments: ["op": "bind", "context_id": context.tabID.uuidString]
@@ -2785,6 +2800,21 @@ import XCTest
                 clientName: endpoint.clientName,
                 context: context
             )
+            for _ in 0 ..< 200 {
+                let securityContext = await fixture.networkManager
+                    .debugDomainInvocationSecurityContextForTesting(
+                        connectionID: endpoint.connectionID,
+                        toolName: MCPWindowToolName.askOracle
+                    )
+                if securityContext.hasAuthoritativeRoutingContext,
+                   securityContext.workspaceID == workspaceID,
+                   !securityContext.authorizedCanonicalRoots.isEmpty
+                {
+                    return
+                }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTFail("Oracle test routing context did not become authoritative")
         }
 
         private func activateWorkspace(_ context: PersistentMCPTestContext) async throws {
