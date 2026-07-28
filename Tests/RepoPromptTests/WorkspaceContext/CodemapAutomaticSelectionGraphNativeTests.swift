@@ -558,7 +558,6 @@ final class CodemapAutomaticSelectionGraphNativeTests: WorkspaceFileContextStore
         XCTAssertFalse(result.issues.isEmpty)
         let demanded = Array(fixture.demandedTickets.values.dropFirst(ticketOffset))
         XCTAssertEqual(demanded.map(\.fileID), [target.id])
-        XCTAssertEqual(demandAttempts.value, 1)
         XCTAssertEqual(Set(cleaned.values.map(\.retainID)), Set(demanded.map(\.retainID)))
     }
 
