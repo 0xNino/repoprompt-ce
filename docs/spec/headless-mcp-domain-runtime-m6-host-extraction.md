@@ -15,7 +15,7 @@ Gate 6A introduces `MCPDomainHost` in `RepoPromptDomainRuntime` as the protocol-
 - authoritative `DomainToolInvocationSecurityContext` installation;
 - active invocation ownership, per-connection cancellation, and bounded runtime drain.
 
-The app remains a transport and presentation shell. `ServerNetworkManager` still owns app/window routing, policy filtering, connection admission lanes, resource leases, watchdog selection, progress, tool-card publication, observer callbacks, result formatting, and transport delivery. It now obtains catalog snapshots and exact resolutions from `MCPDomainHost` and enters providers through `MCPDomainHost.invoke`. Connection removal also cancels host-owned invocations.
+The app remains a transport and presentation shell. `MCPDomainHost` owns canonical policy filtering, connection registrations and replacement generations, admission lanes, resource leases, progress state, watchdog execution, settlement, delivery accounting, terminal fencing, and bounded drain. `ServerNetworkManager` adapts app/window routing, tool-card publication, observer callbacks, result formatting, and physical transport delivery to those runtime capabilities. It obtains catalog snapshots and exact resolutions from `MCPDomainHost`; connection removal terminal-fences and cancels the exact host generation.
 
 `MCPService` receives an injected host-bootstrap operation. The production default performs the existing one-time Codex tool-timeout migration before listener startup; tests and later standalone composition can supply a different bootstrap without duplicating lifecycle ownership.
 
@@ -189,6 +189,54 @@ Evidence:
 - `make dev-provider-test` — ticket `fcb0084e-a489-442a-8e0b-9573227c0d22`, passed
 - ledger verification — 3,689 exact methods; root/provider list tickets `d5d91c33-0234-46fc-b1b2-39ecd5222b83` and `a761b7c1-ce83-48df-973d-7d6a7b2c9c85`
 
-## Gate 6B exposure rule
+## Gate 6B — standalone preview
 
-No `--backend headless` surface is introduced by Gate 6A. Gate 6B may be exposed only after one shared non-App physical provider composition supplies the complete canonical tool catalog to both app and standalone hosts. A partial catalog, headless-only replacement providers, or a synthetic window authority is not an acceptable preview.
+Gate 6B exposes only the explicit `--backend headless` preview. The parser still defaults to
+`app`, rejects headless interactive/exec combinations, and leaves automatic selection to M7.
+
+The production direct composition:
+
+- constructs `MCPDomainRuntime` in standalone mode with an isolated profile and
+  `DomainPersistenceCoordinator` storage;
+- registers a real `.standalone` scope rather than a synthetic window;
+- installs all 27 Swift-owned canonical definitions and applies the long-running and
+  protected-mutation decorators;
+- reuses `MCPDomainReadToolProvider` for the nine migrated reads and the extracted production
+  apply-edits/diff substrate for operation-ID, revision, retry, and path-fence semantics;
+- adapts physical capability families through Foundation/Sendable protocols without importing
+  AppKit, SwiftUI, or `MCPServerViewModel`;
+- installs one MCP SDK server over the terminal-aware `MCPStdioServerTransport`, with one-hop
+  delivery accounting and explicit EOF/read/poll/PPID/broken-pipe/cancellation provenance;
+- carries nested Agent/Context Builder calls through an owner-only, inode-fenced Unix endpoint
+  and a single-use runtime-generation/peer-identity launch token;
+- cancels and awaits provider, endpoint, and reader tasks before bounded runtime drain.
+
+`MCPFoundationStandaloneBackend`, generated schema manifests/recorders, and live-window schema
+authorities are absent. `Scripts/headless_runtime_guardrails.sh` enforces those constraints.
+
+Focused evidence:
+
+- `make dev-swift-build PRODUCT=repoprompt-mcp` — ticket
+  `21d62d24-8d50-436d-9cf7-6168eb47f466`, passed
+- `make dev-test FILTER=DirectHeadless` — ticket
+  `85613910-335d-4d71-8b82-759644c61864`, 9 passed
+- `make dev-test FILTER=DomainAgentWorktreeBindingStoreTests` — ticket
+  `bde7ba65-c1dd-4a21-8b1f-4dba19b6d7f3`, 2 passed
+- `make dev-test FILTER=DomainCredentialAndChildLaunchTests` — ticket
+  `a5354120-4f93-4602-bdd5-7c56fab4570c`, 2 passed, including token replay,
+  foreign-runtime rejection without consumption, and expiry
+- canonical app/direct schema fingerprint — ticket
+  `d6247ccb-d6b7-4954-bddc-7370ef41d5be`, passed for all 27 tools and globals
+- M0 contract relocation/parity inventory — ticket
+  `33071c7f-cfe0-45c9-ac13-31174d382b82`, 3 passed
+
+Final bounded validation:
+
+- `make dev-test FILTER=DirectHeadless` — ticket `56e2a405-5409-41d0-a758-d07517039a35`, passed after the final nonblocking-frame, child-policy, and terminal-category hardening;
+- `ALLOW_ADHOC_SIGNING=1 make dev-build` — ticket `ec3e28af-8130-44af-ab02-30f72e90a623`, passed both products, packaged the app/helper, verified architectures/layout/signatures, and ran the embedded-helper smoke without launching the app;
+- `make dev-lint` — ticket `6464e35e-06cf-4f11-acf7-dc4812f398ec`, passed;
+- `make guardrails` — passed, including headless-runtime/source-layout/contributor/legal/Codex guards;
+- ledger verification — 3,756 exact root/provider methods; list tickets `886fce93-6ad4-4530-970b-657038b0f742` and `dec91d0b-bdfe-4b4c-86c7-4b7ba9538a3b`;
+- provider package — ticket `47b04d4e-466b-4e00-b243-2687bbc5cadf`, passed;
+- `make dev-codex-schema-check` — ticket `f9b2e28f-6703-41a7-bf5c-c98408b14837`, environment-blocked before comparison because the installed Codex CLI is `0.144.1` and the repository floor is `0.145.0`;
+- one bounded full `make dev-test` — ticket `35672252-0786-453b-b562-6a9a859cbf16`, completed with unrelated lower-stack/environment failures in codemap scheduler-priority timing, goal-feature defaults, and a bootstrap socket-lock cascade; no M6-focused suite failed, and the focused M6 rerun above is clean. Per the bounded verification policy this root run was not repeated.
