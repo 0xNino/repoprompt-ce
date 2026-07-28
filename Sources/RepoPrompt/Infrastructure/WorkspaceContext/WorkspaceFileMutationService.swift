@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 enum WorkspaceFileCreatePathResolutionPolicy {
     case literalPreferredIfStronger
@@ -91,6 +92,7 @@ struct WorkspaceFileMutationService {
 
     @discardableResult
     func overwrite(file: WorkspaceFileRecord, content: String) async throws -> WorkspaceFileMutationWriteResult {
+        try await MCPDomainMutationCommitContext.willCommit()
         let result = try await store.editFile(rootID: file.rootID, relativePath: file.standardizedRelativePath, newContent: content)
         if let result {
             return .fromCatalogMaterialization(result)
@@ -226,6 +228,7 @@ struct WorkspaceFileMutationService {
         if await exactExistingFile(absolutePath, rootScope: rootScope) != nil {
             throw FileManagerError.fileSystemServiceNotFoundWithContext("path already exists: \(userPath)")
         }
+        try await MCPDomainMutationCommitContext.willCommit()
         let result = try await store.createFile(
             rootID: root.id,
             relativePath: relativePath,

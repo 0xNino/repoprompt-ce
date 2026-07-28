@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptDomainRuntime
 
 struct WorkspaceFileEditHost: FileEditHost {
     let mutationService: WorkspaceFileMutationService
@@ -35,12 +34,10 @@ struct WorkspaceFileEditHost: FileEditHost {
         if overwrite,
            let resolved = await mutationService.exactExistingFile(path, rootScope: lookupRootScope)
         {
-            try await MCPDomainMutationCommitContext.willCommit()
             try await mutationService.overwrite(file: resolved, content: content)
             return
         }
 
-        try await MCPDomainMutationCommitContext.willCommit()
         let writeResult = try await mutationService.createFileWithPostcondition(
             userPath: path,
             content: content,

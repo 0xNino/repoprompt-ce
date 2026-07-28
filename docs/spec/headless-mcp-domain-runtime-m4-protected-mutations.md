@@ -61,7 +61,7 @@ Gate 4B activates `file_actions`, `apply_edits`, and mutating `manage_worktree` 
 | symlink/TOCTOU fence | `DomainMutationPathFence` | root device/inode and resolved requested path are revalidated immediately before physical mutation |
 | durable replay | `DomainMutationJournal`, schema version 1, CAS-written `Settings/protected-mutation-journal.json` | stable `operation_id` + deterministic request/scope fingerprint elects one writer and replays the exact result |
 | file actions | existing `MCPServerViewModel.performFileAction` backend | hook follows freshness/argument validation and precedes create/trash/move I/O |
-| apply edits | existing `WorkspaceFileEditHost` backend | hook follows path/edit/approval resolution and precedes overwrite/create I/O |
+| apply edits | existing `WorkspaceFileEditHost`/`WorkspaceFileMutationService` backend | hook follows path/edit/approval/existence resolution and immediately precedes overwrite/create store I/O |
 | worktrees | existing worktree provider and `VCSService` backends | hook follows selector, confirmation, or routed approval and precedes settings/Git/session mutation |
 
 Relative file paths remain compatible when exactly one authoritative root is bound; ambiguous multi-root relative writes fail closed. Verified app-proxy external worktree creation retains its explicit `allow_external_path` behavior while headless grants remain root-scoped.
@@ -78,14 +78,14 @@ Cancellation before the commit hook records `cancelledBeforeCommit` and permits 
 |---|---|
 | `make dev-test FILTER=DomainProtectedMutationJournalTests` | passed 5 adversarial fixtures after final fence/fingerprint strengthening, ticket `f6363730-c0dc-4afb-95bd-7c3272a3a7a6` |
 | `make dev-test FILTER=HeadlessMCPDomainRuntimeM0ContractTests` | passed 3 contract/ledger tests, ticket `673437d2-8b07-4232-8401-6b8539f78d71` |
-| `make dev-test FILTER=MCPFileActionPartialSuccessTests` | passed 3 app compatibility tests, ticket `b0a09b71-6642-4f4f-aa46-8de8366ec534` |
-| focused apply-edits materialization test | passed, ticket `2d6777dc-140f-4689-843a-cc0738ede99d` |
+| `make dev-test FILTER=MCPFileActionPartialSuccessTests` | passed 3 app compatibility tests, ticket `25816d99-c2f7-41f9-9be6-99158c3acf20` |
+| focused apply-edits materialization test | passed, ticket `b58ef2f3-0170-47d9-b0dc-d1f4b9533963` |
 | `make dev-test FILTER=ManageWorktreeToolServiceTests` | passed 2 provider tests, ticket `4ee23570-2a76-41f3-96ab-3b2e3bd58db5` |
 | `make dev-test FILTER=ToolCatalogSnapshotTests` | passed 20 frozen catalog tests, ticket `0f8a0c6e-3538-44af-a753-b118f43348ae` |
 | `make dev-test-list` + `verify-ledger` | passed; 3,639 exact root/provider IDs reconciled, list ticket `d2f504c5-cc1e-4263-8fca-b6b5ea8141de` |
-| `make dev-swift-build PRODUCT=RepoPrompt` | passed, ticket `8f581c71-6a21-4866-99da-229a4a5d3b0c` |
+| `make dev-swift-build PRODUCT=RepoPrompt` | passed, ticket `6a8b2c17-11f8-41a8-82da-ecf60948f4b6` |
 | `make dev-swift-build PRODUCT=repoprompt-mcp` | passed, ticket `1c59725c-f484-429a-be78-0d318cff6f34` |
-| `make dev-lint` | passed, ticket `fbb8c35f-99aa-485f-8c64-efe17d73ea8b` |
+| `make dev-lint` | passed, ticket `dd1728b2-2b3e-407d-bbd2-17c59604a89d` |
 | `make guardrails` | passed |
 
 
