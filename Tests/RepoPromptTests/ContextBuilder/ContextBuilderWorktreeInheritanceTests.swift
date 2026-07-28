@@ -2249,6 +2249,18 @@ import XCTest
             fixture: PersistentMCPTestFixture,
             bindContext: Bool = true
         ) async throws {
+            let workspaceID = try XCTUnwrap(context.workspaceID)
+            let workspace = try XCTUnwrap(
+                fixture.contextA.window.workspaceManager.workspaces.first { $0.id == workspaceID }
+            )
+            let authorityClient = DomainWorkspaceAuthorityClient(
+                store: AppDomainRuntimeComposition.shared.runtime.workspaceStore,
+                windowID: context.windowID
+            )
+            _ = try await authorityClient.registerForRead(
+                workspace,
+                fileURL: fixture.contextA.rootURL.appendingPathComponent("fixture.repoprompt-workspace")
+            )
             if bindContext {
                 _ = try await endpoint.callTool(
                     name: "bind_context",
@@ -2267,6 +2279,32 @@ import XCTest
                 clientName: endpoint.clientName,
                 context: context
             )
+            if !bindContext {
+                let runtime = AppDomainRuntimeComposition.shared.runtime
+                var registration = try? await runtime.routingCoordinator.currentRegistration(
+                    connectionID: endpoint.connectionID
+                )
+                if registration == nil {
+                    _ = await runtime.routingCoordinator.registerConnection(
+                        connectionID: endpoint.connectionID,
+                        operationID: UUID()
+                    )
+                    registration = try await runtime.routingCoordinator.currentRegistration(
+                        connectionID: endpoint.connectionID
+                    )
+                }
+                _ = try await runtime.routingCoordinator.bind(
+                    connection: XCTUnwrap(registration),
+                    binding: .runScoped(
+                        runID: XCTUnwrap(context.runID),
+                        context: .init(
+                            workspaceID: workspaceID,
+                            contextID: context.tabID
+                        )
+                    ),
+                    operationID: UUID()
+                )
+            }
         }
 
         private func toolResultText(_ response: PersistentMCPTestRPCResponse) throws -> String {
