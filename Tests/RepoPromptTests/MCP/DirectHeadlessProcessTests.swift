@@ -56,14 +56,14 @@ final class DirectHeadlessProcessTests: XCTestCase {
             "app_settings": ["op": "list"],
             "bind_context": ["op": "status"],
             "manage_workspaces": ["action": "list"],
-            "manage_selection": ["op": "get"],
+            "manage_selection": ["op": "set", "paths": ["Package.swift"]],
             "file_actions": ["action": "create", "path": profile.appendingPathComponent("denied.txt").path, "content": "denied"],
             "get_code_structure": ["paths": [fixturePath], "signatures": false],
             "get_file_tree": ["type": "roots"],
             "read_file": ["path": fixturePath, "start_line": 1, "limit": 1],
             "file_search": ["pattern": "swift-tools-version", "path": fixturePath, "regex": false],
             "workspace_context": ["op": "snapshot"],
-            "prompt": ["op": "get"],
+            "prompt": ["op": "set", "text": "headless process context mutation"],
             "apply_edits": ["path": fixturePath, "search": "not-present", "replace": "never"],
             "oracle_utils": ["op": "models"],
             "oracle_send": ["chat_id": UUID().uuidString, "message": "continue"],
@@ -103,6 +103,23 @@ final class DirectHeadlessProcessTests: XCTestCase {
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: profile.appendingPathComponent("denied.txt").path))
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: fixturePath)), fixtureBefore)
+
+        let deniedExportPath = root.appendingPathComponent(".build/denied-headless-process-export-\(UUID().uuidString).txt")
+        try Self.writeJSON([
+            "jsonrpc": "2.0",
+            "id": 500,
+            "method": "tools/call",
+            "params": [
+                "name": "prompt",
+                "arguments": ["op": "export", "path": deniedExportPath.path]
+            ]
+        ], to: input.fileHandleForWriting)
+        let deniedExportReply = try Self.readJSONLine(from: output.fileHandleForReading)
+        let deniedExportResult = try XCTUnwrap(deniedExportReply["result"] as? [String: Any])
+        XCTAssertEqual(deniedExportResult["isError"] as? Bool, true)
+        let deniedContent = try XCTUnwrap(deniedExportResult["content"] as? [[String: Any]])
+        XCTAssertTrue(deniedContent.description.contains("grantMissing"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: deniedExportPath.path))
 
         try input.fileHandleForWriting.close()
         let exited = expectation(description: "bounded EOF drain")

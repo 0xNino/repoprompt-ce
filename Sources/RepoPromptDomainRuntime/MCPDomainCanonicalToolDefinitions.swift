@@ -13,6 +13,36 @@ package enum MCPDomainCanonicalToolDefinitions {
         definitionsByName[name]
     }
 
+    /// Deterministic, human-readable review projection. Runtime composition never loads this
+    /// representation; the checked-in generated artifact is guarded byte-for-byte by tests.
+    package static func reviewSnapshotData() throws -> Data {
+        struct Provenance: Encodable {
+            let formatVersion: Int
+            let authority: String
+            let generatedFrom: String
+            let regeneration: String
+        }
+        struct Snapshot: Encodable {
+            let provenance: Provenance
+            let tools: [MCPDomainToolDefinition]
+        }
+
+        let snapshot = Snapshot(
+            provenance: Provenance(
+                formatVersion: 1,
+                authority: "generated-review-projection-only",
+                generatedFrom: "Sources/RepoPromptDomainRuntime/MCPDomainCanonicalToolDefinitions.swift",
+                regeneration: "mkdir -p .build && touch .build/update-mcp-domain-schema-review-snapshot && make dev-test FILTER=ToolCatalogSnapshotTests/testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot"
+            ),
+            tools: definitions
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        var data = try encoder.encode(snapshot)
+        data.append(0x0A)
+        return data
+    }
+
     private static let definitionsByName = Dictionary(
         uniqueKeysWithValues: definitions.map { ($0.name, $0) }
     )

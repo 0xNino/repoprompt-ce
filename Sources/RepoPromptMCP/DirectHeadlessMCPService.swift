@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import Logging
@@ -25,7 +26,21 @@ actor DirectHeadlessMCPService {
         let policyProfile: MCPClientToolPolicyProfile
         let restrictedToolNames: Set<String>
         let additionalToolNames: Set<String>
+        let ephemeralGrantedOperations: Set<String>
     }
+
+    static let topLevelDefaultMutationOperations: Set<String> = [
+        "manage_selection.add",
+        "manage_selection.remove",
+        "manage_selection.set",
+        "manage_selection.clear",
+        "manage_selection.promote",
+        "manage_selection.demote",
+        "prompt.set",
+        "prompt.append",
+        "prompt.clear",
+        "prompt.select_preset"
+    ]
 
     private let logger: Logger
     private let environment: [String: String]
@@ -60,7 +75,8 @@ actor DirectHeadlessMCPService {
                 principal: prepared.principal,
                 policyProfile: .direct,
                 restrictedToolNames: [],
-                additionalToolNames: []
+                additionalToolNames: [],
+                ephemeralGrantedOperations: Self.topLevelDefaultMutationOperations
             )
         )
         try await prepared.childEndpoint.start { [weak self] fd, peerPID, handshake in
@@ -181,16 +197,19 @@ actor DirectHeadlessMCPService {
             runtime: runtime,
             endpointDescriptor: childEndpoint.socketURL.path
         )
+        let parentProcessID = getppid()
+        let verifiedFingerprint = Self.verifiedExecutableFingerprint(processID: parentProcessID)
         let principal = DomainClientPrincipal(
-            principalID: UUID(),
-            stableKey: "headless-stdio:\(getppid())",
+            principalID: connectionID,
+            stableKey: "headless-stdio:\(parentProcessID)",
             displayName: CLIEventLogger.detectClientName() ?? "headless-stdio-client",
-            kind: .directStdio,
-            assurance: .displayNameOnly,
-            processID: getppid(),
-            runID: nil,
-            provider: nil,
-            claimedProcessID: getppid()
+            kind: .runScoped,
+            assurance: verifiedFingerprint == nil ? .displayNameOnly : .verifiedProcess,
+            processID: verifiedFingerprint == nil ? nil : parentProcessID,
+            runID: scopeID.rawValue,
+            provider: "direct-stdio",
+            verifiedIdentityFingerprint: verifiedFingerprint,
+            claimedProcessID: nil
         )
         return PreparedRuntime(
             runtime: runtime,
@@ -326,7 +345,8 @@ actor DirectHeadlessMCPService {
             principal: principal,
             policyProfile: Self.childPolicyProfile(providerIdentifier: handshake.providerIdentifier),
             restrictedToolNames: accepted.restrictedTools,
-            additionalToolNames: accepted.additionalTools
+            additionalToolNames: accepted.additionalTools,
+            ephemeralGrantedOperations: []
         )
         let server = Server(
             name: "RepoPrompt CE",
@@ -389,8 +409,23 @@ actor DirectHeadlessMCPService {
             workspaceRevision: snapshot?.workspace.revisions.workingRevision,
             authorizedCanonicalRoots: Set(snapshot?.roots.map(\.path) ?? []),
             hasAuthoritativeRoutingContext: snapshot != nil,
-            ephemeralGrantedToolNames: connection.additionalToolNames
+            ephemeralGrantedToolNames: connection.additionalToolNames,
+            ephemeralGrantedOperations: connection.ephemeralGrantedOperations
         )
+    }
+
+    /// Binds the kernel-observed parent PID to the executable identity currently on disk.
+    /// Display names and initialize metadata never participate in mutation authority.
+    nonisolated static func verifiedExecutableFingerprint(processID: Int32) -> String? {
+        var buffer = [CChar](repeating: 0, count: 4096)
+        guard proc_pidpath(processID, &buffer, UInt32(buffer.count)) > 0 else { return nil }
+        let path = URL(fileURLWithPath: String(cString: buffer)).standardizedFileURL.path
+        var info = stat()
+        guard lstat(path, &info) == 0 else { return nil }
+        let material = "\(path)|\(info.st_dev)|\(info.st_ino)"
+        return SHA256.hash(data: Data(material.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     private nonisolated static func childPolicyProfile(

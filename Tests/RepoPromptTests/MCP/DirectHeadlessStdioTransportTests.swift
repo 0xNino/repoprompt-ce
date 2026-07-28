@@ -138,6 +138,42 @@ final class DirectHeadlessStdioTransportTests: XCTestCase {
         output.closeAll()
     }
 
+    func testInboundFrameQueueBackpressureTerminatesAtConfiguredStallBound() async throws {
+        var input = try PipeDescriptors.make()
+        var output = try PipeDescriptors.make()
+        let tracker = MCPDomainResponseDeliveryTracker()
+        let transport = MCPStdioServerTransport(
+            stdinFD: input.read,
+            stdoutFD: output.write,
+            pollIntervalMilliseconds: 5,
+            readBackpressureStallTimeout: .milliseconds(25),
+            writeStallTimeout: .milliseconds(100),
+            maximumInboundFrameBytes: 1024,
+            maximumBufferedFrames: 1,
+            deliveryTracker: tracker
+        )
+        try await transport.connect()
+        let frames = (1 ... 2).map {
+            Data("{\"jsonrpc\":\"2.0\",\"id\":\($0),\"method\":\"tools/list\"}\n".utf8)
+        }
+        for frame in frames {
+            XCTAssertEqual(frame.withUnsafeBytes { Darwin.write(input.write, $0.baseAddress, $0.count) }, frame.count)
+        }
+
+        let terminal = await transport.waitUntilTerminal()
+        XCTAssertEqual(
+            terminal,
+            .stdinBackpressureStall(
+                frameBytes: frames[1].count - 1,
+                maximumBufferedFrames: 1
+            )
+        )
+        XCTAssertEqual(tracker.snapshot().pendingRequestCount, 1)
+        await transport.disconnect()
+        input.closeAll()
+        output.closeAll()
+    }
+
     func testDisconnectAwaitsOwnedReaderAndRecordsCancellation() async throws {
         var input = try PipeDescriptors.make()
         var output = try PipeDescriptors.make()

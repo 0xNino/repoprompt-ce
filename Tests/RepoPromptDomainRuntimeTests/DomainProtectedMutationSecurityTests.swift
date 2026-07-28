@@ -100,6 +100,31 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         XCTAssertEqual(runCallCount, 1)
     }
 
+    func testExactRunScopedOperationGrantAllowsNamedActionAndDeniesSiblingAction() async throws {
+        let fixture = try RuntimeFixture(mode: .standalone)
+        let calls = CallCounter()
+        let binding = fixture.protectedBinding(toolName: "prompt", calls: calls)
+        let exactOperation = fixture.context(
+            kind: .runScoped,
+            assurance: .verifiedProcess,
+            ephemeralGrantedToolNames: [],
+            ephemeralGrantedOperations: ["prompt.set"]
+        )
+
+        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(exactOperation) {
+            try await binding(["op": .string("set")])
+        }
+        await XCTAssertThrowsErrorAsync(
+            try await MCPDomainInvocationSecurityContext.$current.withValue(exactOperation) {
+                try await binding(["op": .string("append")])
+            }
+        ) { error in
+            XCTAssertEqual(error as? DomainMutationPolicyError, .grantMissing)
+        }
+        let callCount = await calls.value
+        XCTAssertEqual(callCount, 1)
+    }
+
     func testVersionedGrantReloadsAcrossRunningPolicyStoresAndRevocationIsImmediate() async throws {
         let storage = FileManager.default.temporaryDirectory
             .appendingPathComponent("m4-policy-\(UUID().uuidString)", isDirectory: true)
@@ -381,7 +406,8 @@ private final class RuntimeFixture: @unchecked Sendable {
         verifiedIdentityFingerprint: String? = nil,
         authorizedCanonicalRoots: Set<String> = [],
         hasAuthoritativeRoutingContext: Bool = true,
-        ephemeralGrantedToolNames: Set<String>
+        ephemeralGrantedToolNames: Set<String>,
+        ephemeralGrantedOperations: Set<String> = []
     ) -> DomainToolInvocationSecurityContext {
         DomainToolInvocationSecurityContext(
             principal: DomainClientPrincipal(
@@ -404,7 +430,8 @@ private final class RuntimeFixture: @unchecked Sendable {
             runtimeGeneration: runtime.identity.lifecycleGeneration,
             authorizedCanonicalRoots: authorizedCanonicalRoots,
             hasAuthoritativeRoutingContext: hasAuthoritativeRoutingContext,
-            ephemeralGrantedToolNames: ephemeralGrantedToolNames
+            ephemeralGrantedToolNames: ephemeralGrantedToolNames,
+            ephemeralGrantedOperations: ephemeralGrantedOperations
         )
     }
 }

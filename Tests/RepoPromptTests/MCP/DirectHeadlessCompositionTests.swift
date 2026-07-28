@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
@@ -21,7 +22,21 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         )
         let prepared = try await service.prepareRuntime()
         addTeardownBlock { await service.teardown(prepared) }
+        XCTAssertEqual(prepared.principal.kind, .runScoped)
+        XCTAssertEqual(prepared.principal.assurance, .verifiedProcess)
+        XCTAssertEqual(prepared.principal.runID, prepared.scopeID.rawValue)
+        XCTAssertEqual(prepared.principal.processID, getppid())
+        XCTAssertNotNil(prepared.principal.verifiedIdentityFingerprint)
         let snapshot = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        let mutationRootMappings = DirectHeadlessVersionControlBackend.mutationRootMappings(
+            workspaceRoots: snapshot.roots
+        )
+        XCTAssertEqual(Set(mutationRootMappings.map(\.canonicalRoot)), Set(snapshot.roots.map(\.path)))
+        XCTAssertEqual(Set(mutationRootMappings.map(\.physicalRoot)), Set(snapshot.roots.map(\.path)))
+        let untrustedRequestedTarget = profile.appendingPathComponent("caller-selected-worktree", isDirectory: true)
+        XCTAssertFalse(mutationRootMappings.contains {
+            $0.physicalRoot == untrustedRequestedTarget.deletingLastPathComponent().standardizedFileURL.path
+        })
         let context = DomainToolInvocationSecurityContext(
             principal: prepared.principal,
             connectionID: prepared.connectionID,
@@ -33,21 +48,22 @@ final class DirectHeadlessCompositionTests: XCTestCase {
             workspaceRevision: snapshot.workspace.revisions.workingRevision,
             authorizedCanonicalRoots: Set(snapshot.roots.map(\.path)),
             hasAuthoritativeRoutingContext: true,
-            ephemeralGrantedToolNames: []
+            ephemeralGrantedToolNames: [],
+            ephemeralGrantedOperations: DirectHeadlessMCPService.topLevelDefaultMutationOperations
         )
         let fixturePath = root.appendingPathComponent("Package.swift").path
         let arguments: [String: [String: Value]] = [
             "app_settings": ["op": .string("list")],
             "bind_context": ["op": .string("status")],
             "manage_workspaces": ["action": .string("list")],
-            "manage_selection": ["op": .string("get")],
+            "manage_selection": ["op": .string("set"), "paths": .array([.string("Package.swift")])],
             "file_actions": ["action": .string("create"), "path": .string(profile.appendingPathComponent("denied.txt").path)],
             "get_code_structure": ["paths": .array([.string(fixturePath)]), "signatures": .bool(false)],
             "get_file_tree": ["type": .string("roots")],
             "read_file": ["path": .string(fixturePath), "start_line": .int(1), "limit": .int(1)],
             "file_search": ["pattern": .string("swift-tools-version"), "path": .string(fixturePath), "regex": .bool(false)],
             "workspace_context": ["op": .string("snapshot")],
-            "prompt": ["op": .string("get")],
+            "prompt": ["op": .string("set"), "text": .string("headless context mutation")],
             "apply_edits": ["path": .string(fixturePath), "search": .string("not-present"), "replace": .string("never")],
             "oracle_utils": ["op": .string("models")],
             "ask_oracle": ["message": .string("Reply exactly OK")],
@@ -86,7 +102,8 @@ final class DirectHeadlessCompositionTests: XCTestCase {
                 workspaceRevision: context.workspaceRevision,
                 authorizedCanonicalRoots: context.authorizedCanonicalRoots,
                 hasAuthoritativeRoutingContext: context.hasAuthoritativeRoutingContext,
-                ephemeralGrantedToolNames: context.ephemeralGrantedToolNames
+                ephemeralGrantedToolNames: context.ephemeralGrantedToolNames,
+                ephemeralGrantedOperations: context.ephemeralGrantedOperations
             )
             do {
                 _ = try await prepared.runtime.domainHost.invoke(MCPDomainHostInvocation(
@@ -105,6 +122,43 @@ final class DirectHeadlessCompositionTests: XCTestCase {
             dispatched.insert(name)
         }
         XCTAssertEqual(dispatched, Set(arguments.keys))
+        let mutated = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        XCTAssertEqual(mutated.selection, ["Package.swift"])
+        XCTAssertEqual(mutated.prompt, "headless context mutation")
+
+        let deniedExport = try await prepared.runtime.domainHost.resolve(
+            toolName: "prompt",
+            scope: .standalone(id: prepared.scopeID)
+        )
+        let deniedPath = root.appendingPathComponent(".build/denied-headless-prompt-export-\(UUID().uuidString).txt")
+        let deniedInvocationID = UUID()
+        let deniedSecurityContext = DomainToolInvocationSecurityContext(
+            principal: context.principal,
+            connectionID: context.connectionID,
+            connectionGeneration: context.connectionGeneration,
+            invocationID: deniedInvocationID,
+            runtimeID: context.runtimeID,
+            runtimeGeneration: context.runtimeGeneration,
+            workspaceID: context.workspaceID,
+            workspaceRevision: context.workspaceRevision,
+            authorizedCanonicalRoots: context.authorizedCanonicalRoots,
+            hasAuthoritativeRoutingContext: context.hasAuthoritativeRoutingContext,
+            ephemeralGrantedToolNames: context.ephemeralGrantedToolNames,
+            ephemeralGrantedOperations: context.ephemeralGrantedOperations
+        )
+        do {
+            _ = try await prepared.runtime.domainHost.invoke(MCPDomainHostInvocation(
+                invocationID: deniedInvocationID,
+                connectionID: prepared.connectionID,
+                resolution: deniedExport,
+                arguments: ["op": .string("export"), "path": .string(deniedPath.path)],
+                securityContext: deniedSecurityContext
+            ))
+            XCTFail("A verified direct session must not broaden prompt mutation defaults to filesystem export")
+        } catch let error as DomainMutationPolicyError {
+            XCTAssertEqual(error, .grantMissing)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: deniedPath.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: profile.appendingPathComponent("denied.txt").path))
     }
 }

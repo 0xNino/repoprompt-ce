@@ -726,6 +726,7 @@ allowed_tracked_docs=(
   "docs/spec/headless-mcp-domain-runtime-m5-ai-agent-interaction.md"
   "docs/spec/headless-mcp-domain-runtime-m6-host-extraction.md"
   "docs/spec/history-query-tools.md"
+  "docs/spec/mcp-domain-canonical-tool-definitions.generated.json"
   "docs/worktrees.md"
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
   "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"

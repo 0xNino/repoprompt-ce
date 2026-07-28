@@ -275,10 +275,7 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
             let url = URL(fileURLWithPath: path).standardizedFileURL
             try await MCPDomainMutationCommitContext.admitPhysicalTargets(
                 [repo.path, url.path],
-                rootMappings: [
-                    DomainMutationPhysicalRootMapping(canonicalRoot: repo.path, physicalRoot: repo.path),
-                    DomainMutationPhysicalRootMapping(canonicalRoot: url.deletingLastPathComponent().path, physicalRoot: url.deletingLastPathComponent().path)
-                ]
+                rootMappings: Self.mutationRootMappings(workspaceRoots: snapshot.roots)
             )
             try await MCPDomainMutationCommitContext.willCommit()
             var command = ["-C", repo.path, "worktree", "add"]
@@ -389,6 +386,15 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
             return try .object(["op": .string(op), "operation_id": .string(operation.id.uuidString), "output": .string(output)])
         default:
             throw MCPError.invalidParams("unknown manage_worktree op: \(op)")
+        }
+    }
+
+    nonisolated static func mutationRootMappings(
+        workspaceRoots: [URL]
+    ) -> [DomainMutationPhysicalRootMapping] {
+        workspaceRoots.map { root in
+            let path = root.standardizedFileURL.path
+            return DomainMutationPhysicalRootMapping(canonicalRoot: path, physicalRoot: path)
         }
     }
 

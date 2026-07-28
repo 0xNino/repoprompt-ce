@@ -11,6 +11,7 @@ actor MCPStdioServerTransport: Transport {
         case stdinTruncatedFrame(bytes: Int)
         case stdinFrameTooLarge(bytes: Int, maximum: Int)
         case stdinPoll(errno: Int32)
+        case stdinBackpressureStall(frameBytes: Int, maximumBufferedFrames: Int)
         case parentProcessChanged(initial: Int32, current: Int32)
         case stdoutBrokenPipe(bytesWritten: Int, totalBytes: Int)
         case stdoutWrite(errno: Int32, bytesWritten: Int, totalBytes: Int)
@@ -21,6 +22,7 @@ actor MCPStdioServerTransport: Transport {
     private let stdinFD: Int32
     private let stdoutFD: Int32
     private let pollIntervalMilliseconds: Int32
+    private let readBackpressureStallTimeout: Duration
     private let writeStallTimeout: Duration
     private let maximumInboundFrameBytes: Int
     private let maximumBufferedFrames: Int
@@ -36,6 +38,7 @@ actor MCPStdioServerTransport: Transport {
         stdinFD: Int32 = STDIN_FILENO,
         stdoutFD: Int32 = STDOUT_FILENO,
         pollIntervalMilliseconds: Int32 = 100,
+        readBackpressureStallTimeout: Duration = .seconds(5),
         writeStallTimeout: Duration = .seconds(5),
         maximumInboundFrameBytes: Int = 16 * 1024 * 1024,
         maximumBufferedFrames: Int = 64,
@@ -46,6 +49,7 @@ actor MCPStdioServerTransport: Transport {
         self.stdinFD = stdinFD
         self.stdoutFD = stdoutFD
         self.pollIntervalMilliseconds = pollIntervalMilliseconds
+        self.readBackpressureStallTimeout = readBackpressureStallTimeout
         self.writeStallTimeout = writeStallTimeout
         self.maximumInboundFrameBytes = max(1, maximumInboundFrameBytes)
         self.maximumBufferedFrames = max(1, maximumBufferedFrames)
@@ -86,6 +90,8 @@ actor MCPStdioServerTransport: Transport {
         let deliveryTracker = deliveryTracker
         let terminalState = terminalState
         let maximumInboundFrameBytes = maximumInboundFrameBytes
+        let maximumBufferedFrames = maximumBufferedFrames
+        let readBackpressureStallTimeout = readBackpressureStallTimeout
         readTask = Task.detached(priority: .userInitiated) { [captured] in
             var pending = Data()
             var buffer = [UInt8](repeating: 0, count: 16 * 1024)
@@ -154,6 +160,8 @@ actor MCPStdioServerTransport: Transport {
                     if !frame.isEmpty {
                         let data = Data(frame)
                         var enqueued = false
+                        var backpressureDeadline: ContinuousClock.Instant?
+                        let clock = ContinuousClock()
                         while !enqueued, !Task.isCancelled {
                             switch captured.yield(data) {
                             case .enqueued:
@@ -162,6 +170,19 @@ actor MCPStdioServerTransport: Transport {
                             case .dropped:
                                 // Buffering-oldest drops only the incoming element. Retain it here and
                                 // stop reading until the server consumes capacity, preserving request order.
+                                if let backpressureDeadline {
+                                    guard clock.now < backpressureDeadline else {
+                                        let terminal = TerminalError.stdinBackpressureStall(
+                                            frameBytes: data.count,
+                                            maximumBufferedFrames: maximumBufferedFrames
+                                        )
+                                        await terminalState.record(terminal)
+                                        captured.finish(throwing: terminal)
+                                        return
+                                    }
+                                } else {
+                                    backpressureDeadline = clock.now.advanced(by: readBackpressureStallTimeout)
+                                }
                                 try? await Task.sleep(for: .milliseconds(1))
                             case .terminated:
                                 return

@@ -38,6 +38,28 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertEqual(signatures, Self.expectedSignatures)
     }
 
+    func testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot() throws {
+        let generated = try MCPDomainCanonicalToolDefinitions.reviewSnapshotData()
+        let repoRoot = try RepoRoot.url()
+        let snapshotURL = repoRoot
+            .appendingPathComponent("docs/spec/mcp-domain-canonical-tool-definitions.generated.json")
+        let updateMarker = repoRoot.appendingPathComponent(".build/update-mcp-domain-schema-review-snapshot")
+        if FileManager.default.fileExists(atPath: updateMarker.path) {
+            try generated.write(to: snapshotURL, options: .atomic)
+            try FileManager.default.removeItem(at: updateMarker)
+        }
+        let committed = try Data(contentsOf: snapshotURL)
+        XCTAssertEqual(
+            committed,
+            generated,
+            "Regenerate the readable projection with the command recorded in its provenance block."
+        )
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: committed) as? [String: Any])
+        let provenance = try XCTUnwrap(object["provenance"] as? [String: Any])
+        XCTAssertEqual(provenance["authority"] as? String, "generated-review-projection-only")
+        XCTAssertEqual((object["tools"] as? [[String: Any]])?.count, 27)
+    }
+
     func testShippingAppRegistrationUsesCanonicalTwentySevenSchemaFingerprints() async throws {
         let window = Self.makeWindowWithoutAutoStart()
         let expected = try Dictionary(uniqueKeysWithValues: MCPDomainCanonicalToolDefinitions.definitions.map {
