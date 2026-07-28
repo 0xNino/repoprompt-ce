@@ -89,6 +89,12 @@ package actor MCPDomainHost {
 
     private let metrics: DomainRuntimeMetricsSink
     private let beforeFinalAdmission: @Sendable () async -> Void
+    private let mutationAdmissionController = MCPDomainToolResourceAdmissionController(
+        limit: MCPDomainToolAdmissionLimits.exclusiveConnection
+    )
+    private let smallReadAdmissionController = MCPDomainToolResourceAdmissionController(
+        limit: MCPDomainToolAdmissionLimits.smallReadPerWindow
+    )
     private var lifecycle: MCPDomainHostLifecycle = .accepting
     private var activeInvocations: [UUID: ActiveInvocation] = [:]
     private var invocationIDsByConnection: [UUID: Set<UUID>] = [:]
@@ -239,6 +245,18 @@ package actor MCPDomainHost {
         } onCancel: {
             task.cancel()
         }
+    }
+
+    package func acquireMutationResourceAdmission(
+        _ resource: MCPDomainToolResourceAdmissionController.Resource
+    ) async throws -> MCPDomainToolResourceAdmissionController.Lease {
+        try await mutationAdmissionController.acquire(resource)
+    }
+
+    package func acquireSmallReadResourceAdmission(
+        windowID: Int
+    ) async throws -> MCPDomainToolResourceAdmissionController.Lease {
+        try await smallReadAdmissionController.acquire(.window(windowID))
     }
 
     package func cancelInvocations(connectionID: UUID) {

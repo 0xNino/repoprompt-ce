@@ -164,6 +164,104 @@ final class MCPDomainHostTests: XCTestCase {
         XCTAssertEqual(snapshot.activeInvocationCount, 0)
     }
 
+    func testHostOwnsCanonicalCatalogAndCallPolicyDecisions() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mcp-domain-host-policy-\(UUID().uuidString)", isDirectory: true)
+        let runtime = MCPDomainRuntime(
+            configuration: .init(
+                mode: .standalone,
+                profileIdentifier: "host-policy-test",
+                storageDirectory: directory,
+                eventDirectory: directory,
+                temporaryDirectory: directory,
+                externalReloadInterval: nil
+            )
+        )
+        try await runtime.start()
+        _ = try await runtime.toolRegistry.register(
+            registrationID: MCPDomainToolRegistrationID(),
+            scope: .window(id: 1),
+            bindings: [
+                Self.binding(toolName: MCPWindowToolName.readFile),
+                Self.binding(toolName: MCPWindowToolName.askUser),
+                Self.binding(toolName: MCPWindowToolName.agentExplore),
+            ]
+        )
+
+        let directPolicy = MCPDomainClientPolicySnapshot(
+            restrictedToolNames: [MCPWindowToolName.askUser],
+            additionalToolNames: [],
+            role: .direct,
+            allowsAgentExternalControlTools: false
+        )
+        let advertisement = await runtime.domainHost.advertisedCatalog(
+            MCPDomainCatalogAdvertisementRequest(
+                isGloballyEnabled: true,
+                disabledToolNames: [MCPWindowToolName.readFile],
+                policy: directPolicy
+            )
+        )
+        XCTAssertTrue(advertisement.definitions.isEmpty)
+        XCTAssertEqual(advertisement.hiddenReasonsByToolName[MCPWindowToolName.readFile], .disabled)
+        XCTAssertEqual(advertisement.hiddenReasonsByToolName[MCPWindowToolName.askUser], .restricted)
+        XCTAssertEqual(advertisement.hiddenReasonsByToolName[MCPWindowToolName.agentExplore], .roleAdvertisementPolicy)
+
+        do {
+            try await runtime.domainHost.evaluateEarlyCallPolicy(
+                toolName: MCPWindowToolName.askUser,
+                policy: directPolicy
+            )
+            XCTFail("Missing additional grant passed early policy")
+        } catch let denial as MCPDomainCallPolicyDenial {
+            XCTAssertEqual(denial, .missingAdditionalGrant(toolName: MCPWindowToolName.askUser))
+        }
+
+        let grantedPolicy = MCPDomainClientPolicySnapshot(
+            restrictedToolNames: [MCPWindowToolName.askUser],
+            additionalToolNames: [MCPWindowToolName.askUser],
+            role: .direct,
+            allowsAgentExternalControlTools: false
+        )
+        try await runtime.domainHost.evaluateEarlyCallPolicy(
+            toolName: MCPWindowToolName.askUser,
+            policy: grantedPolicy
+        )
+        do {
+            _ = try await runtime.domainHost.evaluatePreAdmissionCallPolicy(
+                toolName: MCPWindowToolName.askUser,
+                policy: grantedPolicy
+            )
+            XCTFail("Restricted tool passed pre-admission policy")
+        } catch let denial as MCPDomainCallPolicyDenial {
+            XCTAssertEqual(denial, .restricted(toolName: MCPWindowToolName.askUser))
+        }
+        do {
+            _ = try await runtime.domainHost.evaluatePreAdmissionCallPolicy(
+                toolName: MCPWindowToolName.agentExplore,
+                policy: directPolicy
+            )
+            XCTFail("Role-hidden agent_explore passed pre-admission policy")
+        } catch let denial as MCPDomainCallPolicyDenial {
+            XCTAssertEqual(denial, .roleUnavailable(toolName: MCPWindowToolName.agentExplore))
+        }
+
+        let readDecision = try await runtime.domainHost.evaluatePreAdmissionCallPolicy(
+            toolName: MCPWindowToolName.readFile,
+            policy: directPolicy
+        )
+        XCTAssertEqual(readDecision.admissionClass, .smallRead)
+
+        let disabled = await runtime.domainHost.advertisedCatalog(
+            MCPDomainCatalogAdvertisementRequest(
+                isGloballyEnabled: false,
+                disabledToolNames: [],
+                policy: directPolicy
+            )
+        )
+        XCTAssertTrue(disabled.definitions.isEmpty)
+        XCTAssertTrue(disabled.hiddenReasonsByToolName.isEmpty)
+    }
+
     func testCancelledDrainCallerReturnsWithoutSpinning() async throws {
         let blocker = InvocationBlocker()
         let fixture = try await makeFixture(binding: Self.binding { arguments in
@@ -254,6 +352,7 @@ final class MCPDomainHostTests: XCTestCase {
     }
 
     private static func binding(
+        toolName: String = MCPWindowToolName.readFile,
         description: String = "host fixture",
         operation: @Sendable @escaping ([String: Value]) async throws -> Value = { arguments in
             arguments["path"] ?? .string("ok")
@@ -261,7 +360,7 @@ final class MCPDomainHostTests: XCTestCase {
     ) -> MCPDomainToolBinding {
         MCPDomainToolBinding(
             definition: MCPDomainToolDefinition(
-                name: MCPWindowToolName.readFile,
+                name: toolName,
                 description: description,
                 inputSchema: .object([
                     "type": .string("object"),

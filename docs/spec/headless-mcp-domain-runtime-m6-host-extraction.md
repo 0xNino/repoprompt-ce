@@ -141,6 +141,30 @@ Corrective focused evidence:
   - conductor ticket `3c6a91b0-05b4-4882-ba2f-7c91006d8c37`
   - environment blocked before comparison: installed Codex CLI `0.144.1` is below the required `0.145.0` floor
 
+## Gate 6A protocol-neutral policy and resource admission ownership
+
+The A3 extraction moves canonical `tools/list` filtering, two-stage `tools/call` policy decisions, admission classification, admission-limit constants, and keyed application/window resource admission into `RepoPromptDomainRuntime`:
+
+- `MCPDomainHost.advertisedCatalog` owns disabled, restricted, explicit-grant, and role visibility ordering over one registry snapshot;
+- `evaluateEarlyCallPolicy` and `evaluatePreAdmissionCallPolicy` preserve the existing early grant-denial versus later restricted/role/admission-class ordering, while `ServerNetworkManager` maps typed outcomes to the existing byte-identical user errors;
+- `MCPDomainToolResourceAdmissionController` is the physical cancellation-safe FIFO lease authority, including repository resource identity for standalone composition;
+- the host owns the mutation and small-read controllers; the app keeps only routing-to-resource selection, timing evidence, and the intentional explicit release boundary before formatter/observer tails;
+- the app compatibility controller name is now only a typealias used by the existing focused tests.
+
+Evidence:
+
+- `make dev-test FILTER=MCPDomainHostTests` — ticket `f81f5c8f-d964-4c50-b9e9-12d66d05c3e2`, 6 passed
+- `make dev-test FILTER=MCPToolAdmissionPolicyTests` — ticket `5a5875b5-de96-4e75-a946-ab201f104fff`, passed
+- `make dev-test FILTER=ToolCatalogSnapshotTests` — ticket `1aadf74a-4648-4948-8554-929d60afbd9e`, 22 passed
+- `make dev-test FILTER=MCPAgentPolicyAdmissionRaceTests` — ticket `95bf4a7c-349c-4fd1-8703-45cb872e39f1`, 39 passed
+- `make dev-test FILTER=MCPToolExecutionWatchdogIntegrationTests` — ticket `f675276f-eff8-4b95-9bc9-2c3d5b930d52`, 22 passed, including resource release timing
+- `make dev-test FILTER=PersistentMCPResponseDeliveryTests` — ticket `04f7c112-e618-452e-9aa3-e2292451716b`, 24 passed
+- `make dev-test FILTER=MCPProxyTerminalRecordTests` — ticket `1be5980a-9584-40ba-9992-edc36db01488`, 7 passed
+- `make dev-swift-build PRODUCT=RepoPrompt` — ticket `94134db9-89f1-42b3-b5d2-c49894abe761`, passed
+- `make dev-swift-build PRODUCT=repoprompt-mcp` — ticket `b2d3146e-d3be-4dd5-b26a-0f182348ea09`, passed
+- `make dev-lint` — ticket `ad6078a8-bb3c-48ed-ade8-ab6750c0c07f`, passed
+- ledger verification — 3,685 exact methods; root/provider list tickets `b83c1f34-6f5f-4f2a-9c6d-cd76436cac73` and `bbdd4de0-e74d-4c45-ab45-1783ffb04057`
+
 ## Gate 6B exposure rule
 
 No `--backend headless` surface is introduced by Gate 6A. Gate 6B may be exposed only after one shared non-App physical provider composition supplies the complete canonical tool catalog to both app and standalone hosts. A partial catalog, headless-only replacement providers, or a synthetic window authority is not an acceptable preview.

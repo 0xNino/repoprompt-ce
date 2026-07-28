@@ -1753,12 +1753,6 @@ actor ServerNetworkManager {
     private var clientIDByConnection: [UUID: String] = [:]
     private var callLimiters: [UUID: MCPConnectionCallLimiters] = [:]
 
-    private nonisolated let mutationAdmissionController = MCPToolResourceAdmissionController(
-        limit: MCPToolAdmissionPolicy.exclusiveConnectionLimit
-    )
-    private nonisolated let smallReadAdmissionController = MCPToolResourceAdmissionController(
-        limit: MCPToolAdmissionPolicy.smallReadPerWindowLimit
-    )
     private nonisolated let codeStructureSettlementRegistry = MCPCodeStructureSettlementRegistry()
     private nonisolated let toolCardOwnershipLedger = MCPToolCardOwnershipLedger()
     #if DEBUG
@@ -2733,6 +2727,28 @@ actor ServerNetworkManager {
         let taskLabelKind = runState?.taskLabelKind
         let allowsAgentExternalControlTools = runState?.allowsAgentExternalControlTools ?? false
         return (restricted, additional, preassigned, purpose, taskLabelKind, allowsAgentExternalControlTools)
+    }
+
+    private static func domainPolicySnapshot(
+        restricted: Set<String>,
+        additional: Set<String>,
+        taskLabelKind: AgentModelCatalog.TaskLabelKind?,
+        allowsAgentExternalControlTools: Bool
+    ) -> MCPDomainClientPolicySnapshot {
+        let role: MCPClientTaskRole = switch taskLabelKind {
+        case .explore:
+            .explore
+        case .engineer, .pair, .design:
+            .engineer
+        case nil:
+            .direct
+        }
+        return MCPDomainClientPolicySnapshot(
+            restrictedToolNames: restricted,
+            additionalToolNames: additional,
+            role: role,
+            allowsAgentExternalControlTools: allowsAgentExternalControlTools
+        )
     }
 
     #if DEBUG
@@ -11295,85 +11311,57 @@ actor ServerNetworkManager {
             let disabled = await MainActor.run {
                 ToolAvailabilityStore.shared.effectiveDisabledTools
             }
-            // Listing consumes one immutable actor snapshot. No per-service scan may
-            // observe a partially-mutated catalog or create a second schema authority.
-            let catalog = await domainHost.catalogSnapshot()
             let policy = await effectivePolicyState(for: connectionID)
-            let restricted = policy.restricted
-            let additionalTools = policy.additional
+            let domainPolicy = Self.domainPolicySnapshot(
+                restricted: policy.restricted,
+                additional: policy.additional,
+                taskLabelKind: policy.taskLabelKind,
+                allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
+            )
+            // The domain host owns canonical filtering; this app shell retains only
+            // purpose-specific schema/description and client annotation projection.
+            let advertisement = await domainHost.advertisedCatalog(
+                MCPDomainCatalogAdvertisementRequest(
+                    isGloballyEnabled: isEnabledState,
+                    disabledToolNames: disabled,
+                    policy: domainPolicy
+                )
+            )
             #if DEBUG
                 var hiddenToolReasons: [String: Int] = [:]
                 var hiddenToolSamples: [String] = []
-                func recordHiddenTool(_ toolName: String, reason: String) {
-                    hiddenToolReasons[reason, default: 0] += 1
-                    guard hiddenToolSamples.count < 20 else { return }
-                    hiddenToolSamples.append("\(toolName):\(reason)")
+                for (toolName, reason) in advertisement.hiddenReasonsByToolName.sorted(by: { $0.key < $1.key }) {
+                    hiddenToolReasons[reason.rawValue, default: 0] += 1
+                    guard hiddenToolSamples.count < 20 else { continue }
+                    hiddenToolSamples.append("\(toolName):\(reason.rawValue)")
                 }
             #endif
 
             var tools: [MCP.Tool] = []
+            tools.reserveCapacity(advertisement.definitions.count)
+            for definition in advertisement.definitions {
+                let schemaValue = try await cachedSchema(
+                    for: definition.name,
+                    schema: definition.inputSchema,
+                    purpose: policy.purpose
+                )
+                let description = advertisedToolDescription(
+                    for: definition.name,
+                    baseDescription: definition.description,
+                    purpose: policy.purpose
+                )
 
-            // Only proceed when the global MCP switch is ON
-            if await isEnabledState {
-                for definition in catalog.definitions {
-                    if disabled.contains(definition.name) {
-                        #if DEBUG
-                            recordHiddenTool(definition.name, reason: "disabled")
-                        #endif
-                        continue
-                    }
-                    if restricted.contains(definition.name) {
-                        #if DEBUG
-                            recordHiddenTool(definition.name, reason: "restricted")
-                        #endif
-                        continue
-                    }
-
-                    // • hide policy-gated tools unless explicitly granted via additionalTools
-                    if MCPPolicyGatedTools.names.contains(definition.name),
-                       !additionalTools.contains(definition.name)
-                    {
-                        #if DEBUG
-                            recordHiddenTool(definition.name, reason: "missing_additional_tool_grant")
-                        #endif
-                        continue
-                    }
-
-                    // • role-based advertisement filtering (advertisement-only, not execution-time)
-                    if !AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
-                        toolName: definition.name,
-                        taskLabelKind: policy.taskLabelKind,
-                        allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
-                    ) {
-                        #if DEBUG
-                            recordHiddenTool(definition.name, reason: "role_advertisement_policy")
-                        #endif
-                        continue
-                    }
-
-                    let schemaValue = try await cachedSchema(
-                        for: definition.name,
-                        schema: definition.inputSchema,
-                        purpose: policy.purpose
-                    )
-                    let description = advertisedToolDescription(
-                        for: definition.name,
-                        baseDescription: definition.description,
-                        purpose: policy.purpose
-                    )
-
-                    tools.append(
-                        .init(
-                            name: definition.name,
-                            description: description,
-                            inputSchema: schemaValue,
-                            annotations: CodexMCPToolAnnotationProjection.project(
-                                definition.annotations.mcpAnnotations,
-                                clientIdentifier: clientIdentifier
-                            )
+                tools.append(
+                    .init(
+                        name: definition.name,
+                        description: description,
+                        inputSchema: schemaValue,
+                        annotations: CodexMCPToolAnnotationProjection.project(
+                            definition.annotations.mcpAnnotations,
+                            clientIdentifier: clientIdentifier
                         )
                     )
-                }
+                )
             }
 
             #if DEBUG
@@ -11610,18 +11598,28 @@ actor ServerNetworkManager {
                 // tools/list already performs any needed persisted routing hydration.
                 // Avoid repeating that work while a tool call is in-flight.
 
-                // Block policy-gated tools unless explicitly granted via additionalTools
-                if MCPPolicyGatedTools.names.contains(toolName) {
-                    let effectivePolicy = await effectivePolicyState(for: connectionID)
-                    if !effectivePolicy.additional.contains(toolName) {
-                        #if DEBUG
-                            await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [
-                                "toolName": toolName,
-                                "reason": "missing_additional_tool_grant"
-                            ])
-                        #endif
-                        return CallTool.Result.err("Tool '\(toolName)' is only available during discovery or agent mode runs.")
-                    }
+                let effectivePolicy = await effectivePolicyState(for: connectionID)
+                let domainPolicy = Self.domainPolicySnapshot(
+                    restricted: effectivePolicy.restricted,
+                    additional: effectivePolicy.additional,
+                    taskLabelKind: effectivePolicy.taskLabelKind,
+                    allowsAgentExternalControlTools: effectivePolicy.allowsAgentExternalControlTools
+                )
+                do {
+                    try await domainHost.evaluateEarlyCallPolicy(
+                        toolName: toolName,
+                        policy: domainPolicy
+                    )
+                } catch MCPDomainCallPolicyDenial.missingAdditionalGrant {
+                    #if DEBUG
+                        await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [
+                            "toolName": toolName,
+                            "reason": "missing_additional_tool_grant"
+                        ])
+                    #endif
+                    return CallTool.Result.err("Tool '\(toolName)' is only available during discovery or agent mode runs.")
+                } catch {
+                    // Early policy intentionally owns only explicit-grant gating.
                 }
             }
 
@@ -11667,28 +11665,41 @@ actor ServerNetworkManager {
                 await self.effectivePolicyState(for: connectionID)
             }
             connectionLog("tools/call \(toolName): policy ready")
+            let preAdmissionDecision: MCPDomainPreAdmissionDecision
             do {
                 let policyState = EditFlowPerf.begin(
                     EditFlowPerf.Stage.MCPToolCall.policyGating,
                     EditFlowPerf.Dimensions(toolName: toolName)
                 )
                 defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.policyGating, policyState) }
-                if policy.restricted.contains(toolName) {
-                    log.notice("Connection \(connectionID) attempted to call restricted tool \(toolName)")
-                    return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool '\(toolName)' is disabled for this connection.")
-                }
-                if MCPToolCapabilities.capabilities(for: toolName).contains(.agentExploreControl),
-                   !AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
-                       toolName: toolName,
-                       taskLabelKind: policy.taskLabelKind,
-                       allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
-                   )
-                {
-                    return Self.toolErrorResult(
-                        rawJSON: capturedRawJSON,
-                        message: "Tool 'agent_explore' is only available to MCP-started non-explore Agent Mode runs."
-                    )
-                }
+                let domainPolicy = Self.domainPolicySnapshot(
+                    restricted: policy.restricted,
+                    additional: policy.additional,
+                    taskLabelKind: policy.taskLabelKind,
+                    allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
+                )
+                preAdmissionDecision = try await domainHost.evaluatePreAdmissionCallPolicy(
+                    toolName: toolName,
+                    policy: domainPolicy
+                )
+            } catch MCPDomainCallPolicyDenial.restricted {
+                log.notice("Connection \(connectionID) attempted to call restricted tool \(toolName)")
+                return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool '\(toolName)' is disabled for this connection.")
+            } catch MCPDomainCallPolicyDenial.roleUnavailable {
+                return Self.toolErrorResult(
+                    rawJSON: capturedRawJSON,
+                    message: "Tool 'agent_explore' is only available to MCP-started non-explore Agent Mode runs."
+                )
+            } catch {
+                MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
+                    classKey: .unclassified,
+                    reason: .unclassifiedTool
+                )
+                return Self.executionContractToolErrorResult(
+                    rawJSON: capturedRawJSON,
+                    code: "tool_execution_admission_unclassified",
+                    message: "No static admission classification exists for tool '\(toolName)'."
+                )
             }
 
             // Create immutable copies for Swift 6 concurrency safety
@@ -11735,19 +11746,7 @@ actor ServerNetworkManager {
 
             // Connection lanes provide bounded FIFO admission only. Shared-state correctness is
             // enforced below by explicit window/app/repository resource ownership.
-            guard let admissionClass = Self.admissionClass(forCanonicalToolName: toolName) else {
-                MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
-                    classKey: .unclassified,
-                    reason: .unclassifiedTool
-                )
-                return await finalizeToolResult(
-                    Self.executionContractToolErrorResult(
-                        rawJSON: capturedRawJSON,
-                        code: "tool_execution_admission_unclassified",
-                        message: "No static admission classification exists for tool '\(toolName)'."
-                    )
-                )
-            }
+            let admissionClass = preAdmissionDecision.admissionClass
             let callLane = admissionClass.connectionLane
             connectionLog("tools/call \(toolName): acquiring limiter lane=\(callLane.rawValue)")
             let limiterResolution = await EditFlowPerf.measure(
@@ -12034,9 +12033,9 @@ actor ServerNetworkManager {
                                         ? nil
                                         : await self.runIDForConnection(connectionID)
                                 }
-                                let mutationAdmissionLease: MCPToolResourceAdmissionController.Lease?
+                                let mutationAdmissionLease: MCPDomainToolResourceAdmissionController.Lease?
                                 if admissionClass == .exclusive {
-                                    let mutationResource: MCPToolResourceAdmissionController.Resource
+                                    let mutationResource: MCPDomainToolResourceAdmissionController.Resource
                                     if MCPGlobalToolName.orderedToolNames.contains(toolName) {
                                         mutationResource = .appWide
                                     } else if let chosenID {
@@ -12050,7 +12049,7 @@ actor ServerNetworkManager {
                                     }
                                     do {
                                         let evidenceLeaseWaitStart = evidenceClock.now
-                                        mutationAdmissionLease = try await self.mutationAdmissionController.acquire(mutationResource)
+                                        mutationAdmissionLease = try await self.domainHost.acquireMutationResourceAdmission(mutationResource)
                                         MCPToolConcurrencyEvidenceRecorder.shared.recordLeaseWait(
                                             classKey: evidenceClass,
                                             milliseconds: evidenceLeaseWaitStart.duration(to: evidenceClock.now).mcpMilliseconds
@@ -12071,7 +12070,7 @@ actor ServerNetworkManager {
                                 }
                                 defer { mutationAdmissionLease?.release() }
 
-                                let smallReadAdmissionLease: MCPToolResourceAdmissionController.Lease?
+                                let smallReadAdmissionLease: MCPDomainToolResourceAdmissionController.Lease?
                                 if admissionClass == .smallRead {
                                     guard let chosenID else {
                                         return Self.executionContractToolErrorResult(
@@ -12082,7 +12081,7 @@ actor ServerNetworkManager {
                                     }
                                     do {
                                         let evidenceLeaseWaitStart = evidenceClock.now
-                                        smallReadAdmissionLease = try await self.smallReadAdmissionController.acquire(.window(chosenID))
+                                        smallReadAdmissionLease = try await self.domainHost.acquireSmallReadResourceAdmission(windowID: chosenID)
                                         MCPToolConcurrencyEvidenceRecorder.shared.recordLeaseWait(
                                             classKey: evidenceClass,
                                             milliseconds: evidenceLeaseWaitStart.duration(to: evidenceClock.now).mcpMilliseconds
