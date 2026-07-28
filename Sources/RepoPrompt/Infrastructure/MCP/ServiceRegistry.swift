@@ -31,7 +31,9 @@ enum ServiceRegistry {
         do {
             let runtime = AppDomainRuntimeComposition.shared.runtime
             bindings = try tools.map {
-                try runtime.protectedMutationProvider.protectedBinding($0.domainBinding())
+                let domainBinding = try $0.domainBinding()
+                let longRunningBinding = runtime.longRunningToolProvider.wrapping(domainBinding)
+                return try runtime.protectedMutationProvider.protectedBinding(longRunningBinding)
             }
         } catch {
             #if DEBUG || EDIT_FLOW_PERF

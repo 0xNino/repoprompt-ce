@@ -2154,7 +2154,7 @@ struct AgentRunMCPToolService {
             parentSessionID: parentSessionID,
             failureReason: failureReason,
             worktreeBindings: worktreeBindings,
-            activeWorktreeMerges: activeWorktreeMerges
+            appActiveWorktreeMerges: activeWorktreeMerges
         )
     }
 

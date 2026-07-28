@@ -172,6 +172,7 @@ package actor DomainMutationPolicyStore {
         action: String,
         workspaceID: UUID? = nil,
         canonicalRoots: Set<String> = [],
+        requiresAuthoritativeRoutingContext: Bool = true,
         now: Date = Date()
     ) async throws -> DomainMutationAuthorizationSnapshot {
         if !didBootstrap { await bootstrap() } else { await refreshFromPersistence() }
@@ -204,7 +205,7 @@ package actor DomainMutationPolicyStore {
                 canonicalRoots: canonicalRoots
             )
         }
-        guard context.hasAuthoritativeRoutingContext else {
+        guard !requiresAuthoritativeRoutingContext || context.hasAuthoritativeRoutingContext else {
             throw DomainMutationPolicyError.routingContextUnavailable
         }
         if context.principal.kind == .runScoped,
