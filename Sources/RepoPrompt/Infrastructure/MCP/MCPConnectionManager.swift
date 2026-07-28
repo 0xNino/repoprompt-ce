@@ -13466,12 +13466,6 @@ actor ServerNetworkManager {
             connectionID: connectionID,
             connectionGeneration: connectionGeneration,
             invocationID: invocationID,
-            mutationRequestKey: [
-                "v1",
-                connectionID.uuidString.lowercased(),
-                String(connectionGeneration),
-                invocationID.uuidString.lowercased()
-            ].joined(separator: ":"),
             runtimeID: runtimeIdentity.runtimeID,
             runtimeGeneration: runtimeIdentity.lifecycleGeneration,
             workspaceID: workspaceID,

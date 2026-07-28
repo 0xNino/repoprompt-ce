@@ -390,7 +390,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
             let routed = await fixture.lease.releaseWhenRouted(timeoutMs: 1000)
             XCTAssertTrue(routed)
-            try await fixture.establishAuthoritativeDomainRouting()
+            try await fixture.assertAuthoritativeDomainRoutingThroughAppSeam()
 
             let baseline = await fixture.retainedConnectionSnapshot()
             Self.assertStableAgentModeSnapshot(baseline, fixture: fixture)
@@ -1561,7 +1561,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 [fixture.liveFileURL.path]
             )
 
-            let independent = try await fixture.makeIndependentPeerConnection()
+            let independent = try await fixture.makeIndependentPeerConnection(peerIdentity: .verifiedLocalProcess)
             do {
                 let independentGet = try await independent.socketClient.request(
                     id: 4,
@@ -1650,7 +1650,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             try await requireGateStarted(canonicalGate)
             XCTAssertEqual(fixture.canonicalSelectionRevision(), revisionAfterClear)
 
-            let handover = try await fixture.makeHandoverConnection()
+            let handover = try await fixture.makeHandoverConnection(peerIdentity: .verifiedLocalProcess)
             do {
                 let replacementContext = try XCTUnwrap(
                     fixture.window.mcpServer.tabContextByConnectionID[handover.connectionID]
@@ -1820,7 +1820,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 1
             )
 
-            let handover = try await fixture.makeHandoverConnection()
+            let handover = try await fixture.makeHandoverConnection(peerIdentity: .verifiedLocalProcess)
             do {
                 let replacementContext = try XCTUnwrap(
                     fixture.window.mcpServer.tabContextByConnectionID[handover.connectionID]
@@ -1930,7 +1930,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 )
                 fixture.assertPeerIsolationAndLifecycle(expectedSelection: completedSelection)
 
-                let independent = try await fixture.makeIndependentPeerConnection()
+                let independent = try await fixture.makeIndependentPeerConnection(peerIdentity: .verifiedLocalProcess)
                 do {
                     let independentGet = try await independent.socketClient.request(
                         id: 4,
@@ -2737,6 +2737,15 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             socketClient.close()
             await manager.stop()
             await networkManager.debugRemoveConnection(connectionID)
+            let runtime = AppDomainRuntimeComposition.shared.runtime
+            if let registration = try? await runtime.routingCoordinator.currentRegistration(
+                connectionID: connectionID
+            ) {
+                _ = await runtime.routingCoordinator.unregisterConnection(
+                    registration,
+                    operationID: UUID()
+                )
+            }
             window.mcpServer.removeTabContext(
                 forConnectionID: connectionID,
                 clientName: AgentProviderKind.codexMCPClientID,
@@ -2772,6 +2781,15 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             socketClient.close()
             await manager.stop()
             await networkManager.debugRemoveConnection(connectionID)
+            let runtime = AppDomainRuntimeComposition.shared.runtime
+            if let registration = try? await runtime.routingCoordinator.currentRegistration(
+                connectionID: connectionID
+            ) {
+                _ = await runtime.routingCoordinator.unregisterConnection(
+                    registration,
+                    operationID: UUID()
+                )
+            }
         }
     }
 
@@ -3204,27 +3222,34 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             }
         }
 
-        func establishAuthoritativeDomainRouting() async throws {
+        func assertAuthoritativeDomainRoutingThroughAppSeam() async throws {
+            let requestID = 9001
+            let response = try await socketClient.request(
+                id: requestID,
+                method: "tools/call",
+                params: [
+                    "name": "get_file_tree",
+                    "arguments": ["type": "roots"]
+                ]
+            )
+            let object = try PersistentAgentModeMCPReadFileConnectionTests.responseObject(
+                from: response,
+                id: requestID
+            )
+            XCTAssertNil(object["error"])
+            let result = try XCTUnwrap(object["result"] as? [String: Any])
+            XCTAssertNotEqual(result["isError"] as? Bool, true)
+
             let runtime = AppDomainRuntimeComposition.shared.runtime
-            let workspace = try XCTUnwrap(
-                window.workspaceManager.workspaces.first { $0.id == workspaceID }
-            )
-            let authority = DomainWorkspaceAuthorityClient(
-                store: runtime.workspaceStore,
-                windowID: windowID
-            )
-            _ = try await authority.registerForRead(
-                workspace,
-                fileURL: window.workspaceManager.workspaceFileURL(for: workspace)
-            )
-            _ = await runtime.routingCoordinator.registerConnection(
-                connectionID: connectionID,
-                operationID: UUID()
-            )
             let registration = try await runtime.routingCoordinator.currentRegistration(
                 connectionID: connectionID
             )
-            let outcome = await runtime.routingCoordinator.bind(
+            let resolved = try await runtime.routingCoordinator.resolveReadContext(
+                connection: registration
+            )
+            XCTAssertEqual(resolved.context.workspaceID, workspaceID)
+            XCTAssertEqual(resolved.context.contextID, Self.tabID)
+            let unchanged = await runtime.routingCoordinator.bind(
                 connection: registration,
                 binding: .runScoped(
                     runID: runID,
@@ -3232,8 +3257,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 ),
                 operationID: UUID()
             )
-            guard outcome.disposition == .applied || outcome.disposition == .unchanged else {
-                throw ClientFixtureError.domainRoutingBindingFailed(outcome.diagnostic ?? "unknown")
+            guard unchanged.disposition == .unchanged else {
+                throw ClientFixtureError.domainRoutingProjectionMissing(
+                    unchanged.diagnostic ?? String(describing: unchanged.disposition)
+                )
             }
         }
 
@@ -3612,7 +3639,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertEqual(routingGuardWindow.workspaceManager.activeWorkspace?.activeComposeTabID, Self.tabID)
         }
 
-        func makeIndependentPeerConnection() async throws -> IndependentConnection {
+        func makeIndependentPeerConnection(
+            peerIdentity: PeerIdentity
+        ) async throws -> IndependentConnection {
             let independentConnectionID = UUID()
             try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
             let snapshot = await ServiceRegistry.catalogSnapshot()
@@ -3774,7 +3803,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
         }
 
-        func makeHandoverConnection() async throws -> HandoverConnection {
+        func makeHandoverConnection(
+            peerIdentity: PeerIdentity
+        ) async throws -> HandoverConnection {
             let handoverConnectionID = UUID()
             var socketFDs = [Int32](repeating: -1, count: 2)
             guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketFDs) == 0 else {
@@ -4039,7 +4070,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         case liveFixtureTooShort(Int)
         case presentationStateMismatch(String)
         case windowCatalogRegistrationWasNotOwned(String)
-        case domainRoutingBindingFailed(String)
+        case domainRoutingProjectionMissing(String)
         case syntheticWatcherPublisherIngressUnavailable(UUID)
         case syntheticWatcherStillActive(UUID)
     }

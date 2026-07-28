@@ -54,12 +54,26 @@ package struct DomainClientPrincipal: Codable, Hashable, Sendable {
 }
 
 package struct DomainToolInvocationSecurityContext: Hashable, Sendable {
+    /// Authoritative server-owned durable request namespace. Public operation_id remains correlation-only.
+    package static func durableMutationRequestKey(
+        connectionID: UUID,
+        connectionGeneration: UInt64,
+        invocationID: UUID
+    ) -> String {
+        [
+            "v1",
+            connectionID.uuidString.lowercased(),
+            String(connectionGeneration),
+            invocationID.uuidString.lowercased()
+        ].joined(separator: ":")
+    }
+
     package let principal: DomainClientPrincipal
     package let connectionID: UUID
     package let connectionGeneration: UInt64
     package let invocationID: UUID
     /// Server-owned request identity used for journal dedupe. Public operation_id remains correlation-only.
-    package let mutationRequestKey: String
+    package private(set) var mutationRequestKey: String
     package let runtimeID: UUID
     package let runtimeGeneration: UInt64
     package let workspaceID: UUID?
@@ -74,7 +88,6 @@ package struct DomainToolInvocationSecurityContext: Hashable, Sendable {
         connectionID: UUID,
         connectionGeneration: UInt64,
         invocationID: UUID,
-        mutationRequestKey: String? = nil,
         runtimeID: UUID,
         runtimeGeneration: UInt64,
         workspaceID: UUID? = nil,
@@ -87,7 +100,11 @@ package struct DomainToolInvocationSecurityContext: Hashable, Sendable {
         self.connectionID = connectionID
         self.connectionGeneration = connectionGeneration
         self.invocationID = invocationID
-        self.mutationRequestKey = mutationRequestKey ?? invocationID.uuidString
+        self.mutationRequestKey = Self.durableMutationRequestKey(
+            connectionID: connectionID,
+            connectionGeneration: connectionGeneration,
+            invocationID: invocationID
+        )
         self.runtimeID = runtimeID
         self.runtimeGeneration = runtimeGeneration
         self.workspaceID = workspaceID
@@ -96,6 +113,13 @@ package struct DomainToolInvocationSecurityContext: Hashable, Sendable {
         self.hasAuthoritativeRoutingContext = hasAuthoritativeRoutingContext
         self.ephemeralGrantedToolNames = ephemeralGrantedToolNames
     }
+
+    #if DEBUG
+        /// Journal-unit-test escape hatch. Production/package callers cannot replace authoritative request identity.
+        internal mutating func overrideMutationRequestKeyForTesting(_ mutationRequestKey: String) {
+            self.mutationRequestKey = mutationRequestKey
+        }
+    #endif
 }
 
 package enum MCPDomainInvocationSecurityContext {

@@ -82,6 +82,10 @@ package struct DomainMutationJournalDocument: Codable, Sendable {
     var revision: UInt64
     var records: [String: DomainMutationJournalRecord]
     var updatedAt: Date
+
+    package var recordSnapshots: [DomainMutationJournalRecord] {
+        Array(records.values)
+    }
 }
 
 package struct DomainMutationJournalTicket: Hashable, Sendable {

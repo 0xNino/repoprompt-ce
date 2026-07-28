@@ -126,28 +126,116 @@ import XCTest
                         identity: .verified(processID: Int(getpid()), fingerprint: "test:verified:worktree")
                     )
                     try await bind(endpoint, to: fixture.contextA.tabID)
-                    _ = try await waitForAuthoritativeContext(
+                    let initialSecurityContext = try await waitForAuthoritativeContext(
                         manager: manager,
                         endpoint: endpoint,
                         toolName: "file_actions"
                     )
+                    let runtime = AppDomainRuntimeComposition.shared.runtime
+                    var journalKeys = try await Set(
+                        runtime.mutationJournal.snapshot().recordSnapshots.map(\.key)
+                    )
+                    let sharedCorrelationID = "shared-correlation-id"
 
                     let firstLogical = repo.appendingPathComponent("CorrelationOne.txt")
+                    let firstResponse = try await endpoint.callTool(
+                        name: "file_actions",
+                        arguments: [
+                            "action": "create",
+                            "path": firstLogical.path,
+                            "content": "one",
+                            "operation_id": sharedCorrelationID
+                        ]
+                    )
+                    XCTAssertFalse(try toolResult(firstResponse).isError)
+                    let firstCapture = try await captureJournalRecord(
+                        runtime: runtime,
+                        excluding: journalKeys,
+                        toolName: "file_actions",
+                        action: "create"
+                    )
+                    journalKeys = firstCapture.allKeys
+                    assertDurableRequestKey(
+                        firstCapture.record,
+                        endpoint: endpoint,
+                        connectionGeneration: initialSecurityContext.connectionGeneration,
+                        operationID: sharedCorrelationID
+                    )
+
+                    _ = await runtime.routingCoordinator.registerConnection(
+                        connectionID: endpoint.connectionID,
+                        operationID: UUID()
+                    )
+                    try await bind(endpoint, to: fixture.contextA.tabID)
+                    let routingProbe = try await endpoint.callTool(
+                        name: "get_file_tree",
+                        arguments: ["type": "roots"]
+                    )
+                    XCTAssertFalse(try toolResult(routingProbe).isError)
+                    let reboundSecurityContext = try await waitForAuthoritativeContext(
+                        manager: manager,
+                        endpoint: endpoint,
+                        toolName: "file_actions"
+                    )
+                    XCTAssertGreaterThan(
+                        reboundSecurityContext.connectionGeneration,
+                        initialSecurityContext.connectionGeneration
+                    )
+
                     let secondLogical = repo.appendingPathComponent("CorrelationTwo.txt")
-                    for (path, content) in [(firstLogical, "one"), (secondLogical, "two")] {
-                        let response = try await endpoint.callTool(
-                            name: "file_actions",
-                            arguments: [
-                                "action": "create",
-                                "path": path.path,
-                                "content": content,
-                                "operation_id": "shared-correlation-id"
-                            ]
-                        )
-                        XCTAssertFalse(try toolResult(response).isError)
-                    }
+                    let secondResponse = try await endpoint.callTool(
+                        name: "file_actions",
+                        arguments: [
+                            "action": "create",
+                            "path": secondLogical.path,
+                            "content": "two",
+                            "operation_id": sharedCorrelationID
+                        ]
+                    )
+                    XCTAssertFalse(try toolResult(secondResponse).isError)
+                    let secondCapture = try await captureJournalRecord(
+                        runtime: runtime,
+                        excluding: journalKeys,
+                        toolName: "file_actions",
+                        action: "create"
+                    )
+                    journalKeys = secondCapture.allKeys
+                    assertDurableRequestKey(
+                        secondCapture.record,
+                        endpoint: endpoint,
+                        connectionGeneration: reboundSecurityContext.connectionGeneration,
+                        operationID: sharedCorrelationID
+                    )
+                    XCTAssertNotEqual(firstCapture.record.key, secondCapture.record.key)
+
+                    let thirdLogical = repo.appendingPathComponent("CorrelationThree.txt")
+                    let thirdResponse = try await endpoint.callTool(
+                        name: "file_actions",
+                        arguments: [
+                            "action": "create",
+                            "path": thirdLogical.path,
+                            "content": "three",
+                            "operation_id": sharedCorrelationID
+                        ]
+                    )
+                    XCTAssertFalse(try toolResult(thirdResponse).isError)
+                    let thirdCapture = try await captureJournalRecord(
+                        runtime: runtime,
+                        excluding: journalKeys,
+                        toolName: "file_actions",
+                        action: "create"
+                    )
+                    journalKeys = thirdCapture.allKeys
+                    assertDurableRequestKey(
+                        thirdCapture.record,
+                        endpoint: endpoint,
+                        connectionGeneration: reboundSecurityContext.connectionGeneration,
+                        operationID: sharedCorrelationID
+                    )
+                    XCTAssertNotEqual(secondCapture.record.key, thirdCapture.record.key)
                     XCTAssertEqual(try String(contentsOf: firstLogical, encoding: .utf8), "one")
                     XCTAssertEqual(try String(contentsOf: secondLogical, encoding: .utf8), "two")
+                    XCTAssertEqual(try String(contentsOf: thirdLogical, encoding: .utf8), "three")
 
                     await manager.setRunPurpose(.agentModeRun, for: endpoint.connectionID)
                     for toolName in ["prompt", "workspace_context"] {
@@ -178,10 +266,24 @@ import XCTest
                             "path": worktree.path,
                             "branch": "test/protected-mutation-\(UUID().uuidString.lowercased())",
                             "base_ref": "HEAD",
-                            "allow_external_path": true
+                            "allow_external_path": true,
+                            "operation_id": sharedCorrelationID
                         ]
                     )
                     XCTAssertFalse(try toolResult(create).isError)
+                    let worktreeCapture = try await captureJournalRecord(
+                        runtime: runtime,
+                        excluding: journalKeys,
+                        toolName: "manage_worktree",
+                        action: "create"
+                    )
+                    journalKeys = worktreeCapture.allKeys
+                    assertDurableRequestKey(
+                        worktreeCapture.record,
+                        endpoint: endpoint,
+                        connectionGeneration: reboundSecurityContext.connectionGeneration,
+                        operationID: sharedCorrelationID
+                    )
                     worktreeCreated = true
                     let testBinding = AgentSessionWorktreeBinding(
                         id: "test-binding-\(UUID().uuidString)",
@@ -259,11 +361,35 @@ import XCTest
                         arguments: [
                             "path": logicalTarget.path,
                             "search": fixture.contextA.sentinel,
-                            "replace": replacement
+                            "replace": replacement,
+                            "operation_id": sharedCorrelationID
                         ]
                     )
                     let translatedResult = try toolResult(translated)
                     XCTAssertFalse(translatedResult.isError)
+                    let applyEditsCapture = try await captureJournalRecord(
+                        runtime: runtime,
+                        excluding: journalKeys,
+                        toolName: "apply_edits",
+                        action: "replace"
+                    )
+                    journalKeys = applyEditsCapture.allKeys
+                    assertDurableRequestKey(
+                        applyEditsCapture.record,
+                        endpoint: endpoint,
+                        connectionGeneration: reboundSecurityContext.connectionGeneration,
+                        operationID: sharedCorrelationID
+                    )
+                    XCTAssertEqual(
+                        Set([
+                            firstCapture.record.key,
+                            secondCapture.record.key,
+                            thirdCapture.record.key,
+                            worktreeCapture.record.key,
+                            applyEditsCapture.record.key
+                        ]).count,
+                        5
+                    )
                     let logicalContents = try String(contentsOf: logicalTarget, encoding: .utf8)
                     let physicalContents = try String(contentsOf: physicalTarget, encoding: .utf8)
                     XCTAssertTrue(logicalContents.contains(fixture.contextA.sentinel))
@@ -301,6 +427,50 @@ import XCTest
                     throw error
                 }
             }
+        }
+
+        private func captureJournalRecord(
+            runtime: MCPDomainRuntime,
+            excluding priorKeys: Set<String>,
+            toolName: String,
+            action: String
+        ) async throws -> (record: DomainMutationJournalRecord, allKeys: Set<String>) {
+            let document = try await runtime.mutationJournal.snapshot()
+            let matches = document.recordSnapshots.filter {
+                !priorKeys.contains($0.key) && $0.toolName == toolName && $0.action == action
+            }
+            let allKeys = Set(document.recordSnapshots.map(\.key))
+            XCTAssertEqual(matches.count, 1, "new journal records=\(allKeys.sorted())")
+            return try (XCTUnwrap(matches.first), allKeys)
+        }
+
+        private func assertDurableRequestKey(
+            _ record: DomainMutationJournalRecord,
+            endpoint: PersistentMCPTestEndpoint,
+            connectionGeneration: UInt64,
+            operationID: String,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) {
+            let requestKey = [
+                "v1",
+                endpoint.connectionID.uuidString.lowercased(),
+                String(connectionGeneration),
+                record.ownerInvocationID.uuidString.lowercased()
+            ].joined(separator: ":")
+            XCTAssertEqual(
+                record.key,
+                "\(record.toolName).\(record.action):request:\(requestKey)",
+                file: file,
+                line: line
+            )
+            XCTAssertEqual(record.operationID, operationID, file: file, line: line)
+            XCTAssertEqual(
+                record.status.rawValue,
+                DomainMutationJournalStatus.applied.rawValue,
+                file: file,
+                line: line
+            )
         }
 
         private func registerDomainWorkspace(_ context: PersistentMCPTestContext) async throws {

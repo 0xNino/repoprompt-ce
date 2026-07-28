@@ -14,12 +14,12 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
         }
         let arguments = fixture.arguments(operationID: "correlation-1")
 
-        let first = try await fixture.invoke(binding, arguments: arguments, mutationRequestKey: "request-1")
+        let first = try await fixture.invoke(binding, arguments: arguments, requestIdentitySeed: "request-1")
         let replay = try await fixture.invoke(
             binding,
             arguments: arguments,
             workspaceRevision: 8,
-            mutationRequestKey: "request-1"
+            requestIdentitySeed: "request-1"
         )
         XCTAssertEqual(first.stringValue, "applied")
         XCTAssertEqual(replay.stringValue, "applied")
@@ -31,7 +31,7 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
         let distinctRequest = try await fixture.invoke(
             binding,
             arguments: reusedCorrelation,
-            mutationRequestKey: "request-2"
+            requestIdentitySeed: "request-2"
         )
         XCTAssertEqual(distinctRequest.stringValue, "applied")
         let callsAfterDistinctRequest = await calls.value
@@ -41,7 +41,7 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
             try await fixture.invoke(
                 binding,
                 arguments: reusedCorrelation,
-                mutationRequestKey: "request-1"
+                requestIdentitySeed: "request-1"
             )
         ) { error in
             XCTAssertEqual(error as? DomainMutationJournalError, .operationIDCollision("correlation-1"))
@@ -117,7 +117,7 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
                 operationID: "translated-correlation",
                 path: physicalTarget
             ),
-            mutationRequestKey: "translated-request"
+            requestIdentitySeed: "translated-request"
         )
         XCTAssertEqual(result.stringValue, "translated")
         let snapshot = try await fixture.runtime.mutationJournal.snapshot()
@@ -144,7 +144,7 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
             try await fixture.invoke(
                 binding,
                 arguments: fixture.arguments(operationID: "parent-swap", path: target),
-                mutationRequestKey: "parent-swap-request"
+                requestIdentitySeed: "parent-swap-request"
             )
         ) { error in
             XCTAssertTrue(error is DomainMutationPathFenceError)
@@ -168,7 +168,7 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
         }
         let arguments = fixture.arguments(operationID: "cancel-before")
         let task = Task {
-            try await fixture.invoke(binding, arguments: arguments, mutationRequestKey: "cancel-before-request")
+            try await fixture.invoke(binding, arguments: arguments, requestIdentitySeed: "cancel-before-request")
         }
         await gate.waitUntilEntered()
         task.cancel()
@@ -185,7 +185,7 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
         let retry = try await fixture.invoke(
             binding,
             arguments: arguments,
-            mutationRequestKey: "cancel-before-request"
+            requestIdentitySeed: "cancel-before-request"
         )
         XCTAssertEqual(retry.stringValue, "retried")
         let callsAfterRetry = await calls.value
@@ -204,7 +204,7 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
         }
         let arguments = fixture.arguments(operationID: "cancel-after")
         let task = Task {
-            try await fixture.invoke(binding, arguments: arguments, mutationRequestKey: "cancel-after-request")
+            try await fixture.invoke(binding, arguments: arguments, requestIdentitySeed: "cancel-after-request")
         }
         await gate.waitUntilEntered()
         task.cancel()
@@ -227,7 +227,7 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
             try await restarted.invoke(
                 restartedBinding,
                 arguments: arguments,
-                mutationRequestKey: "cancel-after-request"
+                requestIdentitySeed: "cancel-after-request"
             )
         ) { error in
             XCTAssertEqual(error as? DomainMutationJournalError, .interruptedCommit("cancel-after"))
@@ -257,7 +257,7 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
         }
         let arguments = first.arguments(operationID: "n-writer")
         let owner = Task {
-            try await first.invoke(firstBinding, arguments: arguments, mutationRequestKey: "n-writer-request")
+            try await first.invoke(firstBinding, arguments: arguments, requestIdentitySeed: "n-writer-request")
         }
         await gate.waitUntilEntered()
 
@@ -265,7 +265,7 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
             try await second.invoke(
                 secondBinding,
                 arguments: arguments,
-                mutationRequestKey: "n-writer-request"
+                requestIdentitySeed: "n-writer-request"
             )
         ) { error in
             XCTAssertEqual(error as? DomainMutationJournalError, .operationInProgress("n-writer"))
@@ -276,7 +276,7 @@ final class DomainProtectedMutationJournalTests: XCTestCase {
         let replay = try await second.invoke(
             secondBinding,
             arguments: arguments,
-            mutationRequestKey: "n-writer-request"
+            requestIdentitySeed: "n-writer-request"
         )
         XCTAssertEqual(replay.stringValue, "winner")
         let callsAfterContention = await calls.value
@@ -352,9 +352,9 @@ private final class M4BFixture: @unchecked Sendable {
         _ binding: MCPDomainToolBinding,
         arguments: [String: Value],
         workspaceRevision: UInt64 = 7,
-        mutationRequestKey: String = UUID().uuidString
+        requestIdentitySeed: String = UUID().uuidString
     ) async throws -> Value {
-        let context = DomainToolInvocationSecurityContext(
+        var context = DomainToolInvocationSecurityContext(
             principal: DomainClientPrincipal(
                 principalID: UUID(),
                 stableKey: "app:test",
@@ -369,7 +369,6 @@ private final class M4BFixture: @unchecked Sendable {
             connectionID: UUID(),
             connectionGeneration: 1,
             invocationID: UUID(),
-            mutationRequestKey: mutationRequestKey,
             runtimeID: runtime.identity.runtimeID,
             runtimeGeneration: runtime.identity.lifecycleGeneration,
             workspaceID: UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!,
@@ -377,6 +376,7 @@ private final class M4BFixture: @unchecked Sendable {
             authorizedCanonicalRoots: [root.path],
             ephemeralGrantedToolNames: ["file_actions"]
         )
+        context.overrideMutationRequestKeyForTesting(requestIdentitySeed)
         return try await MCPDomainInvocationSecurityContext.$current.withValue(context) {
             try await binding(arguments)
         }
