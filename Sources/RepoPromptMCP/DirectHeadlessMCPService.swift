@@ -143,7 +143,6 @@ actor DirectHeadlessMCPService {
             storageDirectory: storage,
             eventDirectory: events,
             temporaryDirectory: temporary,
-            protectedMutationStage: .m4B,
             hostDrainTimeout: .seconds(5)
         ), prepareChildLaunch: { toolName, arguments, securityContext in
             try await childLaunchCoordinator.prepare(

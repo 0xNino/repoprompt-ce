@@ -454,80 +454,17 @@ final class TabContextRoutingTests: XCTestCase {
         )
     }
 
-    func testActiveTabCompatibilityDecisionAllowsOnlyLegacyNonRunScopedCallers() {
-        XCTAssertEqual(
-            MCPServerViewModel.activeTabCompatibilityFallbackDecision(
-                policy: .allowLegacyImplicitRouting,
-                fallbackEnabled: true,
-                hasRunScopedContext: false,
-                runPurpose: .unknown
-            ),
-            .allowed
-        )
-        XCTAssertEqual(
-            MCPServerViewModel.activeTabCompatibilityFallbackDecision(
-                policy: .allowLegacyImplicitRouting,
-                fallbackEnabled: false,
-                hasRunScopedContext: false,
-                runPurpose: .unknown
-            ),
-            .disabled
-        )
-        XCTAssertEqual(
-            MCPServerViewModel.activeTabCompatibilityFallbackDecision(
-                policy: .requireExplicitOrRunScoped,
-                fallbackEnabled: true,
-                hasRunScopedContext: false,
-                runPurpose: .unknown
-            ),
-            .notAllowedByPolicy
-        )
-        XCTAssertEqual(
-            MCPServerViewModel.activeTabCompatibilityFallbackDecision(
-                policy: .allowLegacyImplicitRouting,
-                fallbackEnabled: true,
-                hasRunScopedContext: true,
-                runPurpose: .unknown
-            ),
-            .prohibitedForRunScoped(.unknown)
-        )
-        XCTAssertEqual(
-            MCPServerViewModel.activeTabCompatibilityFallbackDecision(
-                policy: .allowActiveTabCompatibility,
-                fallbackEnabled: true,
-                hasRunScopedContext: false,
-                runPurpose: .agentModeRun
-            ),
-            .prohibitedForRunScoped(.agentModeRun)
-        )
-    }
-
-    func testRoutingRecoveryGuidanceDistinguishesLegacyBindingFromAgentModeRestart() {
-        do {
-            let caseLabel = "testDisabledActiveTabCompatibilityGuidanceMentionsBindContext"
-            let message = MCPServerViewModel.activeTabCompatibilityDisabledMessage(toolName: "workspace_context")
-            XCTAssertTrue(message.contains("bind_context"), caseLabel + ": " + message)
-            XCTAssertTrue(message.contains("context_id"), caseLabel + ": " + message)
-            XCTAssertTrue(message.contains("disabled"), caseLabel + ": " + message)
-        }
-
+    func testRoutingRecoveryGuidanceDistinguishesExplicitBindingFromAgentModeRestart() {
         do {
             let caseLabel = "testAgentModeRoutingRecoveryDoesNotRecommendRejectedExplicitContextOverrides"
-            for message in [
-                MCPServerViewModel.tabContextRoutingErrorMessage(
-                    toolName: "context_builder",
-                    runPurpose: .agentModeRun
-                ),
-                MCPServerViewModel.runScopedActiveTabCompatibilityMessage(
-                    toolName: "context_builder",
-                    runPurpose: .agentModeRun
-                )
-            ] {
-                XCTAssertTrue(message.contains("Retry"), caseLabel + ": " + message)
-                XCTAssertTrue(message.contains("restart this Agent Mode run"), caseLabel + ": " + message)
-                XCTAssertFalse(message.contains("bind_context"), caseLabel + ": " + message)
-                XCTAssertFalse(message.contains("context_id"), caseLabel + ": " + message)
-            }
+            let message = MCPServerViewModel.tabContextRoutingErrorMessage(
+                toolName: "context_builder",
+                runPurpose: .agentModeRun
+            )
+            XCTAssertTrue(message.contains("Retry"), caseLabel + ": " + message)
+            XCTAssertTrue(message.contains("restart this Agent Mode run"), caseLabel + ": " + message)
+            XCTAssertFalse(message.contains("bind_context"), caseLabel + ": " + message)
+            XCTAssertFalse(message.contains("context_id"), caseLabel + ": " + message)
 
             let ordinary = MCPServerViewModel.tabContextRoutingErrorMessage(
                 toolName: "workspace_context",
@@ -538,13 +475,9 @@ final class TabContextRoutingTests: XCTestCase {
         }
     }
 
-    func testConnectionManagerRunScopedCompatibilityPoliciesPreserveCanonicalLookupRules() {
+    func testConnectionManagerRunScopedPoliciesPreserveCanonicalLookupRules() {
         do {
-            let caseLabel = "testConnectionManagerRoutingPoliciesKeepRunScopedToolsOutOfLegacyGenericBinding"
-            XCTAssertFalse(ServerNetworkManager.shouldUseGenericTabBindingCompatibility(for: "agent_run"), caseLabel)
-            XCTAssertFalse(ServerNetworkManager.shouldUseGenericTabBindingCompatibility(for: "ask_oracle"), caseLabel)
-            XCTAssertFalse(ServerNetworkManager.shouldUseGenericTabBindingCompatibility(for: "context_builder"), caseLabel)
-            XCTAssertTrue(ServerNetworkManager.shouldUseGenericTabBindingCompatibility(for: "legacy_tool"), caseLabel)
+            let caseLabel = "testConnectionManagerRetainsOnlyDeclaredContextBuilderBindingFields"
             XCTAssertTrue(ServerNetworkManager.shouldRehydrateContextID(for: "context_builder"), caseLabel)
             XCTAssertTrue(ServerNetworkManager.shouldRehydrateLegacyTabID(for: "context_builder"), caseLabel)
         }
@@ -573,10 +506,6 @@ final class TabContextRoutingTests: XCTestCase {
                     ), caseLabel + ": \(purpose) \(toolName)")
                 }
             }
-
-            XCTAssertTrue(ServerNetworkManager.shouldUseGenericTabBindingCompatibility(for: "legacy_tool"), caseLabel)
-            XCTAssertTrue(ServerNetworkManager.shouldInjectLegacyTabIDForCompatibility(for: "context_builder"), caseLabel)
-            XCTAssertFalse(ServerNetworkManager.shouldUseGenericTabBindingCompatibility(for: "workspace_context"), caseLabel)
         }
     }
 
@@ -588,9 +517,7 @@ final class TabContextRoutingTests: XCTestCase {
         XCTAssertTrue(ServerNetworkManager.shouldBypassLogicalContextPreResolution(for: "bind_context"))
     }
 
-    func testMigratedToolContextPreResolutionPersistsWindowAffinity() {
-        XCTAssertFalse(ServerNetworkManager.shouldUseGenericTabBindingCompatibility(for: "workspace_context"))
-        XCTAssertFalse(ServerNetworkManager.shouldUseGenericTabBindingCompatibility(for: "manage_selection"))
+    func testToolContextPreResolutionPersistsWindowAffinity() {
         XCTAssertTrue(ServerNetworkManager.shouldPersistResolvedLogicalContextWindowMapping(for: "workspace_context"))
         XCTAssertTrue(ServerNetworkManager.shouldPersistResolvedLogicalContextWindowMapping(for: "manage_selection"))
         XCTAssertFalse(ServerNetworkManager.shouldRehydrateContextID(for: "workspace_context"))
@@ -788,8 +715,7 @@ final class TabContextRoutingTests: XCTestCase {
             explicitlyBound: true
         )
         let resolved = MCPServerViewModel.ResolvedTabContextSnapshot(
-            snapshot: context,
-            usesActiveTabCompatibility: false
+            snapshot: context
         )
         let activeSelectionBeforePersistence = try XCTUnwrap(window.workspaceManager.composeTab(with: activeTabID)?.selection)
 
@@ -1298,7 +1224,6 @@ final class TabContextRoutingTests: XCTestCase {
         resetContext.selection = StoredSelection()
         let resolved = MCPServerViewModel.ResolvedTabContextSnapshot(
             snapshot: resetContext,
-            usesActiveTabCompatibility: false,
             source: .explicitBinding
         )
 
@@ -1326,7 +1251,7 @@ final class TabContextRoutingTests: XCTestCase {
                 windowID: window.windowID
             ),
             toolName: "manage_selection",
-            policy: .allowActiveTabCompatibility
+            policy: .requireExplicitOrRunScoped
         )
         let nextFullAddSelection = StoredSelection(
             selectedPaths: ["/tmp/Full.swift"],
@@ -2015,16 +1940,10 @@ final class TabContextRoutingTests: XCTestCase {
         let context = makeTabContext(runID: UUID(), windowID: 11)
         let resolved = MCPServerViewModel.ResolvedTabContextSnapshot(
             snapshot: context,
-            usesActiveTabCompatibility: false,
             source: .runInstall
-        )
-        let activeCompatibility = MCPServerViewModel.ResolvedTabContextSnapshot(
-            snapshot: context,
-            usesActiveTabCompatibility: true
         )
         let explicitHint = MCPServerViewModel.ResolvedTabContextSnapshot(
             snapshot: context,
-            usesActiveTabCompatibility: false,
             source: .explicitHint
         )
 
@@ -2035,10 +1954,6 @@ final class TabContextRoutingTests: XCTestCase {
             ),
             context.tabID
         )
-        XCTAssertNil(MCPServerViewModel.spawnParentSourceTabIDForAgentSessionCreation(
-            purpose: .agentModeRun,
-            resolvedContext: activeCompatibility
-        ))
         XCTAssertNil(MCPServerViewModel.spawnParentSourceTabIDForAgentSessionCreation(
             purpose: .unknown,
             resolvedContext: resolved
@@ -2125,7 +2040,7 @@ final class TabContextRoutingTests: XCTestCase {
         }
 
         @MainActor
-        func testAgentRunExplicitLaunchSourceIsExactAndDoesNotUseActiveTabCompatibility() async throws {
+        func testAgentRunExplicitLaunchSourceUsesExactBoundContext() async throws {
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let window = WindowState()
@@ -2504,7 +2419,7 @@ final class TabContextRoutingTests: XCTestCase {
             }
 
             let runScopedConnectionID = UUID()
-            window.mcpServer.windowIDByConnection[runScopedConnectionID] = window.windowID
+            window.mcpServer.presentationWindowByConnection[runScopedConnectionID] = window.windowID
             window.mcpServer.setRequestMetadataOverrideForTesting(.init(
                 connectionID: runScopedConnectionID,
                 clientName: "public-start-missing-run-route",
@@ -2521,7 +2436,7 @@ final class TabContextRoutingTests: XCTestCase {
             }
 
             let hintedRunScopedConnectionID = UUID()
-            window.mcpServer.windowIDByConnection[hintedRunScopedConnectionID] = window.windowID
+            window.mcpServer.presentationWindowByConnection[hintedRunScopedConnectionID] = window.windowID
             window.mcpServer.connectionIDToRunID[hintedRunScopedConnectionID] = UUID()
             window.mcpServer.setRequestMetadataOverrideForTesting(.init(
                 connectionID: hintedRunScopedConnectionID,
@@ -2549,7 +2464,7 @@ final class TabContextRoutingTests: XCTestCase {
                 window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = nil
             }
             let missingActiveConnectionID = UUID()
-            window.mcpServer.windowIDByConnection[missingActiveConnectionID] = window.windowID
+            window.mcpServer.presentationWindowByConnection[missingActiveConnectionID] = window.windowID
             window.mcpServer.setRequestMetadataOverrideForTesting(.init(
                 connectionID: missingActiveConnectionID,
                 clientName: "public-start-missing-active",

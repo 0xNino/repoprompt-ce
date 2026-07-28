@@ -185,7 +185,7 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+TabContext.swift")
         let body = try XCTUnwrap(source.slice(
             from: "        guard let resolved else {",
-            to: "        if resolved.usesActiveTabCompatibility,"
+            to: "        if let frozenLookupContext = resolved.snapshot.frozenLookupContext"
         ))
 
         try Self.assertOrdered([

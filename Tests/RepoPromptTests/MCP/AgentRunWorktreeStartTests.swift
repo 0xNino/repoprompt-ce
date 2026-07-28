@@ -4306,7 +4306,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 let manager = ServerNetworkManager.shared
                 if installStarted {
                     await window.mcpServer.stopServer()
-                    await ServiceRegistry.unregister(window.mcpServer.windowMCPToolCatalogService)
+                    await AppDomainRuntimeComposition.shared.unregister(window.mcpServer.windowMCPToolCatalogService)
                     await window.mcpServer.shutdownListener()
 
                     if await manager.isRunning() {

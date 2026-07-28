@@ -97,7 +97,7 @@ actor MCPToolCatalogReadiness {
     /// Check if required services are ready (MainActor)
     @MainActor
     private func checkServicesReady(windowID: Int?) async -> Bool {
-        let snapshot = await ServiceRegistry.catalogSnapshot()
+        let snapshot = await AppDomainRuntimeComposition.shared.catalogSnapshot()
         let globalCatalogReady = MCPGlobalToolName.orderedToolNames.allSatisfy { toolName in
             snapshot.activeScopesByToolName[toolName]?.contains(.application) == true
         }
@@ -121,7 +121,7 @@ actor MCPToolCatalogReadiness {
             return true
         }
         let requiredScope = MCPDomainToolRegistrationScope.window(id: windowID)
-        let windowCatalogReady = MCPWindowToolGroup.orderedToolNames.allSatisfy { toolName in
+        let windowCatalogReady = MCPAppToolGroup.orderedToolNames.allSatisfy { toolName in
             snapshot.activeScopesByToolName[toolName]?.contains(requiredScope) == true
         }
         if !windowCatalogReady {

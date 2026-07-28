@@ -4,9 +4,9 @@ import RepoPromptDomainRuntime
 
 @MainActor
 final class MCPPromptContextToolProvider {
-    private let dependencies: MCPWindowToolDependencies
+    private let dependencies: MCPAppPhysicalCapabilityAdapters
 
-    init(runtime _: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    init(runtime _: MCPAppToolBinder, dependencies: MCPAppPhysicalCapabilityAdapters) {
         self.dependencies = dependencies
     }
 
@@ -65,7 +65,7 @@ final class MCPPromptContextToolProvider {
             try await dependencies.resolveTabContextSnapshot(
                 metadata,
                 MCPWindowToolName.workspaceContext,
-                .allowLegacyImplicitRouting
+                .requireExplicitOrRunScoped
             )
         }
         let dto = try await dependencies.buildTabWorkspaceContext(
@@ -73,7 +73,7 @@ final class MCPPromptContextToolProvider {
             Set(includeArr),
             display,
             overridePreset,
-            resolvedTabContext.usesActiveTabCompatibility
+            false
         )
         return try Value(dto)
     }
@@ -109,36 +109,10 @@ final class MCPPromptContextToolProvider {
             try await dependencies.resolveTabContextSnapshot(
                 metadata,
                 MCPWindowToolName.prompt,
-                .allowLegacyImplicitRouting
+                .requireExplicitOrRunScoped
             )
         }
-        if !resolvedContext.usesActiveTabCompatibility {
-            return try await executeTabScopedPrompt(op: op, args: args, resolvedContext: resolvedContext)
-        }
-        switch op {
-        case "get":
-            return try await activePromptReply(op: op)
-        case "set":
-            guard let text = args["text"]?.stringValue else { throw MCPError.invalidParams("text required for set") }
-            await MainActor.run { dependencies.promptVM.promptText = text }
-            return try Value(simplePromptReply(text, op: op))
-        case "append":
-            guard let text = args["text"]?.stringValue else { throw MCPError.invalidParams("text required for append") }
-            let combined = await dependencies.promptVM.promptText + text
-            await MainActor.run { dependencies.promptVM.promptText = combined }
-            return try Value(simplePromptReply(combined, op: op))
-        case "clear":
-            await MainActor.run { dependencies.promptVM.promptText = "" }
-            return try Value(simplePromptReply("", op: op))
-        case "export":
-            return try await exportPrompt(args: args, resolvedContext: resolvedContext, tabContext: nil)
-        case "select_preset":
-            let preset = try await resolveRequiredPreset(args["preset"])
-            await MainActor.run { dependencies.promptVM.selectCopyPreset(preset.id) }
-            return try Value(ToolResultDTOs.PromptToolEnvelope.forSelectPreset(dependencies.copyPresetDescriptorDTO(preset)))
-        default:
-            throw MCPError.invalidParams("invalid op: \(op)")
-        }
+        return try await executeTabScopedPrompt(op: op, args: args, resolvedContext: resolvedContext)
     }
 
     private func executeTabScopedPrompt(op: String, args: [String: Value], resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot) async throws -> Value {
@@ -255,7 +229,7 @@ final class MCPPromptContextToolProvider {
         return try Value(envelope)
     }
 
-    private func exportPrompt(args: [String: Value], resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot, tabContext: MCPServerViewModel.TabScopedContext?) async throws -> Value {
+    private func exportPrompt(args: [String: Value], resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot, tabContext: MCPServerViewModel.TabContextSnapshot?) async throws -> Value {
         guard let rawPath = args["path"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !rawPath.isEmpty else {
             throw MCPError.invalidParams("path required for export")
         }
@@ -270,7 +244,7 @@ final class MCPPromptContextToolProvider {
         }
         let pathDisplay = await MainActor.run { dependencies.promptVM.filePathDisplayOption }
         let rootRefs = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: .allLoaded)
-        let effectiveContext = tabContext.map { MCPServerViewModel.ResolvedTabContextSnapshot(snapshot: $0, usesActiveTabCompatibility: false) } ?? resolvedContext
+        let effectiveContext = tabContext.map { MCPServerViewModel.ResolvedTabContextSnapshot(snapshot: $0) } ?? resolvedContext
         let files = try await dependencies.buildExportSelectedFileInfos(effectiveContext, cfg, tabContext?.selection, pathDisplay)
         let metadata = await dependencies.captureRequestMetadata()
         let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)

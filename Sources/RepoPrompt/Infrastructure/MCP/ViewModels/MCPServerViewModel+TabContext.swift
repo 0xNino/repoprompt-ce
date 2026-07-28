@@ -13,7 +13,7 @@ import MCP
 extension MCPServerViewModel {
     struct DetachedContextBuilderTabContext {
         let connectionID: UUID
-        let context: TabScopedContext
+        let context: TabContextSnapshot
     }
 
     struct ContextBuilderCommittedTabSnapshot {
@@ -285,16 +285,12 @@ extension MCPServerViewModel {
         }
     }
 
-    /// TEMPORARY COMPATIBILITY ALIAS for code not yet migrated off the
-    /// pre-snapshot name. New code should use `TabContextSnapshot`.
-    typealias TabScopedContext = TabContextSnapshot
-
     enum TabContextSnapshotSource: String, Equatable {
         case explicitBinding
         case runInstall
         case runHandover
         case pendingRunScoped
-        case implicitBindingCompatibility
+        case restoredBinding
         case explicitHint
     }
 
@@ -346,53 +342,12 @@ extension MCPServerViewModel {
     }
 
     enum TabContextResolutionPolicy: Equatable {
-        /// Agent/restricted tools: require a bound, run-scoped, or explicit hinted tab context.
+        /// Require a bound, run-scoped, or explicit hinted tab context.
         case requireExplicitOrRunScoped
-        /// Legacy non-agent tools during migration: allow active-tab fallback only; pending/headless routing remains run-scoped.
-        case allowLegacyImplicitRouting
-        /// One-shot callers that may use active UI compatibility but should not consume runless pending queues.
-        case allowActiveTabCompatibility
-
-        var allowsLegacyImplicitRouting: Bool {
-            self == .allowLegacyImplicitRouting
-        }
-
-        var allowsActiveTabCompatibility: Bool {
-            switch self {
-            case .allowLegacyImplicitRouting, .allowActiveTabCompatibility:
-                true
-            case .requireExplicitOrRunScoped:
-                false
-            }
-        }
-    }
-
-    enum ActiveTabCompatibilityFallbackDecision: Equatable {
-        case allowed
-        case disabled
-        case prohibitedForRunScoped(MCPRunPurpose?)
-        case notAllowedByPolicy
-    }
-
-    struct ActiveTabCompatibilityFallbackDiagnostic: Equatable {
-        enum Outcome: String, Equatable {
-            case allowed
-            case disabled
-            case prohibitedForRunScoped
-        }
-
-        let toolName: String
-        let connectionID: UUID?
-        let windowID: Int?
-        let clientName: String?
-        let outcome: Outcome
-        let message: String
-        let timestamp: Date
     }
 
     enum TabContextResolution {
         case tabContextSnapshot(TabContextSnapshot, source: TabContextSnapshotSource)
-        case activeTabCompatibility
 
         var snapshot: TabContextSnapshot? {
             if case let .tabContextSnapshot(snapshot, _) = self { return snapshot }
@@ -429,7 +384,7 @@ extension MCPServerViewModel {
 
     @MainActor
     struct PendingRunScopedContextStore {
-        private var storage: [String: [Int: [UUID: TabScopedContext]]] = [:]
+        private var storage: [String: [Int: [UUID: TabContextSnapshot]]] = [:]
 
         var isEmpty: Bool {
             storage.isEmpty
@@ -440,7 +395,7 @@ extension MCPServerViewModel {
         }
 
         @discardableResult
-        mutating func enqueueReplacing(_ context: TabScopedContext, clientName: String, windowID: Int) -> Int {
+        mutating func enqueueReplacing(_ context: TabContextSnapshot, clientName: String, windowID: Int) -> Int {
             guard let runID = context.runID else { return queueLength(clientName: clientName, windowID: windowID) }
 
             // Keep exactly one pending entry per run for a client. If the run is reinstalled
@@ -464,7 +419,7 @@ extension MCPServerViewModel {
             return runMap.count
         }
 
-        mutating func pop(clientName: String, windowID: Int, runID: UUID) -> (context: TabScopedContext?, remaining: Int) {
+        mutating func pop(clientName: String, windowID: Int, runID: UUID) -> (context: TabContextSnapshot?, remaining: Int) {
             guard var windowMap = storage[clientName],
                   var runMap = windowMap[windowID]
             else {
@@ -485,7 +440,7 @@ extension MCPServerViewModel {
             return (context, runMap.count)
         }
 
-        mutating func popByRunID(clientName: String, runID: UUID) -> (context: TabScopedContext?, windowID: Int?, remaining: Int) {
+        mutating func popByRunID(clientName: String, runID: UUID) -> (context: TabContextSnapshot?, windowID: Int?, remaining: Int) {
             guard var windowMap = storage[clientName] else {
                 return (nil, nil, 0)
             }
@@ -532,8 +487,8 @@ extension MCPServerViewModel {
             return removed
         }
 
-        mutating func purge(tabID: UUID) -> [TabScopedContext] {
-            var removed: [TabScopedContext] = []
+        mutating func purge(tabID: UUID) -> [TabContextSnapshot] {
+            var removed: [TabContextSnapshot] = []
             let clientNames = Array(storage.keys)
 
             for clientName in clientNames {
@@ -570,7 +525,7 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    private func recordLastContext(clientName: String, context: TabScopedContext) {
+    private func recordLastContext(clientName: String, context: TabContextSnapshot) {
         var perWindow = lastContextByClientAndWindow[clientName] ?? [:]
         perWindow[context.windowID] = context
         lastContextByClientAndWindow[clientName] = perWindow
@@ -582,7 +537,7 @@ extension MCPServerViewModel {
         clientName: String,
         windowID: Int,
         runHint: UUID?
-    ) -> (context: TabScopedContext?, remaining: Int, usedRunHint: Bool) {
+    ) -> (context: TabContextSnapshot?, remaining: Int, usedRunHint: Bool) {
         guard let runHint else {
             return (nil, store.queueLength(clientName: clientName, windowID: windowID), false)
         }
@@ -596,7 +551,7 @@ extension MCPServerViewModel {
         connectionID: UUID,
         clientName: String?,
         providedWindowID: Int?,
-        bound: TabScopedContext
+        bound: TabContextSnapshot
     ) -> Bool {
         // Always keep bindings tied to an active discovery run – they manage their own lifecycle.
         if bound.runID != nil {
@@ -655,7 +610,7 @@ extension MCPServerViewModel {
     @MainActor
     private func readFileAutoSelectionContextKey(
         connectionID: UUID,
-        context: TabScopedContext
+        context: TabContextSnapshot
     ) -> MCPReadFileAutoSelectionCoordinator.ContextKey {
         MCPReadFileAutoSelectionCoordinator.ContextKey(
             windowID: context.windowID,
@@ -667,13 +622,13 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    private func activateReadFileAutoSelection(_ context: inout TabScopedContext) {
+    private func activateReadFileAutoSelection(_ context: inout TabContextSnapshot) {
         nextReadFileAutoSelectionBindingGeneration &+= 1
         context.readFileAutoSelectionGeneration = nextReadFileAutoSelectionBindingGeneration
     }
 
     @MainActor
-    private func invalidateReadFileAutoSelection(connectionID: UUID, context: TabScopedContext) {
+    private func invalidateReadFileAutoSelection(connectionID: UUID, context: TabContextSnapshot) {
         let key = readFileAutoSelectionContextKey(connectionID: connectionID, context: context)
         evictReadFileAutoSelectionCoverageCertificate(for: key)
         #if DEBUG
@@ -702,7 +657,7 @@ extension MCPServerViewModel {
         publishDomainRoutingRelease(connectionID: connectionID)
         invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
         endMirroringForConnection(connectionID)
-        windowIDByConnection.removeValue(forKey: connectionID)
+        presentationWindowByConnection.removeValue(forKey: connectionID)
         let updatedMappings = Self.runMappingsAfterBindingRelease(
             contextRunID: context.runID,
             connectionID: connectionID,
@@ -738,7 +693,7 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    private func beginMirroringForConnection(_ connectionID: UUID, context: TabScopedContext) {
+    private func beginMirroringForConnection(_ connectionID: UUID, context: TabContextSnapshot) {
         if tabContextCancellablesByConnectionID[connectionID] != nil { return }
 
         guard let manager = workspaceManager else {
@@ -834,7 +789,7 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    private func pushVirtualContextToUI(_ context: TabScopedContext) async {
+    private func pushVirtualContextToUI(_ context: TabContextSnapshot) async {
         // `commitTabContext` already recounts when it applies the active tab. Avoid a
         // duplicate immediate recount after the heavy file-selector projection.
         await commitTabContext(context)
@@ -891,7 +846,7 @@ extension MCPServerViewModel {
             )
         }
 
-        if let mappedWindowID = windowIDByConnection[connectionID],
+        if let mappedWindowID = presentationWindowByConnection[connectionID],
            mappedWindowID == windowID
         {
             let workspace = workspaceManager?.activeWorkspace
@@ -1207,14 +1162,14 @@ extension MCPServerViewModel {
         activateReadFileAutoSelection(&context)
         tabContextByConnectionID[connectionID] = context
         publishDomainRoutingBinding(connectionID: connectionID, context: context)
-        windowIDByConnection[connectionID] = windowID
+        presentationWindowByConnection[connectionID] = windowID
         if let runID {
             let mappingSucceeded = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: windowID)
             guard mappingSucceeded else {
                 fileToolLookupContextCacheByConnectionID.removeValue(forKey: connectionID)
                 pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)?.task.cancel()
                 tabContextByConnectionID.removeValue(forKey: connectionID)
-                windowIDByConnection.removeValue(forKey: connectionID)
+                presentationWindowByConnection.removeValue(forKey: connectionID)
                 throw TabBindError.runMappingRejected(runID)
             }
         }
@@ -1362,7 +1317,7 @@ extension MCPServerViewModel {
             activateReadFileAutoSelection(&context)
             tabContextByConnectionID[uuid] = context
             publishDomainRoutingBinding(connectionID: uuid, context: context)
-            windowIDByConnection[uuid] = context.windowID
+            presentationWindowByConnection[uuid] = context.windowID
             var pendingPolicyToken: PendingPolicyRunIDMappingToken?
             if let runID = context.runID {
                 if deferRunIDReplacementForPendingPolicy {
@@ -1404,7 +1359,7 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    private func enqueuePendingContext(_ context: TabScopedContext, clientName: String, windowID: Int) {
+    private func enqueuePendingContext(_ context: TabContextSnapshot, clientName: String, windowID: Int) {
         guard let runID = context.runID else {
             tabContextLog("enqueuePendingContext skipped runless context clientName=\(clientName) window=\(windowID) tab=\(context.tabID)")
             return
@@ -1420,13 +1375,13 @@ extension MCPServerViewModel {
         clientName: String,
         windowID: Int,
         connectionID: UUID
-    ) -> TabScopedContext? {
+    ) -> TabContextSnapshot? {
         let queueBefore = pendingRunScopedTabContexts.queueLength(clientName: clientName, windowID: windowID)
         let runHint = connectionIDToRunID[connectionID]
 
         // Only set a hint mapping if we don't already have one; do not override
-        if windowIDByConnection[connectionID] == nil {
-            windowIDByConnection[connectionID] = windowID
+        if presentationWindowByConnection[connectionID] == nil {
+            presentationWindowByConnection[connectionID] = windowID
         }
         if let runID = runHint,
            let previousConnection = connectionIDByRunID[runID],
@@ -1442,11 +1397,11 @@ extension MCPServerViewModel {
                 invalidateReadFileAutoSelection(connectionID: previousConnection, context: existing)
                 endMirroringForConnection(previousConnection)
                 connectionIDToRunID.removeValue(forKey: previousConnection)
-                windowIDByConnection.removeValue(forKey: previousConnection)
+                presentationWindowByConnection.removeValue(forKey: previousConnection)
                 var rebound = existing
                 activateReadFileAutoSelection(&rebound)
                 tabContextByConnectionID[connectionID] = rebound
-                windowIDByConnection[connectionID] = rebound.windowID
+                presentationWindowByConnection[connectionID] = rebound.windowID
                 _ = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: rebound.windowID)
                 recordLastContext(clientName: clientName, context: rebound)
                 beginMirroringForConnection(connectionID, context: rebound)
@@ -1477,7 +1432,7 @@ extension MCPServerViewModel {
         activateReadFileAutoSelection(&context)
         tabContextByConnectionID[connectionID] = context
         publishDomainRoutingBinding(connectionID: connectionID, context: context)
-        windowIDByConnection[connectionID] = context.windowID
+        presentationWindowByConnection[connectionID] = context.windowID
         if let runID = context.runID {
             let mappingSucceeded = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: context.windowID)
             // If we successfully registered the mapping, or if the initial runHint matched, count it as used
@@ -1497,7 +1452,7 @@ extension MCPServerViewModel {
         let clientName: String?
         let windowID: Int?
         /// Run purpose known at request capture time. Agent Mode / run-scoped calls
-        /// must fail closed instead of using active-tab compatibility.
+        /// must fail closed instead of inferring a mutable presentation tab.
         let runPurpose: MCPRunPurpose?
         /// One-shot dispatch-level tab-context hint from context_id / legacy _tabID.
         /// This is not a sticky connection binding; resolvers validate it against any
@@ -1569,98 +1524,15 @@ extension MCPServerViewModel {
 
     struct ResolvedTabContextSnapshot {
         var snapshot: TabContextSnapshot
-        let usesActiveTabCompatibility: Bool
         let source: TabContextSnapshotSource?
 
         init(
             snapshot: TabContextSnapshot,
-            usesActiveTabCompatibility: Bool,
             source: TabContextSnapshotSource? = nil
         ) {
             self.snapshot = snapshot
-            self.usesActiveTabCompatibility = usesActiveTabCompatibility
             self.source = source
         }
-    }
-
-    nonisolated static func activeTabCompatibilityFallbackDecision(
-        policy: TabContextResolutionPolicy,
-        fallbackEnabled: Bool,
-        hasRunScopedContext: Bool,
-        runPurpose: MCPRunPurpose?
-    ) -> ActiveTabCompatibilityFallbackDecision {
-        guard policy.allowsActiveTabCompatibility else { return .notAllowedByPolicy }
-        if hasRunScopedContext || runPurpose == .agentModeRun || runPurpose == .discoverRun {
-            return .prohibitedForRunScoped(runPurpose)
-        }
-        guard fallbackEnabled else { return .disabled }
-        return .allowed
-    }
-
-    @MainActor
-    func setActiveTabCompatibilityFallbackEnabled(_ enabled: Bool) {
-        activeTabCompatibilityFallbackEnabled = enabled
-    }
-
-    @MainActor
-    func clearActiveTabCompatibilityFallbackDiagnostics() {
-        activeTabCompatibilityFallbackDiagnostics.removeAll()
-    }
-
-    @MainActor
-    private func recordActiveTabCompatibilityFallbackDiagnostic(
-        toolName: String,
-        connectionID: UUID?,
-        windowID: Int?,
-        clientName: String?,
-        outcome: ActiveTabCompatibilityFallbackDiagnostic.Outcome,
-        message: String
-    ) {
-        let diagnostic = ActiveTabCompatibilityFallbackDiagnostic(
-            toolName: toolName,
-            connectionID: connectionID,
-            windowID: windowID,
-            clientName: clientName,
-            outcome: outcome,
-            message: message,
-            timestamp: Date()
-        )
-        activeTabCompatibilityFallbackDiagnostics.append(diagnostic)
-        if activeTabCompatibilityFallbackDiagnostics.count > 100 {
-            activeTabCompatibilityFallbackDiagnostics.removeFirst(activeTabCompatibilityFallbackDiagnostics.count - 100)
-        }
-        tabContextLog("active-tab compatibility \(outcome.rawValue): tool=\(toolName) connectionID=\(connectionID?.uuidString ?? "nil") window=\(windowID.map(String.init) ?? "nil") client=\(clientName ?? "nil") message=\(message)")
-    }
-
-    @MainActor
-    func activeTabCompatibilitySnapshot(
-        metadata: RequestMetadata,
-        toolName: String
-    ) throws -> TabContextSnapshot {
-        guard let manager = workspaceManager else {
-            throw TabBindError.missingWorkspace
-        }
-        guard let workspace = manager.activeWorkspace else {
-            throw TabBindError.missingWorkspace
-        }
-        guard let tabID = workspace.activeComposeTabID ?? workspace.composeTabs.first?.id else {
-            throw TabBindError.tabNotFound(UUID())
-        }
-        let resolvedWindowID = metadata.windowID
-            ?? metadata.connectionID.flatMap { windowIDByConnection[$0] }
-            ?? windowID
-        let runID = metadata.connectionID.flatMap { connectionIDToRunID[$0] }
-        let snapshot = try makeTabContextSnapshot(
-            tabID: tabID,
-            workspaceID: workspace.id,
-            windowID: resolvedWindowID,
-            runID: runID,
-            explicitlyBound: false,
-            captureActiveUIState: true,
-            flushActiveSelection: true
-        )
-        tabContextLog("active-tab compatibility snapshot for \(toolName) tab=\(snapshot.tabID) window=\(snapshot.windowID)")
-        return snapshot
     }
 
     @MainActor
@@ -1681,14 +1553,7 @@ extension MCPServerViewModel {
         case let .tabContextSnapshot(snapshot, source):
             ResolvedTabContextSnapshot(
                 snapshot: snapshot,
-                usesActiveTabCompatibility: false,
                 source: source
-            )
-        case .activeTabCompatibility:
-            try ResolvedTabContextSnapshot(
-                snapshot: activeTabCompatibilitySnapshot(metadata: metadata, toolName: toolName),
-                usesActiveTabCompatibility: true,
-                source: nil
             )
         }
     }
@@ -1918,8 +1783,7 @@ extension MCPServerViewModel {
             )
         }
 
-        if !resolved.usesActiveTabCompatibility,
-           let canonicalSelection = verification.canonicalSelection,
+        if let canonicalSelection = verification.canonicalSelection,
            canonicalSelection == verification.expectedSelection,
            MCPTabContextSelectionMirrorPolicy.isExplicitAutoReset(canonicalSelection)
         {
@@ -1929,8 +1793,7 @@ extension MCPServerViewModel {
                 canonicalSelection: canonicalSelection,
                 metadata: metadata
             )
-        } else if !resolved.usesActiveTabCompatibility,
-                  let canonicalSelection = verification.canonicalSelection,
+        } else if let canonicalSelection = verification.canonicalSelection,
                   canonicalSelection == verification.expectedSelection,
                   let connectionID = metadata.connectionID,
                   let latest = tabContextByConnectionID[connectionID],
@@ -1962,7 +1825,6 @@ extension MCPServerViewModel {
         metadata: RequestMetadata
     ) {
         guard MCPTabContextSelectionMirrorPolicy.isExplicitAutoReset(canonicalSelection),
-              !resolvedContext.usesActiveTabCompatibility,
               resolvedContext.source != nil,
               let connectionID = metadata.connectionID,
               var latest = tabContextByConnectionID[connectionID],
@@ -2158,7 +2020,7 @@ extension MCPServerViewModel {
         var resolved = try? resolveTabContextSnapshot(
             from: metadata,
             toolName: "file_tool_lookup_scope",
-            policy: .allowLegacyImplicitRouting
+            policy: .requireExplicitOrRunScoped
         )
         if var snapshot = resolved?.snapshot {
             if snapshot.runID == nil,
@@ -2238,11 +2100,6 @@ extension MCPServerViewModel {
             }
             return WorkspaceLookupContext(rootScope: baseScope, bindingProjection: nil)
         }
-        if resolved.usesActiveTabCompatibility,
-           resolved.snapshot.activeAgentSessionID == nil
-        {
-            return WorkspaceLookupContext(rootScope: baseScope, bindingProjection: nil)
-        }
         if let frozenLookupContext = resolved.snapshot.frozenLookupContext {
             return frozenLookupContext
         }
@@ -2252,7 +2109,6 @@ extension MCPServerViewModel {
             worktreeBindingState: resolved.snapshot.worktreeBindingState
         )
         guard let connectionID = metadata.connectionID,
-              !resolved.usesActiveTabCompatibility,
               let boundSnapshot = tabContextByConnectionID[connectionID],
               fileToolLookupSnapshotMatches(boundSnapshot, resolved.snapshot),
               source.activeAgentSessionID != nil,
@@ -2486,17 +2342,16 @@ extension MCPServerViewModel {
         var resolvedContext = try resolveTabContextSnapshot(
             from: metadata,
             toolName: toolName,
-            policy: .allowLegacyImplicitRouting
+            policy: .requireExplicitOrRunScoped
         )
         let lookupContext = await resolveFileToolLookupContext(from: metadata)
-        if !resolvedContext.usesActiveTabCompatibility,
-           resolvedContext.snapshot.activeAgentSessionID != nil,
+        if resolvedContext.snapshot.activeAgentSessionID != nil,
            case .unhydrated = resolvedContext.snapshot.worktreeBindingState
         {
             resolvedContext = try resolveTabContextSnapshot(
                 from: metadata,
                 toolName: toolName,
-                policy: .allowLegacyImplicitRouting
+                policy: .requireExplicitOrRunScoped
             )
         }
         return (resolvedContext, lookupContext)
@@ -2600,7 +2455,6 @@ extension MCPServerViewModel {
     ) -> WorkspaceLookupRootScope {
         if purpose == .discoverRun,
            let resolvedContext,
-           !resolvedContext.usesActiveTabCompatibility,
            resolvedContext.snapshot.runID != nil
         {
             return .visibleWorkspacePlusGitData
@@ -2624,15 +2478,14 @@ extension MCPServerViewModel {
     private static func isExactRunScopedTabContext(
         _ resolvedContext: ResolvedTabContextSnapshot
     ) -> Bool {
-        guard !resolvedContext.usesActiveTabCompatibility,
-              resolvedContext.snapshot.runID != nil
+        guard resolvedContext.snapshot.runID != nil
         else {
             return false
         }
         switch resolvedContext.source {
         case .runInstall, .runHandover, .pendingRunScoped:
             return true
-        case .explicitBinding, .implicitBindingCompatibility, .explicitHint, nil:
+        case .explicitBinding, .restoredBinding, .explicitHint, nil:
             return false
         }
     }
@@ -2668,7 +2521,7 @@ extension MCPServerViewModel {
         let resolvedContext = try? resolveTabContextSnapshot(
             from: metadata,
             toolName: "agent_session_spawn_source",
-            policy: .allowLegacyImplicitRouting
+            policy: .requireExplicitOrRunScoped
         )
         return Self.spawnParentSourceTabIDForAgentSessionCreation(
             purpose: purpose,
@@ -2830,14 +2683,9 @@ extension MCPServerViewModel {
                 toolName: "agent_run.start review source",
                 policy: .requireExplicitOrRunScoped
             )
-            guard !resolved.usesActiveTabCompatibility else {
-                throw MCPError.invalidParams(
-                    "agent_run.start review packaging requires an exact tab context; active-tab compatibility is not allowed."
-                )
-            }
             if isRunScoped, !Self.isExactRunScopedTabContext(resolved) {
                 throw MCPError.invalidParams(
-                    "agent_run.start was invoked from a run-scoped connection without an exact run tab. Refusing active-tab fallback."
+                    "agent_run.start was invoked from a run-scoped connection without an exact run tab."
                 )
             }
             route = isRunScoped ? .runScoped : .explicitTabContext
@@ -2865,7 +2713,6 @@ extension MCPServerViewModel {
                     captureActiveUIState: true,
                     flushActiveSelection: true
                 ),
-                usesActiveTabCompatibility: false,
                 source: nil
             )
             route = .windowOnlyActiveCompose
@@ -2958,25 +2805,9 @@ extension MCPServerViewModel {
             "• Or pass a matching explicit tab context hint for this tool call"
     }
 
-    nonisolated static func activeTabCompatibilityDisabledMessage(toolName: String) -> String {
-        "Active-tab compatibility fallback is disabled for \(toolName). Bind explicitly instead:\n" +
-            "• Call 'bind_context' with op='list' to discover context_id values\n" +
-            "• Call 'bind_context' with op='bind' and the intended context_id before retrying\n" +
-            "• Or pass a matching context_id/_tabID hint on this tool call"
-    }
-
     private nonisolated static func agentModeRoutingRecoveryMessage(toolName: String) -> String {
         "RepoPrompt could not route \(toolName) to the active Agent Mode run. " +
             "Retry the tool call once. If it fails again, tell the user the RepoPrompt connection failed and ask them to restart this Agent Mode run."
-    }
-
-    nonisolated static func runScopedActiveTabCompatibilityMessage(toolName: String, runPurpose: MCPRunPurpose?) -> String {
-        if runPurpose == .agentModeRun {
-            return agentModeRoutingRecoveryMessage(toolName: toolName)
-        }
-        let purpose = runPurpose?.rawValue ?? "run-scoped"
-        return "Active-tab compatibility fallback is not allowed for \(toolName) during \(purpose) execution. " +
-            "Bind the MCP connection to its invoking tab context with bind_context/context_id, or retry after run-scoped routing is established."
     }
 
     private static func hint(_ hint: TabContextHint, matches context: TabContextSnapshot) -> Bool {
@@ -3001,7 +2832,7 @@ extension MCPServerViewModel {
         }
 
         if let windowID = providedWindowID {
-            windowIDByConnection[connectionID] = windowIDByConnection[connectionID] ?? windowID
+            presentationWindowByConnection[connectionID] = presentationWindowByConnection[connectionID] ?? windowID
             guard existing.windowID == windowID else {
                 tabContextLog("resolveTabContext handover skipped (window mismatch) runID=\(runID) prevWindow=\(existing.windowID) newWindow=\(windowID)")
                 return nil
@@ -3016,12 +2847,12 @@ extension MCPServerViewModel {
         invalidateReadFileAutoSelection(connectionID: previousConnection, context: existing)
         endMirroringForConnection(previousConnection)
         connectionIDToRunID.removeValue(forKey: previousConnection)
-        windowIDByConnection.removeValue(forKey: previousConnection)
+        presentationWindowByConnection.removeValue(forKey: previousConnection)
 
         var rebound = existing
         activateReadFileAutoSelection(&rebound)
         tabContextByConnectionID[connectionID] = rebound
-        windowIDByConnection[connectionID] = rebound.windowID
+        presentationWindowByConnection[connectionID] = rebound.windowID
         let mappingOK = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: rebound.windowID)
         if let clientName { recordLastContext(clientName: clientName, context: rebound) }
         beginMirroringForConnection(connectionID, context: rebound)
@@ -3043,7 +2874,7 @@ extension MCPServerViewModel {
         // Prefer network-provided window ID, but if it's missing and we've
         // already learned the mapping for this connection, use our mapping.
         var resolvedWindowID = providedWindowID
-        if resolvedWindowID == nil, let cid = connectionID, let mapped = windowIDByConnection[cid] {
+        if resolvedWindowID == nil, let cid = connectionID, let mapped = presentationWindowByConnection[cid] {
             resolvedWindowID = mapped
             tabContextLog("resolveTabContext used stored window mapping for connectionID=\(cid) window=\(mapped)")
         }
@@ -3068,10 +2899,10 @@ extension MCPServerViewModel {
                     throw MCPError.invalidParams("Explicit tab context hint for \(toolName) targets tab \(explicitHint.tabID), but this connection is already bound to tab \(bound.tabID). Clear or intentionally rebind the connection before targeting a different tab context.")
                 }
                 if let hinted = resolvedWindowID {
-                    if let existing = windowIDByConnection[connectionID], existing != hinted {
+                    if let existing = presentationWindowByConnection[connectionID], existing != hinted {
                         tabContextLog("resolveTabContext ignoring mismatched window hint for bound connectionID=\(connectionID) existing=\(existing) hinted=\(hinted)")
-                    } else if windowIDByConnection[connectionID] == nil {
-                        windowIDByConnection[connectionID] = hinted
+                    } else if presentationWindowByConnection[connectionID] == nil {
+                        presentationWindowByConnection[connectionID] = hinted
                     }
                 }
                 if startMirroring {
@@ -3080,7 +2911,7 @@ extension MCPServerViewModel {
                 tabContextLog("resolveTabContext using bound context connectionID=\(connectionID) runID=\(bound.runID?.uuidString ?? "nil") tab=\(bound.tabID)")
                 let source: TabContextSnapshotSource = {
                     if bound.runID != nil { return .runInstall }
-                    return bound.explicitlyBound ? .explicitBinding : .implicitBindingCompatibility
+                    return bound.explicitlyBound ? .explicitBinding : .restoredBinding
                 }()
                 return .tabContextSnapshot(bound, source: source)
             } else {
@@ -3131,52 +2962,7 @@ extension MCPServerViewModel {
             return .tabContextSnapshot(context, source: .pendingRunScoped)
         }
 
-        // 5) Named active-tab compatibility fallback for legacy, non-agent callers.
-        let hasRunScopedContext = connectionID.flatMap { connectionIDToRunID[$0] } != nil
-        switch Self.activeTabCompatibilityFallbackDecision(
-            policy: policy,
-            fallbackEnabled: activeTabCompatibilityFallbackEnabled,
-            hasRunScopedContext: hasRunScopedContext,
-            runPurpose: runPurpose
-        ) {
-        case .allowed:
-            let message = "Using temporary legacy active-tab compatibility fallback. Clients should bind explicitly with bind_context/context_id."
-            recordActiveTabCompatibilityFallbackDiagnostic(
-                toolName: toolName,
-                connectionID: connectionID,
-                windowID: resolvedWindowID,
-                clientName: clientName,
-                outcome: .allowed,
-                message: message
-            )
-            return .activeTabCompatibility
-        case .disabled:
-            let message = Self.activeTabCompatibilityDisabledMessage(toolName: toolName)
-            recordActiveTabCompatibilityFallbackDiagnostic(
-                toolName: toolName,
-                connectionID: connectionID,
-                windowID: resolvedWindowID,
-                clientName: clientName,
-                outcome: .disabled,
-                message: message
-            )
-            throw MCPError.invalidParams(message)
-        case let .prohibitedForRunScoped(prohibitedPurpose):
-            let message = Self.runScopedActiveTabCompatibilityMessage(toolName: toolName, runPurpose: prohibitedPurpose)
-            recordActiveTabCompatibilityFallbackDiagnostic(
-                toolName: toolName,
-                connectionID: connectionID,
-                windowID: resolvedWindowID,
-                clientName: clientName,
-                outcome: .prohibitedForRunScoped,
-                message: message
-            )
-            throw MCPError.invalidParams(message)
-        case .notAllowedByPolicy:
-            break
-        }
-
-        // 6) Fail closed with routing guidance.
+        // The final runtime never infers domain context from a mutable active tab.
         throw MCPError.invalidParams(Self.tabContextRoutingErrorMessage(toolName: toolName, runPurpose: runPurpose))
     }
 
@@ -3203,7 +2989,7 @@ extension MCPServerViewModel {
             guard case let .tabContextSnapshot(context, _) = resolution else {
                 throw MCPError.invalidParams(Self.tabContextRoutingErrorMessage(toolName: toolName, runPurpose: purpose))
             }
-            windowIDByConnection[connectionID] = context.windowID
+            presentationWindowByConnection[connectionID] = context.windowID
             beginMirroringForConnection(connectionID, context: context)
             return (connectionID, context)
         } catch {
@@ -3218,7 +3004,7 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    func requireCurrentTabContext(toolName: String) async throws -> TabScopedContext {
+    func requireCurrentTabContext(toolName: String) async throws -> TabContextSnapshot {
         let (_, context) = try await contextForCurrentRequest(toolName: toolName)
         return context
     }
@@ -3416,7 +3202,7 @@ extension MCPServerViewModel {
         expected: TabContextSnapshot
     ) -> Bool {
         guard let workspaceID = expected.workspaceID,
-              windowIDByConnection[connectionID] == expected.windowID,
+              presentationWindowByConnection[connectionID] == expected.windowID,
               let manager = workspaceManager,
               manager.activeWorkspaceID == workspaceID,
               let tab = manager.composeTab(with: expected.tabID)
@@ -3644,7 +3430,7 @@ extension MCPServerViewModel {
         clientName: String,
         windowID: Int,
         runHint: UUID?
-    ) -> (context: TabScopedContext?, remaining: Int, usedRunHint: Bool) {
+    ) -> (context: TabContextSnapshot?, remaining: Int, usedRunHint: Bool) {
         popPendingContextForBinding(
             from: &store,
             clientName: clientName,
@@ -3718,7 +3504,7 @@ extension MCPServerViewModel {
            connectionIDToRunID[connectionID] == runID
         {
             pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: runID)
-            windowIDByConnection[connectionID] = windowID
+            presentationWindowByConnection[connectionID] = windowID
             if signalRouting {
                 MCPRoutingWaiter.signalRouted(runID)
             }
@@ -3737,7 +3523,7 @@ extension MCPServerViewModel {
         if let existingConnection = connectionIDByRunID[runID],
            existingConnection != connectionID
         {
-            let existingWindow = windowIDByConnection[existingConnection]
+            let existingWindow = presentationWindowByConnection[existingConnection]
             if let existingWindow, existingWindow != windowID {
                 tabContextLog("registerRunIDMapping refused window mismatch runID=\(runID) existingWindow=\(existingWindow) newWindow=\(windowID)")
                 return false
@@ -3759,7 +3545,7 @@ extension MCPServerViewModel {
             // Avoid dangling reverse mapping for stale run
             connectionIDByRunID.removeValue(forKey: previous)
         }
-        windowIDByConnection[connectionID] = windowID
+        presentationWindowByConnection[connectionID] = windowID
         connectionIDByRunID[runID] = connectionID
         connectionIDToRunID[connectionID] = runID
         pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: runID)
@@ -3789,7 +3575,7 @@ extension MCPServerViewModel {
         let displacedConnectionID = connectionIDByRunID[runID]
         if let displacedConnectionID,
            displacedConnectionID != connectionID,
-           let existingWindow = windowIDByConnection[displacedConnectionID],
+           let existingWindow = presentationWindowByConnection[displacedConnectionID],
            existingWindow != windowID
         {
             tabContextLog("registerPendingPolicyRunIDMapping refused window mismatch runID=\(runID) existingWindow=\(existingWindow) newWindow=\(windowID)")
@@ -3807,7 +3593,7 @@ extension MCPServerViewModel {
             previousRunID: previousRunID,
             previousRunPrimaryConnectionID: previousRunID.flatMap { connectionIDByRunID[$0] },
             previousPendingPolicyTokenID: previousRunID.flatMap { pendingPolicyRunIDMappingTokenIDByRunID[$0] },
-            previousWindowID: windowIDByConnection[connectionID]
+            previousWindowID: presentationWindowByConnection[connectionID]
         )
         installReadFileAutoSelectionHandoverLineage(for: token)
 
@@ -3822,7 +3608,7 @@ extension MCPServerViewModel {
             connectionIDByRunID.removeValue(forKey: previousRunID)
             pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: previousRunID)
         }
-        windowIDByConnection[connectionID] = windowID
+        presentationWindowByConnection[connectionID] = windowID
         connectionIDByRunID[runID] = connectionID
         connectionIDToRunID[connectionID] = runID
         pendingPolicyRunIDMappingTokenIDByRunID[runID] = token.id
@@ -3967,9 +3753,9 @@ extension MCPServerViewModel {
             connectionIDToRunID[token.connectionID] == $0
         } ?? true
         if restoredPreviousRun, let previousWindowID = token.previousWindowID {
-            windowIDByConnection[token.connectionID] = previousWindowID
+            presentationWindowByConnection[token.connectionID] = previousWindowID
         } else {
-            windowIDByConnection.removeValue(forKey: token.connectionID)
+            presentationWindowByConnection.removeValue(forKey: token.connectionID)
         }
 
         if signalRoutingFailure, liveConnectionID(forRunID: token.runID) == nil {
@@ -3981,7 +3767,7 @@ extension MCPServerViewModel {
     @MainActor
     func updateCurrentTabContext(
         toolName: String,
-        mutation: (inout TabScopedContext) -> Void
+        mutation: (inout TabContextSnapshot) -> Void
     ) async throws {
         var (connectionID, context) = try await contextForCurrentRequest(toolName: toolName)
         let previousPrompt = context.promptText
@@ -4102,7 +3888,7 @@ extension MCPServerViewModel {
         fileToolLookupContextCacheByConnectionID.removeValue(forKey: connectionID)
         pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)?.task.cancel()
         tabContextByConnectionID.removeValue(forKey: connectionID)
-        windowIDByConnection.removeValue(forKey: connectionID)
+        presentationWindowByConnection.removeValue(forKey: connectionID)
         connectionIDByRunID.removeValue(forKey: runID)
         pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: runID)
         connectionIDToRunID.removeValue(forKey: connectionID)
@@ -4288,7 +4074,7 @@ extension MCPServerViewModel {
         pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)?.task.cancel()
         tabContextByConnectionID.removeValue(forKey: connectionID)
         if !deferRunMappingCleanupUntilCaller {
-            windowIDByConnection.removeValue(forKey: connectionID)
+            presentationWindowByConnection.removeValue(forKey: connectionID)
             if let runID = commitOwnedContext.runID {
                 connectionIDByRunID.removeValue(forKey: runID)
             }
@@ -4382,7 +4168,7 @@ extension MCPServerViewModel {
                 fileToolLookupContextCacheByConnectionID.removeValue(forKey: connectionID)
                 pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)?.task.cancel()
                 tabContextByConnectionID.removeValue(forKey: connectionID)
-                windowIDByConnection.removeValue(forKey: connectionID)
+                presentationWindowByConnection.removeValue(forKey: connectionID)
 
                 if let boundRunID = context.runID,
                    connectionIDByRunID[boundRunID] == connectionID
@@ -4410,7 +4196,7 @@ extension MCPServerViewModel {
                     removedDeferredMapping = true
                 }
                 if removedDeferredMapping {
-                    windowIDByConnection.removeValue(forKey: connectionID)
+                    presentationWindowByConnection.removeValue(forKey: connectionID)
                     tabContextLog("removeTabContext removed deferred mapping connectionID=\(connectionID) runID=\(runID.uuidString)")
                 }
             }
@@ -4424,7 +4210,7 @@ extension MCPServerViewModel {
             }
             if let mappedConnection = connectionIDByRunID[runID] {
                 connectionIDToRunID.removeValue(forKey: mappedConnection)
-                windowIDByConnection.removeValue(forKey: mappedConnection)
+                presentationWindowByConnection.removeValue(forKey: mappedConnection)
             }
             connectionIDByRunID.removeValue(forKey: runID)
             pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: runID)
@@ -4457,7 +4243,7 @@ extension MCPServerViewModel {
 
     @MainActor
     private func commitTabContext(
-        _ context: TabScopedContext,
+        _ context: TabContextSnapshot,
         isStillCurrent: @MainActor () -> Bool = { true }
     ) async -> CommittedTabWrite? {
         guard isStillCurrent(), !Task.isCancelled else { return nil }

@@ -1415,7 +1415,7 @@
                 EditFlowPerf.Stage.MCPWindowToolCatalog.registrationUpdateWindowToolsEnabledDidSet,
                 EditFlowPerf.Stage.MCPWindowToolCatalog.registrationUpdateAgentBootstrap,
                 EditFlowPerf.Stage.MCPWindowToolCatalog.readinessWarmAccess,
-                EditFlowPerf.Stage.MCPWindowToolCatalog.serviceRegistryToolsPublication,
+                EditFlowPerf.Stage.MCPWindowToolCatalog.domainRegistrationToolsPublication,
                 EditFlowPerf.Stage.MCPWindowToolCatalog.codexTurnMCPServerEnable
             ] {
                 EditFlowPerf.measure(stage) {}
@@ -1435,7 +1435,7 @@
                     "EditFlow.MCPWindowToolCatalog.RegistrationUpdate.WindowToolsEnabledDidSet",
                     "EditFlow.MCPWindowToolCatalog.RegistrationUpdate.AgentBootstrap",
                     "EditFlow.MCPWindowToolCatalog.ReadinessWarmAccess",
-                    "EditFlow.MCPWindowToolCatalog.ServiceRegistryToolsPublication",
+                    "EditFlow.MCPAppToolCatalog.DomainRegistrationToolsPublication",
                     "EditFlow.MCPWindowToolCatalog.CodexTurnMCPServerEnable"
                 ])
             )
@@ -1455,7 +1455,7 @@
                     EditFlowPerf.Dimensions(toolName: "read_file", outcome: outcome)
                 ) {}
                 EditFlowPerf.measure(
-                    EditFlowPerf.Stage.MCPToolCall.legacyTabBindingCompatibility,
+                    EditFlowPerf.Stage.MCPToolCall.presentationContextResolution,
                     EditFlowPerf.Dimensions(toolName: "read_file", outcome: outcome)
                 ) {}
             }

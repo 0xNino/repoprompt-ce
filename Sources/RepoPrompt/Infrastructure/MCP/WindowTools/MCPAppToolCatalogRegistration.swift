@@ -2,26 +2,26 @@ import Foundation
 import RepoPromptDomainRuntime
 
 @MainActor
-protocol MCPWindowToolProviding {
-    var group: MCPWindowToolGroup { get }
+protocol MCPAppToolProviding {
+    var group: MCPAppToolGroup { get }
     func buildTools() -> [Tool]
 }
 
 @MainActor
-final class MCPWindowToolCatalogService: WindowScopedService {
+final class MCPAppToolCatalogRegistration: WindowScopedService {
     let domainRegistrationID = MCPDomainToolRegistrationID()
     let windowID: Int
 
-    private let providers: [any MCPWindowToolProviding]
+    private let providers: [any MCPAppToolProviding]
     private let sharedBindings: [MCPDomainToolBinding]
-    private let sharedBindingRuntime: MCPWindowToolRuntime?
+    private let runtime: MCPAppToolBinder
     private var toolsCache: [Tool]?
 
     init(
         windowID: Int,
-        providers: [any MCPWindowToolProviding],
+        providers: [any MCPAppToolProviding],
         sharedBindings: [MCPDomainToolBinding] = [],
-        sharedBindingRuntime: MCPWindowToolRuntime? = nil
+        runtime: MCPAppToolBinder
     ) {
         #if DEBUG || EDIT_FLOW_PERF
             let constructionState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.construction)
@@ -30,7 +30,7 @@ final class MCPWindowToolCatalogService: WindowScopedService {
         self.windowID = windowID
         self.providers = providers
         self.sharedBindings = sharedBindings
-        self.sharedBindingRuntime = sharedBindingRuntime
+        self.runtime = runtime
     }
 
     var longRunningInteractionAdapter: DomainLongRunningInteractionAdapter? {
@@ -50,34 +50,40 @@ final class MCPWindowToolCatalogService: WindowScopedService {
                 let materializationState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupWindowCatalogToolsMaterialization)
                 defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupWindowCatalogToolsMaterialization, materializationState) }
             #endif
-            var providersByGroup: [MCPWindowToolGroup: [any MCPWindowToolProviding]] = [:]
+            var providersByGroup: [MCPAppToolGroup: [any MCPAppToolProviding]] = [:]
             for provider in providers {
                 providersByGroup[provider.group, default: []].append(provider)
             }
-            let legacyTools = MCPWindowToolGroup.allCases.flatMap { group in
-                providersByGroup[group]?.flatMap { $0.buildTools() } ?? []
-            }
-            let sharedTools: [Tool]
+            let appAdapterBindings: [MCPDomainToolBinding]
             do {
-                if sharedBindings.isEmpty {
-                    sharedTools = []
-                } else {
-                    guard let sharedBindingRuntime else {
-                        preconditionFailure("Shared domain tool bindings require the app execution runtime")
-                    }
-                    sharedTools = try sharedBindings.map {
-                        try Tool(domainBinding: $0, runtime: sharedBindingRuntime)
-                    }
+                appAdapterBindings = try MCPAppToolGroup.allCases.flatMap { group in
+                    try providersByGroup[group]?.flatMap { provider in
+                        try provider.buildTools().map { try $0.domainBinding() }
+                    } ?? []
                 }
             } catch {
-                preconditionFailure("Invalid shared domain tool definition: \(error)")
+                preconditionFailure("Invalid app adapter tool definition: \(error)")
             }
-            var toolsByName: [String: Tool] = [:]
-            for tool in legacyTools + sharedTools {
-                precondition(toolsByName.updateValue(tool, forKey: tool.name) == nil, "Duplicate MCP tool definition: \(tool.name)")
+            var bindingsByName: [String: MCPDomainToolBinding] = [:]
+            for binding in appAdapterBindings + sharedBindings {
+                precondition(
+                    bindingsByName.updateValue(binding, forKey: binding.definition.name) == nil,
+                    "Duplicate MCP tool definition: \(binding.definition.name)"
+                )
             }
-            let built = MCPWindowToolGroup.orderedToolNames.compactMap { toolsByName[$0] }
-            precondition(built.count == toolsByName.count, "Window catalog contains a non-canonical MCP tool")
+            let orderedBindings = MCPAppToolGroup.orderedToolNames.compactMap { bindingsByName[$0] }
+            precondition(
+                orderedBindings.count == bindingsByName.count,
+                "App tool registration contains a non-canonical MCP tool"
+            )
+            let built: [Tool]
+            do {
+                built = try orderedBindings.map {
+                    try Tool(domainBinding: $0, runtime: runtime)
+                }
+            } catch {
+                preconditionFailure("Invalid canonical domain tool definition: \(error)")
+            }
             toolsCache = built
             return built
         }

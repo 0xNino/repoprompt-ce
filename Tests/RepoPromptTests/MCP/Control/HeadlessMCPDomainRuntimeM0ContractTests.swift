@@ -14,7 +14,7 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         let allTools = globals + windows
 
         XCTAssertEqual(globals, MCPGlobalToolName.orderedToolNames)
-        XCTAssertEqual(windows, MCPWindowToolGroup.orderedToolNames)
+        XCTAssertEqual(windows, MCPAppToolGroup.orderedToolNames)
         XCTAssertEqual(allTools.count, 27)
         XCTAssertEqual(Set(allTools).count, allTools.count)
 
@@ -41,11 +41,11 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
             try strings(protectedMutations, key: "gate_4b_families"),
             ["file_actions", "apply_edits", "manage_worktree"]
         )
-        let registrySource = try source("Sources/RepoPrompt/Infrastructure/MCP/ServiceRegistry.swift")
+        let registrySource = try source("Sources/RepoPrompt/App/AppDomainRuntimeRegistration.swift")
         XCTAssertTrue(registrySource.contains("protectedMutationProvider.protectedBinding"))
         XCTAssertEqual(registrySource.components(separatedBy: "protectedMutationProvider.protectedBinding").count - 1, 1)
         let compositionSource = try source("Sources/RepoPrompt/App/AppDomainRuntimeComposition.swift")
-        XCTAssertTrue(compositionSource.contains("protectedMutationStage: .m4B"))
+        XCTAssertFalse(compositionSource.contains("protectedMutationStage"))
 
         let window = makeWindowWithoutAutoStart()
         addTeardownBlock { @MainActor in
@@ -243,8 +243,8 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         let dependencies = try dictionary(manifest, key: "dependencies")
         let expectedDependencies = try strings(dependencies, key: "stored_dependencies")
         let sourceDependencies = try storedPropertyNames(
-            inStructNamed: "MCPWindowToolDependencies",
-            source: source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolDependencies.swift")
+            inStructNamed: "MCPAppPhysicalCapabilityAdapters",
+            source: source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAppPhysicalCapabilityAdapters.swift")
         )
         XCTAssertEqual(sourceDependencies, expectedDependencies)
         XCTAssertEqual(expectedDependencies.count, try integer(dependencies, key: "stored_dependency_count"))
@@ -522,12 +522,12 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
             let hops = try XCTUnwrap(perToolHops[tool], tool)
             XCTAssertFalse(hops.isEmpty, tool)
             XCTAssertTrue(Set(hops).isSubset(of: inventoriedSymbols), tool)
-            if MCPWindowToolGroup.orderedToolNames.contains(tool) {
+            if MCPAppToolGroup.orderedToolNames.contains(tool) {
                 XCTAssertTrue(hops.contains("MCPServerViewModel"), tool)
                 let marker = "name: MCPWindowToolName.\(swiftToolIdentifier(tool))"
                 if m3SharedReadTools.contains(tool) {
                     XCTAssertTrue(hops.contains("MCPDomainReadToolProvider"), tool)
-                    XCTAssertTrue(hops.contains("MCPWindowToolRuntime"), tool)
+                    XCTAssertTrue(hops.contains("MCPAppToolBinder"), tool)
                     XCTAssertNotNil(
                         MCPDomainCanonicalToolDefinitions.definition(named: tool),
                         "\(tool) shared schema"
@@ -542,7 +542,7 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
                         XCTAssertFalse(try providerPaths.contains { try source($0).contains(marker) }, "\(tool) duplicate schema in \(provider)")
                     }
                 } else {
-                    XCTAssertTrue(hops.contains("MCPWindowToolRuntime"), tool)
+                    XCTAssertTrue(hops.contains("MCPAppToolBinder"), tool)
                     let provider = try XCTUnwrap(hops.first { $0.hasSuffix("ToolProvider") }, tool)
                     let providerPaths = expectedLocalSiteRows.compactMap { site -> String? in
                         guard (site["symbol"] as? String) == provider else { return nil }

@@ -2,10 +2,9 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 
-/// Constructor-time dependency bundle for extracted window-tool providers.
-///
-/// Providers receive narrow services/closures instead of an
-/// `MCPServerViewModel` reference.
+/// Explicit app-process physical capability adapters used by domain-owned tool bindings.
+/// Presentation and AppKit interactions remain on MainActor; schema, policy, and catalog
+/// authority remain in RepoPromptDomainRuntime.
 struct MCPFileActionMutationAcknowledgement {
     let warning: String?
     let operationID: String
@@ -13,7 +12,7 @@ struct MCPFileActionMutationAcknowledgement {
     let freshness: String
 }
 
-struct MCPWindowToolDependencies {
+struct MCPAppPhysicalCapabilityAdapters {
     struct ContextBuilderTabResolution {
         let identity: WorkspaceSelectionIdentity
         let nestedTabContext: MCPServerViewModel.TabContextSnapshot
@@ -43,7 +42,7 @@ struct MCPWindowToolDependencies {
         _ rootScope: WorkspaceLookupRootScope
     ) async throws -> SearchResults
     typealias RequireTargetWindow = @MainActor @Sendable () throws -> WindowState
-    typealias RequireCurrentTabContext = @MainActor @Sendable (_ toolName: String) async throws -> MCPServerViewModel.TabScopedContext
+    typealias RequireCurrentTabContext = @MainActor @Sendable (_ toolName: String) async throws -> MCPServerViewModel.TabContextSnapshot
     typealias RequireAgentModeConnection = @Sendable (_ toolName: String) async throws -> UUID
     typealias ResolveAgentModeTabID = @Sendable (_ args: [String: Value], _ connectionID: UUID?) async throws -> UUID
     typealias ResolveContextBuilderTab = @MainActor @Sendable (
@@ -121,7 +120,7 @@ struct MCPWindowToolDependencies {
     ) throws -> MCPServerViewModel.ResolvedTabContextSnapshot
     typealias UpdateCurrentTabContext = @MainActor @Sendable (
         _ toolName: String,
-        _ mutation: (inout MCPServerViewModel.TabScopedContext) -> Void
+        _ mutation: (inout MCPServerViewModel.TabContextSnapshot) -> Void
     ) async throws -> Void
     typealias SelectedRecordsForCurrentTabContext = @MainActor @Sendable (
         _ metadata: MCPServerViewModel.RequestMetadata,
@@ -156,7 +155,7 @@ struct MCPWindowToolDependencies {
         _ toolName: String
     ) async -> Void
     typealias FreezePromptGitReviewContext = @MainActor @Sendable (
-        _ context: MCPServerViewModel.TabScopedContext
+        _ context: MCPServerViewModel.TabContextSnapshot
     ) async -> FrozenPromptGitReviewContext
     typealias ParseManageSelectionInputs = @Sendable (_ rawPaths: [String], _ slicesValue: Value?) -> MCPServerViewModel.ManageSelectionInputs
     typealias ResolveFileToolLookupContext = @MainActor @Sendable (_ metadata: MCPServerViewModel.RequestMetadata) async -> WorkspaceLookupContext
@@ -167,7 +166,7 @@ struct MCPWindowToolDependencies {
         resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot,
         lookupContext: WorkspaceLookupContext
     )
-    typealias StabilizedVirtualSelection = @MainActor @Sendable (_ context: MCPServerViewModel.TabScopedContext) async -> StoredSelection
+    typealias StabilizedVirtualSelection = @MainActor @Sendable (_ context: MCPServerViewModel.TabContextSnapshot) async -> StoredSelection
     typealias BuildCurrentSelectionReply = @MainActor @Sendable (
         _ includeBlocks: Bool,
         _ display: FilePathDisplay,
@@ -184,7 +183,7 @@ struct MCPWindowToolDependencies {
         _ viewMode: String?,
         _ codeMapUsageOverride: CodeMapUsage?,
         _ lookupContext: WorkspaceLookupContext,
-        _ virtualContext: MCPServerViewModel.TabScopedContext?,
+        _ virtualContext: MCPServerViewModel.TabContextSnapshot?,
         _ reviewGitContext: FrozenPromptGitReviewContext?
     ) async throws -> ToolResultDTOs.SelectionReply
     typealias BuildSelectionMutationReply = @MainActor @Sendable (
@@ -194,7 +193,7 @@ struct MCPWindowToolDependencies {
         _ extraInvalid: [String],
         _ viewMode: String?,
         _ codeMapUsageOverride: CodeMapUsage?,
-        _ virtualContext: MCPServerViewModel.TabScopedContext?,
+        _ virtualContext: MCPServerViewModel.TabContextSnapshot?,
         _ lookupContext: WorkspaceLookupContext,
         _ reviewGitContext: FrozenPromptGitReviewContext?
     ) async throws -> ToolResultDTOs.SelectionReply
@@ -294,7 +293,7 @@ struct MCPWindowToolDependencies {
     typealias WorkspaceContextMessage = @MainActor @Sendable (_ operation: String?, _ path: String?) async -> String
     typealias ParseCopyPresetSelector = @Sendable (_ value: Value?) -> MCPServerViewModel.CopyPresetSelector?
     typealias ResolveCopyPreset = @MainActor @Sendable (_ selector: MCPServerViewModel.CopyPresetSelector) -> CopyPreset?
-    typealias BuildTabWorkspaceContext = @MainActor @Sendable (_ context: MCPServerViewModel.TabScopedContext, _ include: Set<String>, _ display: FilePathDisplay, _ copyPresetOverride: CopyPreset?, _ activeTabCompatibility: Bool) async throws -> ToolResultDTOs.PromptContextDTO
+    typealias BuildTabWorkspaceContext = @MainActor @Sendable (_ context: MCPServerViewModel.TabContextSnapshot, _ include: Set<String>, _ display: FilePathDisplay, _ copyPresetOverride: CopyPreset?, _ presentationActiveContext: Bool) async throws -> ToolResultDTOs.PromptContextDTO
     typealias SelectedFilesWithStats = @MainActor @Sendable (_ resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot) async throws -> ToolResultDTOs.SelectedFilesReply
     typealias SelectionCollectionsForCurrentTabContext = @MainActor @Sendable () async throws -> MCPServerViewModel.SelectionReplyAssembler.SelectionCollections
     typealias BuildCopyPresetContextDTO = @MainActor @Sendable (_ active: CopyPreset, _ effective: CopyPreset) -> ToolResultDTOs.CopyPresetContextDTO
@@ -306,7 +305,7 @@ struct MCPWindowToolDependencies {
         _ selectionOverride: StoredSelection?,
         _ display: FilePathDisplay
     ) async throws -> [ToolResultDTOs.SelectedFileInfo]
-    typealias BuildTabClipboardContent = @MainActor @Sendable (_ cfg: PromptContextResolved, _ context: MCPServerViewModel.TabScopedContext) async -> String
+    typealias BuildTabClipboardContent = @MainActor @Sendable (_ cfg: PromptContextResolved, _ context: MCPServerViewModel.TabContextSnapshot) async -> String
     typealias WritePromptExportFile = @MainActor @Sendable (
         _ path: String,
         _ content: String,

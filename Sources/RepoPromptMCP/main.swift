@@ -2537,11 +2537,6 @@ func handleRuntimeError(_ err: CLIRuntimeError) -> Never {
 
 // MARK: - CLI Mode Selection
 
-enum MCPBackend: String, CaseIterable {
-    case app
-    case headless
-}
-
 /// CLI operating mode
 enum CLIMode {
     case proxy(MCPBackend)
@@ -2568,7 +2563,7 @@ func parseCLIMode() -> CLIMode {
     var execOptions = ExecOptions()
     var isInteractive = false
     var isExec = false
-    var backend = MCPBackend.app
+    var backend = MCPBackend.auto
 
     var i = args.startIndex
     while i < args.endIndex {
@@ -2578,7 +2573,7 @@ func parseCLIMode() -> CLIMode {
         case "--backend":
             i = args.index(after: i)
             guard i < args.endIndex, let parsed = MCPBackend(rawValue: args[i].lowercased()) else {
-                fputs("Error: --backend requires 'app' or 'headless'.\n", stderr)
+                fputs("Error: --backend requires 'app', 'headless', or 'auto'.\n", stderr)
                 exit(2)
             }
             backend = parsed
@@ -2586,7 +2581,7 @@ func parseCLIMode() -> CLIMode {
         case let value where value.hasPrefix("--backend="):
             let raw = String(value.dropFirst("--backend=".count)).lowercased()
             guard let parsed = MCPBackend(rawValue: raw) else {
-                fputs("Error: --backend requires 'app' or 'headless'.\n", stderr)
+                fputs("Error: --backend requires 'app', 'headless', or 'auto'.\n", stderr)
                 exit(2)
             }
             backend = parsed
@@ -3603,6 +3598,48 @@ if DirectHeadlessChildBridge.isRequested() {
     }
 }
 
+if case .proxy = mode {
+    // Proxy/direct MCP mode is for a host-owned pipe or socket. Keep the ordinary terminal
+    // help behavior independent of the selected backend, including the default `auto` path.
+    // Do not use a positive-timeout stdin probe here: hosts may send initialize later.
+    let stdinIsTTY = isatty(STDIN_FILENO) != 0
+    let stdoutIsTTY = isatty(STDOUT_FILENO) != 0
+    let hasNoUserArgs = CommandLine.arguments.count <= 1
+    if stdinIsTTY || stdoutIsTTY || (hasNoUserArgs && (!stdinLooksLikeMCPTransport() || stdinHasImmediateDisconnect())) {
+        let usage = """
+        RepoPrompt MCP CLI
+
+        This command is designed to be used as an MCP server by host applications
+        (Claude Desktop, Cursor, etc.) or with explicit mode flags.
+
+        Quick start:
+          __RPCE_CLI__ -l                    # List available tools
+          __RPCE_CLI__ -e 'tree'             # Execute a command
+          __RPCE_CLI__ -i                    # Interactive REPL
+          __RPCE_CLI__ --help                # Full help
+
+        """.replacingOccurrences(of: "__RPCE_CLI__", with: cliDisplayCommand())
+        fputs(usage, stderr)
+        exit(0)
+    }
+}
+
+let resolvedBackend: MCPResolvedBackend? = if case let .proxy(requestedBackend) = mode {
+    MCPBackendSelection.resolve(requested: requestedBackend)
+} else {
+    nil
+}
+
+if let resolvedBackend {
+    log.debug(
+        "Selected MCP backend before initialize",
+        metadata: [
+            "requested": "\(String(describing: mode))",
+            "selected": "\(resolvedBackend.rawValue)"
+        ]
+    )
+}
+
 // Exec mode is a bounded one-shot command runner. Run it directly instead of
 // through ServiceGroup so completion exits deterministically.
 if case let .exec(options) = mode {
@@ -3632,7 +3669,7 @@ if case let .exec(options) = mode {
     }
 }
 
-if case .proxy(.headless) = mode {
+if resolvedBackend == .headless {
     do {
         try await DirectHeadlessMCPService(logger: log).run()
         exit(MCPCLIExitCode.ok.rawValue)
@@ -3645,35 +3682,11 @@ if case .proxy(.headless) = mode {
 /// Create appropriate service based on mode
 let service: any Service
 switch mode {
-case .proxy(.app):
-    // In proxy mode, only show help when directly launched from a terminal.
-    // IMPORTANT: Do not infer "user mode" from a short stdin poll timeout.
-    // MCP hosts can legitimately take >200ms before sending initialize, and
-    // timing-based detection causes false exits during startup races.
-    let stdinIsTTY = isatty(STDIN_FILENO) != 0
-    let stdoutIsTTY = isatty(STDOUT_FILENO) != 0
-    let hasNoUserArgs = CommandLine.arguments.count <= 1
-
-    if stdinIsTTY || stdoutIsTTY || (hasNoUserArgs && (!stdinLooksLikeMCPTransport() || stdinHasImmediateDisconnect())) {
-        let usage = """
-        RepoPrompt MCP CLI
-
-        This command is designed to be used as an MCP server by host applications
-        (Claude Desktop, Cursor, etc.) or with explicit mode flags.
-
-        Quick start:
-          __RPCE_CLI__ -l                    # List available tools
-          __RPCE_CLI__ -e 'tree'             # Execute a command
-          __RPCE_CLI__ -i                    # Interactive REPL
-          __RPCE_CLI__ --help                # Full help
-
-        """.replacingOccurrences(of: "__RPCE_CLI__", with: cliDisplayCommand())
-        fputs(usage, stderr)
-        exit(0)
+case .proxy:
+    guard resolvedBackend == .app else {
+        fatalError("Headless direct service exits before app service composition")
     }
     service = MCPService()
-case .proxy(.headless):
-    fatalError("Headless direct service exits before app service composition")
 case let .interactive(options):
     service = InteractiveMCPService(options: options, logger: log)
 case let .exec(options):

@@ -924,7 +924,55 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
     private static func windowTool(named name: String, in window: WindowState) async throws -> RepoPromptApp.Tool {
         let tools = await window.mcpServer.windowMCPTools
-        return try XCTUnwrap(tools.first { $0.name == name })
+        let tool = try XCTUnwrap(tools.first { $0.name == name })
+        return RepoPromptApp.Tool(
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+            annotations: tool.annotations,
+            isEnabledByDefault: tool.isEnabledByDefault,
+            returnsValue: { arguments in
+                if ServerNetworkManager.currentConnectionID != nil {
+                    return try await tool(arguments)
+                }
+
+                let connectionID = UUID()
+                try await MainActor.run {
+                    let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+                    let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+                    try window.mcpServer.bindTabForConnection(
+                        connectionID: connectionID,
+                        clientName: "Worktree API Smoke",
+                        tabID: tabID,
+                        workspaceID: workspace.id,
+                        windowID: window.windowID,
+                        explicitlyBound: true
+                    )
+                }
+                do {
+                    let result = try await ServerNetworkManager.withConnectionID(connectionID) {
+                        try await tool(arguments)
+                    }
+                    await MainActor.run {
+                        window.mcpServer.removeTabContext(
+                            forConnectionID: connectionID,
+                            clientName: "Worktree API Smoke",
+                            windowID: window.windowID
+                        )
+                    }
+                    return result
+                } catch {
+                    await MainActor.run {
+                        window.mcpServer.removeTabContext(
+                            forConnectionID: connectionID,
+                            clientName: "Worktree API Smoke",
+                            windowID: window.windowID
+                        )
+                    }
+                    throw error
+                }
+            }
+        )
     }
 
     private struct GitFixture {

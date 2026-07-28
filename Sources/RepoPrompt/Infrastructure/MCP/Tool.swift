@@ -88,7 +88,7 @@ extension Tool {
     @MainActor
     init(
         domainBinding: MCPDomainToolBinding,
-        runtime: MCPWindowToolRuntime
+        runtime: MCPAppToolBinder
     ) throws {
         let schemaData = try JSONEncoder().encode(domainBinding.definition.inputSchema)
         let schema = try JSONDecoder().decode(JSONSchema.self, from: schemaData)

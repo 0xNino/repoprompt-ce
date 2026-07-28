@@ -5,13 +5,13 @@ import Ontology
 import RepoPromptDomainRuntime
 
 @MainActor
-final class MCPFileToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .files
+final class MCPFileToolProvider: MCPAppToolProviding {
+    let group: MCPAppToolGroup = .files
 
-    private let runtime: MCPWindowToolRuntime
-    private let dependencies: MCPWindowToolDependencies
+    private let runtime: MCPAppToolBinder
+    private let dependencies: MCPAppPhysicalCapabilityAdapters
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    init(runtime: MCPAppToolBinder, dependencies: MCPAppPhysicalCapabilityAdapters) {
         self.runtime = runtime
         self.dependencies = dependencies
     }

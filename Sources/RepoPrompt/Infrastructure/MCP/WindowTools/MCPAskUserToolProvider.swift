@@ -5,13 +5,13 @@ import Ontology
 import RepoPromptDomainRuntime
 
 @MainActor
-final class MCPAskUserToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .askUser
+final class MCPAskUserToolProvider: MCPAppToolProviding {
+    let group: MCPAppToolGroup = .askUser
 
-    private let runtime: MCPWindowToolRuntime
-    private let dependencies: MCPWindowToolDependencies
+    private let runtime: MCPAppToolBinder
+    private let dependencies: MCPAppPhysicalCapabilityAdapters
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    init(runtime: MCPAppToolBinder, dependencies: MCPAppPhysicalCapabilityAdapters) {
         self.runtime = runtime
         self.dependencies = dependencies
     }
@@ -153,7 +153,7 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
     /// Execute the ask_user tool - routes to appropriate UI based on run purpose.
     private static func executeAskUser(
         args: [String: Value],
-        dependencies: MCPWindowToolDependencies
+        dependencies: MCPAppPhysicalCapabilityAdapters
     ) async throws -> Value {
         // Get connection ID and determine run purpose for routing.
         guard let connectionID = ServerNetworkManager.currentConnectionID else {

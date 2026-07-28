@@ -11,8 +11,8 @@ enum MCPToolFreshnessPolicy {
 }
 
 @MainActor
-final class MCPWindowToolRuntime {
-    typealias ProviderImplementation = @Sendable (MCPWindowToolContext, [String: Value]) async throws -> Value
+final class MCPAppToolBinder {
+    typealias ProviderImplementation = @Sendable (MCPAppToolInvocation, [String: Value]) async throws -> Value
     typealias ExecuteTool = @Sendable (
         _ name: String,
         _ freshnessPolicy: MCPToolFreshnessPolicy,
@@ -52,7 +52,7 @@ final class MCPWindowToolRuntime {
         )
     }
 
-    func context(for toolName: String) -> MCPWindowToolContext {
-        MCPWindowToolContext(toolName: toolName, windowID: windowID)
+    func context(for toolName: String) -> MCPAppToolInvocation {
+        MCPAppToolInvocation(toolName: toolName, windowID: windowID)
     }
 }

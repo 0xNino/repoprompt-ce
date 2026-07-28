@@ -122,7 +122,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                     throw error
                 }
 
-                let afterShutdown = await ServiceRegistry.catalogSnapshot()
+                let afterShutdown = await AppDomainRuntimeComposition.shared.catalogSnapshot()
                 XCTAssertTrue(MCPGlobalToolName.orderedToolNames.allSatisfy { toolName in
                     afterShutdown.activeScopesByToolName[toolName]?.contains(.application) == true
                 })
@@ -1726,8 +1726,8 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             await contextB.window.tearDown()
             await contextA.window.tearDown()
             await contextA.window.mcpServer.shutdownListener()
-            await ServiceRegistry.unregister(contextB.catalogService)
-            await ServiceRegistry.unregister(contextA.catalogService)
+            await AppDomainRuntimeComposition.shared.unregister(contextB.catalogService)
+            await AppDomainRuntimeComposition.shared.unregister(contextA.catalogService)
             await contextB.window.workspaceFileContextStore.unloadRoot(id: contextB.rootID)
             await contextA.window.workspaceFileContextStore.unloadRoot(id: contextA.rootID)
             contextB.window.workspaceManager.workspaces.removeAll { $0.id == contextB.workspaceID }
@@ -1810,7 +1810,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 throw ClientFixtureError.exactAbsoluteCatalogMiss
             }
             let catalogService = window.mcpServer.windowMCPToolCatalogService
-            try await ServiceRegistry.register(catalogService)
+            try await AppDomainRuntimeComposition.shared.register(catalogService)
             return PersistentMCPTestContext(
                 rootURL: rootURL,
                 fileURL: fileURL,
@@ -1827,13 +1827,13 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         private static func ensureRequiredCatalogAndEnableTransport(
             contexts: [PersistentMCPTestContext]
         ) async throws {
-            let snapshot = await ServiceRegistry.catalogSnapshot()
+            let snapshot = await AppDomainRuntimeComposition.shared.catalogSnapshot()
             let globalsReady = MCPGlobalToolName.orderedToolNames.allSatisfy { toolName in
                 snapshot.activeScopesByToolName[toolName]?.contains(.application) == true
             }
             let windowsReady = contexts.allSatisfy { context in
                 let scope = MCPDomainToolRegistrationScope.window(id: context.window.windowID)
-                return MCPWindowToolGroup.orderedToolNames.allSatisfy { toolName in
+                return MCPAppToolGroup.orderedToolNames.allSatisfy { toolName in
                     snapshot.activeScopesByToolName[toolName]?.contains(scope) == true
                 }
             }
@@ -1849,7 +1849,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         }
 
         private static func cleanupContext(_ context: PersistentMCPTestContext) async {
-            await ServiceRegistry.unregister(context.catalogService)
+            await AppDomainRuntimeComposition.shared.unregister(context.catalogService)
             await context.window.workspaceFileContextStore.unloadRoot(id: context.rootID)
             context.window.workspaceManager.workspaces.removeAll { $0.id == context.workspaceID }
             try? FileManager.default.removeItem(at: context.rootURL)
@@ -1866,7 +1866,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         let workspaceID: UUID
         let tabID: UUID
         let sentinel: String
-        let catalogService: MCPWindowToolCatalogService
+        let catalogService: MCPAppToolCatalogRegistration
 
         init(
             rootURL: URL,
@@ -1877,7 +1877,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             workspaceID: UUID,
             tabID: UUID,
             sentinel: String,
-            catalogService: MCPWindowToolCatalogService
+            catalogService: MCPAppToolCatalogRegistration
         ) {
             self.rootURL = rootURL
             self.fileURL = fileURL

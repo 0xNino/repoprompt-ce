@@ -218,7 +218,7 @@ extension MCPWorktreeToolProvider {
         let resolved = try dependencies.resolveTabContextSnapshot(
             metadata,
             MCPWindowToolName.manageWorktree,
-            .allowLegacyImplicitRouting
+            .requireExplicitOrRunScoped
         )
         let isRoutedAgentMode = await (try? dependencies.requireAgentModeConnection(MCPWindowToolName.manageWorktree)) != nil
 

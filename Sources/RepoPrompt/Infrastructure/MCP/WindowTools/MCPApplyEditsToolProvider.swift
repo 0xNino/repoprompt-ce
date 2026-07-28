@@ -5,15 +5,15 @@ import Ontology
 import RepoPromptShared
 
 @MainActor
-final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .applyEdits
+final class MCPApplyEditsToolProvider: MCPAppToolProviding {
+    let group: MCPAppToolGroup = .applyEdits
 
     private typealias EditSummary = ToolResultDTOs.EditSummary
 
-    private let runtime: MCPWindowToolRuntime
-    private let dependencies: MCPWindowToolDependencies
+    private let runtime: MCPAppToolBinder
+    private let dependencies: MCPAppPhysicalCapabilityAdapters
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    init(runtime: MCPAppToolBinder, dependencies: MCPAppPhysicalCapabilityAdapters) {
         self.runtime = runtime
         self.dependencies = dependencies
     }
@@ -91,11 +91,9 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                 metadata,
                 MCPWindowToolName.applyEdits
             )
-            if !resolvedContext.usesActiveTabCompatibility,
-               let failure = MCPMutationRetryableFailure.unresolvedRouteFailure(
-                   for: resolvedContext.snapshot
-               )
-            {
+            if let failure = MCPMutationRetryableFailure.unresolvedRouteFailure(
+                for: resolvedContext.snapshot
+            ) {
                 return Self.retryableFailureSummary(request: request, failure: failure)
             }
             if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(
@@ -138,7 +136,7 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
             } else {
                 nil
             }
-            let virtualTabID: UUID? = resolvedContext.usesActiveTabCompatibility ? nil : resolvedContext.snapshot.tabID
+            let virtualTabID: UUID? = resolvedContext.snapshot.tabID
             let availableTabIDs = await MainActor.run {
                 Set(dependencies.workspaceManager?.activeWorkspace?.composeTabs.map(\.id) ?? [])
             }

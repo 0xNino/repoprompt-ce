@@ -57,7 +57,7 @@ extension MCPServerViewModel {
     /// M3 read providers may continue reading the local cache, but new binding decisions
     /// and run launch reservations must use the coordinator snapshot/token APIs.
     @MainActor
-    func publishDomainRoutingBinding(connectionID: UUID, context: TabScopedContext) {
+    func publishDomainRoutingBinding(connectionID: UUID, context: TabContextSnapshot) {
         guard let coordinator = domainRoutingCoordinator else { return }
         let binding: DomainBinding = if let workspaceID = context.workspaceID {
             if let runID = context.runID {
@@ -176,7 +176,7 @@ extension MCPServerViewModel {
             resolved = try resolveTabContextSnapshot(
                 from: metadata,
                 toolName: toolName,
-                policy: .allowLegacyImplicitRouting
+                policy: .requireExplicitOrRunScoped
             )
         } catch {
             return try domainReadUnavailable(

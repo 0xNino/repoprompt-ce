@@ -24,7 +24,7 @@ final class MCPToolExecutionContractTests: XCTestCase {
             let caseLabel = "testCatalogCoversEveryAdvertisedGlobalAndWindowToolExactlyOnce"
             XCTAssertEqual(
                 MCPToolExecutionContractCatalog.orderedAdvertisedToolNames,
-                MCPGlobalToolName.orderedToolNames + MCPWindowToolGroup.orderedToolNames,
+                MCPGlobalToolName.orderedToolNames + MCPAppToolGroup.orderedToolNames,
                 caseLabel
             )
             XCTAssertEqual(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count, 27, caseLabel)

@@ -725,6 +725,7 @@ allowed_tracked_docs=(
   "docs/spec/headless-mcp-domain-runtime-m4-protected-mutations.md"
   "docs/spec/headless-mcp-domain-runtime-m5-ai-agent-interaction.md"
   "docs/spec/headless-mcp-domain-runtime-m6-host-extraction.md"
+  "docs/spec/headless-mcp-domain-runtime-m7-cutover.md"
   "docs/spec/history-query-tools.md"
   "docs/spec/mcp-domain-canonical-tool-definitions.generated.json"
   "docs/worktrees.md"

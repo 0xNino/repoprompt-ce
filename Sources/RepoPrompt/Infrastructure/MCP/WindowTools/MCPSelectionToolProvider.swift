@@ -4,17 +4,17 @@ import MCP
 import Ontology
 
 @MainActor
-final class MCPSelectionToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .selection
+final class MCPSelectionToolProvider: MCPAppToolProviding {
+    let group: MCPAppToolGroup = .selection
 
-    private let runtime: MCPWindowToolRuntime
-    private let dependencies: MCPWindowToolDependencies
+    private let runtime: MCPAppToolBinder
+    private let dependencies: MCPAppPhysicalCapabilityAdapters
 
     private struct ArtifactCommitConflict: Error {
         let reason: String
     }
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    init(runtime: MCPAppToolBinder, dependencies: MCPAppPhysicalCapabilityAdapters) {
         self.runtime = runtime
         self.dependencies = dependencies
     }
@@ -168,7 +168,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
         }
         await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionAutoSelectionDrain, transition: .completed)
         try Task.checkCancellation()
-        var resolvedContext = try dependencies.resolveTabContextSnapshot(metadata, MCPWindowToolName.manageSelection, .allowLegacyImplicitRouting)
+        var resolvedContext = try dependencies.resolveTabContextSnapshot(metadata, MCPWindowToolName.manageSelection, .requireExplicitOrRunScoped)
         let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
         try Task.checkCancellation()
         let lookupRootScope = lookupContext.rootScope
@@ -179,10 +179,8 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
         }
         try Task.checkCancellation()
         await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionConstruction)
-        if !resolvedContext.usesActiveTabCompatibility {
-            resolvedContext.snapshot.selection = await dependencies.stabilizedVirtualSelection(resolvedContext.snapshot)
-            try Task.checkCancellation()
-        }
+        resolvedContext.snapshot.selection = await dependencies.stabilizedVirtualSelection(resolvedContext.snapshot)
+        try Task.checkCancellation()
         resolvedContext.snapshot.selection = lookupContext.physicalizeSelection(resolvedContext.snapshot.selection)
         let frozenReviewContext: FrozenPromptGitReviewContext?
         let artifactResolution: MCPManageSelectionArtifactResolution
@@ -274,7 +272,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
             for error in extraInvalid where !combinedInvalid.contains(error) {
                 combinedInvalid.append(error)
             }
-            let previewCodeMapOverride: CodeMapUsage? = (!resolvedContext.usesActiveTabCompatibility && context.runID != nil) ? .auto : nil
+            let previewCodeMapOverride: CodeMapUsage? = context.runID != nil ? .auto : nil
             await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionConstruction, transition: .completed)
             try Task.checkCancellation()
             await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionReplyConstruction)
@@ -286,7 +284,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                 view,
                 previewCodeMapOverride,
                 lookupContext,
-                resolvedContext.usesActiveTabCompatibility ? nil : context,
+                context,
                 frozenReviewContext
             )
             if let fence = artifactResolution.fence {
@@ -589,7 +587,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
         resolvedContext: inout MCPServerViewModel.ResolvedTabContextSnapshot,
         metadata: MCPServerViewModel.RequestMetadata,
         lookupContext: WorkspaceLookupContext,
-        baseContext: MCPServerViewModel.TabScopedContext,
+        baseContext: MCPServerViewModel.TabContextSnapshot,
         selection: StoredSelection,
         includeBlocks: Bool,
         display: FilePathDisplay,
@@ -638,7 +636,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
         }
         await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionPersistence, transition: .completed)
         try Task.checkCancellation()
-        let codeMapOverride: CodeMapUsage? = (!resolvedContext.usesActiveTabCompatibility && baseContext.runID != nil) ? .auto : nil
+        let codeMapOverride: CodeMapUsage? = baseContext.runID != nil ? .auto : nil
         var replyContext = baseContext
         replyContext.selection = canonicalSelection
         await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionReplyConstruction)
@@ -649,7 +647,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
             extraInvalid,
             view,
             codeMapOverride,
-            resolvedContext.usesActiveTabCompatibility ? nil : replyContext,
+            replyContext,
             lookupContext,
             reviewGitContext
         )

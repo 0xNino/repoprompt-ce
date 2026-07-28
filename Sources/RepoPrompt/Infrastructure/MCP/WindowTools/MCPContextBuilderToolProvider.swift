@@ -259,13 +259,13 @@ enum ContextBuilderTypedPromptResolver {
 }
 
 @MainActor
-final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .contextBuilder
+final class MCPContextBuilderToolProvider: MCPAppToolProviding {
+    let group: MCPAppToolGroup = .contextBuilder
 
-    private let runtime: MCPWindowToolRuntime
-    private let dependencies: MCPWindowToolDependencies
+    private let runtime: MCPAppToolBinder
+    private let dependencies: MCPAppPhysicalCapabilityAdapters
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    init(runtime: MCPAppToolBinder, dependencies: MCPAppPhysicalCapabilityAdapters) {
         self.runtime = runtime
         self.dependencies = dependencies
     }
@@ -334,7 +334,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
     private static func executeContextBuilder(
         args: [String: Value],
         connectionID: UUID?,
-        dependencies: MCPWindowToolDependencies
+        dependencies: MCPAppPhysicalCapabilityAdapters
     ) async throws -> ContextBuilderToolResult {
         let instructions = args["instructions"]?.stringValue ?? ""
         let metadata = await dependencies.captureRequestMetadata()

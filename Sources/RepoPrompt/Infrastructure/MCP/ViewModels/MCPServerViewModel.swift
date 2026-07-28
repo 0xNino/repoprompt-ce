@@ -423,11 +423,11 @@ final class MCPServerViewModel: ObservableObject {
         private var oracleChatSendOverrideForTesting: MCPOracleToolService.SendChat?
         var requestMetadataOverrideForTesting: RequestMetadata?
         var agentRunDispatchOverrideForTesting: AgentExternalMCPRunStarter.DispatchInstruction?
-        private var contextBuilderFollowUpOverrideForTesting: MCPWindowToolDependencies.RunMCPPlanOrQuestion?
+        private var contextBuilderFollowUpOverrideForTesting: MCPAppPhysicalCapabilityAdapters.RunMCPPlanOrQuestion?
         private var contextBuilderBeforeFinalReviewAuthorizationForTesting:
-            MCPWindowToolDependencies.BeforeContextBuilderFinalReviewAuthorization?
+            MCPAppPhysicalCapabilityAdapters.BeforeContextBuilderFinalReviewAuthorization?
         private var contextBuilderDidFinalizeReviewForTesting:
-            MCPWindowToolDependencies.DidFinalizeContextBuilderReview?
+            MCPAppPhysicalCapabilityAdapters.DidFinalizeContextBuilderReview?
         private var contextBuilderSelectionReplyObserverForTesting: ((
             StoredSelection,
             WorkspaceLookupContext?,
@@ -476,14 +476,14 @@ final class MCPServerViewModel: ObservableObject {
         }
 
         func setContextBuilderFollowUpOverrideForTesting(
-            _ override: MCPWindowToolDependencies.RunMCPPlanOrQuestion?
+            _ override: MCPAppPhysicalCapabilityAdapters.RunMCPPlanOrQuestion?
         ) {
             contextBuilderFollowUpOverrideForTesting = override
         }
 
         func setContextBuilderFinalReviewAuthorizationHooksForTesting(
-            before: MCPWindowToolDependencies.BeforeContextBuilderFinalReviewAuthorization?,
-            after: MCPWindowToolDependencies.DidFinalizeContextBuilderReview?
+            before: MCPAppPhysicalCapabilityAdapters.BeforeContextBuilderFinalReviewAuthorization?,
+            after: MCPAppPhysicalCapabilityAdapters.DidFinalizeContextBuilderReview?
         ) {
             contextBuilderBeforeFinalReviewAuthorizationForTesting = before
             contextBuilderDidFinalizeReviewForTesting = after
@@ -508,7 +508,7 @@ final class MCPServerViewModel: ObservableObject {
                 try resolveTabContextSnapshot(
                     from: metadata,
                     toolName: MCPWindowToolName.oracleSend,
-                    policy: .allowLegacyImplicitRouting
+                    policy: .requireExplicitOrRunScoped
                 )
             },
             requireCurrentTabContext: { [self] toolName in try await requireCurrentTabContext(toolName: toolName) },
@@ -1048,7 +1048,7 @@ final class MCPServerViewModel: ObservableObject {
     @Published var isApprovalOverlayVisible: Bool = false
 
     @MainActor
-    private lazy var windowToolRuntime = MCPWindowToolRuntime(windowID: windowID) { [weak self] name, freshnessPolicy, args, implementation in
+    private lazy var windowToolRuntime = MCPAppToolBinder(windowID: windowID) { [weak self] name, freshnessPolicy, args, implementation in
         guard let self else {
             throw MCPError.internalError("Window deallocated while executing \(name)")
         }
@@ -1056,12 +1056,12 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else {
                 throw MCPError.internalError("Window deallocated during \(name)")
             }
-            return try await implementation(MCPWindowToolContext(toolName: name, windowID: windowID), args)
+            return try await implementation(MCPAppToolInvocation(toolName: name, windowID: windowID), args)
         }
     }
 
     @MainActor
-    private lazy var windowToolDependencies = MCPWindowToolDependencies(
+    private lazy var windowToolDependencies = MCPAppPhysicalCapabilityAdapters(
         executeOracleUtils: { [weak self] args in
             guard let self else { throw MCPError.internalError("Window deallocated while executing oracle_utils") }
             return try await oracleToolService.executeOracleUtils(args: args)
@@ -1129,7 +1129,7 @@ final class MCPServerViewModel: ObservableObject {
                 targetWindow: targetWindow,
                 connectionID: connectionID
             )
-            return MCPWindowToolDependencies.ContextBuilderTabResolution(
+            return MCPAppPhysicalCapabilityAdapters.ContextBuilderTabResolution(
                 identity: resolution.identity,
                 nestedTabContext: resolution.nestedTabContext,
                 agentModeSessionID: resolution.agentModeSessionID,
@@ -1559,14 +1559,14 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { return nil }
             return resolveCopyPreset(from: selector)
         },
-        buildTabWorkspaceContext: { [weak self] context, include, display, copyPresetOverride, activeTabCompatibility in
+        buildTabWorkspaceContext: { [weak self] context, include, display, copyPresetOverride, presentationActiveContext in
             guard let self else { throw MCPError.internalError("Window deallocated while building workspace context") }
             return try await buildTabWorkspaceContext(
                 context: context,
                 include: include,
                 display: display,
                 copyPresetOverride: copyPresetOverride,
-                activeTabCompatibility: activeTabCompatibility
+                presentationActiveContext: presentationActiveContext
             )
         },
         selectedFilesWithStats: { [weak self] resolvedContext in
@@ -1724,9 +1724,9 @@ final class MCPServerViewModel: ObservableObject {
         sideEffects: domainReadSideEffectCoordinator
     )
 
-    /// Single window-scoped service registered with ServiceRegistry for this window's MCP tool catalog.
+    /// Window-scoped app tool registration installed in the domain runtime catalog.
     @MainActor
-    private lazy var windowToolCatalogService = MCPWindowToolCatalogService(
+    private lazy var windowToolCatalogService = MCPAppToolCatalogRegistration(
         windowID: windowID,
         providers: [
             MCPSelectionToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
@@ -1740,7 +1740,7 @@ final class MCPServerViewModel: ObservableObject {
             MCPAgentSessionControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies)
         ],
         sharedBindings: domainReadToolProvider.bindings,
-        sharedBindingRuntime: windowToolRuntime
+        runtime: windowToolRuntime
     )
     private var cancellables: Set<AnyCancellable> = []
 
@@ -1796,9 +1796,9 @@ final class MCPServerViewModel: ObservableObject {
         await workspaceManager?.applyStoredSelectionMirrorForReadFileAutoSelection(tabID: key.tabID)
     }
 
-    /// Presentation cache for M3 read-provider compatibility. M2 routing truth lives in domainRoutingCoordinator.
+    /// Presentation snapshot cache. Domain routing remains the only routing authority.
     @MainActor
-    var tabContextByConnectionID: [UUID: TabScopedContext] = [:]
+    var tabContextByConnectionID: [UUID: TabContextSnapshot] = [:]
     @MainActor
     var detachedContextBuilderTabContextByRunID: [UUID: DetachedContextBuilderTabContext] = [:]
     @MainActor
@@ -1822,7 +1822,7 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     var pendingPolicyRunIDMappingTokenIDByRunID: [UUID: UUID] = [:]
     @MainActor
-    var windowIDByConnection: [UUID: Int] = [:]
+    var presentationWindowByConnection: [UUID: Int] = [:]
     let domainRoutingCoordinator: DomainRoutingCoordinator?
     let domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient?
     let domainReadSideEffectCoordinator: DomainReadSideEffectCoordinator
@@ -1835,14 +1835,7 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     var tabContextCancellablesByConnectionID: [UUID: Set<AnyCancellable>] = [:]
     @MainActor
-    var lastContextByClientAndWindow: [String: [Int: TabScopedContext]] = [:]
-    /// Temporary legacy routing switch. Diagnostics/tests can disable active-tab
-    /// compatibility to verify clients bind explicitly with `bind_context`.
-    @MainActor
-    var activeTabCompatibilityFallbackEnabled = true
-    @MainActor
-    var activeTabCompatibilityFallbackDiagnostics: [ActiveTabCompatibilityFallbackDiagnostic] = []
-
+    var lastContextByClientAndWindow: [String: [Int: TabContextSnapshot]] = [:]
     var isMultiWindowModeEffectivelyActive: Bool {
         WindowStatesManager.shared.isMultiWindowModeEffectivelyActive
     }
@@ -2233,7 +2226,7 @@ final class MCPServerViewModel: ObservableObject {
         let candidateWindowIDs = [
             managerWindowID,
             metadata.windowID,
-            windowIDByConnection[connectionID]
+            presentationWindowByConnection[connectionID]
         ].compactMap(\.self)
 
         for candidateWindowID in candidateWindowIDs where candidateWindowID != windowID {
@@ -2255,7 +2248,7 @@ final class MCPServerViewModel: ObservableObject {
         let resolvedContext = try? resolveTabContextSnapshot(
             from: metadata,
             toolName: "agent_run_wait_scope",
-            policy: .allowLegacyImplicitRouting
+            policy: .requireExplicitOrRunScoped
         )
         guard let parentRunID = await resolveRunIDForExecution(metadata: metadata, resolvedContext: resolvedContext) else {
             steeringDebugLog("[AgentRunSteeringWake] agent_run wait scope skipped: no parent runID childSessions=\(sessionIDs.map(\.uuidString).sorted().joined(separator: ","))")
@@ -2420,7 +2413,6 @@ final class MCPServerViewModel: ObservableObject {
         }
 
         if let resolvedContext,
-           !resolvedContext.usesActiveTabCompatibility,
            let runID = resolvedContext.snapshot.runID
         {
             let context = resolvedContext.snapshot
@@ -2816,7 +2808,7 @@ final class MCPServerViewModel: ObservableObject {
     /// Ensures tools are registered before this window becomes eligible for routing.
     @discardableResult
     func ensureServerReadyForAgentBootstrap() async -> Bool {
-        let catalogIsRegistered = await ServiceRegistry.isRegistered(windowToolCatalogService)
+        let catalogIsRegistered = await AppDomainRuntimeComposition.shared.isRegistered(windowToolCatalogService)
         let invalidateCatalogBeforeUpdate = !windowToolsEnabled || !catalogIsRegistered
         #if DEBUG || EDIT_FLOW_PERF
             let registrationUpdateAgentBootstrapState = EditFlowPerf.begin(
@@ -2935,7 +2927,7 @@ final class MCPServerViewModel: ObservableObject {
         }
 
         do {
-            let registration = try await ServiceRegistry.register(windowToolCatalogService)
+            let registration = try await AppDomainRuntimeComposition.shared.register(windowToolCatalogService)
             #if DEBUG
                 await afterWindowToolRegistrationBeforeRetentionForTesting?()
             #endif
@@ -3012,7 +3004,7 @@ final class MCPServerViewModel: ObservableObject {
     private func unregisterWindowToolRegistration(
         _ handle: MCPDomainToolRegistrationHandle
     ) async {
-        await ServiceRegistry.unregister(handle)
+        await AppDomainRuntimeComposition.shared.unregister(handle)
         if activeWindowToolRegistrationHandle == handle {
             activeWindowToolRegistrationHandle = nil
         }
@@ -3341,9 +3333,9 @@ final class MCPServerViewModel: ObservableObject {
         let resolvedContext = try? resolveTabContextSnapshot(
             from: metadata,
             toolName: name,
-            policy: .allowLegacyImplicitRouting
+            policy: .requireExplicitOrRunScoped
         )
-        if let resolvedContext, !resolvedContext.usesActiveTabCompatibility {
+        if let resolvedContext {
             let context = resolvedContext.snapshot
             mcpServerViewModelDebugLog("runTool '\(name)' bound context for tab=\(context.tabID) runID=\(context.runID?.uuidString ?? "nil")")
         }
@@ -3568,7 +3560,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     @MainActor
-    var windowMCPToolCatalogService: MCPWindowToolCatalogService {
+    var windowMCPToolCatalogService: MCPAppToolCatalogRegistration {
         windowToolCatalogService
     }
 
@@ -3718,12 +3710,12 @@ final class MCPServerViewModel: ObservableObject {
         guard await ServerNetworkManager.shared.runPurpose(for: connectionID) == .agentModeRun else {
             return false
         }
-        if let resolvedContext = try? resolveTabContextSnapshot(
+        if (try? resolveTabContextSnapshot(
             from: metadata,
             toolName: "agent_run_source_binding",
-            policy: .allowLegacyImplicitRouting
-        ) {
-            return !resolvedContext.usesActiveTabCompatibility
+            policy: .requireExplicitOrRunScoped
+        )) != nil {
+            return true
         }
         return false
     }
@@ -4043,10 +4035,10 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     #if DEBUG
-        private var stageProgressSinkForTesting: MCPWindowToolDependencies.SendStageProgress?
+        private var stageProgressSinkForTesting: MCPAppPhysicalCapabilityAdapters.SendStageProgress?
 
         func installStageProgressSinkForTesting(
-            _ sink: MCPWindowToolDependencies.SendStageProgress?
+            _ sink: MCPAppPhysicalCapabilityAdapters.SendStageProgress?
         ) {
             stageProgressSinkForTesting = sink
         }
@@ -4135,7 +4127,7 @@ final class MCPServerViewModel: ObservableObject {
                 try resolveTabContextSnapshot(
                     from: metadata,
                     toolName: "autoSelectReadFile",
-                    policy: .allowLegacyImplicitRouting
+                    policy: .requireExplicitOrRunScoped
                 )
             }
             let ctx = resolvedContext.snapshot
@@ -4229,7 +4221,7 @@ final class MCPServerViewModel: ObservableObject {
         guard let resolvedContext = try? resolveTabContextSnapshot(
             from: metadata,
             toolName: "enqueueReadFileAutoSelection",
-            policy: .allowLegacyImplicitRouting
+            policy: .requireExplicitOrRunScoped
         ) else {
             EditFlowPerf.end(
                 EditFlowPerf.Stage.ReadFile.AutoSelect.eligibilityResolution,
@@ -4238,7 +4230,7 @@ final class MCPServerViewModel: ObservableObject {
             )
             return
         }
-        let hasVirtualContext = !resolvedContext.usesActiveTabCompatibility
+        let hasVirtualContext = true
         let shouldApply = AutoSliceSelection.shouldApply(
             purpose: purpose,
             hasVirtualContext: hasVirtualContext
@@ -4301,7 +4293,7 @@ final class MCPServerViewModel: ObservableObject {
         guard let resolvedContext = try? resolveTabContextSnapshot(
             from: metadata,
             toolName: "drainReadFileAutoSelection",
-            policy: .allowLegacyImplicitRouting
+            policy: .requireExplicitOrRunScoped
         ) else { return Task.isCancelled ? .cancelled : .completed }
         let key = readFileAutoSelectionContextKey(resolvedContext: resolvedContext, metadata: metadata)
         for predecessorKey in readFileAutoSelectionPredecessorContextKeys(
@@ -4557,13 +4549,13 @@ final class MCPServerViewModel: ObservableObject {
         resolvedContext: ResolvedTabContextSnapshot,
         metadata: RequestMetadata
     ) -> MCPReadFileAutoSelectionCoordinator.ContextKey {
-        let route: MCPReadFileAutoSelectionCoordinator.Route = if !resolvedContext.usesActiveTabCompatibility,
-                                                                  let connectionID = metadata.connectionID
-        {
-            .bound(connectionID: connectionID, runID: resolvedContext.snapshot.runID)
-        } else {
-            .activeTabCompatibility
+        guard let connectionID = metadata.connectionID else {
+            preconditionFailure("Read-file auto-selection requires an explicitly bound MCP connection")
         }
+        let route = MCPReadFileAutoSelectionCoordinator.Route.bound(
+            connectionID: connectionID,
+            runID: resolvedContext.snapshot.runID
+        )
         return MCPReadFileAutoSelectionCoordinator.ContextKey(
             windowID: resolvedContext.snapshot.windowID,
             workspaceID: resolvedContext.snapshot.workspaceID,
@@ -4575,19 +4567,14 @@ final class MCPServerViewModel: ObservableObject {
 
     @MainActor
     func isReadFileAutoSelectionContextCurrent(_ key: MCPReadFileAutoSelectionCoordinator.ContextKey) -> Bool {
-        switch key.route {
-        case let .bound(connectionID, runID):
-            guard let context = tabContextByConnectionID[connectionID] else { return false }
-            return context.windowID == key.windowID
-                && context.workspaceID == key.workspaceID
-                && context.tabID == key.tabID
-                && context.runID == runID
-                && context.readFileAutoSelectionGeneration == key.bindingGeneration
-        case .activeTabCompatibility:
-            guard let active = workspaceManager?.activeWorkspace else { return false }
-            return active.id == key.workspaceID
-                && (active.activeComposeTabID ?? active.composeTabs.first?.id) == key.tabID
-        }
+        guard case let .bound(connectionID, runID) = key.route,
+              let context = tabContextByConnectionID[connectionID]
+        else { return false }
+        return context.windowID == key.windowID
+            && context.workspaceID == key.workspaceID
+            && context.tabID == key.tabID
+            && context.runID == runID
+            && context.readFileAutoSelectionGeneration == key.bindingGeneration
     }
 
     @MainActor
@@ -5022,16 +5009,9 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     func readFileAutoSelectionContext(
         for key: MCPReadFileAutoSelectionCoordinator.ContextKey
-    ) -> TabScopedContext? {
-        switch key.route {
-        case let .bound(connectionID, _):
-            tabContextByConnectionID[connectionID]
-        case .activeTabCompatibility:
-            try? activeTabCompatibilitySnapshot(
-                metadata: RequestMetadata(connectionID: nil, clientName: nil, windowID: key.windowID),
-                toolName: "readFileAutoSelectionContext"
-            )
-        }
+    ) -> TabContextSnapshot? {
+        guard case let .bound(connectionID, _) = key.route else { return nil }
+        return tabContextByConnectionID[connectionID]
     }
 
     private func autoSelectedFullFilePaths() async -> [String] {
@@ -5040,7 +5020,7 @@ final class MCPServerViewModel: ObservableObject {
         guard let resolvedContext = try? resolveTabContextSnapshot(
             from: metadata,
             toolName: "autoSelectedFullFilePaths",
-            policy: .allowLegacyImplicitRouting
+            policy: .requireExplicitOrRunScoped
         ) else { return [] }
         return await autoSelectedFullFilePaths(
             selection: resolvedContext.snapshot.selection,
@@ -5113,7 +5093,7 @@ final class MCPServerViewModel: ObservableObject {
         guard let resolvedContext = try? resolveTabContextSnapshot(
             from: metadata,
             toolName: "enqueueFileSearchAutoSelection",
-            policy: .allowLegacyImplicitRouting
+            policy: .requireExplicitOrRunScoped
         ) else {
             EditFlowPerf.end(
                 EditFlowPerf.Stage.Search.AutoSelect.agentEligibility,
@@ -5124,7 +5104,7 @@ final class MCPServerViewModel: ObservableObject {
         }
         let shouldApply = AutoSliceSelection.shouldApply(
             purpose: purpose,
-            hasVirtualContext: !resolvedContext.usesActiveTabCompatibility
+            hasVirtualContext: true
         )
         EditFlowPerf.end(
             EditFlowPerf.Stage.Search.AutoSelect.agentEligibility,
@@ -5183,7 +5163,7 @@ final class MCPServerViewModel: ObservableObject {
             let resolvedContext = try resolveTabContextSnapshot(
                 from: metadata,
                 toolName: "applySelectionSlices",
-                policy: .allowLegacyImplicitRouting
+                policy: .requireExplicitOrRunScoped
             )
             return try await applySelectionSlicesVirtual(
                 resolvedContext: resolvedContext,
@@ -5333,7 +5313,7 @@ final class MCPServerViewModel: ObservableObject {
         let resolved = try resolveTabContextSnapshot(
             from: metadata,
             toolName: MCPWindowToolName.getCodeStructure,
-            policy: .allowLegacyImplicitRouting
+            policy: .requireExplicitOrRunScoped
         )
         let selection = resolved.snapshot.selection
         let selectedPaths = StoredSelectionPathNormalization.standardizedPaths(
@@ -5967,7 +5947,7 @@ final class MCPServerViewModel: ObservableObject {
         guard var resolvedContext = try? resolveTabContextSnapshot(
             from: metadata,
             toolName: MCPWindowToolName.readFile,
-            policy: .allowLegacyImplicitRouting
+            policy: .requireExplicitOrRunScoped
         ) else { return nil }
 
         resolvedContext.snapshot = await stabilizedVirtualContext(for: resolvedContext.snapshot)
@@ -6206,11 +6186,9 @@ final class MCPServerViewModel: ObservableObject {
             from: metadata,
             toolName: MCPWindowToolName.fileActions
         )
-        if !resolvedContext.usesActiveTabCompatibility,
-           let failure = MCPMutationRetryableFailure.unresolvedRouteFailure(
-               for: resolvedContext.snapshot
-           )
-        {
+        if let failure = MCPMutationRetryableFailure.unresolvedRouteFailure(
+            for: resolvedContext.snapshot
+        ) {
             throw failure
         }
         if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(
@@ -6222,7 +6200,7 @@ final class MCPServerViewModel: ObservableObject {
         try Task.checkCancellation()
         let effectivePath = lookupContext.translateInputPath(path)
         let effectiveNewPath = newPath.map { lookupContext.translateInputPath($0) }
-        let shouldSelectCreatedFileInActiveUI = resolvedContext.usesActiveTabCompatibility
+        let shouldSelectCreatedFileInActiveUI = false
         let store = promptVM.workspaceFileContextStore
         let mutationRootMappings = await lookupContext.domainMutationPhysicalRootMappings(store: store)
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPreMutationChecks, transition: .completed)
@@ -6333,7 +6311,7 @@ final class MCPServerViewModel: ObservableObject {
                 "Reply delivery was cancelled after the durable mutation. Inspect the filesystem and use operation ID \(operationID) only to correlate this result; do not blindly replay."
             )
         }
-        if action.lowercased() == "create", !resolvedContext.usesActiveTabCompatibility {
+        if action.lowercased() == "create" {
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection)
             let baseSelection = resolvedContext.snapshot.selection
             let addResult = await addStoredSelectionPaths(
@@ -6775,7 +6753,7 @@ final class MCPServerViewModel: ObservableObject {
         let resolved = try resolveTabContextSnapshot(
             from: metadata,
             toolName: MCPWindowToolName.getFileTree,
-            policy: .allowLegacyImplicitRouting
+            policy: .requireExplicitOrRunScoped
         )
         return storedSelection(
             for: resolved.snapshot,

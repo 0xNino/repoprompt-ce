@@ -349,7 +349,7 @@ final class WindowRoutingService: Service {
     @discardableResult
     func registerDomainTools() async throws -> MCPDomainToolRegistrationResult {
         await updateCachedTools()
-        return try await ServiceRegistry.register(self)
+        return try await AppDomainRuntimeComposition.shared.register(self)
     }
 
     // ---------------------------------------------------------------------

@@ -132,7 +132,7 @@ extension MCPServerViewModel {
         let resolved = try resolveTabContextSnapshot(
             from: metadata,
             toolName: "selection",
-            policy: .allowLegacyImplicitRouting,
+            policy: .requireExplicitOrRunScoped,
             startMirroring: false
         )
         let stabilized = try stabilizedSelectionReadSnapshot(resolved)
@@ -156,7 +156,7 @@ extension MCPServerViewModel {
             let resolved = try resolveTabContextSnapshot(
                 from: metadata,
                 toolName: "selection",
-                policy: .allowLegacyImplicitRouting,
+                policy: .requireExplicitOrRunScoped,
                 startMirroring: false
             )
             let stabilized = try stabilizedSelectionReadSnapshot(resolved)

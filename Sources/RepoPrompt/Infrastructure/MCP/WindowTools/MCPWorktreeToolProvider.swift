@@ -4,17 +4,17 @@ import MCP
 import RepoPromptDomainRuntime
 
 @MainActor
-final class MCPWorktreeToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .git
+final class MCPWorktreeToolProvider: MCPAppToolProviding {
+    let group: MCPAppToolGroup = .git
 
-    private let runtime: MCPWindowToolRuntime
-    let dependencies: MCPWindowToolDependencies
+    private let runtime: MCPAppToolBinder
+    let dependencies: MCPAppPhysicalCapabilityAdapters
     private let vcsService: VCSService
     private let resolver: GitRepoTargetResolver
 
     init(
-        runtime: MCPWindowToolRuntime,
-        dependencies: MCPWindowToolDependencies,
+        runtime: MCPAppToolBinder,
+        dependencies: MCPAppPhysicalCapabilityAdapters,
         vcsService: VCSService = .shared,
         resolver: GitRepoTargetResolver = GitRepoTargetResolver()
     ) {
@@ -418,7 +418,7 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
         let resolved = try dependencies.resolveTabContextSnapshot(
             metadata,
             MCPWindowToolName.manageWorktree,
-            .allowLegacyImplicitRouting
+            .requireExplicitOrRunScoped
         )
         guard let sessionID = resolved.snapshot.activeAgentSessionID else {
             throw MCPError.invalidParams("session_id is required because current MCP routing does not resolve an active Agent session.")

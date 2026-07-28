@@ -196,10 +196,10 @@ private struct MCPGitDiffRepoOutcome {
 
 @MainActor
 final class MCPGitToolProvider {
-    private let dependencies: MCPWindowToolDependencies
+    private let dependencies: MCPAppPhysicalCapabilityAdapters
     private var stagedAdvertisementsByInvocation: [UUID: [GitDiffPublishedArtifact]] = [:]
 
-    init(runtime _: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    init(runtime _: MCPAppToolBinder, dependencies: MCPAppPhysicalCapabilityAdapters) {
         self.dependencies = dependencies
     }
 
@@ -449,7 +449,7 @@ final class MCPGitToolProvider {
             try dependencies.resolveTabContextSnapshot(
                 metadata,
                 MCPWindowToolName.git,
-                .allowLegacyImplicitRouting
+                .requireExplicitOrRunScoped
             )
         } else {
             nil
@@ -1086,16 +1086,12 @@ final class MCPGitToolProvider {
                         ?? dependencies.resolveTabContextSnapshot(
                             metadata,
                             MCPWindowToolName.git,
-                            .allowLegacyImplicitRouting
+                            .requireExplicitOrRunScoped
                         )
                     let snapshotSelection = resolvedContext.snapshot.selection
-                    let stabilizedSelection: StoredSelection = if resolvedContext.usesActiveTabCompatibility {
-                        snapshotSelection
-                    } else {
-                        await dependencies.stabilizedVirtualSelection(
-                            resolvedContext.snapshot
-                        )
-                    }
+                    let stabilizedSelection = await dependencies.stabilizedVirtualSelection(
+                        resolvedContext.snapshot
+                    )
                     let logicalSelection = Self.selectionHasPublishableGitDiffCandidates(stabilizedSelection)
                         ? stabilizedSelection
                         : snapshotSelection

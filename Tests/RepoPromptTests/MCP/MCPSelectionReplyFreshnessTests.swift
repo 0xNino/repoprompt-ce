@@ -245,57 +245,6 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         XCTAssertTrue(reply.codeStructure?.unmappedPaths?.isEmpty ?? true)
     }
 
-    func testActiveVisibleSelectionMarksMissingCachedFileTokensIncomplete() async throws {
-        let root = try makeTemporaryRoot(name: "ActiveVisibleIncomplete")
-        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
-        let oldFile = root.appendingPathComponent("Old.swift")
-        let newFile = root.appendingPathComponent("New.swift")
-        try write(SwiftFixtureSource.emptyStruct("OldTokenBaseline"), to: oldFile)
-        try write(SwiftFixtureSource.emptyStruct("NewVisibleSelection"), to: newFile)
-
-        let tabID = UUID()
-        let oldSelection = StoredSelection(selectedPaths: [oldFile.path])
-        let newSelection = StoredSelection(selectedPaths: [newFile.path])
-        let (window, workspaceID) = await makeWindow(root: root, tabID: tabID, selection: oldSelection)
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
-        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
-            in: window,
-            path: root.path
-        )
-        await window.promptManager.tokenCountingViewModel.forceImmediateRecount()
-
-        var liveTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
-        liveTab.selection = newSelection
-        XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(liveTab, inWorkspaceID: workspaceID))
-        let context = makeContext(
-            window: window,
-            workspaceID: workspaceID,
-            tabID: tabID,
-            selection: newSelection
-        )
-        let activeResolution = MCPServerViewModel.ResolvedTabContextSnapshot(
-            snapshot: context,
-            usesActiveTabCompatibility: true
-        )
-
-        let reply = await window.mcpServer.buildCurrentSelectionReply(
-            includeBlocks: false,
-            display: .full,
-            resolvedContext: activeResolution,
-            lookupContext: .visibleWorkspace
-        )
-
-        XCTAssertEqual(reply.files?.map(\.path), [newFile.path])
-        XCTAssertEqual(reply.tokenAccounting?.source, "active_tab_published")
-        XCTAssertEqual(reply.tokenAccounting?.status, "incomplete")
-        XCTAssertTrue(reply.tokenAccounting?.refreshPending == true)
-        XCTAssertTrue(reply.tokenAccounting?.incompleteComponents?.contains("files") == true)
-        XCTAssertEqual(reply.totalTokens, 0)
-        let formatted = ToolOutputFormatter.formatSelectionReplyToString(reply)
-        XCTAssertTrue(formatted.contains("- Total tokens: pending (Auto view)"), formatted)
-        XCTAssertFalse(formatted.contains("- Total tokens: 0 (Auto view)"), formatted)
-    }
-
     func testMutationReplyRereadsLiveTabSelectionAfterProviderStabilization() async throws {
         let root = try makeTemporaryRoot(name: "MutationReply")
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
@@ -366,8 +315,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             selection: staleSelection
         )
         let resolvedContext = MCPServerViewModel.ResolvedTabContextSnapshot(
-            snapshot: providerStabilizedContext,
-            usesActiveTabCompatibility: false
+            snapshot: providerStabilizedContext
         )
         let ingressBeforeReply = await window.workspaceFileContextStore.scopedIngressBarrierStatsForTesting(
             rootID: loadedRoot.id
@@ -482,7 +430,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         let connectionID = UUID()
         let clientName = "selection-read-snapshot"
         window.mcpServer.tabContextByConnectionID[connectionID] = staleContext
-        window.mcpServer.windowIDByConnection[connectionID] = window.windowID
+        window.mcpServer.presentationWindowByConnection[connectionID] = window.windowID
         window.mcpServer.connectionIDToRunID[connectionID] = try XCTUnwrap(staleContext.runID)
         window.mcpServer.setRequestMetadataOverrideForTesting(.init(
             connectionID: connectionID,
@@ -542,8 +490,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         )
 
         let captured = try window.mcpServer.stabilizedSelectionReadSnapshot(.init(
-            snapshot: staleContext,
-            usesActiveTabCompatibility: false
+            snapshot: staleContext
         ))
         XCTAssertEqual(captured.snapshot.selection, freshSelection)
         XCTAssertEqual(captured.snapshot.selectionRevision, canonicalRevision)
@@ -571,13 +518,6 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             $0.entry.file.standardizedFullPath == laterFile.standardizedFileURL.path
         })
 
-        let compatibilitySnapshot = try window.mcpServer.stabilizedSelectionReadSnapshot(.init(
-            snapshot: staleContext,
-            usesActiveTabCompatibility: true
-        ))
-        XCTAssertEqual(compatibilitySnapshot.snapshot.selection, staleSelection)
-        XCTAssertEqual(compatibilitySnapshot.snapshot.selectionRevision, 0)
-
         let missingTabID = UUID()
         var missingCanonicalContext = makeContext(
             window: window,
@@ -587,8 +527,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         )
         missingCanonicalContext.selectionRevision = 0
         XCTAssertThrowsError(try window.mcpServer.stabilizedSelectionReadSnapshot(.init(
-            snapshot: missingCanonicalContext,
-            usesActiveTabCompatibility: false
+            snapshot: missingCanonicalContext
         ))) { error in
             XCTAssertEqual(
                 error as? MCPServerViewModel.StabilizedSelectionReadSnapshotError,
@@ -691,8 +630,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             selection: logicalSelection
         )
         let resolvedContext = MCPServerViewModel.ResolvedTabContextSnapshot(
-            snapshot: context,
-            usesActiveTabCompatibility: false
+            snapshot: context
         )
 
         var liveTab = try XCTUnwrap(window.workspaceManager.composeTab(for: targetIdentity))
@@ -841,85 +779,6 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
     }
 
     #if DEBUG
-        func testActiveMCPTokenRepliesCompleteWhileBackgroundRecountIsBlockedAndCoalesce() async throws {
-            let root = try makeTemporaryRoot(name: "ActiveTokenCache")
-            defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
-            let fileURL = root.appendingPathComponent("Cached.swift")
-            try write(SwiftFixtureSource.emptyStruct("ActiveCachedTokenType"), to: fileURL)
-
-            let tabID = UUID()
-            let selection = StoredSelection(selectedPaths: [fileURL.path])
-            let (window, workspaceID) = await makeWindow(root: root, tabID: tabID, selection: selection)
-            defer { WindowStatesManager.shared.unregisterWindowState(window) }
-            _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
-                in: window,
-                path: root.path
-            )
-            let tokenCounter = window.promptManager.tokenCountingViewModel
-            await tokenCounter.forceImmediateRecount()
-            let recountGate = TokenAccountingGate()
-            tokenCounter.setBeforeTokenCalculationForTesting {
-                await recountGate.markStartedAndWaitForRelease()
-            }
-            defer {
-                Task { @MainActor in
-                    await recountGate.release()
-                    tokenCounter.setBeforeTokenCalculationForTesting(nil)
-                }
-            }
-
-            let baselineStarts = tokenCounter.tokenCalculationStartCountForTesting()
-            tokenCounter.markDirty(.selection)
-            await recountGate.waitUntilStarted()
-
-            let context = makeContext(
-                window: window,
-                workspaceID: workspaceID,
-                tabID: tabID,
-                selection: selection
-            )
-            let activeResolution = MCPServerViewModel.ResolvedTabContextSnapshot(
-                snapshot: context,
-                usesActiveTabCompatibility: true
-            )
-            let repliesCompleted = expectation(description: "active token replies complete while recount is blocked")
-            var selectionReply: ToolResultDTOs.SelectionReply?
-            var workspaceReply: ToolResultDTOs.PromptContextDTO?
-            var replyError: Error?
-            Task { @MainActor in
-                selectionReply = await window.mcpServer.buildCurrentSelectionReply(
-                    includeBlocks: false,
-                    display: .relative,
-                    resolvedContext: activeResolution,
-                    lookupContext: .visibleWorkspace
-                )
-                do {
-                    workspaceReply = try await window.mcpServer.buildTabWorkspaceContext(
-                        context: context,
-                        include: ["selection", "tokens"],
-                        display: .relative,
-                        activeTabCompatibility: true
-                    )
-                } catch {
-                    replyError = error
-                }
-                repliesCompleted.fulfill()
-            }
-            await fulfillment(of: [repliesCompleted], timeout: 1)
-            if let replyError { throw replyError }
-            let resolvedSelectionReply = try XCTUnwrap(selectionReply)
-            let resolvedWorkspaceReply = try XCTUnwrap(workspaceReply)
-
-            XCTAssertEqual(resolvedSelectionReply.tokenAccounting?.source, "active_tab_published")
-            XCTAssertTrue(resolvedSelectionReply.tokenAccounting?.refreshPending == true)
-            XCTAssertEqual(resolvedWorkspaceReply.tokenAccounting?.source, "active_tab_published")
-            XCTAssertTrue(resolvedWorkspaceReply.tokenAccounting?.refreshPending == true)
-            XCTAssertEqual(tokenCounter.tokenCalculationStartCountForTesting(), baselineStarts + 1)
-
-            await recountGate.release()
-            tokenCounter.setBeforeTokenCalculationForTesting(nil)
-        }
-
         func testBoundMCPTokenRepliesCompleteWhileContentRefreshIsBlockedAndCoalesce() async throws {
             let root = try makeTemporaryRoot(name: "BoundTokenCache")
             defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
@@ -953,8 +812,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 selection: selection
             )
             let boundResolution = MCPServerViewModel.ResolvedTabContextSnapshot(
-                snapshot: context,
-                usesActiveTabCompatibility: false
+                snapshot: context
             )
             let baselineStarts = window.mcpServer.virtualTokenRefreshStartCountForTesting()
             let firstCompleted = expectation(description: "first bound token reply completes before refresh")
@@ -987,7 +845,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                         context: context,
                         include: ["selection", "tokens"],
                         display: .relative,
-                        activeTabCompatibility: false
+                        presentationActiveContext: false
                     )
                 } catch {
                     replyError = error
@@ -1120,12 +978,10 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 promptText: "Second signature"
             )
             let firstResolution = MCPServerViewModel.ResolvedTabContextSnapshot(
-                snapshot: firstContext,
-                usesActiveTabCompatibility: false
+                snapshot: firstContext
             )
             let secondResolution = MCPServerViewModel.ResolvedTabContextSnapshot(
-                snapshot: secondContext,
-                usesActiveTabCompatibility: false
+                snapshot: secondContext
             )
             let baselineStarts = window.mcpServer.virtualTokenRefreshStartCountForTesting()
 
@@ -1677,89 +1533,6 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         }
     #endif
 
-    func testActiveCompatibilityLookupContextPreservesActiveSessionAuthority() async throws {
-        let workspaceRoot = try makeTemporaryRoot(name: "CompatibilityWorkspace")
-        let worktreeRoot = try makeTemporaryRoot(name: "CompatibilityWorktree")
-        defer {
-            try? FileManager.default.removeItem(at: workspaceRoot.deletingLastPathComponent())
-            try? FileManager.default.removeItem(at: worktreeRoot.deletingLastPathComponent())
-        }
-        try write(SwiftFixtureSource.emptyStruct("WorkspaceFile"), to: workspaceRoot.appendingPathComponent("WorkspaceFile.swift"))
-        try write(SwiftFixtureSource.emptyStruct("WorktreeFile"), to: worktreeRoot.appendingPathComponent("WorktreeFile.swift"))
-
-        let tabID = UUID()
-        let sessionID = UUID()
-        let (window, workspaceID) = await makeWindow(
-            root: workspaceRoot,
-            tabID: tabID,
-            selection: StoredSelection()
-        )
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
-        let loadedWorkspaceRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
-            in: window,
-            path: workspaceRoot.path
-        )
-        let loadedSessionWorktreeRoot = try await window.workspaceFileContextStore.loadRoot(
-            path: worktreeRoot.path,
-            kind: .sessionWorktree
-        )
-        addTeardownBlock {
-            await window.workspaceFileContextStore.unloadRoot(id: loadedSessionWorktreeRoot.id)
-        }
-        let metadata = MCPServerViewModel.RequestMetadata(
-            connectionID: nil,
-            clientName: "selection-reply-compatibility-test",
-            windowID: window.windowID
-        )
-
-        var bindingState = AgentSessionWorktreeBindingState.unavailable
-        window.mcpServer.registerAgentWorktreeBindingsProvider { requestedSessionID, requestedTabID in
-            guard requestedSessionID == sessionID, requestedTabID == tabID else { return .unavailable }
-            return bindingState
-        }
-
-        let noSessionContext = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
-        XCTAssertEqual(noSessionContext, .visibleWorkspace)
-
-        let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
-        var liveTab = try XCTUnwrap(window.workspaceManager.composeTab(for: identity))
-        liveTab.activeAgentSessionID = sessionID
-        XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(liveTab, inWorkspaceID: workspaceID))
-
-        bindingState = .hydrated([])
-        let emptyBindingContext = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
-        XCTAssertEqual(emptyBindingContext, .visibleWorkspace)
-
-        let logicalRoot = WorkspaceRootRef(
-            id: loadedWorkspaceRoot.id,
-            name: loadedWorkspaceRoot.name,
-            fullPath: loadedWorkspaceRoot.standardizedFullPath
-        )
-        let physicalRoot = WorkspaceRootRef(
-            id: UUID(),
-            name: loadedWorkspaceRoot.name,
-            fullPath: worktreeRoot.path
-        )
-        bindingState = .hydrated([makeBinding(logicalRoot: logicalRoot, physicalRoot: physicalRoot)])
-        let boundContext = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
-        XCTAssertNotNil(boundContext.bindingProjection)
-        XCTAssertEqual(boundContext.rootScope, boundContext.bindingProjection?.lookupRootScope)
-        XCTAssertEqual(
-            boundContext.translateInputPath(workspaceRoot.appendingPathComponent("WorktreeFile.swift").path),
-            worktreeRoot.appendingPathComponent("WorktreeFile.swift").path
-        )
-
-        bindingState = .unhydrated
-        let unresolvedContext = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
-        XCTAssertEqual(
-            unresolvedContext,
-            WorkspaceLookupContext(
-                rootScope: .sessionBoundWorkspace(canonicalRootPaths: [], physicalRootPaths: []),
-                bindingProjection: nil
-            )
-        )
-    }
-
     private func makeWindow(
         root: URL,
         tabID: UUID,
@@ -1802,7 +1575,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         tabID: UUID,
         selection: StoredSelection,
         promptText: String = ""
-    ) -> MCPServerViewModel.TabScopedContext {
+    ) -> MCPServerViewModel.TabContextSnapshot {
         MCPServerViewModel.TabContextSnapshot(
             tabID: tabID,
             windowID: window.windowID,

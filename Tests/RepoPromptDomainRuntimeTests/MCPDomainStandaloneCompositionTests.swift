@@ -14,7 +14,6 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
             storageDirectory: root.appendingPathComponent("Runtime", isDirectory: true),
             eventDirectory: root.appendingPathComponent("Events", isDirectory: true),
             temporaryDirectory: root.appendingPathComponent("Temporary", isDirectory: true),
-            protectedMutationStage: .m4B
         ))
         try await runtime.start()
         let scopeID = DomainStandaloneScopeID()

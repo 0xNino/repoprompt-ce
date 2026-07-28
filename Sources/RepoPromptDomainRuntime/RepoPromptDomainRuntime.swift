@@ -15,7 +15,6 @@ package struct DomainRuntimeConfiguration: Sendable {
     package let legacyRuntimeDefaults: [String: Data]
     package let externalReloadInterval: Duration?
     package let metrics: DomainRuntimeMetricsSink
-    package let protectedMutationStage: DomainProtectedMutationStage
     package let hostDrainTimeout: Duration
 
     package init(
@@ -28,7 +27,6 @@ package struct DomainRuntimeConfiguration: Sendable {
         legacyRuntimeDefaults: [String: Data] = [:],
         externalReloadInterval: Duration? = .seconds(1),
         metrics: DomainRuntimeMetricsSink = .disabled,
-        protectedMutationStage: DomainProtectedMutationStage = .m3Compatibility,
         hostDrainTimeout: Duration = .seconds(5)
     ) {
         self.mode = mode
@@ -41,7 +39,6 @@ package struct DomainRuntimeConfiguration: Sendable {
         self.legacyRuntimeDefaults = legacyRuntimeDefaults
         self.externalReloadInterval = externalReloadInterval
         self.metrics = metrics
-        self.protectedMutationStage = protectedMutationStage
         self.hostDrainTimeout = hostDrainTimeout
     }
 }
@@ -200,7 +197,6 @@ package actor MCPDomainRuntime {
         )
         self.mutationJournal = mutationJournal
         protectedMutationProvider = MCPDomainProtectedMutationToolProvider(
-            stage: configuration.protectedMutationStage,
             policyStore: mutationPolicyStore,
             journal: mutationJournal
         )

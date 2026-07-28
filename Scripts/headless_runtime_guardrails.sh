@@ -23,6 +23,35 @@ for forbidden in \
   fi
 done
 
+for retired in \
+  ServiceRegistry \
+  MCPWindowToolRuntime \
+  MCPWindowToolDependencies \
+  MCPWindowToolContext \
+  MCPWindowToolCatalogService \
+  MCPWindowToolGroup \
+  MCPAppToolDependencies \
+  sharedBindingRuntime \
+  appAdapterTools \
+  activeTabCompatibility \
+  PresentationActiveContextFallback \
+  usesPresentationActiveContext \
+  allowLegacyImplicitRouting \
+  shouldUseGenericTabBindingCompatibility \
+  TabScopedContext \
+  DomainProtectedMutationStage \
+  migratedToolNames; do
+  if grep -R -n --include='*.swift' "$retired" Sources; then
+    echo "error: retired M7 migration authority remains in production sources: $retired" >&2
+    exit 1
+  fi
+done
+
+if grep -R -n --include='*.swift' -E '@MainActor|^[[:space:]]*import[[:space:]]+(AppKit|SwiftUI|Combine)([[:space:]]|$)' "$runtime_sources"; then
+  echo "error: RepoPromptDomainRuntime must have zero domain-owned MainActor or UI dependencies" >&2
+  exit 1
+fi
+
 canonical_file="$runtime_sources/MCPDomainCanonicalToolDefinitions.swift"
 if [[ ! -f "$canonical_file" ]]; then
   echo "error: missing canonical Swift tool definitions" >&2
@@ -45,7 +74,7 @@ if grep -E -q '(^|[^[:alnum:]_])StdioTransport\(' "$direct_sources/DirectHeadles
 fi
 
 if ! grep -q 'MCPDomainReadToolProvider' "$runtime_sources/MCPDomainStandaloneCapabilityProvider.swift"; then
-  echo "error: standalone composition must reuse the canonical migrated read provider" >&2
+  echo "error: standalone composition must reuse the canonical read provider" >&2
   exit 1
 fi
 

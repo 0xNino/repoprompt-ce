@@ -67,8 +67,7 @@ final class AppDomainRuntimeComposition: Sendable {
                 temporaryDirectory: FileManager.default.temporaryDirectory
                     .appendingPathComponent("RepoPrompt CE", isDirectory: true),
                 legacyRuntimeDefaults: legacyRuntimeDefaults,
-                metrics: AppDomainRuntimeMetrics.editFlowSink,
-                protectedMutationStage: .m4B
+                metrics: AppDomainRuntimeMetrics.editFlowSink
             )
         )
     }
@@ -136,8 +135,8 @@ final class AppGlobalMCPServiceComposition {
 
     func ensureRegistered() async throws {
         if let registrationHandles,
-           await ServiceRegistry.isActive(registrationHandles.appSettings),
-           await ServiceRegistry.isActive(registrationHandles.windowRouting)
+           await AppDomainRuntimeComposition.shared.isActive(registrationHandles.appSettings),
+           await AppDomainRuntimeComposition.shared.isActive(registrationHandles.windowRouting)
         {
             await restoreAvailabilityPublicationIfNeeded()
             status = .registered
@@ -154,7 +153,7 @@ final class AppGlobalMCPServiceComposition {
         status = .registering
         let task = Task { @MainActor [runtime, appSettingsService, windowRoutingService] in
             try await runtime.start()
-            let appSettings = try await ServiceRegistry.register(appSettingsService)
+            let appSettings = try await AppDomainRuntimeComposition.shared.register(appSettingsService)
             let windowRouting = try await windowRoutingService.registerDomainTools()
             return RegistrationHandles(
                 appSettings: appSettings.handle,

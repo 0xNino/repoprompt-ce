@@ -1,7 +1,7 @@
 import Foundation
 
 /// Ordered public tool-family groups for a window-scoped MCP catalog.
-enum MCPWindowToolGroup: CaseIterable, Hashable {
+enum MCPAppToolGroup: CaseIterable, Hashable {
     case selection
     case files
     case promptContext
