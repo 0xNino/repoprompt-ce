@@ -864,16 +864,19 @@ actor ServerNetworkManager {
 
     private let bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming
     private let bootstrapPeerPIDResolver: (@Sendable (Int32) -> Int?)?
+    private let domainHost: MCPDomainHost
     private var isRunningState: Bool = false
     private var lifecycleGeneration: UInt64 = 0
     private var isEnabledState: Bool = true
 
     init(
         bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming = .production,
-        bootstrapPeerPIDResolver: (@Sendable (Int32) -> Int?)? = nil
+        bootstrapPeerPIDResolver: (@Sendable (Int32) -> Int?)? = nil,
+        domainHost: MCPDomainHost = AppDomainRuntimeComposition.shared.runtime.domainHost
     ) {
         self.bootstrapLifecycleTiming = bootstrapLifecycleTiming
         self.bootstrapPeerPIDResolver = bootstrapPeerPIDResolver
+        self.domainHost = domainHost
     }
 
     // Bootstrap socket server. Startup candidates remain separate until bind/listen and
@@ -6843,6 +6846,7 @@ actor ServerNetworkManager {
 
         let limiters = callLimiters.removeValue(forKey: id)
         await limiters?.cancelAll()
+        await domainHost.cancelInvocations(connectionID: id)
 
         let assignedWindowID = connectionWindowMap[id]
         let cleanupClientID = clientIDByConnection[id]
@@ -9907,7 +9911,7 @@ actor ServerNetworkManager {
             let disabled = await MainActor.run {
                 ToolAvailabilityStore.shared.effectiveDisabledTools
             }
-            let catalog = await ServiceRegistry.catalogSnapshot()
+            let catalog = await domainHost.catalogSnapshot()
             let policy = effectivePolicyState(for: connectionID)
             let restricted = policy.restricted
             let additionalTools = policy.additional
@@ -11293,7 +11297,7 @@ actor ServerNetworkManager {
             }
             // Listing consumes one immutable actor snapshot. No per-service scan may
             // observe a partially-mutated catalog or create a second schema authority.
-            let catalog = await ServiceRegistry.catalogSnapshot()
+            let catalog = await domainHost.catalogSnapshot()
             let policy = await effectivePolicyState(for: connectionID)
             let restricted = policy.restricted
             let additionalTools = policy.additional
@@ -11862,7 +11866,7 @@ actor ServerNetworkManager {
 
                                 let (windowCount, multiWindowModeEffective) = routingSnapshot
                                 var chosenID: Int?
-                                var singleWindowFallbackResolvedTool: MCPDomainResolvedTool?
+                                var singleWindowFallbackResolvedTool: MCPDomainHostResolution?
                                 let windowStr: String
                                 let observerRunIDForCallbacksFinal: UUID?
                                 do {
@@ -11988,7 +11992,7 @@ actor ServerNetworkManager {
                                     if !bypassWindowRouting,
                                        windowCount == 1,
                                        chosenID == nil,
-                                       let fallback = await ServiceRegistry.resolveUniqueWindowTool(toolName: toolName),
+                                       let fallback = try? await self.domainHost.resolveUniqueWindowTool(toolName: toolName),
                                        case let .window(fallbackWindowID) = fallback.scope
                                     {
                                         singleWindowFallbackResolvedTool = fallback
@@ -12817,13 +12821,13 @@ actor ServerNetworkManager {
                                 }()
                                 var resolvedTool = singleWindowFallbackResolvedTool
                                 if resolvedTool == nil, let registrationScope {
-                                    resolvedTool = await ServiceRegistry.resolve(
+                                    resolvedTool = try? await self.domainHost.resolve(
                                         toolName: toolName,
                                         scope: registrationScope
                                     )
                                 }
                                 if let resolvedTool {
-                                    let toolDef = resolvedTool.binding.definition
+                                    let toolDef = resolvedTool.definition
                                     connectionLog("tools/call \(toolName): dispatching exact domain binding scope=\(String(describing: registrationScope))")
 
                                     // Inject window_id from routing if tool schema declares it and caller didn't provide it.
@@ -12877,11 +12881,13 @@ actor ServerNetworkManager {
                                                 return try await operation()
                                             }
                                         #endif
-                                        return try await MCPDomainInvocationSecurityContext.$current.withValue(
-                                            invocationSecurityContext
-                                        ) {
-                                            try await resolvedTool.binding(effectiveArgs)
-                                        }
+                                        return try await self.domainHost.invoke(MCPDomainHostInvocation(
+                                            invocationID: invocationID,
+                                            connectionID: connectionID,
+                                            resolution: resolvedTool,
+                                            arguments: effectiveArgs,
+                                            securityContext: invocationSecurityContext
+                                        ))
                                     }
 
                                     // Window-scoped bindings retain exact registry generation ownership.
@@ -12889,7 +12895,7 @@ actor ServerNetworkManager {
                                         let ownershipWindowID = chosenID ?? registeredWindowID
                                         guard let windowDispatchIdentity = await self.captureWindowToolDispatchIdentity(
                                             windowID: ownershipWindowID,
-                                            catalogRegistrationHandle: resolvedTool.handle
+                                            catalogRegistrationHandle: resolvedTool.registrationHandle
                                         ) else {
                                             return Self.executionContractToolErrorResult(
                                                 rawJSON: capturedRawJSON,

@@ -16,6 +16,7 @@ package struct DomainRuntimeConfiguration: Sendable {
     package let externalReloadInterval: Duration?
     package let metrics: DomainRuntimeMetricsSink
     package let protectedMutationStage: DomainProtectedMutationStage
+    package let hostDrainTimeout: Duration
 
     package init(
         mode: DomainRuntimeMode,
@@ -27,7 +28,8 @@ package struct DomainRuntimeConfiguration: Sendable {
         legacyRuntimeDefaults: [String: Data] = [:],
         externalReloadInterval: Duration? = .seconds(1),
         metrics: DomainRuntimeMetricsSink = .disabled,
-        protectedMutationStage: DomainProtectedMutationStage = .m3Compatibility
+        protectedMutationStage: DomainProtectedMutationStage = .m3Compatibility,
+        hostDrainTimeout: Duration = .seconds(5)
     ) {
         self.mode = mode
         self.profileIdentifier = profileIdentifier
@@ -40,6 +42,7 @@ package struct DomainRuntimeConfiguration: Sendable {
         self.externalReloadInterval = externalReloadInterval
         self.metrics = metrics
         self.protectedMutationStage = protectedMutationStage
+        self.hostDrainTimeout = hostDrainTimeout
     }
 }
 
@@ -87,6 +90,8 @@ package struct DomainRuntimeSnapshot: Sendable {
     package let activityPublicationSequence: UInt64
     package let activeActivityCount: Int
     package let recentTerminalActivityCount: Int
+    package let hostLifecycle: MCPDomainHostLifecycle
+    package let activeHostInvocationCount: Int
 }
 
 package struct DomainShutdownResult: Sendable {
@@ -103,6 +108,7 @@ package actor MCPDomainRuntime {
     package nonisolated let identity: DomainRuntimeIdentity
     package nonisolated let configuration: DomainRuntimeConfiguration
     package nonisolated let toolRegistry: MCPDomainToolRegistry
+    package nonisolated let domainHost: MCPDomainHost
     package nonisolated let workspaceStore: DomainWorkspaceStore
     package nonisolated let contextStore: DomainContextStore
     package nonisolated let routingCoordinator: DomainRoutingCoordinator
@@ -157,10 +163,16 @@ package actor MCPDomainRuntime {
         let contextStore = DomainContextStore(authority: authority)
         self.workspaceStore = workspaceStore
         self.contextStore = contextStore
-        routingCoordinator = DomainRoutingCoordinator(
+        let routingCoordinator = DomainRoutingCoordinator(
             identity: runtimeIdentity,
             contextStore: contextStore,
             metrics: configuration.metrics
+        )
+        self.routingCoordinator = routingCoordinator
+        domainHost = MCPDomainHost(
+            identity: runtimeIdentity,
+            registry: toolRegistry,
+            routingCoordinator: routingCoordinator
         )
         readSideEffectCoordinator = DomainReadSideEffectCoordinator(identity: runtimeIdentity)
         let mutationPolicyStore = DomainMutationPolicyStore(
@@ -244,6 +256,7 @@ package actor MCPDomainRuntime {
         publishSnapshot()
         externalReloadTask?.cancel()
         externalReloadTask = nil
+        _ = await domainHost.drain(timeout: configuration.hostDrainTimeout)
         await mutationApprovalBroker.shutdown()
         await interactionBroker.shutdown()
         _ = await agentSessionStore.shutdown()
@@ -266,6 +279,7 @@ package actor MCPDomainRuntime {
         let routing = await routingCoordinator.snapshot()
         let agentSessions = await agentSessionStore.snapshot()
         let activities = await activityCenter.snapshot()
+        let host = await domainHost.snapshot()
         return DomainRuntimeSnapshot(
             identity: identity,
             lifecycle: lifecycle,
@@ -278,7 +292,9 @@ package actor MCPDomainRuntime {
             agentSessionPersistenceHealth: agentSessions.persistenceHealth,
             activityPublicationSequence: activities.publicationSequence,
             activeActivityCount: activities.active.count,
-            recentTerminalActivityCount: activities.recentTerminal.count
+            recentTerminalActivityCount: activities.recentTerminal.count,
+            hostLifecycle: host.lifecycle,
+            activeHostInvocationCount: host.activeInvocationCount
         )
     }
 

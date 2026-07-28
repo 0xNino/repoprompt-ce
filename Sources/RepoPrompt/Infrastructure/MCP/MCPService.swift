@@ -80,6 +80,7 @@ actor MCPService: Sendable {
 
     /// ──────────────────────────────────────────────
     private let controller = ServerController.shared
+    private let hostBootstrapOperation: @Sendable () async -> Void
     private let controllerStartOperation: @Sendable () async throws -> Void
     private let controllerStopOperation: @Sendable () async -> Void
     private let controllerFullShutdownOperation: @Sendable () async -> Void
@@ -118,6 +119,10 @@ actor MCPService: Sendable {
 
     /// ──────────────────────────────────────────────
     init(
+        hostBootstrapOperation: @escaping @Sendable () async -> Void = {
+            // One-time Codex migration: no-op when the RepoPrompt entry or config file is missing.
+            _ = MCPIntegrationHelper.ensureCodexToolTimeout()
+        },
         controllerStartOperation: @escaping @Sendable () async throws -> Void = {
             try await ServerController.shared.startServer()
         },
@@ -128,6 +133,7 @@ actor MCPService: Sendable {
             await ServerController.shared.fullShutdown()
         }
     ) {
+        self.hostBootstrapOperation = hostBootstrapOperation
         self.controllerStartOperation = controllerStartOperation
         self.controllerStopOperation = controllerStopOperation
         self.controllerFullShutdownOperation = controllerFullShutdownOperation
@@ -167,10 +173,10 @@ actor MCPService: Sendable {
         } else {
             lifecycleGeneration &+= 1
             let generation = lifecycleGeneration
+            let bootstrap = hostBootstrapOperation
             let operation = controllerStartOperation
             let task = Task {
-                // One-time Codex migration: no-op when the RepoPrompt entry or config file is missing.
-                _ = MCPIntegrationHelper.ensureCodexToolTimeout()
+                await bootstrap()
                 mcpServiceLog("Starting MCP listener")
                 try await operation()
             }
