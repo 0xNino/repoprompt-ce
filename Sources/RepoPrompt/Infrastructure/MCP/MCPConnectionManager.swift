@@ -13282,7 +13282,7 @@ actor ServerNetworkManager {
         connectionID: UUID,
         invocationID: UUID,
         toolName: String
-    ) -> DomainToolInvocationSecurityContext {
+    ) async -> DomainToolInvocationSecurityContext {
         let policy = effectivePolicyState(for: connectionID)
         let runID = runIDByConnectionID[connectionID]
         let displayName = clientIdentifier(forConnection: connectionID) ?? "unknown"
@@ -13310,7 +13310,24 @@ actor ServerNetworkManager {
         } else {
             []
         }
-        let runtimeIdentity = AppDomainRuntimeComposition.shared.runtime.identity
+        let runtime = AppDomainRuntimeComposition.shared.runtime
+        let runtimeIdentity = runtime.identity
+        let connectionGeneration = connectionLifecycleGenerationByID[connectionID] ?? 0
+        let registration = DomainConnectionRegistration(
+            connectionID: connectionID,
+            generation: connectionGeneration,
+            runtimeID: runtimeIdentity.runtimeID
+        )
+        var workspaceID: UUID?
+        var workspaceRevision: UInt64?
+        var authorizedCanonicalRoots: Set<String> = []
+        if let handle = try? await runtime.routingCoordinator.resolveReadContext(connection: registration),
+           let workspace = await runtime.contextStore.workspaceSnapshot(handle.context.workspaceID)
+        {
+            workspaceID = handle.context.workspaceID
+            workspaceRevision = handle.workspaceRevision
+            authorizedCanonicalRoots = Set(workspace.document.metadata.repoPaths)
+        }
         let principal = DomainClientPrincipal(
             principalID: connectionID,
             stableKey: stableKey,
@@ -13324,10 +13341,13 @@ actor ServerNetworkManager {
         return DomainToolInvocationSecurityContext(
             principal: principal,
             connectionID: connectionID,
-            connectionGeneration: connectionLifecycleGenerationByID[connectionID] ?? 0,
+            connectionGeneration: connectionGeneration,
             invocationID: invocationID,
             runtimeID: runtimeIdentity.runtimeID,
             runtimeGeneration: runtimeIdentity.lifecycleGeneration,
+            workspaceID: workspaceID,
+            workspaceRevision: workspaceRevision,
+            authorizedCanonicalRoots: authorizedCanonicalRoots,
             ephemeralGrantedToolNames: ephemeralGrantedToolNames
         )
     }

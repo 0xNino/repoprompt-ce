@@ -6244,6 +6244,7 @@ final class MCPServerViewModel: ObservableObject {
                     throw MCPError.invalidParams("content is required for create action")
                 }
                 let policy = (ifExists ?? "error").lowercased()
+                try await MCPDomainMutationCommitContext.willCommit()
                 try await writeFile(
                     path: effectivePath,
                     content: content,
@@ -6258,12 +6259,14 @@ final class MCPServerViewModel: ObservableObject {
                 guard effectivePath.hasPrefix("/") else {
                     throw MCPError.invalidParams("delete requires an absolute path. Received: \(path)")
                 }
+                try await MCPDomainMutationCommitContext.willCommit()
                 try await moveItemToTrash(path: effectivePath, lookupRootScope: lookupContext.rootScope)
 
             case "move", "rename":
                 guard let newPath else {
                     throw MCPError.invalidParams("new_path is required for move/rename action")
                 }
+                try await MCPDomainMutationCommitContext.willCommit()
                 try await renameFile(oldPath: effectivePath, newPath: effectiveNewPath ?? newPath, lookupRootScope: lookupContext.rootScope)
 
             default:

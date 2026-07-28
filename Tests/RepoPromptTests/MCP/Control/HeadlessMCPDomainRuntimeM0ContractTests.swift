@@ -32,7 +32,7 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertEqual(actionEvidence["wire_envelope_claim"] as? Bool, false)
 
         let protectedMutations = try dictionary(catalog, key: "m4_" + "protected_mutations")
-        XCTAssertEqual(try string(protectedMutations, key: "construction_stage"), "m4a")
+        XCTAssertEqual(try string(protectedMutations, key: "construction_stage"), "m4b")
         XCTAssertEqual(
             try strings(protectedMutations, key: "gate_4a_families"),
             ["manage_selection", "prompt", "workspace_context", "bind_context", "manage_workspaces"]
@@ -45,7 +45,7 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertTrue(registrySource.contains("protectedMutationProvider.protectedBinding"))
         XCTAssertEqual(registrySource.components(separatedBy: "protectedMutationProvider.protectedBinding").count - 1, 1)
         let compositionSource = try source("Sources/RepoPrompt/App/AppDomainRuntimeComposition.swift")
-        XCTAssertTrue(compositionSource.contains("protectedMutationStage: .m4A"))
+        XCTAssertTrue(compositionSource.contains("protectedMutationStage: .m4B"))
 
         let window = makeWindowWithoutAutoStart()
         addTeardownBlock { @MainActor in
@@ -382,8 +382,16 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         let actorInventory = try dictionary(manifest, key: "main_actor")
         XCTAssertEqual(
             try strings(actorInventory, key: "m4_non_main_actor_authorities"),
-            ["DomainMutationPolicyStore", "DomainMutationApprovalBroker", "MCPDomainProtectedMutationToolProvider"]
+            ["DomainMutationPolicyStore", "DomainMutationApprovalBroker", "DomainMutationJournal", "DomainMutationPathFence", "MCPDomainProtectedMutationToolProvider"]
         )
+        let journalSource = try source("Sources/RepoPromptDomainRuntime/DomainMutationJournal.swift")
+        XCTAssertTrue(journalSource.contains("package actor DomainMutationJournal"))
+        XCTAssertTrue(journalSource.contains("case indeterminateAfterCommit"))
+        XCTAssertFalse(journalSource.contains("import AppKit"))
+        let pathFenceSource = try source("Sources/RepoPromptDomainRuntime/DomainMutationPathFence.swift")
+        XCTAssertTrue(pathFenceSource.contains("rootIdentityChanged"))
+        XCTAssertTrue(pathFenceSource.contains("pathResolutionChanged"))
+        XCTAssertFalse(pathFenceSource.contains("import AppKit"))
         XCTAssertEqual(try string(actorInventory, key: "m4_" + "main_actor_presenter"), "WorkspaceApprovalManager")
         let policySource = try source("Sources/RepoPromptDomainRuntime/DomainMutationPolicy.swift")
         XCTAssertTrue(policySource.contains("package actor DomainMutationPolicyStore"))

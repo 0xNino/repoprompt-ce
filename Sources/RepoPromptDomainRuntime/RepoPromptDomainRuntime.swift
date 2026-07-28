@@ -105,6 +105,7 @@ package actor MCPDomainRuntime {
     package nonisolated let readSideEffectCoordinator: DomainReadSideEffectCoordinator
     package nonisolated let mutationPolicyStore: DomainMutationPolicyStore
     package nonisolated let mutationApprovalBroker: DomainMutationApprovalBroker
+    package nonisolated let mutationJournal: DomainMutationJournal
     package nonisolated let protectedMutationProvider: MCPDomainProtectedMutationToolProvider
 
     private let workspaceAuthority: DomainWorkspaceContextAuthority
@@ -159,9 +160,16 @@ package actor MCPDomainRuntime {
         )
         self.mutationPolicyStore = mutationPolicyStore
         mutationApprovalBroker = DomainMutationApprovalBroker()
+        let mutationJournal = DomainMutationJournal(
+            persistence: persistence,
+            profileIdentifier: configuration.profileIdentifier,
+            createdAt: createdAt
+        )
+        self.mutationJournal = mutationJournal
         protectedMutationProvider = MCPDomainProtectedMutationToolProvider(
             stage: configuration.protectedMutationStage,
-            policyStore: mutationPolicyStore
+            policyStore: mutationPolicyStore,
+            journal: mutationJournal
         )
     }
 

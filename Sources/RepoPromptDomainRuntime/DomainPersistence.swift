@@ -307,6 +307,12 @@ package struct DomainPersistenceCoordinator: Sendable {
     private var protectedMutationPolicyLockURL: URL {
         lockDirectory.appendingPathComponent("protected-mutations.lock")
     }
+    private var protectedMutationJournalURL: URL {
+        settingsDirectory.appendingPathComponent("protected-mutation-journal.json")
+    }
+    private var protectedMutationJournalLockURL: URL {
+        lockDirectory.appendingPathComponent("protected-mutation-journal.lock")
+    }
     private var catalogURL: URL { runtimeRoot.appendingPathComponent("workspace-catalog.json") }
     private var indexURL: URL { workspaceRoot.appendingPathComponent("workspacesIndex.json") }
 
@@ -369,6 +375,36 @@ package struct DomainPersistenceCoordinator: Sendable {
                     throw DomainPersistenceError.externalDocumentConflict
                 }
                 try DomainPersistenceLock.atomicWrite(data, to: worker.protectedMutationPolicyURL)
+            }
+        }
+    }
+
+    package func loadProtectedMutationJournalData() async throws -> Data? {
+        try await DomainBlockingIO.run { cancellation in
+            try cancellation.check()
+            let worker = blockingWorker(cancellation)
+            guard worker.fileManager.fileExists(atPath: worker.protectedMutationJournalURL.path) else {
+                return nil
+            }
+            return try Data(contentsOf: worker.protectedMutationJournalURL)
+        }
+    }
+
+    package func compareAndSwapProtectedMutationJournalData(
+        expectedDigest: String?,
+        data: Data
+    ) async throws {
+        try await DomainBlockingIO.run { cancellation in
+            let worker = blockingWorker(cancellation)
+            try cancellation.check()
+            try worker.withLock(at: worker.protectedMutationJournalLockURL) {
+                try cancellation.check()
+                let currentData = try? Data(contentsOf: worker.protectedMutationJournalURL)
+                let currentDigest = currentData.map(DomainContentDigest.sha256)
+                guard currentDigest == expectedDigest else {
+                    throw DomainPersistenceError.externalDocumentConflict
+                }
+                try DomainPersistenceLock.atomicWrite(data, to: worker.protectedMutationJournalURL)
             }
         }
     }

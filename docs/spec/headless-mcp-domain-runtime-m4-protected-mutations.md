@@ -17,7 +17,7 @@ Gate 4A protects the mutation actions of `manage_selection`, `prompt`, `workspac
 | policy administration | `repoprompt-mcp policy list|grant|revoke` | mutations require stdin and stderr TTYs plus an immediate `yes` confirmation |
 | construction | `ServiceRegistry` wraps every registered binding exactly once | app providers remain physical backends; no second mutation registration exists |
 
-The runtime starts in an explicit construction stage. Production app composition selects `m4A`; the default remains `m3Compatibility`, and 4B families are not protected until the later gate changes construction to `m4B`. This prevents both partial activation and dual executable mutation paths.
+The runtime starts in an explicit construction stage. The 4A commit selected `m4A`; after its focused gate passed, the 4B commit switches production app composition to `m4B`. The configuration default remains `m3Compatibility` for explicit compatibility fixtures. This prevents both partial activation and dual executable mutation paths.
 
 ### Security ledger
 
@@ -51,7 +51,43 @@ The runtime starts in an explicit construction stage. Production app composition
 
 ## Gate 4B — filesystem, apply-edits, and worktree mutations
 
-Not active in the 4A commit. Gate 4B must extend the same provider/policy path to `file_actions`, `apply_edits`, and `manage_worktree`, then add admission and precommit root/symlink fences, durable operation-ID deduplication, CAS, cancellation-before-commit, postcommit partial success, and interruption/N-writer evidence before switching construction to `m4B`.
+Gate 4B activates `file_actions`, `apply_edits`, and mutating `manage_worktree` actions through the same `MCPDomainProtectedMutationToolProvider`; the physical app providers remain the single execution backends.
+
+### Security and settlement ledger
+
+| Concern | M4 authority | Commit boundary |
+|---|---|---|
+| root scope | immutable workspace roots/revision captured from `DomainRoutingCoordinator` | requested paths resolve within an authoritative canonical root at admission |
+| symlink/TOCTOU fence | `DomainMutationPathFence` | root device/inode and resolved requested path are revalidated immediately before physical mutation |
+| durable replay | `DomainMutationJournal`, schema version 1, CAS-written `Settings/protected-mutation-journal.json` | stable `operation_id` + deterministic request/scope fingerprint elects one writer and replays the exact result |
+| file actions | existing `MCPServerViewModel.performFileAction` backend | hook follows freshness/argument validation and precedes create/trash/move I/O |
+| apply edits | existing `WorkspaceFileEditHost` backend | hook follows path/edit/approval resolution and precedes overwrite/create I/O |
+| worktrees | existing worktree provider and `VCSService` backends | hook follows selector, confirmation, or routed approval and precedes settings/Git/session mutation |
+
+Relative file paths remain compatible when exactly one authoritative root is bound; ambiguous multi-root relative writes fail closed. Verified app-proxy external worktree creation retains its explicit `allow_external_path` behavior while headless grants remain root-scoped.
+
+Cancellation before the commit hook records `cancelledBeforeCommit` and permits the same stable operation to retry. Once the hook atomically moves the record to `committing`, cancellation or reply loss produces a partial-success diagnostic and durable `indeterminateAfterCommit`; restart refuses automatic reexecution. Applied records contain the encoded exact MCP result. Collision, active-owner, corrupt/future journal, CAS exhaustion, and interrupted commit all default-deny.
+
+### MainActor ledger
+
+`DomainMutationJournal`, `DomainMutationPathFence`, and the protected provider are AppKit-free domain authorities. Existing physical file/edit/worktree providers retain their current actor isolation. The task-local commit controller crosses into those providers only to revalidate policy/path authority and CAS the durable journal at their physical commit point.
+
+### Gate 4B focused evidence
+
+| Validation | Result |
+|---|---|
+| `make dev-test FILTER=DomainProtectedMutationJournalTests` | passed 5 adversarial fixtures after final fence/fingerprint strengthening, ticket `f6363730-c0dc-4afb-95bd-7c3272a3a7a6` |
+| `make dev-test FILTER=HeadlessMCPDomainRuntimeM0ContractTests` | passed 3 contract/ledger tests, ticket `673437d2-8b07-4232-8401-6b8539f78d71` |
+| `make dev-test FILTER=MCPFileActionPartialSuccessTests` | passed 3 app compatibility tests, ticket `b0a09b71-6642-4f4f-aa46-8de8366ec534` |
+| focused apply-edits materialization test | passed, ticket `2d6777dc-140f-4689-843a-cc0738ede99d` |
+| `make dev-test FILTER=ManageWorktreeToolServiceTests` | passed 2 provider tests, ticket `4ee23570-2a76-41f3-96ab-3b2e3bd58db5` |
+| `make dev-test FILTER=ToolCatalogSnapshotTests` | passed 20 frozen catalog tests, ticket `0f8a0c6e-3538-44af-a753-b118f43348ae` |
+| `make dev-test-list` + `verify-ledger` | passed; 3,639 exact root/provider IDs reconciled, list ticket `d2f504c5-cc1e-4263-8fca-b6b5ea8141de` |
+| `make dev-swift-build PRODUCT=RepoPrompt` | passed, ticket `8f581c71-6a21-4866-99da-229a4a5d3b0c` |
+| `make dev-swift-build PRODUCT=repoprompt-mcp` | passed, ticket `1c59725c-f484-429a-be78-0d318cff6f34` |
+| `make dev-lint` | passed, ticket `fbb8c35f-99aa-485f-8c64-efe17d73ea8b` |
+| `make guardrails` | passed |
+
 
 ## Explicit exclusions
 

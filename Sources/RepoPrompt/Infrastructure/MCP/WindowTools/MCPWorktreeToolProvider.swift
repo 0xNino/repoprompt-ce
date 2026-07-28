@@ -1,6 +1,7 @@
 import Foundation
 import JSONSchema
 import MCP
+import RepoPromptDomainRuntime
 
 @MainActor
 final class MCPWorktreeToolProvider: MCPWindowToolProviding {
@@ -152,6 +153,9 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
         let omittedPrunableCount = allWorktrees.count - worktrees.count
         let includeStatus = parseBool(args["include_status"]) ?? false
         let persistVisuals = parseBool(args["persist_visuals"]) ?? false
+        if persistVisuals, !worktrees.isEmpty {
+            try await MCPDomainMutationCommitContext.willCommit()
+        }
         let dtos = try await worktrees.asyncMap { worktree in
             try await worktreeDTO(worktree, includeStatus: includeStatus, persistVisuals: persistVisuals)
         }
@@ -177,6 +181,9 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
     private func executeShow(args: [String: Value]) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
         let context = try await resolveRepositoryContext(args: args)
         let worktree = try await resolveWorktree(args: args, repo: context.repo, allRepos: context.allRepos, requireExplicit: false)
+        if parseBool(args["persist_visuals"]) == true {
+            try await MCPDomainMutationCommitContext.willCommit()
+        }
         let dto = try await worktreeDTO(
             worktree,
             includeStatus: parseBool(args["include_status"]) ?? false,
@@ -217,6 +224,7 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             )
         )
 
+        try await MCPDomainMutationCommitContext.willCommit()
         let createResult = try await vcsService.createGitWorktreeWithResult(request: plan.createRequest, at: context.repo.rootURL)
         let created = createResult.descriptor
         let identity = try persistOrResolveVisualIdentity(
@@ -268,6 +276,7 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
         let worktree = try await resolveWorktree(args: args, repo: context.repo, allRepos: context.allRepos, requireExplicit: true)
         let sessionID = try await resolveBindingSessionID(args: args)
         try validateLiveSession(sessionID, in: dependencies.requireTargetWindow())
+        try await MCPDomainMutationCommitContext.willCommit()
         let identity = try persistOrResolveVisualIdentity(for: worktree, args: args, persist: true)
         let bindingResult = try await applyBinding(
             sessionID: sessionID,
@@ -313,6 +322,9 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             remaining = existing.filter { standardizedPath($0.logicalRootPath) != normalized }
         }
 
+        if !removed.isEmpty {
+            try await MCPDomainMutationCommitContext.willCommit()
+        }
         _ = try await agentModeVM.transitionWorktreeBindings(
             remaining,
             forSessionID: sessionID,
@@ -370,6 +382,7 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
         )
         var desiredBindings = existing.filter { standardizedPath($0.logicalRootPath) != normalizedRoot }
         desiredBindings.append(binding)
+        try await MCPDomainMutationCommitContext.willCommit()
         _ = try await agentModeVM.transitionWorktreeBindings(
             desiredBindings,
             forSessionID: sessionID,
@@ -688,15 +701,15 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
     private func validateArguments(_ args: [String: Value], for op: Operation) throws {
         let valid: Set<String> = switch op {
         case .list:
-            ["op", "repo_root", "repo_key", "include_status", "include_graph", "graph_limit", "persist_visuals"]
+            ["op", "operation_id", "repo_root", "repo_key", "include_status", "include_graph", "graph_limit", "persist_visuals"]
         case .show:
-            ["op", "repo_root", "repo_key", "worktree", "worktree_id", "include_status", "include_graph", "graph_limit", "persist_visuals"]
+            ["op", "operation_id", "repo_root", "repo_key", "worktree", "worktree_id", "include_status", "include_graph", "graph_limit", "persist_visuals"]
         case .create:
-            ["op", "repo_root", "repo_key", "session_id", "include_status", "branch", "base_ref", "path", "detach", "force", "allow_external_path", "bind", "label", "color", "icon_name", "marker_style"]
+            ["op", "operation_id", "repo_root", "repo_key", "session_id", "include_status", "branch", "base_ref", "path", "detach", "force", "allow_external_path", "bind", "label", "color", "icon_name", "marker_style"]
         case .bind, .select:
-            ["op", "repo_root", "repo_key", "worktree", "worktree_id", "session_id", "include_status", "label", "color", "icon_name", "marker_style"]
+            ["op", "operation_id", "repo_root", "repo_key", "worktree", "worktree_id", "session_id", "include_status", "label", "color", "icon_name", "marker_style"]
         case .unbind:
-            ["op", "repo_root", "repo_key", "worktree", "worktree_id", "session_id", "all"]
+            ["op", "operation_id", "repo_root", "repo_key", "worktree", "worktree_id", "session_id", "all"]
         case .preview:
             ["op", "session_id", "repo_root", "target", "target_worktree_id", "include_graph", "graph_limit", "context_lines", "detect_renames", "publish_artifacts"]
         case .apply:

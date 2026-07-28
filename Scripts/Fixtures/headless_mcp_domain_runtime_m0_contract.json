@@ -69,12 +69,15 @@
       }
     },
     "m4_protected_mutations": {
-      "construction_stage": "m4a",
+      "construction_stage": "m4b",
       "gate_4a_families": ["manage_selection", "prompt", "workspace_context", "bind_context", "manage_workspaces"],
       "gate_4b_families": ["file_actions", "apply_edits", "manage_worktree"],
       "definition_and_registration_authority": "MCPDomainProtectedMutationToolProvider",
       "schema_parity": "wrapped_binding_definition_preserved",
-      "dual_mutation_prevention": "ServiceRegistry_wraps_each_binding_once"
+      "dual_mutation_prevention": "ServiceRegistry_wraps_each_binding_once",
+      "gate_4b_operation_journal": "DomainMutationJournal_schema_v1_CAS",
+      "gate_4b_path_fence": "authoritative_roots_and_symlink_identity_at_admission_and_precommit",
+      "gate_4b_commit_settlement": "cancel_before_commit_retryable_after_commit_indeterminate"
     },
     "action_execution_evidence": {
       "status": "explicitly_unmeasured_in_m0",
@@ -578,7 +581,7 @@
     ],
     "non_main_actors": ["MCPBootstrapLease", "MCPReplayState", "BootstrapSocketMCPTransport"],
     "m3_non_main_actor_hops": ["MCPDomainReadToolProvider", "DomainReadSideEffectCoordinator"],
-    "m4_non_main_actor_authorities": ["DomainMutationPolicyStore", "DomainMutationApprovalBroker", "MCPDomainProtectedMutationToolProvider"],
+    "m4_non_main_actor_authorities": ["DomainMutationPolicyStore", "DomainMutationApprovalBroker", "DomainMutationJournal", "DomainMutationPathFence", "MCPDomainProtectedMutationToolProvider"],
     "m4_main_actor_presenter": "WorkspaceApprovalManager",
     "m3_shared_read_tools": ["get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "oracle_chat_log", "git", "history"],
     "m3_context_requirements": {
@@ -704,6 +707,12 @@
         "classification": "protected_mutation_grant_authority"
       },
       {
+        "owner": "DomainMutationJournal",
+        "backing": "versioned_file_with_compare_and_swap",
+        "path": "~/Library/Application Support/RepoPrompt CE/Settings/protected-mutation-journal.json",
+        "classification": "protected_mutation_operation_replay_and_commit_settlement_authority"
+      },
+      {
         "owner": "ApplyEditsApprovalStore",
         "backing": "UserDefaults",
         "classification": "runtime_policy_migration_candidate"
@@ -759,6 +768,13 @@
         "state": "approval_and_tool_policy",
         "current_authority": "DomainMutationPolicyStore_plus_legacy_app_policy_facades",
         "dirty_revision_required": true,
+        "saved_revision_required": true,
+        "migration_milestone": "M4"
+      },
+      {
+        "state": "protected_mutation_operation_journal",
+        "current_authority": "DomainMutationJournal",
+        "dirty_revision_required": false,
         "saved_revision_required": true,
         "migration_milestone": "M4"
       },

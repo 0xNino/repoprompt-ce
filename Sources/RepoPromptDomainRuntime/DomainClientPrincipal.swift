@@ -51,6 +51,9 @@ package struct DomainToolInvocationSecurityContext: Hashable, Sendable {
     package let invocationID: UUID
     package let runtimeID: UUID
     package let runtimeGeneration: UInt64
+    package let workspaceID: UUID?
+    package let workspaceRevision: UInt64?
+    package let authorizedCanonicalRoots: Set<String>
     package let ephemeralGrantedToolNames: Set<String>
 
     package init(
@@ -60,6 +63,9 @@ package struct DomainToolInvocationSecurityContext: Hashable, Sendable {
         invocationID: UUID,
         runtimeID: UUID,
         runtimeGeneration: UInt64,
+        workspaceID: UUID? = nil,
+        workspaceRevision: UInt64? = nil,
+        authorizedCanonicalRoots: Set<String> = [],
         ephemeralGrantedToolNames: Set<String>
     ) {
         self.principal = principal
@@ -68,6 +74,9 @@ package struct DomainToolInvocationSecurityContext: Hashable, Sendable {
         self.invocationID = invocationID
         self.runtimeID = runtimeID
         self.runtimeGeneration = runtimeGeneration
+        self.workspaceID = workspaceID
+        self.workspaceRevision = workspaceRevision
+        self.authorizedCanonicalRoots = authorizedCanonicalRoots
         self.ephemeralGrantedToolNames = ephemeralGrantedToolNames
     }
 }

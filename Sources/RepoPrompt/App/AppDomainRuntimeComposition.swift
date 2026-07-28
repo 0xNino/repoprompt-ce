@@ -44,7 +44,7 @@ final class AppDomainRuntimeComposition: Sendable {
                 temporaryDirectory: FileManager.default.temporaryDirectory
                     .appendingPathComponent("RepoPrompt CE", isDirectory: true),
                 legacyRuntimeDefaults: legacyRuntimeDefaults,
-                protectedMutationStage: .m4A
+                protectedMutationStage: .m4B
             )
         )
     }

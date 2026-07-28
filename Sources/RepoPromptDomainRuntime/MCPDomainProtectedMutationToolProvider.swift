@@ -12,16 +12,30 @@ package struct DomainProtectedMutationOperation: Hashable, Sendable {
     package let action: String
 }
 
+package enum DomainProtectedMutationError: Error, Equatable, LocalizedError, Sendable {
+    case partialSuccessAfterCommit(operationID: String)
+
+    package var errorDescription: String? {
+        switch self {
+        case let .partialSuccessAfterCommit(operationID):
+            "Protected mutation crossed its durable commit boundary but reply settlement was interrupted. Inspect state before retrying operation ID \(operationID)."
+        }
+    }
+}
+
 package struct MCPDomainProtectedMutationToolProvider: Sendable {
     package let stage: DomainProtectedMutationStage
     private let policyStore: DomainMutationPolicyStore
+    private let journal: DomainMutationJournal
 
     package init(
         stage: DomainProtectedMutationStage,
-        policyStore: DomainMutationPolicyStore
+        policyStore: DomainMutationPolicyStore,
+        journal: DomainMutationJournal
     ) {
         self.stage = stage
         self.policyStore = policyStore
+        self.journal = journal
     }
 
     package func protectedBinding(
@@ -32,6 +46,7 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
         }
         let definition = binding.definition
         let policyStore = policyStore
+        let journal = journal
         let stage = stage
         return MCPDomainToolBinding(definition: definition) { arguments in
             guard let operation = Self.operation(
@@ -41,10 +56,26 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
             ) else {
                 return try await binding(arguments)
             }
+            guard let securityContext = MCPDomainInvocationSecurityContext.current else {
+                throw DomainMutationPolicyError.principalMissing
+            }
+
+            if stage == .m4B, Self.isDurableMutationFamily(operation.toolName) {
+                return try await Self.executeDurableMutation(
+                    operation: operation,
+                    arguments: arguments,
+                    securityContext: securityContext,
+                    binding: binding,
+                    policyStore: policyStore,
+                    journal: journal
+                )
+            }
+
             let authorization = try await policyStore.authorize(
-                context: MCPDomainInvocationSecurityContext.current,
+                context: securityContext,
                 toolName: operation.toolName,
-                action: operation.action
+                action: operation.action,
+                workspaceID: securityContext.workspaceID
             )
             try Task.checkCancellation()
             try await policyStore.revalidate(authorization)
@@ -126,5 +157,178 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
         default:
             return nil
         }
+    }
+
+    private static func executeDurableMutation(
+        operation: DomainProtectedMutationOperation,
+        arguments: [String: Value],
+        securityContext: DomainToolInvocationSecurityContext,
+        binding: MCPDomainToolBinding,
+        policyStore: DomainMutationPolicyStore,
+        journal: DomainMutationJournal
+    ) async throws -> Value {
+        var effectiveArguments = arguments
+        let suppliedOperationID = arguments["operation_id"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let operationID = suppliedOperationID.flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString
+        effectiveArguments["operation_id"] = .string(operationID)
+
+        var authorizedRoots = securityContext.authorizedCanonicalRoots
+        if operation.toolName == "manage_worktree",
+           securityContext.principal.kind == .appProxy,
+           arguments["allow_external_path"]?.boolValue == true,
+           let path = arguments["path"]?.stringValue,
+           path.hasPrefix("/")
+        {
+            authorizedRoots.insert(URL(fileURLWithPath: path).deletingLastPathComponent().path)
+        }
+        let pathFence = try await DomainMutationPathFence.admit(
+            requestedPaths: requestedPaths(operation: operation, arguments: effectiveArguments),
+            authorizedRoots: authorizedRoots
+        )
+        let authorization = try await policyStore.authorize(
+            context: securityContext,
+            toolName: operation.toolName,
+            action: operation.action,
+            workspaceID: securityContext.workspaceID,
+            canonicalRoots: pathFence.coveredRoots
+        )
+        try Task.checkCancellation()
+
+        let fingerprint = try mutationFingerprint(
+            operation: operation,
+            arguments: effectiveArguments,
+            workspaceID: securityContext.workspaceID,
+            pathFence: pathFence
+        )
+        let key = "\(operation.toolName).\(operation.action):\(operationID)"
+        let begin = try await journal.begin(
+            key: key,
+            operationID: operationID,
+            toolName: operation.toolName,
+            action: operation.action,
+            fingerprint: fingerprint,
+            ownerInvocationID: securityContext.invocationID,
+            workspaceID: securityContext.workspaceID,
+            workspaceRevision: securityContext.workspaceRevision,
+            pathFence: pathFence
+        )
+        switch begin {
+        case let .replay(result):
+            return result
+        case let .execute(ticket):
+            let commitState = DomainMutationCommitState()
+            let controller = DomainMutationCommitController {
+                try await commitState.beginIfNeeded {
+                    try Task.checkCancellation()
+                    try await policyStore.revalidate(authorization)
+                    try await DomainMutationPathFence.revalidate(pathFence)
+                    try await journal.markCommitting(ticket)
+                }
+            }
+            do {
+                let result = try await MCPDomainMutationCommitContext.$controller.withValue(controller) {
+                    try await binding(effectiveArguments)
+                }
+                let didBeginCommit = await commitState.hasBegunCommit()
+                if Task.isCancelled, didBeginCommit {
+                    try? await detachedFinishIndeterminate(journal: journal, ticket: ticket)
+                    throw DomainProtectedMutationError.partialSuccessAfterCommit(operationID: operationID)
+                }
+                try await detachedFinishApplied(journal: journal, ticket: ticket, result: result)
+                return result
+            } catch let error as DomainProtectedMutationError {
+                throw error
+            } catch {
+                let didBeginCommit = await commitState.hasBegunCommit()
+                if didBeginCommit {
+                    try? await detachedFinishIndeterminate(journal: journal, ticket: ticket)
+                    throw DomainProtectedMutationError.partialSuccessAfterCommit(operationID: operationID)
+                }
+                try? await detachedFinishBeforeCommit(
+                    journal: journal,
+                    ticket: ticket,
+                    cancelled: error is CancellationError
+                )
+                throw error
+            }
+        }
+    }
+
+    private static func isDurableMutationFamily(_ toolName: String) -> Bool {
+        ["file_actions", "apply_edits", "manage_worktree"].contains(toolName)
+    }
+
+    private static func requestedPaths(
+        operation: DomainProtectedMutationOperation,
+        arguments: [String: Value]
+    ) -> [String] {
+        switch operation.toolName {
+        case "file_actions":
+            return [arguments["path"]?.stringValue, arguments["new_path"]?.stringValue].compactMap { $0 }
+        case "apply_edits":
+            return [arguments["path"]?.stringValue].compactMap { $0 }
+        case "manage_worktree":
+            return ["repo_root", "path", "worktree", "target"].compactMap { key in
+                guard let path = arguments[key]?.stringValue, path.hasPrefix("/") else { return nil }
+                return path
+            }
+        default:
+            return []
+        }
+    }
+
+    private static func mutationFingerprint(
+        operation: DomainProtectedMutationOperation,
+        arguments: [String: Value],
+        workspaceID: UUID?,
+        pathFence: DomainMutationPathFenceSnapshot
+    ) throws -> String {
+        struct Payload: Encodable {
+            let toolName: String
+            let action: String
+            let arguments: [String: Value]
+            let workspaceID: UUID?
+            let pathFence: DomainMutationPathFenceSnapshot
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(Payload(
+            toolName: operation.toolName,
+            action: operation.action,
+            arguments: arguments,
+            workspaceID: workspaceID,
+            pathFence: pathFence
+        ))
+        return DomainContentDigest.sha256(data)
+    }
+
+    private static func detachedFinishApplied(
+        journal: DomainMutationJournal,
+        ticket: DomainMutationJournalTicket,
+        result: Value
+    ) async throws {
+        try await Task.detached(priority: .utility) {
+            try await journal.finishApplied(ticket, result: result)
+        }.value
+    }
+
+    private static func detachedFinishBeforeCommit(
+        journal: DomainMutationJournal,
+        ticket: DomainMutationJournalTicket,
+        cancelled: Bool
+    ) async throws {
+        try await Task.detached(priority: .utility) {
+            try await journal.finishBeforeCommit(ticket, cancelled: cancelled)
+        }.value
+    }
+
+    private static func detachedFinishIndeterminate(
+        journal: DomainMutationJournal,
+        ticket: DomainMutationJournalTicket
+    ) async throws {
+        try await Task.detached(priority: .utility) {
+            try await journal.finishIndeterminateAfterCommit(ticket)
+        }.value
     }
 }
