@@ -150,7 +150,7 @@ The A3 extraction moves canonical `tools/list` filtering, two-stage `tools/call`
 - `MCPDomainToolResourceAdmissionController` is the physical cancellation-safe FIFO lease authority, including repository resource identity for standalone composition;
 - the host owns the mutation and small-read controllers; the app keeps only routing-to-resource selection, timing evidence, and the intentional explicit release boundary before formatter/observer tails;
 - the app compatibility controller name is now only a typealias used by the existing focused tests;
-- `MCPRequestProgressState`, its delivery result, and the transport-only actor capability live in the runtime; the host owns generation-independent request handles, finish invalidation, connection-cancel invalidation, and drain invalidation, while the app adapter keeps the legacy RepoPrompt CLI control fallback and physical `MCP.Server.notify` write.
+- `MCPRequestProgressState`, its delivery result, and the transport-only actor capability live in the runtime; the host owns connection-generation-bound request handles, finish invalidation, connection-cancel invalidation, and drain invalidation, while the app adapter keeps the legacy RepoPrompt CLI control fallback and physical `MCP.Server.notify` write.
 
 Evidence:
 
@@ -166,6 +166,28 @@ Evidence:
 - `make dev-swift-build PRODUCT=repoprompt-mcp` — ticket `ac61444b-6d9a-4fdc-b7ea-d22970164828`, passed
 - `make dev-lint` — ticket `03d1a701-6ee5-4850-9284-abec4ad906df`, passed
 - ledger verification — 3,686 exact methods; root/provider list tickets `a843351d-3d8a-435b-aaf6-8067fd3a1b89` and `b413d7fe-aaf6-48f7-96f2-d42ac8eb4055`
+
+### Review follow-up: final admission and drain closure
+
+The branch-range Gate 6A review identified three additional reentrancy gaps, all closed before beginning Gate 6B:
+
+- connection removal now terminal-fences the exact connection generation in the host before any cleanup suspension; final invocation admission and request-progress creation reject that generation;
+- duplicate invocation IDs are rechecked in the same suspension-free final admission block as lifecycle and connection-terminal state, preventing task-ownership overwrite;
+- host drain closes both host-owned resource controllers, fails queued acquisitions, waits for outstanding leases, and publishes admission counts in its snapshot.
+
+Evidence:
+
+- `make dev-test FILTER=MCPDomainHostTests` — ticket `ceb7af9d-d521-4b94-ae22-db670ff1e7e2`, 10 passed
+- `make dev-test FILTER=MCPToolAdmissionPolicyTests` — ticket `91cc8793-e825-4671-b218-09d6a5d1c784`, 11 passed
+- `make dev-test FILTER=PersistentMCPResponseDeliveryTests` — ticket `aa54db84-91e7-4fbb-9380-faa881b7e860`, 24 passed
+- `make dev-test FILTER=MCPProxyTerminalRecordTests` — ticket `e5533c26-3f81-41cd-b2c9-3f40875642ed`, 7 passed
+- `make dev-test FILTER=ToolCatalogSnapshotTests` — ticket `4b330dd1-7f33-4da7-9a80-8ad4c5e228c1`, 22 passed
+- `make dev-swift-build PRODUCT=RepoPrompt` — ticket `4182be28-547b-42b5-b782-85b56c9c4f78`, passed
+- `make dev-swift-build PRODUCT=repoprompt-mcp` — ticket `30fa3e0d-9fcd-4d1d-b30e-d707cc96358f`, passed
+- `make dev-lint` — ticket `49363f7e-4039-4ddf-aa31-72555dc5ba2f`, passed
+- `make guardrails` — passed
+- `make dev-provider-test` — ticket `fcb0084e-a489-442a-8e0b-9573227c0d22`, passed
+- ledger verification — 3,689 exact methods; root/provider list tickets `d5d91c33-0234-46fc-b1b2-39ecd5222b83` and `a761b7c1-ce83-48df-973d-7d6a7b2c9c85`
 
 ## Gate 6B exposure rule
 

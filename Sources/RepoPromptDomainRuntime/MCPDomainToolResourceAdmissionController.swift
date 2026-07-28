@@ -13,6 +13,16 @@ package enum MCPDomainToolAdmissionLimits {
 /// Protocol-neutral, cancellation-safe admission keyed by the physical state resource.
 /// Connection lanes provide client ordering; this controller bounds cross-connection work.
 package final class MCPDomainToolResourceAdmissionController: @unchecked Sendable {
+    package enum AdmissionError: Error, Equatable, Sendable {
+        case closed
+    }
+
+    package struct Snapshot: Equatable, Sendable {
+        package let activeLeaseCount: Int
+        package let waiterCount: Int
+        package let isClosed: Bool
+    }
+
     package enum Resource: Hashable, Sendable {
         case appWide
         case window(Int)
@@ -53,6 +63,7 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
     private var waitersByResource: [Resource: [Waiter]] = [:]
     private var resourceByWaiterID: [UUID: Resource] = [:]
     private var cancelledWaiterIDs: Set<UUID> = []
+    private var isClosed = false
 
     package init(limit: Int) {
         precondition(limit > 0)
@@ -68,6 +79,9 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
                 let immediateResult: Result<Lease, Error>? = lock.withLock {
                     if cancelledWaiterIDs.remove(waiterID) != nil || Task.isCancelled {
                         return .failure(CancellationError())
+                    }
+                    guard !isClosed else {
+                        return .failure(AdmissionError.closed)
                     }
                     guard canAcquire(resource), waitersByResource[resource]?.isEmpty != false else {
                         let waiter = Waiter(id: waiterID, continuation: continuation)
@@ -104,6 +118,33 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
         lock.withLock { waitersByResource[resource]?.count ?? 0 }
     }
 
+    package func snapshot() -> Snapshot {
+        lock.withLock {
+            Snapshot(
+                activeLeaseCount: activeCountByResource.values.reduce(0, +),
+                waiterCount: resourceByWaiterID.count,
+                isClosed: isClosed
+            )
+        }
+    }
+
+    @discardableResult
+    package func close() -> Int {
+        let waiters: [Waiter] = lock.withLock {
+            guard !isClosed else { return [] }
+            isClosed = true
+            let waiters = waitersByResource.values.flatMap { $0 }
+            waitersByResource.removeAll()
+            resourceByWaiterID.removeAll()
+            cancelledWaiterIDs.removeAll()
+            return waiters
+        }
+        for waiter in waiters {
+            waiter.continuation.resume(throwing: AdmissionError.closed)
+        }
+        return waiters.count
+    }
+
     private func canAcquire(_ resource: Resource) -> Bool {
         (activeCountByResource[resource] ?? 0) < limit
     }
@@ -128,7 +169,7 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
             }
 
             var handoffs: [(CheckedContinuation<Lease, Error>, Lease)] = []
-            while canAcquire(resource), var waiters = waitersByResource[resource], !waiters.isEmpty {
+            while !isClosed, canAcquire(resource), var waiters = waitersByResource[resource], !waiters.isEmpty {
                 let next = waiters.removeFirst()
                 resourceByWaiterID.removeValue(forKey: next.id)
                 if waiters.isEmpty {
@@ -152,7 +193,9 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
                   var waiters = waitersByResource[resource],
                   let index = waiters.firstIndex(where: { $0.id == waiterID })
             else {
-                cancelledWaiterIDs.insert(waiterID)
+                if !isClosed {
+                    cancelledWaiterIDs.insert(waiterID)
+                }
                 return nil
             }
 

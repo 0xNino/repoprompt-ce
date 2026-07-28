@@ -86,7 +86,10 @@ final class MCPDomainHostTests: XCTestCase {
         let task = Task { try await fixture.runtime.domainHost.invoke(invocation) }
         await blocker.awaitStarted()
 
-        await fixture.runtime.domainHost.cancelInvocations(connectionID: fixture.connection.connectionID)
+        await fixture.runtime.domainHost.cancelInvocations(
+            connectionID: fixture.connection.connectionID,
+            connectionGeneration: fixture.connection.generation
+        )
         let draining = await fixture.runtime.domainHost.drain(timeout: Duration.milliseconds(10))
         XCTAssertTrue(draining.deadlineExpired)
         XCTAssertFalse(draining.callerCancelled)
@@ -162,6 +165,154 @@ final class MCPDomainHostTests: XCTestCase {
         let snapshot = await host.snapshot()
         XCTAssertEqual(snapshot.lifecycle, .drained)
         XCTAssertEqual(snapshot.activeInvocationCount, 0)
+    }
+
+    func testConnectionCancellationFencesSuspendedFinalAdmission() async throws {
+        let admissionGate = InvocationBlocker()
+        let invocationCounter = InvocationCounter()
+        let fixture = try await makeFixture(binding: Self.binding { _ in
+            await invocationCounter.increment()
+            return .string("unexpected")
+        })
+        let host = MCPDomainHost(
+            identity: fixture.runtime.identity,
+            registry: fixture.runtime.toolRegistry,
+            routingCoordinator: fixture.runtime.routingCoordinator,
+            beforeFinalAdmission: { await admissionGate.wait() }
+        )
+        let resolution = try await host.resolve(
+            toolName: MCPWindowToolName.readFile,
+            scope: .window(id: 1)
+        )
+        let invocationID = UUID()
+        let invocation = MCPDomainHostInvocation(
+            invocationID: invocationID,
+            connectionID: fixture.connection.connectionID,
+            resolution: resolution,
+            arguments: [:],
+            securityContext: securityContext(
+                identity: fixture.runtime.identity,
+                connection: fixture.connection,
+                invocationID: invocationID
+            )
+        )
+        let task = Task {
+            try await host.invoke(invocation)
+        }
+        await admissionGate.awaitStarted()
+
+        await host.cancelInvocations(
+            connectionID: fixture.connection.connectionID,
+            connectionGeneration: fixture.connection.generation
+        )
+        await admissionGate.resume()
+
+        do {
+            _ = try await task.value
+            XCTFail("Connection cancellation allowed suspended admission to run")
+        } catch let error as MCPDomainHostError {
+            XCTAssertEqual(error, .connectionRegistrationInvalid)
+        }
+        let invocationCount = await invocationCounter.value()
+        XCTAssertEqual(invocationCount, 0)
+    }
+
+    func testDuplicateInvocationIDIsFencedAtFinalAdmission() async throws {
+        let admissionBarrier = InvocationAdmissionBarrier(expectedArrivalCount: 2)
+        let invocationCounter = InvocationCounter()
+        let fixture = try await makeFixture(binding: Self.binding { _ in
+            await invocationCounter.increment()
+            return .string("ok")
+        })
+        let host = MCPDomainHost(
+            identity: fixture.runtime.identity,
+            registry: fixture.runtime.toolRegistry,
+            routingCoordinator: fixture.runtime.routingCoordinator,
+            beforeFinalAdmission: { await admissionBarrier.arriveAndWait() }
+        )
+        let resolution = try await host.resolve(
+            toolName: MCPWindowToolName.readFile,
+            scope: .window(id: 1)
+        )
+        let invocationID = UUID()
+        let invocation = MCPDomainHostInvocation(
+            invocationID: invocationID,
+            connectionID: fixture.connection.connectionID,
+            resolution: resolution,
+            arguments: [:],
+            securityContext: securityContext(
+                identity: fixture.runtime.identity,
+                connection: fixture.connection,
+                invocationID: invocationID
+            )
+        )
+        let first = Task { () -> Error? in
+            do {
+                _ = try await host.invoke(invocation)
+                return nil
+            } catch {
+                return error
+            }
+        }
+        let second = Task { () -> Error? in
+            do {
+                _ = try await host.invoke(invocation)
+                return nil
+            } catch {
+                return error
+            }
+        }
+        await admissionBarrier.awaitAllArrivals()
+        await admissionBarrier.release()
+
+        let errors = await [first.value, second.value]
+        XCTAssertEqual(errors.filter { $0 == nil }.count, 1)
+        let duplicateErrors = errors.compactMap { $0 as? MCPDomainHostError }
+        XCTAssertEqual(duplicateErrors, [.duplicateInvocationID(invocationID)])
+        let invocationCount = await invocationCounter.value()
+        XCTAssertEqual(invocationCount, 1)
+    }
+
+    func testDrainClosesResourceAdmissionAndWaitsForActiveLease() async throws {
+        let fixture = try await makeFixture()
+        let host = fixture.runtime.domainHost
+        let lease = try await host.acquireMutationResourceAdmission(.appWide)
+        let waiter = Task { () -> Error? in
+            do {
+                _ = try await host.acquireMutationResourceAdmission(.appWide)
+                return nil
+            } catch {
+                return error
+            }
+        }
+        for _ in 0 ..< 100 {
+            if await host.snapshot().resourceAdmissionWaiterCount == 1 { break }
+            await Task.yield()
+        }
+        let queuedSnapshot = await host.snapshot()
+        XCTAssertEqual(queuedSnapshot.resourceAdmissionWaiterCount, 1)
+
+        let drainTask = Task { await host.drain(timeout: .seconds(1)) }
+        let waiterError = await waiter.value
+        XCTAssertEqual(
+            waiterError as? MCPDomainToolResourceAdmissionController.AdmissionError,
+            .closed
+        )
+        XCTAssertTrue(lease.release())
+        let drain = await drainTask.value
+        XCTAssertFalse(drain.deadlineExpired)
+        XCTAssertEqual(drain.detachedInvocationCount, 0)
+        let snapshot = await host.snapshot()
+        XCTAssertEqual(snapshot.lifecycle, .drained)
+        XCTAssertEqual(snapshot.activeResourceAdmissionLeaseCount, 0)
+        XCTAssertEqual(snapshot.resourceAdmissionWaiterCount, 0)
+
+        do {
+            _ = try await host.acquireMutationResourceAdmission(.appWide)
+            XCTFail("Drained host issued a new resource lease")
+        } catch let error as MCPDomainHostError {
+            XCTAssertEqual(error, .draining)
+        }
     }
 
     func testHostOwnsCanonicalCatalogAndCallPolicyDecisions() async throws {
@@ -268,6 +419,7 @@ final class MCPDomainHostTests: XCTestCase {
         let invocationID = UUID()
         let optionalHandle = await fixture.runtime.domainHost.beginRequestProgress(
             connectionID: fixture.connection.connectionID,
+            connectionGeneration: fixture.connection.generation,
             invocationID: invocationID,
             token: .string("host-progress")
         )
@@ -291,12 +443,14 @@ final class MCPDomainHostTests: XCTestCase {
 
         let optionalCancelledHandle = await fixture.runtime.domainHost.beginRequestProgress(
             connectionID: fixture.connection.connectionID,
+            connectionGeneration: fixture.connection.generation,
             invocationID: UUID(),
             token: .integer(2)
         )
         let cancelledHandle = try XCTUnwrap(optionalCancelledHandle)
         await fixture.runtime.domainHost.cancelInvocations(
-            connectionID: fixture.connection.connectionID
+            connectionID: fixture.connection.connectionID,
+            connectionGeneration: fixture.connection.generation
         )
         await fixture.runtime.domainHost.sendRequestProgress(
             cancelledHandle,
@@ -442,6 +596,53 @@ final class MCPDomainHostTests: XCTestCase {
             hasAuthoritativeRoutingContext: false,
             ephemeralGrantedToolNames: [MCPWindowToolName.readFile]
         )
+    }
+}
+
+private actor InvocationCounter {
+    private var count = 0
+
+    func increment() {
+        count += 1
+    }
+
+    func value() -> Int {
+        count
+    }
+}
+
+private actor InvocationAdmissionBarrier {
+    private let expectedArrivalCount: Int
+    private var arrivalCount = 0
+    private var arrivalWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var isReleased = false
+
+    init(expectedArrivalCount: Int) {
+        self.expectedArrivalCount = expectedArrivalCount
+    }
+
+    func arriveAndWait() async {
+        arrivalCount += 1
+        if arrivalCount >= expectedArrivalCount {
+            let waiters = arrivalWaiters
+            arrivalWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+        guard !isReleased else { return }
+        await withCheckedContinuation { releaseWaiters.append($0) }
+    }
+
+    func awaitAllArrivals() async {
+        guard arrivalCount < expectedArrivalCount else { return }
+        await withCheckedContinuation { arrivalWaiters.append($0) }
+    }
+
+    func release() {
+        isReleased = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 }
 

@@ -65,6 +65,8 @@ package struct MCPDomainHostSnapshot: Equatable, Sendable {
     package let lifecycle: MCPDomainHostLifecycle
     package let activeInvocationCount: Int
     package let connectionsWithActiveInvocationsCount: Int
+    package let activeResourceAdmissionLeaseCount: Int
+    package let resourceAdmissionWaiterCount: Int
 }
 
 package struct MCPDomainHostDrainResult: Equatable, Sendable {
@@ -80,11 +82,13 @@ package struct MCPDomainHostDrainResult: Equatable, Sendable {
 package actor MCPDomainHost {
     private struct ActiveInvocation {
         let connectionID: UUID
+        let connectionGeneration: UInt64
         let task: Task<Value, Error>
     }
 
     private struct RequestProgressRecord {
         let handle: MCPDomainRequestProgressHandle
+        let connectionGeneration: UInt64
         let state: MCPRequestProgressState
     }
 
@@ -104,6 +108,7 @@ package actor MCPDomainHost {
     private var activeInvocations: [UUID: ActiveInvocation] = [:]
     private var invocationIDsByConnection: [UUID: Set<UUID>] = [:]
     private var requestProgressByStateID: [UUID: RequestProgressRecord] = [:]
+    private var terminalConnectionGenerationByID: [UUID: UInt64] = [:]
 
     package init(
         identity: DomainRuntimeIdentity,
@@ -200,6 +205,15 @@ package actor MCPDomainHost {
         guard lifecycle == .accepting else {
             throw MCPDomainHostError.draining
         }
+        guard activeInvocations[invocation.invocationID] == nil else {
+            throw MCPDomainHostError.duplicateInvocationID(invocation.invocationID)
+        }
+        guard !isConnectionGenerationTerminal(
+            connectionID: invocation.connectionID,
+            generation: invocation.securityContext.connectionGeneration
+        ) else {
+            throw MCPDomainHostError.connectionRegistrationInvalid
+        }
         let metrics = metrics
         let toolName = invocation.resolution.toolName
         let task = Task {
@@ -235,6 +249,7 @@ package actor MCPDomainHost {
         }
         activeInvocations[invocation.invocationID] = ActiveInvocation(
             connectionID: invocation.connectionID,
+            connectionGeneration: invocation.securityContext.connectionGeneration,
             task: task
         )
         invocationIDsByConnection[invocation.connectionID, default: []].insert(invocation.invocationID)
@@ -255,10 +270,16 @@ package actor MCPDomainHost {
 
     package func beginRequestProgress(
         connectionID: UUID,
+        connectionGeneration: UInt64,
         invocationID: UUID,
         token: ProgressToken
     ) -> MCPDomainRequestProgressHandle? {
-        guard lifecycle == .accepting else { return nil }
+        guard lifecycle == .accepting,
+              !isConnectionGenerationTerminal(
+                  connectionID: connectionID,
+                  generation: connectionGeneration
+              )
+        else { return nil }
         let handle = MCPDomainRequestProgressHandle(
             stateID: UUID(),
             connectionID: connectionID,
@@ -266,6 +287,7 @@ package actor MCPDomainHost {
         )
         requestProgressByStateID[handle.stateID] = RequestProgressRecord(
             handle: handle,
+            connectionGeneration: connectionGeneration,
             state: MCPRequestProgressState(token: token)
         )
         return handle
@@ -292,18 +314,28 @@ package actor MCPDomainHost {
     package func acquireMutationResourceAdmission(
         _ resource: MCPDomainToolResourceAdmissionController.Resource
     ) async throws -> MCPDomainToolResourceAdmissionController.Lease {
-        try await mutationAdmissionController.acquire(resource)
+        guard lifecycle == .accepting else { throw MCPDomainHostError.draining }
+        return try await mutationAdmissionController.acquire(resource)
     }
 
     package func acquireSmallReadResourceAdmission(
         windowID: Int
     ) async throws -> MCPDomainToolResourceAdmissionController.Lease {
-        try await smallReadAdmissionController.acquire(.window(windowID))
+        guard lifecycle == .accepting else { throw MCPDomainHostError.draining }
+        return try await smallReadAdmissionController.acquire(.window(windowID))
     }
 
-    package func cancelInvocations(connectionID: UUID) async {
+    package func cancelInvocations(
+        connectionID: UUID,
+        connectionGeneration: UInt64
+    ) async {
+        terminalConnectionGenerationByID[connectionID] = max(
+            terminalConnectionGenerationByID[connectionID] ?? 0,
+            connectionGeneration
+        )
         let progressRecords = requestProgressByStateID.values.filter {
             $0.handle.connectionID == connectionID
+                && $0.connectionGeneration <= connectionGeneration
         }
         for record in progressRecords {
             requestProgressByStateID.removeValue(forKey: record.handle.stateID)
@@ -312,19 +344,22 @@ package actor MCPDomainHost {
 
         let invocationIDs = invocationIDsByConnection[connectionID] ?? []
         for invocationID in invocationIDs {
-            activeInvocations[invocationID]?.task.cancel()
+            guard let invocation = activeInvocations[invocationID],
+                  invocation.connectionGeneration <= connectionGeneration
+            else { continue }
+            invocation.task.cancel()
         }
     }
 
     package func beginDrain() {
         guard lifecycle == .accepting else { return }
         lifecycle = .draining
+        _ = mutationAdmissionController.close()
+        _ = smallReadAdmissionController.close()
         for invocation in activeInvocations.values {
             invocation.task.cancel()
         }
-        if activeInvocations.isEmpty {
-            lifecycle = .drained
-        }
+        markDrainedIfSettled()
     }
 
     package func drain(timeout: Duration) async -> MCPDomainHostDrainResult {
@@ -335,7 +370,7 @@ package actor MCPDomainHost {
             await record.state.invalidate()
         }
         let initialCount = activeInvocations.count
-        guard initialCount > 0 else {
+        guard hasOutstandingWork else {
             lifecycle = .drained
             return MCPDomainHostDrainResult(
                 settledInvocationCount: 0,
@@ -348,7 +383,7 @@ package actor MCPDomainHost {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
         var callerCancelled = false
-        while !activeInvocations.isEmpty, clock.now < deadline {
+        while hasOutstandingWork, clock.now < deadline {
             if Task.isCancelled {
                 callerCancelled = true
                 break
@@ -365,10 +400,8 @@ package actor MCPDomainHost {
         }
 
         let detachedCount = activeInvocations.count
-        let deadlineExpired = detachedCount > 0 && !callerCancelled && clock.now >= deadline
-        if detachedCount == 0 {
-            lifecycle = .drained
-        }
+        let deadlineExpired = hasOutstandingWork && !callerCancelled && clock.now >= deadline
+        markDrainedIfSettled()
         return MCPDomainHostDrainResult(
             settledInvocationCount: max(0, initialCount - detachedCount),
             detachedInvocationCount: detachedCount,
@@ -378,10 +411,13 @@ package actor MCPDomainHost {
     }
 
     package func snapshot() -> MCPDomainHostSnapshot {
-        MCPDomainHostSnapshot(
+        let admission = resourceAdmissionSnapshot
+        return MCPDomainHostSnapshot(
             lifecycle: lifecycle,
             activeInvocationCount: activeInvocations.count,
-            connectionsWithActiveInvocationsCount: invocationIDsByConnection.count
+            connectionsWithActiveInvocationsCount: invocationIDsByConnection.count,
+            activeResourceAdmissionLeaseCount: admission.activeLeaseCount,
+            resourceAdmissionWaiterCount: admission.waiterCount
         )
     }
 
@@ -452,7 +488,37 @@ package actor MCPDomainHost {
         if invocationIDsByConnection[invocation.connectionID]?.isEmpty == true {
             invocationIDsByConnection.removeValue(forKey: invocation.connectionID)
         }
-        if lifecycle == .draining, activeInvocations.isEmpty {
+        markDrainedIfSettled()
+    }
+
+    private func isConnectionGenerationTerminal(
+        connectionID: UUID,
+        generation: UInt64
+    ) -> Bool {
+        guard let terminalGeneration = terminalConnectionGenerationByID[connectionID] else {
+            return false
+        }
+        return generation <= terminalGeneration
+    }
+
+    private var resourceAdmissionSnapshot: (activeLeaseCount: Int, waiterCount: Int) {
+        let mutation = mutationAdmissionController.snapshot()
+        let smallRead = smallReadAdmissionController.snapshot()
+        return (
+            mutation.activeLeaseCount + smallRead.activeLeaseCount,
+            mutation.waiterCount + smallRead.waiterCount
+        )
+    }
+
+    private var hasOutstandingWork: Bool {
+        let admission = resourceAdmissionSnapshot
+        return !activeInvocations.isEmpty
+            || admission.activeLeaseCount > 0
+            || admission.waiterCount > 0
+    }
+
+    private func markDrainedIfSettled() {
+        if lifecycle == .draining, !hasOutstandingWork {
             lifecycle = .drained
         }
     }

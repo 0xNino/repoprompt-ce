@@ -6759,6 +6759,16 @@ actor ServerNetworkManager {
         // actually initiated removal.
         persistAcceptedSocketTerminalRecord(connectionID: id, context: context)
 
+        // Fence this exact connection generation in the domain host before any
+        // cleanup suspension can let a parked invocation cross final admission.
+        let removedConnectionGeneration = connectionLifecycleGenerationByID[id]
+        if let removedConnectionGeneration {
+            await domainHost.cancelInvocations(
+                connectionID: id,
+                connectionGeneration: removedConnectionGeneration
+            )
+        }
+
         // Capture run ownership before any suspension or connection-dictionary cleanup.
         // A discovery child can finish successfully and then disappear through several
         // transport shapes (server terminate, write hangup/stall, read error, TTL, etc.).
@@ -6792,7 +6802,6 @@ actor ServerNetworkManager {
 
         let limiters = callLimiters.removeValue(forKey: id)
         await limiters?.cancelAll()
-        await domainHost.cancelInvocations(connectionID: id)
 
         let assignedWindowID = connectionWindowMap[id]
         let cleanupClientID = clientIDByConnection[id]
@@ -11650,9 +11659,13 @@ actor ServerNetworkManager {
             let capturedPreResolvedWindowID = preResolvedWindowID
             let capturedArguments = dispatchArguments
             let capturedArgsForFormatter = argsForFormatter
-            let capturedProgressState: MCPDomainRequestProgressHandle? = if let progressToken = params._meta?.progressToken {
+            let capturedConnectionGeneration = await requestTimelineConnectionGeneration(for: connectionID)
+            let capturedProgressState: MCPDomainRequestProgressHandle? = if let progressToken = params._meta?.progressToken,
+                                                                            let connectionGeneration = capturedConnectionGeneration
+            {
                 await domainHost.beginRequestProgress(
                     connectionID: connectionID,
+                    connectionGeneration: connectionGeneration,
                     invocationID: invocationID,
                     token: progressToken
                 )
