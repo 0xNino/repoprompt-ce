@@ -127,10 +127,13 @@ let package = Package(
         .target(
             name: "RepoPromptDomainRuntime",
             dependencies: [
+                "RepoPromptShared",
                 .product(name: "MCP", package: "swift-sdk")
             ],
             path: "Sources/RepoPromptDomainRuntime",
-            swiftSettings: swift6LanguageMode
+            swiftSettings: swift6LanguageMode + [
+                .define("DEBUG", .when(configuration: .debug))
+            ]
         ),
         .target(
             name: "RepoPromptWorkspaceCore",

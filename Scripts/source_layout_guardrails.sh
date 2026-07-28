@@ -261,13 +261,18 @@ if domain_runtime is None:
 else:
     if domain_runtime.get("type") != "regular": errors.append("RepoPromptDomainRuntime must remain an internal regular target")
     if domain_runtime.get("path") != "Sources/RepoPromptDomainRuntime": errors.append("RepoPromptDomainRuntime target path drifted")
+    runtime_by_name = [
+        dependency["byName"][0]
+        for dependency in domain_runtime.get("dependencies", [])
+        if dependency.get("byName")
+    ]
     runtime_products = {
         (dependency["product"][0], dependency["product"][1])
         for dependency in domain_runtime.get("dependencies", [])
         if "product" in dependency
     }
-    if runtime_products != {("MCP", "swift-sdk")} or len(domain_runtime.get("dependencies", [])) != 1:
-        errors.append("RepoPromptDomainRuntime must depend only on the pinned MCP SDK product")
+    if runtime_by_name != ["RepoPromptShared"] or runtime_products != {("MCP", "swift-sdk")} or len(domain_runtime.get("dependencies", [])) != 2:
+        errors.append("RepoPromptDomainRuntime must depend only on RepoPromptShared and the pinned MCP SDK product")
 if domain_runtime_tests is None:
     errors.append("RepoPromptDomainRuntimeTests target missing")
 else:
