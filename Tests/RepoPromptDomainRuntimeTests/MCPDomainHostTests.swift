@@ -27,7 +27,7 @@ final class MCPDomainHostTests: XCTestCase {
         let snapshot = await fixture.runtime.domainHost.snapshot()
         XCTAssertEqual(snapshot.lifecycle, .accepting)
         XCTAssertEqual(snapshot.activeInvocationCount, 0)
-        XCTAssertEqual(snapshot.activeConnectionCount, 0)
+        XCTAssertEqual(snapshot.connectionsWithActiveInvocationsCount, 0)
     }
 
     func testHostRejectsStaleResolutionAfterRegistrationReplacement() async throws {
@@ -89,6 +89,7 @@ final class MCPDomainHostTests: XCTestCase {
         await fixture.runtime.domainHost.cancelInvocations(connectionID: fixture.connection.connectionID)
         let draining = await fixture.runtime.domainHost.drain(timeout: Duration.milliseconds(10))
         XCTAssertTrue(draining.deadlineExpired)
+        XCTAssertFalse(draining.callerCancelled)
         XCTAssertEqual(draining.detachedInvocationCount, 1)
 
         let rejectedID = UUID()
@@ -114,6 +115,98 @@ final class MCPDomainHostTests: XCTestCase {
         let final = await fixture.runtime.domainHost.snapshot()
         XCTAssertEqual(final.lifecycle, MCPDomainHostLifecycle.drained)
         XCTAssertEqual(final.activeInvocationCount, 0)
+    }
+
+    func testDrainRacingSuspendedAdmissionRejectsLateInvocation() async throws {
+        let admissionGate = InvocationBlocker()
+        let fixture = try await makeFixture()
+        let host = MCPDomainHost(
+            identity: fixture.runtime.identity,
+            registry: fixture.runtime.toolRegistry,
+            routingCoordinator: fixture.runtime.routingCoordinator,
+            beforeFinalAdmission: { await admissionGate.wait() }
+        )
+        let resolution = try await host.resolve(
+            toolName: MCPWindowToolName.readFile,
+            scope: MCPDomainToolRegistrationScope.window(id: 1)
+        )
+        let invocationID = UUID()
+        let invocation = MCPDomainHostInvocation(
+            invocationID: invocationID,
+            connectionID: fixture.connection.connectionID,
+            resolution: resolution,
+            arguments: [:],
+            securityContext: securityContext(
+                identity: fixture.runtime.identity,
+                connection: fixture.connection,
+                invocationID: invocationID
+            )
+        )
+        let invocationTask = Task {
+            try await host.invoke(invocation)
+        }
+        await admissionGate.awaitStarted()
+
+        let drain = await host.drain(timeout: .milliseconds(25))
+        XCTAssertFalse(drain.deadlineExpired)
+        XCTAssertFalse(drain.callerCancelled)
+        XCTAssertEqual(drain.detachedInvocationCount, 0)
+        await admissionGate.resume()
+
+        do {
+            _ = try await invocationTask.value
+            XCTFail("Invocation crossed the final admission fence after drain")
+        } catch let error as MCPDomainHostError {
+            XCTAssertEqual(error, .draining)
+        }
+        let snapshot = await host.snapshot()
+        XCTAssertEqual(snapshot.lifecycle, .drained)
+        XCTAssertEqual(snapshot.activeInvocationCount, 0)
+    }
+
+    func testCancelledDrainCallerReturnsWithoutSpinning() async throws {
+        let blocker = InvocationBlocker()
+        let fixture = try await makeFixture(binding: Self.binding { arguments in
+            await blocker.wait()
+            return arguments["path"] ?? .string("settled")
+        })
+        let resolution = try await fixture.runtime.domainHost.resolve(
+            toolName: MCPWindowToolName.readFile,
+            scope: MCPDomainToolRegistrationScope.window(id: 1)
+        )
+        let invocationID = UUID()
+        let invocation = MCPDomainHostInvocation(
+            invocationID: invocationID,
+            connectionID: fixture.connection.connectionID,
+            resolution: resolution,
+            arguments: [:],
+            securityContext: securityContext(
+                identity: fixture.runtime.identity,
+                connection: fixture.connection,
+                invocationID: invocationID
+            )
+        )
+        let host = fixture.runtime.domainHost
+        let invocationTask = Task {
+            try await host.invoke(invocation)
+        }
+        await blocker.awaitStarted()
+        await fixture.runtime.domainHost.beginDrain()
+
+        let clock = ContinuousClock()
+        let startedAt = clock.now
+        let drainTask = Task {
+            await fixture.runtime.domainHost.drain(timeout: .seconds(5))
+        }
+        drainTask.cancel()
+        let drain = await drainTask.value
+        XCTAssertTrue(drain.callerCancelled)
+        XCTAssertFalse(drain.deadlineExpired)
+        XCTAssertEqual(drain.detachedInvocationCount, 1)
+        XCTAssertLessThan(startedAt.duration(to: clock.now), .milliseconds(250))
+
+        await blocker.resume()
+        _ = try await invocationTask.value
     }
 
     private struct Fixture {

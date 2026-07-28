@@ -1,6 +1,29 @@
 import Foundation
 import RepoPromptDomainRuntime
 
+private enum AppDomainRuntimeMetrics {
+    static let editFlowSink = DomainRuntimeMetricsSink { metric in
+        let dimensions = EditFlowPerf.Dimensions(
+            toolName: metric.dimensions["tool_name"],
+            outcome: metric.dimensions["outcome"],
+            queueDelayMicroseconds: metric.name == "mcp_domain_host_queue_wait"
+                ? metric.dimensions["duration_microseconds"].flatMap(Int.init)
+                : nil,
+            durationMicroseconds: metric.name == "mcp_domain_host_execution"
+                ? metric.dimensions["duration_microseconds"].flatMap(Int.init)
+                : nil
+        )
+        switch metric.name {
+        case "mcp_domain_host_queue_wait":
+            EditFlowPerf.event(EditFlowPerf.Stage.MCPToolCall.domainHostQueueWait, dimensions)
+        case "mcp_domain_host_execution":
+            EditFlowPerf.event(EditFlowPerf.Stage.MCPToolCall.domainHostExecution, dimensions)
+        default:
+            break
+        }
+    }
+}
+
 /// App-process composition for the M2 workspace/context domain authority.
 /// Read providers and protected mutations remain app-owned until later milestones.
 final class AppDomainRuntimeComposition: Sendable {
@@ -44,6 +67,7 @@ final class AppDomainRuntimeComposition: Sendable {
                 temporaryDirectory: FileManager.default.temporaryDirectory
                     .appendingPathComponent("RepoPrompt CE", isDirectory: true),
                 legacyRuntimeDefaults: legacyRuntimeDefaults,
+                metrics: AppDomainRuntimeMetrics.editFlowSink,
                 protectedMutationStage: .m4B
             )
         )

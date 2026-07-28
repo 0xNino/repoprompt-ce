@@ -497,6 +497,8 @@ enum EditFlowPerf {
             static let serviceToolLookupWindowRoutingToolsCacheActorBody: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.WindowRoutingToolsCacheActorBody"
             static let serviceToolLookupWindowCatalogToolsActorBodyTotal: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.WindowCatalogToolsActorBodyTotal"
             static let serviceToolLookupWindowCatalogToolsMaterialization: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.WindowCatalogToolsMaterialization"
+            static let domainHostQueueWait: StaticString = "EditFlow.MCPToolCall.DomainHost.QueueWait"
+            static let domainHostExecution: StaticString = "EditFlow.MCPToolCall.DomainHost.Execution"
             static let dispatch: StaticString = "EditFlow.MCPToolCall.Dispatch"
             static let resolvedProviderDispatch: StaticString = "EditFlow.MCPToolCall.ResolvedProviderDispatch"
             static let handlerResultHandoff: StaticString = "EditFlow.MCPToolCall.HandlerResultHandoff"

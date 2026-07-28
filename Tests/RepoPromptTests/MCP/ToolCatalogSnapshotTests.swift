@@ -682,6 +682,18 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         #endif
     }
 
+    func testAppDelegateTerminationInvokesDomainRuntimeShutdownSeam() async {
+        let probe = AppDelegateTerminationProbe()
+        let appDelegate = AppDelegate()
+        appDelegate.setDomainRuntimeShutdownOperationForTesting {
+            await probe.shutdown()
+        }
+
+        await appDelegate.shutdownDomainRuntimeForTerminationForTesting()
+
+        XCTAssertEqual(probe.invocationCount, 1)
+    }
+
     func testAppDelegateStartupPublishesGlobalRegistrationBeforeObservationOnlyReadiness() async {
         let wiringProbe = AppDelegateRegistrationProbe()
         let wiringDelegate = AppDelegate()
@@ -1248,6 +1260,15 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             }
         }
     #endif
+
+    @MainActor
+    private final class AppDelegateTerminationProbe {
+        private(set) var invocationCount = 0
+
+        func shutdown() {
+            invocationCount += 1
+        }
+    }
 
     @MainActor
     private final class AppDelegateRegistrationProbe {

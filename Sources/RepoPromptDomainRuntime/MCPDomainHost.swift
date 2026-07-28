@@ -42,32 +42,36 @@ package struct MCPDomainHostInvocation: Sendable {
     package let resolution: MCPDomainHostResolution
     package let arguments: [String: Value]
     package let securityContext: DomainToolInvocationSecurityContext
+    package let submittedAt: ContinuousClock.Instant
 
     package init(
         invocationID: UUID,
         connectionID: UUID,
         resolution: MCPDomainHostResolution,
         arguments: [String: Value],
-        securityContext: DomainToolInvocationSecurityContext
+        securityContext: DomainToolInvocationSecurityContext,
+        submittedAt: ContinuousClock.Instant = ContinuousClock().now
     ) {
         self.invocationID = invocationID
         self.connectionID = connectionID
         self.resolution = resolution
         self.arguments = arguments
         self.securityContext = securityContext
+        self.submittedAt = submittedAt
     }
 }
 
 package struct MCPDomainHostSnapshot: Equatable, Sendable {
     package let lifecycle: MCPDomainHostLifecycle
     package let activeInvocationCount: Int
-    package let activeConnectionCount: Int
+    package let connectionsWithActiveInvocationsCount: Int
 }
 
 package struct MCPDomainHostDrainResult: Equatable, Sendable {
     package let settledInvocationCount: Int
     package let detachedInvocationCount: Int
     package let deadlineExpired: Bool
+    package let callerCancelled: Bool
 }
 
 /// Protocol-neutral owner for catalog resolution and exact domain-binding invocation.
@@ -83,6 +87,8 @@ package actor MCPDomainHost {
     package nonisolated let registry: MCPDomainToolRegistry
     package nonisolated let routingCoordinator: DomainRoutingCoordinator
 
+    private let metrics: DomainRuntimeMetricsSink
+    private let beforeFinalAdmission: @Sendable () async -> Void
     private var lifecycle: MCPDomainHostLifecycle = .accepting
     private var activeInvocations: [UUID: ActiveInvocation] = [:]
     private var invocationIDsByConnection: [UUID: Set<UUID>] = [:]
@@ -90,11 +96,15 @@ package actor MCPDomainHost {
     package init(
         identity: DomainRuntimeIdentity,
         registry: MCPDomainToolRegistry,
-        routingCoordinator: DomainRoutingCoordinator
+        routingCoordinator: DomainRoutingCoordinator,
+        metrics: DomainRuntimeMetricsSink = .disabled,
+        beforeFinalAdmission: @escaping @Sendable () async -> Void = {}
     ) {
         self.identity = identity
         self.registry = registry
         self.routingCoordinator = routingCoordinator
+        self.metrics = metrics
+        self.beforeFinalAdmission = beforeFinalAdmission
     }
 
     package func catalogSnapshot() async -> MCPDomainToolCatalogSnapshot {
@@ -125,6 +135,14 @@ package actor MCPDomainHost {
     }
 
     package func invoke(_ invocation: MCPDomainHostInvocation) async throws -> Value {
+        let clock = ContinuousClock()
+        let hostEntry = clock.now
+        recordTimingMetric(
+            name: "mcp_domain_host_queue_wait",
+            toolName: invocation.resolution.toolName,
+            duration: invocation.submittedAt.duration(to: hostEntry),
+            outcome: "entered"
+        )
         guard lifecycle == .accepting else {
             throw MCPDomainHostError.draining
         }
@@ -162,15 +180,45 @@ package actor MCPDomainHost {
             throw MCPDomainHostError.connectionRegistrationInvalid
         }
 
+        await beforeFinalAdmission()
+
+        // Actor reentrancy permits drain to begin across any validation suspension above.
+        // This final check and active-map insertion form the authoritative admission fence:
+        // there is no suspension between them, so beginDrain cannot miss a late invocation.
+        guard lifecycle == .accepting else {
+            throw MCPDomainHostError.draining
+        }
+        let metrics = metrics
+        let toolName = invocation.resolution.toolName
         let task = Task {
-            try Task.checkCancellation()
-            guard await self.registry.isActive(resolved.handle) else {
-                throw MCPDomainHostError.staleRegistration(toolName: invocation.resolution.toolName)
-            }
-            return try await MCPDomainInvocationSecurityContext.$current.withValue(
-                invocation.securityContext
-            ) {
-                try await resolved.binding(invocation.arguments)
+            let executionStartedAt = clock.now
+            do {
+                try Task.checkCancellation()
+                guard await self.registry.isActive(resolved.handle) else {
+                    throw MCPDomainHostError.staleRegistration(toolName: toolName)
+                }
+                let value = try await MCPDomainInvocationSecurityContext.$current.withValue(
+                    invocation.securityContext
+                ) {
+                    try await resolved.binding(invocation.arguments)
+                }
+                Self.recordTimingMetric(
+                    metrics: metrics,
+                    name: "mcp_domain_host_execution",
+                    toolName: toolName,
+                    duration: executionStartedAt.duration(to: clock.now),
+                    outcome: "success"
+                )
+                return value
+            } catch {
+                Self.recordTimingMetric(
+                    metrics: metrics,
+                    name: "mcp_domain_host_execution",
+                    toolName: toolName,
+                    duration: executionStartedAt.duration(to: clock.now),
+                    outcome: error is CancellationError ? "cancelled" : "error"
+                )
+                throw error
             }
         }
         activeInvocations[invocation.invocationID] = ActiveInvocation(
@@ -219,26 +267,40 @@ package actor MCPDomainHost {
             return MCPDomainHostDrainResult(
                 settledInvocationCount: 0,
                 detachedInvocationCount: 0,
-                deadlineExpired: false
+                deadlineExpired: false,
+                callerCancelled: false
             )
         }
 
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
+        var callerCancelled = false
         while !activeInvocations.isEmpty, clock.now < deadline {
+            if Task.isCancelled {
+                callerCancelled = true
+                break
+            }
             let remaining = clock.now.duration(to: deadline)
-            try? await Task.sleep(for: min(remaining, .milliseconds(10)))
+            do {
+                try await Task.sleep(for: min(remaining, .milliseconds(10)))
+            } catch is CancellationError {
+                callerCancelled = true
+                break
+            } catch {
+                break
+            }
         }
 
         let detachedCount = activeInvocations.count
-        let deadlineExpired = detachedCount > 0 && clock.now >= deadline
+        let deadlineExpired = detachedCount > 0 && !callerCancelled && clock.now >= deadline
         if detachedCount == 0 {
             lifecycle = .drained
         }
         return MCPDomainHostDrainResult(
             settledInvocationCount: max(0, initialCount - detachedCount),
             detachedInvocationCount: detachedCount,
-            deadlineExpired: deadlineExpired && detachedCount > 0
+            deadlineExpired: deadlineExpired,
+            callerCancelled: callerCancelled
         )
     }
 
@@ -246,7 +308,7 @@ package actor MCPDomainHost {
         MCPDomainHostSnapshot(
             lifecycle: lifecycle,
             activeInvocationCount: activeInvocations.count,
-            activeConnectionCount: invocationIDsByConnection.count
+            connectionsWithActiveInvocationsCount: invocationIDsByConnection.count
         )
     }
 
@@ -271,6 +333,44 @@ package actor MCPDomainHost {
         else {
             throw MCPDomainHostError.connectionRegistrationInvalid
         }
+    }
+
+    private func recordTimingMetric(
+        name: String,
+        toolName: String,
+        duration: Duration,
+        outcome: String
+    ) {
+        Self.recordTimingMetric(
+            metrics: metrics,
+            name: name,
+            toolName: toolName,
+            duration: duration,
+            outcome: outcome
+        )
+    }
+
+    private nonisolated static func recordTimingMetric(
+        metrics: DomainRuntimeMetricsSink,
+        name: String,
+        toolName: String,
+        duration: Duration,
+        outcome: String
+    ) {
+        let components = duration.components
+        let microseconds = max(
+            0,
+            components.seconds * 1_000_000 + components.attoseconds / 1_000_000_000_000
+        )
+        metrics.record(DomainRuntimeMetric(
+            phase: .runtime,
+            name: name,
+            dimensions: [
+                "tool_name": toolName,
+                "duration_microseconds": String(microseconds),
+                "outcome": outcome,
+            ]
+        ))
     }
 
     private func finishInvocation(_ invocationID: UUID) {

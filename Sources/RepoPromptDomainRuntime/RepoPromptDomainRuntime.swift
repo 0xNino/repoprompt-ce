@@ -172,7 +172,8 @@ package actor MCPDomainRuntime {
         domainHost = MCPDomainHost(
             identity: runtimeIdentity,
             registry: toolRegistry,
-            routingCoordinator: routingCoordinator
+            routingCoordinator: routingCoordinator,
+            metrics: configuration.metrics
         )
         readSideEffectCoordinator = DomainReadSideEffectCoordinator(identity: runtimeIdentity)
         let mutationPolicyStore = DomainMutationPolicyStore(
