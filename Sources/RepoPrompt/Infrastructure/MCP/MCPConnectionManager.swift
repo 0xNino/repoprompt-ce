@@ -156,15 +156,7 @@ private actor MCPConnectionStopRace {
     }
 }
 
-struct MCPResponseDeliverySnapshot: Equatable {
-    let pendingRequestCount: Int
-    let waiterCount: Int
-    let isTerminal: Bool
-
-    var acceptedRequestsFullyResponded: Bool {
-        pendingRequestCount == 0
-    }
-}
+typealias MCPResponseDeliverySnapshot = RepoPromptDomainRuntime.MCPDomainResponseDeliverySnapshot
 
 typealias MCPProgressDeliveryResult = RepoPromptDomainRuntime.MCPProgressDeliveryResult
 typealias MCPRequestProgressState = RepoPromptDomainRuntime.MCPRequestProgressState
