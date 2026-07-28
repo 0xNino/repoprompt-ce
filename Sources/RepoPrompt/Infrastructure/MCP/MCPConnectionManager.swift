@@ -1,5 +1,6 @@
 // MARK: - Connection Management Components
 
+import CryptoKit
 import Darwin
 import Dispatch
 import Foundation
@@ -12,6 +13,11 @@ import RepoPromptShared
 import SwiftUI
 
 #if DEBUG
+    enum DebugDomainPeerIdentity {
+        case verified(processID: Int, fingerprint: String)
+        case unverified
+    }
+
     private var mcpConnectionManagerDebugLoggingEnabled = ProcessInfo.processInfo.environment["REPOPROMPT_MCP_DEBUG"] == "1"
     private var mcpRoutingDebugLoggingEnabled = false
     private var mcpPolicyDebugLoggingEnabled = false
@@ -1123,6 +1129,7 @@ actor ServerNetworkManager {
         private let debugRetainedTransportIngressLimit = 100
         private let debugRestartStatusLimit = 50
         private var debugResolvedToolOperationOverrides: [String: @Sendable () async throws -> Value] = [:]
+        private var debugDomainPeerIdentityByConnectionID: [UUID: DebugDomainPeerIdentity] = [:]
         private var debugExecutionWatchdogAbortTargets: [UUID: any MCPServerConnection] = [:]
         private var debugTerminalRecordDirectoryURLForTesting: URL?
     #endif
@@ -5917,6 +5924,9 @@ actor ServerNetworkManager {
             connections.removeValue(forKey: id)
             connectionLifecycleGenerationByID.removeValue(forKey: id)
             bootstrapPeerPIDByConnectionID.removeValue(forKey: id)
+            #if DEBUG
+                debugDomainPeerIdentityByConnectionID.removeValue(forKey: id)
+            #endif
             connectionTasks.removeValue(forKey: id)
             pendingConnections.removeValue(forKey: id)
             identityContextByConnection.removeValue(forKey: id)
@@ -9661,6 +9671,29 @@ actor ServerNetworkManager {
                 }
             }
 
+            func debugSetDomainPeerIdentityForTesting(
+                connectionID: UUID,
+                identity: DebugDomainPeerIdentity?
+            ) {
+                if let identity {
+                    debugDomainPeerIdentityByConnectionID[connectionID] = identity
+                } else {
+                    debugDomainPeerIdentityByConnectionID.removeValue(forKey: connectionID)
+                }
+            }
+
+            func debugDomainInvocationSecurityContextForTesting(
+                connectionID: UUID,
+                invocationID: UUID = UUID(),
+                toolName: String
+            ) async -> DomainToolInvocationSecurityContext {
+                await domainInvocationSecurityContext(
+                    connectionID: connectionID,
+                    invocationID: invocationID,
+                    toolName: toolName
+                )
+            }
+
             func debugSetBeforeToolResultFormattingForTesting(
                 _ handler: (@Sendable (UUID, String) async -> Void)?
             ) {
@@ -13287,14 +13320,24 @@ actor ServerNetworkManager {
         let runID = runIDByConnectionID[connectionID]
         let displayName = clientIdentifier(forConnection: connectionID) ?? "unknown"
         let stableKey = MCPClientIdentity.storageKey(displayName)
-        let peerPID: Int?
+
+        let peerIdentity: (processID: Int?, fingerprint: String?)
         #if DEBUG
-            peerPID = bootstrapPeerPIDByConnectionID[connectionID] ?? Int(ProcessInfo.processInfo.processIdentifier)
+            switch debugDomainPeerIdentityByConnectionID[connectionID] {
+            case let .verified(processID, fingerprint):
+                peerIdentity = (processID, fingerprint)
+            case .unverified:
+                peerIdentity = (nil, nil)
+            case nil:
+                let processID = bootstrapPeerPIDByConnectionID[connectionID]
+                peerIdentity = (processID, processID.flatMap(Self.verifiedExecutableFingerprint))
+            }
         #else
-            peerPID = bootstrapPeerPIDByConnectionID[connectionID]
+            let processID = bootstrapPeerPIDByConnectionID[connectionID]
+            peerIdentity = (processID, processID.flatMap(Self.verifiedExecutableFingerprint))
         #endif
         let kind: DomainClientPrincipalKind = policy.purpose == .unknown ? .appProxy : .runScoped
-        let assurance: DomainClientPrincipalAssurance = peerPID == nil ? .displayNameOnly : .verifiedProcess
+        let assurance: DomainClientPrincipalAssurance = peerIdentity.fingerprint == nil ? .displayNameOnly : .verifiedProcess
         let roleAllows = AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
             toolName: toolName,
             taskLabelKind: policy.taskLabelKind,
@@ -13310,23 +13353,50 @@ actor ServerNetworkManager {
         } else {
             []
         }
+
         let runtime = AppDomainRuntimeComposition.shared.runtime
         let runtimeIdentity = runtime.identity
-        let connectionGeneration = connectionLifecycleGenerationByID[connectionID] ?? 0
-        let registration = DomainConnectionRegistration(
-            connectionID: connectionID,
-            generation: connectionGeneration,
-            runtimeID: runtimeIdentity.runtimeID
-        )
+        var registration: DomainConnectionRegistration?
+        var hasAuthoritativeRoutingContext = true
+        do {
+            registration = try await runtime.routingCoordinator.currentRegistration(connectionID: connectionID)
+        } catch DomainReadContextResolutionError.connectionUnavailable {
+            // A connection may invoke bind_context before any window has projected a binding.
+            // Establish the coordinator-owned token here, then read that exact token back; never
+            // synthesize a generation from the transport/server lifecycle namespace.
+            _ = await runtime.routingCoordinator.registerConnection(
+                connectionID: connectionID,
+                operationID: UUID()
+            )
+            do {
+                registration = try await runtime.routingCoordinator.currentRegistration(connectionID: connectionID)
+            } catch {
+                hasAuthoritativeRoutingContext = false
+            }
+        } catch {
+            hasAuthoritativeRoutingContext = false
+        }
+        let connectionGeneration = registration?.generation ?? 0
         var workspaceID: UUID?
         var workspaceRevision: UInt64?
         var authorizedCanonicalRoots: Set<String> = []
-        if let handle = try? await runtime.routingCoordinator.resolveReadContext(connection: registration),
-           let workspace = await runtime.contextStore.workspaceSnapshot(handle.context.workspaceID)
-        {
-            workspaceID = handle.context.workspaceID
-            workspaceRevision = handle.workspaceRevision
-            authorizedCanonicalRoots = Set(workspace.document.metadata.repoPaths)
+        if let registration {
+            do {
+                let handle = try await runtime.routingCoordinator.resolveReadContext(connection: registration)
+                guard let workspace = await runtime.contextStore.workspaceSnapshot(handle.context.workspaceID) else {
+                    hasAuthoritativeRoutingContext = false
+                    throw DomainReadContextResolutionError.contextUnavailable
+                }
+                workspaceID = handle.context.workspaceID
+                workspaceRevision = handle.workspaceRevision
+                authorizedCanonicalRoots = Set(workspace.document.metadata.repoPaths.map {
+                    URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath).standardizedFileURL.path
+                })
+            } catch {
+                // Registration is authoritative only together with a resolved domain context.
+                // Never normalize stale, unbound, or unavailable routing into an empty root set.
+                hasAuthoritativeRoutingContext = false
+            }
         }
         let principal = DomainClientPrincipal(
             principalID: connectionID,
@@ -13334,22 +13404,39 @@ actor ServerNetworkManager {
             displayName: displayName,
             kind: kind,
             assurance: assurance,
-            processID: peerPID.map(Int32.init),
+            processID: peerIdentity.processID.map(Int32.init),
             runID: runID,
-            provider: stableKey
+            provider: stableKey,
+            verifiedIdentityFingerprint: peerIdentity.fingerprint
         )
         return DomainToolInvocationSecurityContext(
             principal: principal,
             connectionID: connectionID,
             connectionGeneration: connectionGeneration,
             invocationID: invocationID,
+            mutationRequestKey: invocationID.uuidString,
             runtimeID: runtimeIdentity.runtimeID,
             runtimeGeneration: runtimeIdentity.lifecycleGeneration,
             workspaceID: workspaceID,
             workspaceRevision: workspaceRevision,
             authorizedCanonicalRoots: authorizedCanonicalRoots,
+            hasAuthoritativeRoutingContext: hasAuthoritativeRoutingContext,
             ephemeralGrantedToolNames: ephemeralGrantedToolNames
         )
+    }
+
+    /// Binds a kernel-authenticated peer PID to the executable identity currently on disk.
+    /// Display names never participate. Replacing the executable changes the inode and fingerprint.
+    private nonisolated static func verifiedExecutableFingerprint(_ processID: Int) -> String? {
+        var buffer = [CChar](repeating: 0, count: 4096)
+        guard proc_pidpath(pid_t(processID), &buffer, UInt32(buffer.count)) > 0 else { return nil }
+        let path = String(cString: buffer)
+        var info = stat()
+        guard lstat(path, &info) == 0 else { return nil }
+        let material = "\(URL(fileURLWithPath: path).standardizedFileURL.path)|\(info.st_dev)|\(info.st_ino)"
+        return SHA256.hash(data: Data(material.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     /// Returns the verified peer PID for a bootstrap socket connection, if available.

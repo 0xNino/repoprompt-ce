@@ -64,8 +64,12 @@ enum RuntimePolicyAdministration {
                 return 0
             case "grant":
                 let options = try parseOptions(Array(arguments.dropFirst()))
-                guard let principal = options.single["principal"], !principal.isEmpty else {
-                    throw CommandError.invalidArguments("policy grant requires --principal <stable-key>")
+                guard let principalFingerprint = options.single["principal-fingerprint"] ?? options.single["principal"],
+                      !principalFingerprint.isEmpty
+                else {
+                    throw CommandError.invalidArguments(
+                        "policy grant requires --principal-fingerprint <verified-identity-fingerprint>"
+                    )
                 }
                 let operations = Set(options.multiple["operation"] ?? [])
                 guard !operations.isEmpty else {
@@ -75,13 +79,13 @@ enum RuntimePolicyAdministration {
                 let roots = Set((options.multiple["root"] ?? []).map(canonicalRoot))
                 let (snapshot, _) = await store.snapshot()
                 let grant = DomainHeadlessMutationGrant(
-                    principalKey: principal,
+                    principalKey: principalFingerprint,
                     allowedOperations: operations,
                     canonicalRoots: roots,
                     provider: options.single["provider"],
                     expiresAt: Date().addingTimeInterval(expirySeconds)
                 )
-                try confirm("Grant \(principal) operations=[\(operations.sorted().joined(separator: ","))] roots=[\(roots.sorted().joined(separator: ","))] until \(grant.expiresAt)?")
+                try confirm("Grant \(principalFingerprint) operations=[\(operations.sorted().joined(separator: ","))] roots=[\(roots.sorted().joined(separator: ","))] until \(grant.expiresAt)?")
                 let updated = try await store.addGrant(
                     grant,
                     expectedRevision: snapshot.revision,
@@ -176,7 +180,7 @@ enum RuntimePolicyAdministration {
     private static let usage = """
     Usage:
       rpce-cli policy list
-      rpce-cli policy grant --principal <stable-key> --operation <tool.action> [--operation ...] [--root <path>] [--provider <name>] [--expires-in <seconds>]
+      rpce-cli policy grant --principal-fingerprint <verified-identity-fingerprint> --operation <tool.action> [--operation ...] [--root <path>] [--provider <name>] [--expires-in <seconds>]
       rpce-cli policy revoke --id <uuid>
     Policy administration requires interactive stdin and stderr TTYs; mutation commands require immediate confirmation.
     """

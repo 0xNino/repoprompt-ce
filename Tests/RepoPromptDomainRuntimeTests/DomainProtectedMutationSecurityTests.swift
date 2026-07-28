@@ -100,7 +100,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         XCTAssertEqual(runCallCount, 1)
     }
 
-    func testVersionedGrantPersistsUsesCASAndRevocationSurvivesRestart() async throws {
+    func testVersionedGrantReloadsAcrossRunningPolicyStoresAndRevocationIsImmediate() async throws {
         let storage = FileManager.default.temporaryDirectory
             .appendingPathComponent("m4-policy-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: storage) }
@@ -136,7 +136,9 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         let grantedCallCount = await calls.value
         XCTAssertEqual(grantedCallCount, 1)
 
-        let revoked = try await second.runtime.mutationPolicyStore.revokeGrant(
+        // Model the TTY policy CLI as a distinct process/store while the broker above remains live.
+        let administratorProcess = try RuntimeFixture(mode: .standalone, storage: storage)
+        let revoked = try await administratorProcess.runtime.mutationPolicyStore.revokeGrant(
             id: grant.id,
             expectedRevision: 1,
             administrator: administrator
@@ -158,7 +160,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             allowedOperations: ["manage_selection.set"],
             expiresAt: Date().addingTimeInterval(3600)
         )
-        _ = try await second.runtime.mutationPolicyStore.addGrant(
+        _ = try await administratorProcess.runtime.mutationPolicyStore.addGrant(
             replacement,
             expectedRevision: 2,
             administrator: administrator
@@ -169,10 +171,99 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         let replacementCallCount = await calls.value
         XCTAssertEqual(replacementCallCount, 2)
 
-        let third = try RuntimeFixture(mode: .standalone, storage: storage)
-        let restarted = await third.runtime.mutationPolicyStore.snapshot()
+        let restartedRuntime = try RuntimeFixture(mode: .standalone, storage: storage)
+        let restarted = await restartedRuntime.runtime.mutationPolicyStore.snapshot()
         XCTAssertEqual(restarted.0.revision, 3)
         XCTAssertNotNil(restarted.0.headlessGrants.first?.revokedAt)
+    }
+
+    func testPersistentGrantUsesVerifiedFingerprintNotSpoofableDisplayIdentity() async throws {
+        let fixture = try RuntimeFixture(mode: .standalone)
+        let administrator = Self.ttyAdministrator()
+        let grant = DomainHeadlessMutationGrant(
+            principalKey: "verified:fingerprint:one",
+            allowedOperations: ["manage_selection.set"],
+            expiresAt: Date().addingTimeInterval(3600)
+        )
+        _ = try await fixture.runtime.mutationPolicyStore.addGrant(
+            grant,
+            expectedRevision: 0,
+            administrator: administrator
+        )
+        let calls = CallCounter()
+        let binding = fixture.protectedBinding(toolName: "manage_selection", calls: calls)
+        let spoofed = fixture.context(
+            kind: .runScoped,
+            assurance: .hostLaunchToken,
+            stableKey: "same-display-name",
+            verifiedIdentityFingerprint: "verified:fingerprint:other",
+            ephemeralGrantedToolNames: []
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await MCPDomainInvocationSecurityContext.$current.withValue(spoofed) {
+                try await binding(["op": .string("set")])
+            }
+        ) { error in
+            XCTAssertEqual(error as? DomainMutationPolicyError, .grantMissing)
+        }
+
+        let verified = fixture.context(
+            kind: .runScoped,
+            assurance: .hostLaunchToken,
+            stableKey: "same-display-name",
+            verifiedIdentityFingerprint: "verified:fingerprint:one",
+            ephemeralGrantedToolNames: []
+        )
+        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(verified) {
+            try await binding(["op": .string("set")])
+        }
+        let callCount = await calls.value
+        XCTAssertEqual(callCount, 1)
+    }
+
+    func testWorkspaceRootMutationRequiresCanonicalScopeAndAuthoritativeRouting() async throws {
+        let fixture = try RuntimeFixture(mode: .standalone)
+        let calls = CallCounter()
+        let binding = fixture.protectedBinding(toolName: "manage_workspaces", calls: calls)
+        let allowedRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("m4-allowed-\(UUID().uuidString)", isDirectory: true)
+            .standardizedFileURL.path
+        let inside = URL(fileURLWithPath: allowedRoot).appendingPathComponent("child").path
+        let outside = FileManager.default.temporaryDirectory
+            .appendingPathComponent("m4-outside-\(UUID().uuidString)", isDirectory: true).path
+        let allowed = fixture.context(
+            kind: .runScoped,
+            assurance: .hostLaunchToken,
+            authorizedCanonicalRoots: [allowedRoot],
+            ephemeralGrantedToolNames: ["manage_workspaces"]
+        )
+        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(allowed) {
+            try await binding(["action": .string("add_folder"), "folder_path": .string(inside)])
+        }
+        await XCTAssertThrowsErrorAsync(
+            try await MCPDomainInvocationSecurityContext.$current.withValue(allowed) {
+                try await binding(["action": .string("add_folder"), "folder_path": .string(outside)])
+            }
+        ) { error in
+            XCTAssertEqual(error as? DomainMutationPolicyError, .grantMissing)
+        }
+
+        let staleRouting = fixture.context(
+            kind: .runScoped,
+            assurance: .hostLaunchToken,
+            authorizedCanonicalRoots: [allowedRoot],
+            hasAuthoritativeRoutingContext: false,
+            ephemeralGrantedToolNames: ["manage_workspaces"]
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await MCPDomainInvocationSecurityContext.$current.withValue(staleRouting) {
+                try await binding(["action": .string("add_folder"), "folder_path": .string(inside)])
+            }
+        ) { error in
+            XCTAssertEqual(error as? DomainMutationPolicyError, .routingContextUnavailable)
+        }
+        let callCount = await calls.value
+        XCTAssertEqual(callCount, 1)
     }
 
     func testPolicyAdministrationRequiresLocalTTYPrincipalAndRejectsStaleRevision() async throws {
@@ -287,6 +378,9 @@ private final class RuntimeFixture: @unchecked Sendable {
         kind: DomainClientPrincipalKind,
         assurance: DomainClientPrincipalAssurance,
         stableKey: String? = "client:test",
+        verifiedIdentityFingerprint: String? = nil,
+        authorizedCanonicalRoots: Set<String> = [],
+        hasAuthoritativeRoutingContext: Bool = true,
         ephemeralGrantedToolNames: Set<String>
     ) -> DomainToolInvocationSecurityContext {
         DomainToolInvocationSecurityContext(
@@ -298,15 +392,32 @@ private final class RuntimeFixture: @unchecked Sendable {
                 assurance: assurance,
                 processID: assurance == .displayNameOnly ? nil : 42,
                 runID: UUID(),
-                provider: "test"
+                provider: "test",
+                verifiedIdentityFingerprint: assurance == .displayNameOnly
+                    ? nil
+                    : (verifiedIdentityFingerprint ?? stableKey)
             ),
             connectionID: UUID(),
             connectionGeneration: 1,
             invocationID: UUID(),
             runtimeID: runtime.identity.runtimeID,
             runtimeGeneration: runtime.identity.lifecycleGeneration,
+            authorizedCanonicalRoots: authorizedCanonicalRoots,
+            hasAuthoritativeRoutingContext: hasAuthoritativeRoutingContext,
             ephemeralGrantedToolNames: ephemeralGrantedToolNames
         )
+    }
+}
+
+private func XCTAssertThrowsErrorAsync<T>(
+    _ expression: @autoclosure () async throws -> T,
+    _ verify: (Error) -> Void = { _ in }
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("Expected expression to throw")
+    } catch {
+        verify(error)
     }
 }
 

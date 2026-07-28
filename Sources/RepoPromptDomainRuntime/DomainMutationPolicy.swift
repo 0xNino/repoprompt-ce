@@ -93,6 +93,7 @@ package enum DomainMutationPolicyError: Error, Equatable, LocalizedError, Sendab
     case principalMissing
     case principalUnverified
     case runtimeIdentityMismatch
+    case routingContextUnavailable
     case grantMissing
     case grantExpired
     case grantRevoked
@@ -109,6 +110,8 @@ package enum DomainMutationPolicyError: Error, Equatable, LocalizedError, Sendab
             "Protected mutation denied because the client principal is not verified."
         case .runtimeIdentityMismatch:
             "Protected mutation denied because the runtime generation changed."
+        case .routingContextUnavailable:
+            "Protected mutation denied because the connection has no authoritative routing registration."
         case .grantMissing:
             "Protected mutation denied because no active grant covers this operation."
         case .grantExpired:
@@ -155,28 +158,11 @@ package actor DomainMutationPolicyStore {
     package func bootstrap() async {
         guard !didBootstrap else { return }
         didBootstrap = true
-        do {
-            guard let data = try await persistence.loadProtectedMutationPolicyData() else {
-                health = .ready
-                return
-            }
-            let decoded = try JSONDecoder().decode(DomainMutationPolicyDocument.self, from: data)
-            guard decoded.version == DomainMutationPolicyDocument.schemaVersion,
-                  decoded.profileIdentifier == profileIdentifier
-            else {
-                health = .degradedReadOnly(reason: "future_or_wrong_profile")
-                return
-            }
-            document = decoded
-            documentDigest = DomainContentDigest.sha256(data)
-            health = .ready
-        } catch {
-            health = .degradedReadOnly(reason: "corrupt_policy")
-        }
+        await refreshFromPersistence()
     }
 
     package func snapshot() async -> (DomainMutationPolicyDocument, DomainMutationPolicyHealth) {
-        if !didBootstrap { await bootstrap() }
+        if !didBootstrap { await bootstrap() } else { await refreshFromPersistence() }
         return (document, health)
     }
 
@@ -188,7 +174,7 @@ package actor DomainMutationPolicyStore {
         canonicalRoots: Set<String> = [],
         now: Date = Date()
     ) async throws -> DomainMutationAuthorizationSnapshot {
-        if !didBootstrap { await bootstrap() }
+        if !didBootstrap { await bootstrap() } else { await refreshFromPersistence() }
         guard case .ready = health else {
             if case let .degradedReadOnly(reason) = health {
                 throw DomainMutationPolicyError.policyReadOnly(reason)
@@ -218,8 +204,12 @@ package actor DomainMutationPolicyStore {
                 canonicalRoots: canonicalRoots
             )
         }
+        guard context.hasAuthoritativeRoutingContext else {
+            throw DomainMutationPolicyError.routingContextUnavailable
+        }
         if context.principal.kind == .runScoped,
            context.ephemeralGrantedToolNames.contains(toolName),
+           Self.roots(canonicalRoots, areCoveredBy: context.authorizedCanonicalRoots),
            context.principal.assurance == .verifiedProcess || context.principal.assurance == .hostLaunchToken
         {
             return DomainMutationAuthorizationSnapshot(
@@ -231,11 +221,11 @@ package actor DomainMutationPolicyStore {
             )
         }
 
-        guard let principalKey = context.principal.stableKey else {
-            throw DomainMutationPolicyError.grantMissing
+        guard let principalFingerprint = context.principal.verifiedIdentityFingerprint else {
+            throw DomainMutationPolicyError.principalUnverified
         }
         let candidates = document.headlessGrants.filter { grant in
-            guard grant.principalKey == principalKey else { return false }
+            guard grant.principalKey == principalFingerprint else { return false }
             guard grant.allowedOperations.contains(operation)
                 || grant.allowedOperations.contains("\(toolName).*")
             else { return false }
@@ -245,7 +235,7 @@ package actor DomainMutationPolicyStore {
             if let provider = grant.provider, provider != context.principal.provider {
                 return false
             }
-            return canonicalRoots.isSubset(of: grant.canonicalRoots)
+            return Self.roots(canonicalRoots, areCoveredBy: grant.canonicalRoots)
         }
         guard let grant = candidates.first(where: { $0.revokedAt == nil && $0.expiresAt > now }) else {
             if candidates.contains(where: { $0.revokedAt != nil }) {
@@ -268,7 +258,8 @@ package actor DomainMutationPolicyStore {
     package func revalidate(
         _ snapshot: DomainMutationAuthorizationSnapshot,
         now: Date = Date()
-    ) throws {
+    ) async throws {
+        if !didBootstrap { await bootstrap() } else { await refreshFromPersistence() }
         guard case .ready = health else {
             throw DomainMutationPolicyError.policyReadOnly("policy_changed")
         }
@@ -291,7 +282,7 @@ package actor DomainMutationPolicyStore {
     ) async throws -> DomainMutationPolicyDocument {
         try validateAdministrator(administrator)
         try validateGrant(grant)
-        if !didBootstrap { await bootstrap() }
+        if !didBootstrap { await bootstrap() } else { await refreshFromPersistence() }
         try requireWritable(expectedRevision: expectedRevision)
         guard !document.headlessGrants.contains(where: { $0.id == grant.id }) else {
             throw DomainMutationPolicyError.invalidGrant("duplicate grant id")
@@ -307,7 +298,7 @@ package actor DomainMutationPolicyStore {
         now: Date = Date()
     ) async throws -> DomainMutationPolicyDocument {
         try validateAdministrator(administrator)
-        if !didBootstrap { await bootstrap() }
+        if !didBootstrap { await bootstrap() } else { await refreshFromPersistence() }
         try requireWritable(expectedRevision: expectedRevision)
         guard let index = document.headlessGrants.firstIndex(where: { $0.id == id }) else {
             throw DomainMutationPolicyError.invalidGrant("unknown grant id")
@@ -315,6 +306,18 @@ package actor DomainMutationPolicyStore {
         var grants = document.headlessGrants
         grants[index] = grants[index].revoking(at: now)
         return try await persist(grants: grants)
+    }
+
+    private static func roots(_ requested: Set<String>, areCoveredBy authorized: Set<String>) -> Bool {
+        requested.allSatisfy { requestedRoot in
+            let requested = URL(fileURLWithPath: (requestedRoot as NSString).expandingTildeInPath)
+                .standardizedFileURL.path
+            return authorized.contains { authorizedRoot in
+                let authorized = URL(fileURLWithPath: (authorizedRoot as NSString).expandingTildeInPath)
+                    .standardizedFileURL.path
+                return requested == authorized || requested.hasPrefix(authorized.hasSuffix("/") ? authorized : authorized + "/")
+            }
+        }
     }
 
     private func validateAdministrator(_ principal: DomainClientPrincipal) throws {
@@ -327,7 +330,7 @@ package actor DomainMutationPolicyStore {
 
     private func validateGrant(_ grant: DomainHeadlessMutationGrant) throws {
         guard !grant.principalKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw DomainMutationPolicyError.invalidGrant("principal key is empty")
+            throw DomainMutationPolicyError.invalidGrant("verified principal fingerprint is empty")
         }
         guard !grant.allowedOperations.isEmpty else {
             throw DomainMutationPolicyError.invalidGrant("at least one tool.action is required")
@@ -339,6 +342,41 @@ package actor DomainMutationPolicyStore {
             !value.contains(where: \.isWhitespace) && value.contains(".")
         }) else {
             throw DomainMutationPolicyError.invalidGrant("operations must use tool.action form")
+        }
+    }
+
+    /// Reloads the versioned snapshot for every authorization/revalidation boundary so
+    /// TTY policy administration and revocation are visible to already-running brokers.
+    private func refreshFromPersistence() async {
+        do {
+            guard let data = try await persistence.loadProtectedMutationPolicyData() else {
+                document = DomainMutationPolicyDocument(
+                    profileIdentifier: profileIdentifier,
+                    revision: 0,
+                    headlessGrants: [],
+                    updatedAt: identity.createdAt
+                )
+                documentDigest = nil
+                health = .ready
+                return
+            }
+            let digest = DomainContentDigest.sha256(data)
+            guard digest != documentDigest else {
+                health = .ready
+                return
+            }
+            let decoded = try JSONDecoder().decode(DomainMutationPolicyDocument.self, from: data)
+            guard decoded.version == DomainMutationPolicyDocument.schemaVersion,
+                  decoded.profileIdentifier == profileIdentifier
+            else {
+                health = .degradedReadOnly(reason: "future_or_wrong_profile")
+                return
+            }
+            document = decoded
+            documentDigest = digest
+            health = .ready
+        } catch {
+            health = .degradedReadOnly(reason: "corrupt_policy")
         }
     }
 
@@ -370,8 +408,11 @@ package actor DomainMutationPolicyStore {
                 data: data
             )
         } catch DomainPersistenceError.externalDocumentConflict {
-            health = .degradedReadOnly(reason: "external_policy_conflict")
-            throw DomainMutationPolicyError.policyReadOnly("external_policy_conflict")
+            await refreshFromPersistence()
+            throw DomainMutationPolicyError.policyRevisionConflict(
+                expected: next.revision &- 1,
+                actual: document.revision
+            )
         }
         document = next
         documentDigest = DomainContentDigest.sha256(data)
