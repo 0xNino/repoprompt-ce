@@ -83,6 +83,7 @@ package struct DomainRuntimeSnapshot: Sendable {
     package let workspaceCatalogRevision: UInt64
     package let workspaceHealth: DomainAuthorityHealth
     package let routingRevision: UInt64
+    package let agentSessionPersistenceHealth: DomainAgentSessionPersistenceHealth
     package let activityPublicationSequence: UInt64
     package let activeActivityCount: Int
     package let recentTerminalActivityCount: Int
@@ -128,7 +129,8 @@ package actor MCPDomainRuntime {
         lifecycleGeneration: UInt64 = 1,
         processID: Int32 = ProcessInfo.processInfo.processIdentifier,
         createdAt: Date = Date(),
-        registryID: UUID = UUID()
+        registryID: UUID = UUID(),
+        prepareChildLaunch: @escaping MCPDomainLongRunningToolProvider.PrepareChildLaunch = { _, _, _ in nil }
     ) {
         self.configuration = configuration
         let runtimeIdentity = DomainRuntimeIdentity(
@@ -181,7 +183,8 @@ package actor MCPDomainRuntime {
         )
         agentSessionStore = DomainAgentRunSessionStore(
             identity: runtimeIdentity,
-            storageDirectory: configuration.storageDirectory
+            persistence: persistence,
+            profileIdentifier: configuration.profileIdentifier
         )
         let interactionBroker = DomainInteractionBroker()
         let activityCenter = DomainActivityCenter(identity: runtimeIdentity)
@@ -193,7 +196,8 @@ package actor MCPDomainRuntime {
             identity: runtimeIdentity,
             policyStore: mutationPolicyStore,
             interactionBroker: interactionBroker,
-            activityCenter: activityCenter
+            activityCenter: activityCenter,
+            prepareChildLaunch: prepareChildLaunch
         )
     }
 
@@ -217,7 +221,10 @@ package actor MCPDomainRuntime {
         guard lifecycle == .starting else { return }
         startTask = nil
         let workspaceSnapshot = await workspaceAuthority.snapshot()
-        lifecycle = workspaceSnapshot.health.acceptsMutations ? .ready : .degraded
+        let agentSessions = await agentSessionStore.snapshot()
+        lifecycle = workspaceSnapshot.health.acceptsMutations && agentSessions.persistenceHealth == .ready
+            ? .ready
+            : .degraded
         publishSnapshot()
         startExternalReloadPollingIfNeeded()
     }
@@ -257,6 +264,7 @@ package actor MCPDomainRuntime {
         let catalog = await toolRegistry.snapshot()
         let workspaces = await workspaceAuthority.snapshot()
         let routing = await routingCoordinator.snapshot()
+        let agentSessions = await agentSessionStore.snapshot()
         let activities = await activityCenter.snapshot()
         return DomainRuntimeSnapshot(
             identity: identity,
@@ -267,6 +275,7 @@ package actor MCPDomainRuntime {
             workspaceCatalogRevision: workspaces.catalogRevision,
             workspaceHealth: workspaces.health,
             routingRevision: routing.revision,
+            agentSessionPersistenceHealth: agentSessions.persistenceHealth,
             activityPublicationSequence: activities.publicationSequence,
             activeActivityCount: activities.active.count,
             recentTerminalActivityCount: activities.recentTerminal.count

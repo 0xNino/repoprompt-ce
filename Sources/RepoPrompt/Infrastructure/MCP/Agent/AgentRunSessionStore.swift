@@ -102,6 +102,21 @@ enum AgentRunSessionStore {
         await shared.cleanup(registration: registration)
     }
 
+    @discardableResult
+    static func installCancellationHandler(
+        registration: Registration,
+        handler: @escaping @Sendable () async -> Void
+    ) async -> Bool {
+        await shared.installCancellationHandler(
+            registration: registration,
+            handler: handler
+        )
+    }
+
+    static func removeCancellationHandler(registration: Registration) async {
+        await shared.removeCancellationHandler(registration: registration)
+    }
+
     static func signalSnapshot(_ snapshot: AgentRunMCPSnapshot, cursor: WaitCursor) async {
         await shared.noteSnapshot(snapshot, cursor: cursor)
     }

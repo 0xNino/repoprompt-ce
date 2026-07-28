@@ -107,17 +107,30 @@ package actor DomainInteractionBroker {
     ) async -> DomainInteractionResult {
         guard !isShuttingDown, !Task.isCancelled else { return .cancelled }
         let provider: DomainInteractionProvider?
+        let clientElicitation = request.clientID.flatMap {
+            negotiatedElicitationProvidersByClient[$0]
+        }
         let preferredElicitation = elicitation
-            ?? request.clientID.flatMap { negotiatedElicitationProvidersByClient[$0] }
+            ?? clientElicitation
             ?? negotiatedElicitationProvider
+        let selectedClientElicitation: Bool
         if let preferredElicitation, await preferredElicitation.isAvailable(request) {
             provider = preferredElicitation
+            selectedClientElicitation = elicitation == nil && clientElicitation != nil
         } else if let appUI, await appUI.isAvailable(request) {
             provider = appUI
+            selectedClientElicitation = false
         } else {
             provider = nil
+            selectedClientElicitation = false
         }
         guard let provider else { return .unavailable }
+        if selectedClientElicitation,
+           let clientID = request.clientID,
+           negotiatedElicitationProvidersByClient[clientID] == nil
+        {
+            return .cancelled
+        }
 
         let generation = nextGeneration
         nextGeneration &+= 1
@@ -185,6 +198,20 @@ package actor DomainInteractionBroker {
     package func cancel(requestID: UUID) async {
         guard let record = pending[requestID] else { return }
         await finish(requestID: requestID, generation: record.generation, result: .cancelled)
+    }
+
+    package func cancel(clientID: UUID) async {
+        negotiatedElicitationProvidersByClient.removeValue(forKey: clientID)
+        let targets = pending.values
+            .filter { $0.request.clientID == clientID }
+            .map { (requestID: $0.request.id, generation: $0.generation) }
+        for target in targets {
+            await finish(
+                requestID: target.requestID,
+                generation: target.generation,
+                result: .cancelled
+            )
+        }
     }
 
     package func shutdown() async {

@@ -419,7 +419,7 @@ if [[ -d "$domain_runtime_source_dir" ]]; then
   )
   for file in "${domain_runtime_required_files[@]}"; do
     if [[ ! -f "$domain_runtime_source_dir/$file" ]]; then
-      fail "RepoPromptDomainRuntime M2/M3 authority file missing: $file"
+      fail "RepoPromptDomainRuntime M2-M5 authority file missing: $file"
     fi
   done
   m5_contract_fixture="Scripts/Fixtures/headless_mcp_domain_runtime_m5_contract.json"
@@ -436,13 +436,28 @@ expected = {
     "agent_explore", "agent_run", "agent_manage", "share_thoughts", "set_status",
     "wait_for_next_user_instruction",
 }
-assert value["schema_version"] == 1
+assert value["schema_version"] == 2
 assert value["milestone"] == "M5"
 assert set(value["migrated_tools"]) == expected
 assert value["session_lifecycle"]["false_transient_restoration_allowed"] is False
+assert value["session_lifecycle"]["wait_admission_while_draining"] == "cancelled"
+assert value["session_lifecycle"]["active_prior_owner_claim"] == "unavailable_until_prior_owner_durably_stops"
+assert value["session_persistence"]["write_protocol"] == "advisory_lock_digest_cas_atomic_write"
+assert value["session_persistence"]["duplicate_session_ids"] == "byte_preserved_degraded_read_only"
+assert value["session_persistence"]["committed_base_advances_after_each_successful_cas"] is True
+assert value["session_persistence"]["retained_record_limit"] == 512
+assert value["interaction"]["default_timeout"] == "workspace questionTimeoutSeconds setting"
+assert value["interaction"]["app_presentation_tombstone_limit"] == 256
+assert value["interaction"]["connection_removal_late_waiter"] == "blocked_after_suspended_availability"
 assert value["child_launch"]["real_private_endpoint"] == "deferred_to_M6B"
+assert value["child_launch"]["codex_cached_runtime_behavior"] == "carrier_merged_only_at_final_process_spawn_boundary"
+assert value["child_launch"]["end_to_end_private_connectivity_claimed"] is False
+assert set(value["child_launch"]["launch_environment_consumers"]) == {"claude_native", "codex_app_server", "acp_agent"}
 assert value["credentials"]["packaged_child_keychain_evidence"] == "unresolved_M0_procedure_record"
 assert value["credentials"]["persisted_secret_bytes"] is False
+assert value["credentials"]["actual_owned_bytes_instrumented"] is True
+assert value["approval"]["routing_opt_out"] is False
+assert value["authority"]["typed_policy_errors_preserved"] is True
 assert value["public_contract"]["schema_behavior"] == "wrapped_binding_definition_preserved"
 assert value["public_contract"]["proxy_behavior_changed"] is False
 PY

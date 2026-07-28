@@ -30,16 +30,120 @@ package struct DomainCredentialEnvelopeDescriptor: Hashable, Sendable {
     package let expiresAt: ContinuousClock.Instant
 }
 
-package struct DomainCredentialPayload: Sendable, CustomStringConvertible {
-    package let bytes: [UInt8]
+package enum DomainCredentialPayloadError: Error, Equatable, Sendable {
+    case alreadyConsumed
+}
 
-    package init(bytes: [UInt8]) {
-        self.bytes = bytes
+private final class DomainSecureCredentialBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private let storage: UnsafeMutableRawPointer
+    let byteCount: Int
+    private var isZeroed = false
+
+    init(bytes: [UInt8]) {
+        precondition(!bytes.isEmpty)
+        byteCount = bytes.count
+        storage = UnsafeMutableRawPointer.allocate(
+            byteCount: bytes.count,
+            alignment: MemoryLayout<UInt8>.alignment
+        )
+        bytes.withUnsafeBytes { source in
+            guard let baseAddress = source.baseAddress else { return }
+            storage.copyMemory(from: baseAddress, byteCount: bytes.count)
+        }
+    }
+
+    private init(copying source: UnsafeRawPointer, byteCount: Int) {
+        self.byteCount = byteCount
+        storage = UnsafeMutableRawPointer.allocate(
+            byteCount: byteCount,
+            alignment: MemoryLayout<UInt8>.alignment
+        )
+        storage.copyMemory(from: source, byteCount: byteCount)
+    }
+
+    deinit {
+        lock.lock()
+        zeroLocked()
+        lock.unlock()
+        storage.deallocate()
+    }
+
+    func clone() throws -> DomainSecureCredentialBuffer {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isZeroed else { throw DomainCredentialPayloadError.alreadyConsumed }
+        return DomainSecureCredentialBuffer(copying: UnsafeRawPointer(storage), byteCount: byteCount)
+    }
+
+    func consume<Result>(_ body: (UnsafeRawBufferPointer) throws -> Result) throws -> Result {
+        lock.lock()
+        defer {
+            zeroLocked()
+            lock.unlock()
+        }
+        guard !isZeroed else { throw DomainCredentialPayloadError.alreadyConsumed }
+        return try body(UnsafeRawBufferPointer(start: storage, count: byteCount))
+    }
+
+    func zeroInPlace() {
+        lock.lock()
+        zeroLocked()
+        lock.unlock()
+    }
+
+    private func zeroLocked() {
+        guard !isZeroed else { return }
+        storage.initializeMemory(as: UInt8.self, repeating: 0, count: byteCount)
+        isZeroed = true
+    }
+
+    #if DEBUG
+        func testSnapshot() -> [UInt8] {
+            lock.lock()
+            defer { lock.unlock() }
+            let bytes = storage.assumingMemoryBound(to: UInt8.self)
+            return Array(UnsafeBufferPointer(start: bytes, count: byteCount))
+        }
+
+        func testIsZeroed() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard isZeroed else { return false }
+            let bytes = storage.assumingMemoryBound(to: UInt8.self)
+            return UnsafeBufferPointer(start: bytes, count: byteCount).allSatisfy { $0 == 0 }
+        }
+    #endif
+}
+
+package final class DomainCredentialPayload: @unchecked Sendable, CustomStringConvertible {
+    private let storage: DomainSecureCredentialBuffer
+    private let originalByteCount: Int
+
+    fileprivate init(storage: DomainSecureCredentialBuffer) {
+        self.storage = storage
+        originalByteCount = storage.byteCount
+    }
+
+    package func withConsumedBytes<Result>(
+        _ body: (UnsafeRawBufferPointer) throws -> Result
+    ) throws -> Result {
+        try storage.consume(body)
     }
 
     package var description: String {
-        "<redacted credential payload: \(bytes.count) bytes>"
+        "<redacted credential payload: \(originalByteCount) bytes>"
     }
+
+    #if DEBUG
+        package func test_ownedStorageBytes() -> [UInt8] {
+            storage.testSnapshot()
+        }
+
+        package func test_isOwnedStorageZeroed() -> Bool {
+            storage.testIsZeroed()
+        }
+    #endif
 }
 
 package enum DomainCredentialEnvelopeError: Error, Equatable, Sendable {
@@ -60,7 +164,7 @@ package actor DomainCredentialEnvelopeStore {
 
     private struct Record: Sendable {
         let descriptor: DomainCredentialEnvelopeDescriptor
-        var bytes: [UInt8]
+        let storage: DomainSecureCredentialBuffer
         var state: State
     }
 
@@ -86,7 +190,11 @@ package actor DomainCredentialEnvelopeStore {
             scope: scope,
             expiresAt: clock.now.advanced(by: lifetime)
         )
-        records[descriptor.envelopeID] = Record(descriptor: descriptor, bytes: bytes, state: .active)
+        records[descriptor.envelopeID] = Record(
+            descriptor: descriptor,
+            storage: DomainSecureCredentialBuffer(bytes: bytes),
+            state: .active
+        )
         return descriptor
     }
 
@@ -112,21 +220,26 @@ package actor DomainCredentialEnvelopeStore {
             break
         }
         guard clock.now < record.descriptor.expiresAt else {
-            zero(&record.bytes)
+            record.storage.zeroInPlace()
             record.state = .revoked
             records[descriptor.envelopeID] = record
             throw DomainCredentialEnvelopeError.expired
         }
-        let payload = DomainCredentialPayload(bytes: record.bytes)
-        zero(&record.bytes)
+        let payloadStorage: DomainSecureCredentialBuffer
+        do {
+            payloadStorage = try record.storage.clone()
+        } catch {
+            throw DomainCredentialEnvelopeError.alreadyConsumed
+        }
+        record.storage.zeroInPlace()
         record.state = .consumed
         records[descriptor.envelopeID] = record
-        return payload
+        return DomainCredentialPayload(storage: payloadStorage)
     }
 
     package func revoke(_ envelopeID: UUID) {
         guard var record = records[envelopeID] else { return }
-        zero(&record.bytes)
+        record.storage.zeroInPlace()
         record.state = .revoked
         records[envelopeID] = record
     }
@@ -135,18 +248,21 @@ package actor DomainCredentialEnvelopeStore {
         isShuttingDown = true
         for id in records.keys {
             guard var record = records[id] else { continue }
-            zero(&record.bytes)
+            record.storage.zeroInPlace()
             record.state = .revoked
             records[id] = record
         }
     }
 
-    private func zero(_ bytes: inout [UInt8]) {
-        _ = bytes.withUnsafeMutableBytes { buffer in
-            buffer.initializeMemory(as: UInt8.self, repeating: 0)
+    #if DEBUG
+        package func test_ownedStorageBytes(envelopeID: UUID) -> [UInt8]? {
+            records[envelopeID]?.storage.testSnapshot()
         }
-        bytes.removeAll(keepingCapacity: false)
-    }
+
+        package func test_isOwnedStorageZeroed(envelopeID: UUID) -> Bool? {
+            records[envelopeID]?.storage.testIsZeroed()
+        }
+    #endif
 }
 
 package struct DomainChildLaunchCarrier: Sendable {
@@ -158,6 +274,18 @@ package struct DomainChildLaunchCarrier: Sendable {
     package let launchTokenID: UUID
     package let credentialEnvelope: DomainCredentialEnvelopeDescriptor?
     package let environment: [String: String]
+
+    package init(
+        runID: UUID,
+        launchTokenID: UUID,
+        credentialEnvelope: DomainCredentialEnvelopeDescriptor?,
+        environment: [String: String]
+    ) {
+        self.runID = runID
+        self.launchTokenID = launchTokenID
+        self.credentialEnvelope = credentialEnvelope
+        self.environment = environment
+    }
 }
 
 package struct DomainPrivateChildLaunchHarness: Sendable {

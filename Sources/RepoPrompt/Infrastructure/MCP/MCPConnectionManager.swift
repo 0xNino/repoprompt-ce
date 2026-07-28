@@ -5790,6 +5790,12 @@ actor ServerNetworkManager {
                 }
 
                 guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
+                await self.installNegotiatedElicitationProvider(
+                    connectionID: connectionID,
+                    lifecycleGeneration: expectedLifecycleGeneration,
+                    manager: manager
+                )
+                guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
 
                 // Update identity after successful start
                 if var ctx = self.identityContextByConnection[connectionID] {
@@ -5812,6 +5818,31 @@ actor ServerNetworkManager {
                     )
                 )
             }
+        }
+    }
+
+    private func installNegotiatedElicitationProvider(
+        connectionID: UUID,
+        lifecycleGeneration expectedLifecycleGeneration: UInt64,
+        manager: BootstrapSocketConnectionManager
+    ) async {
+        guard isCurrentConnection(
+            connectionID,
+            lifecycleGeneration: expectedLifecycleGeneration
+        ) else {
+            return
+        }
+        let broker = AppDomainRuntimeComposition.shared.runtime.interactionBroker
+        await broker.installNegotiatedElicitationProvider(
+            MCPAskUserElicitationBridge.provider(connection: manager),
+            clientID: connectionID
+        )
+        guard isCurrentConnection(
+            connectionID,
+            lifecycleGeneration: expectedLifecycleGeneration
+        ) else {
+            await broker.installNegotiatedElicitationProvider(nil, clientID: connectionID)
+            return
         }
     }
 
@@ -6787,6 +6818,9 @@ actor ServerNetworkManager {
         // by the commit path's isStillCurrent checks.
         let cleanupRunPurpose = runPurposeByConnection[id] ?? .unknown
         let cleanupRunID = runIDByConnectionID[id]
+        let interactionBroker = AppDomainRuntimeComposition.shared.runtime.interactionBroker
+        await interactionBroker.cancel(clientID: id)
+        await interactionBroker.installNegotiatedElicitationProvider(nil, clientID: id)
         let detachContextBuilderRunID: UUID? = cleanupRunPurpose == .discoverRun ? cleanupRunID : nil
         let responseDeliverySnapshot = await connections[id]?.responseDeliverySnapshot()
 

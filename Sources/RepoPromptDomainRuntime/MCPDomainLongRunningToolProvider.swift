@@ -5,6 +5,26 @@ package enum DomainChildLaunchContext {
     @TaskLocal package static var current: DomainChildLaunchCarrier?
 }
 
+package enum DomainInteractionPresentationContext {
+    @TaskLocal package static var requestID: UUID?
+}
+
+package struct DomainLongRunningInteractionAdapter: Sendable {
+    package let isAvailable: @Sendable (DomainInteractionRequest) async -> Bool
+    package let resolveDefaultTimeoutSeconds: @Sendable (DomainInteractionRequest) async throws -> TimeInterval
+    package let cancel: @Sendable (UUID) async -> Void
+
+    package init(
+        isAvailable: @escaping @Sendable (DomainInteractionRequest) async -> Bool,
+        resolveDefaultTimeoutSeconds: @escaping @Sendable (DomainInteractionRequest) async throws -> TimeInterval,
+        cancel: @escaping @Sendable (UUID) async -> Void
+    ) {
+        self.isAvailable = isAvailable
+        self.resolveDefaultTimeoutSeconds = resolveDefaultTimeoutSeconds
+        self.cancel = cancel
+    }
+}
+
 package struct MCPDomainLongRunningToolProvider: Sendable {
     package typealias PrepareChildLaunch = @Sendable (
         _ toolName: String,
@@ -48,7 +68,7 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
 
     package func wrapping(
         _ binding: MCPDomainToolBinding,
-        interactionUIAvailable: Bool = true
+        interactionAdapter: DomainLongRunningInteractionAdapter? = nil
     ) -> MCPDomainToolBinding {
         guard Self.migratedToolNames.contains(binding.definition.name) else { return binding }
         let definition = binding.definition
@@ -56,7 +76,7 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
             try await execute(
                 binding: binding,
                 arguments: arguments,
-                interactionUIAvailable: interactionUIAvailable
+                interactionAdapter: interactionAdapter
             )
         }
     }
@@ -64,7 +84,7 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
     private func execute(
         binding: MCPDomainToolBinding,
         arguments: [String: Value],
-        interactionUIAvailable: Bool
+        interactionAdapter: DomainLongRunningInteractionAdapter?
     ) async throws -> Value {
         try Task.checkCancellation()
         let toolName = binding.definition.name
@@ -85,7 +105,7 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
                     arguments: arguments,
                     securityContext: securityContext,
                     activity: activity,
-                    interactionUIAvailable: interactionUIAvailable
+                    interactionAdapter: interactionAdapter
                 )
             } else {
                 let authorizations = try await authorizeIfNeeded(
@@ -93,9 +113,6 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
                     arguments: arguments,
                     context: securityContext
                 )
-                for authorization in authorizations {
-                    try await policyStore.revalidate(authorization)
-                }
                 try Task.checkCancellation()
                 let carrier: DomainChildLaunchCarrier?
                 if requiresChildLaunch(toolName: toolName, arguments: arguments) {
@@ -108,6 +125,10 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
                 } else {
                     carrier = nil
                 }
+                for authorization in authorizations {
+                    try await policyStore.revalidate(authorization)
+                }
+                try Task.checkCancellation()
                 value = try await DomainChildLaunchContext.$current.withValue(carrier) {
                     try await binding(arguments)
                 }
@@ -142,27 +163,47 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
         arguments: [String: Value],
         securityContext: DomainToolInvocationSecurityContext?,
         activity: DomainActivityToken,
-        interactionUIAvailable: Bool
+        interactionAdapter: DomainLongRunningInteractionAdapter?
     ) async throws -> Value {
         _ = await activityCenter.update(
             activity,
             state: .waitingForInteraction,
             statusText: "Waiting for user response"
         )
-        let timeout = interactionTimeout(arguments)
-        let request = DomainInteractionRequest(
+        let requestSeed = DomainInteractionRequest(
             toolName: binding.definition.name,
             clientID: securityContext?.connectionID,
             invocationID: securityContext?.invocationID,
             runID: securityContext?.principal.runID,
             payload: arguments,
-            deadline: Date().addingTimeInterval(timeout)
+            deadline: .distantFuture
         )
-        let appUI = DomainInteractionProvider(
-            kind: .appUI,
-            isAvailable: { _ in interactionUIAvailable },
-            present: { _ in try await binding(arguments) }
+        let timeout = try await interactionTimeout(
+            arguments,
+            request: requestSeed,
+            adapter: interactionAdapter
         )
+        let request = DomainInteractionRequest(
+            id: requestSeed.id,
+            toolName: requestSeed.toolName,
+            clientID: requestSeed.clientID,
+            invocationID: requestSeed.invocationID,
+            runID: requestSeed.runID,
+            payload: requestSeed.payload,
+            deadline: Date().addingTimeInterval(timeout + 1)
+        )
+        let appUI = interactionAdapter.map { adapter in
+            DomainInteractionProvider(
+                kind: .appUI,
+                isAvailable: adapter.isAvailable,
+                present: { request in
+                    try await DomainInteractionPresentationContext.$requestID.withValue(request.id) {
+                        try await binding(arguments)
+                    }
+                },
+                cancel: adapter.cancel
+            )
+        }
         let result = await interactionBroker.request(request, appUI: appUI)
         switch result {
         case let .response(value, _):
@@ -192,32 +233,17 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
     ) async throws -> [DomainMutationAuthorizationSnapshot] {
         let classes = approvalClasses(toolName: toolName, arguments: arguments)
         guard !classes.isEmpty else { return [] }
-        guard let context,
-              context.runtimeID == identity.runtimeID,
-              context.runtimeGeneration == identity.lifecycleGeneration
-        else {
-            throw MCPError.invalidParams(
-                "approval_required_noninteractive: missing current runtime invocation identity"
-            )
+        var snapshots: [DomainMutationAuthorizationSnapshot] = []
+        for approvalClass in classes {
+            snapshots.append(try await policyStore.authorize(
+                context: context,
+                toolName: toolName,
+                action: approvalClass,
+                workspaceID: context?.workspaceID,
+                canonicalRoots: []
+            ))
         }
-        do {
-            var snapshots: [DomainMutationAuthorizationSnapshot] = []
-            for approvalClass in classes {
-                snapshots.append(try await policyStore.authorize(
-                    context: context,
-                    toolName: toolName,
-                    action: approvalClass,
-                    workspaceID: context.workspaceID,
-                    canonicalRoots: [],
-                    requiresAuthoritativeRoutingContext: false
-                ))
-            }
-            return snapshots
-        } catch {
-            throw MCPError.invalidParams(
-                "approval_required_noninteractive: \(toolName) requires explicit \(classes.joined(separator: " and ")) approval"
-            )
-        }
+        return snapshots
     }
 
     private func approvalClasses(
@@ -286,10 +312,25 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
         return UUID(uuidString: raw)
     }
 
-    private func interactionTimeout(_ arguments: [String: Value]) -> TimeInterval {
-        let supplied = arguments["timeout_seconds"]?.intValue
-            ?? arguments["timeout"]?.intValue
-        return TimeInterval(max(1, supplied ?? 300))
+    private func interactionTimeout(
+        _ arguments: [String: Value],
+        request: DomainInteractionRequest,
+        adapter: DomainLongRunningInteractionAdapter?
+    ) async throws -> TimeInterval {
+        if let suppliedValue = arguments["timeout_seconds"] {
+            guard let supplied = suppliedValue.intValue, supplied > 0 else {
+                throw MCPError.invalidParams("timeout_seconds must be a positive integer.")
+            }
+            return TimeInterval(supplied)
+        }
+        if let adapter {
+            let resolved = try await adapter.resolveDefaultTimeoutSeconds(request)
+            guard resolved.isFinite, resolved > 0 else {
+                throw MCPError.internalError("ask_user workspace timeout is invalid")
+            }
+            return resolved
+        }
+        return 300
     }
 
     private static func safeErrorText(_ error: Error) -> String {

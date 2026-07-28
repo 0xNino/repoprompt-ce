@@ -6702,6 +6702,23 @@ final class AgentModeViewModel: ObservableObject {
             autoEditEnabledBeforeOverride: priorAutoEditEnabled,
             taskLabelKind: taskLabelKind
         )
+        let cancellationInstalled = await AgentRunSessionStore.installCancellationHandler(
+            registration: registration
+        ) { [weak self] in
+            await self?.mcpCancelControlRunIfCurrent(
+                tabID: tabID,
+                sessionID: sessionID,
+                activationID: activationID,
+                registration: registration
+            )
+        }
+        guard cancellationInstalled else {
+            session.mcpControlContext = nil
+            await AgentRunSessionStore.cleanup(registration: registration)
+            throw MCPError.internalError(
+                "The Agent session runtime stopped before its cancellation handler could be installed."
+            )
+        }
         session.mcpFollowUpRunPending = startPending
         mcpControlledTabIDs.insert(tabID)
         if markSessionAsMCPOriginated {
@@ -6798,6 +6815,9 @@ final class AgentModeViewModel: ObservableObject {
                 updateGlobalDefault: false
             )
         }
+        await AgentRunSessionStore.removeCancellationHandler(
+            registration: context.registration
+        )
         session.mcpControlContext = nil
         mcpControlledTabIDs.remove(session.tabID)
         if cleanupSessionStore {
@@ -6809,6 +6829,30 @@ final class AgentModeViewModel: ObservableObject {
             updateBindingsFromSession(session)
             refreshAutoEditPermissionGuidanceForActiveSession()
         }
+    }
+
+    private func mcpCancelControlRunIfCurrent(
+        tabID: UUID,
+        sessionID: UUID,
+        activationID: UUID,
+        registration: AgentRunSessionStore.Registration
+    ) async {
+        guard let session = sessions[tabID],
+              session.activeAgentSessionID == sessionID,
+              let context = session.mcpControlContext,
+              context.sessionID == sessionID,
+              context.activationID == activationID,
+              context.registration == registration
+        else {
+            return
+        }
+        cancelPendingInstruction(for: session)
+        await runService.cancelRun(
+            tabID: tabID,
+            session: session,
+            intent: .runtimeShutdown,
+            completion: .terminalTeardownCompleted
+        )
     }
 
     @discardableResult
@@ -15239,6 +15283,10 @@ final class AgentModeViewModel: ObservableObject {
         return .answered(answer?.answers.joined(separator: "\n") ?? "", elapsedSeconds: response.elapsedSeconds)
     }
 
+    func canPresentAskUserInteraction(tabID: UUID) -> Bool {
+        sessions[tabID] != nil
+    }
+
     func askUserInteraction(
         tabID: UUID,
         interaction: AgentAskUserInteraction
@@ -15262,14 +15310,27 @@ final class AgentModeViewModel: ObservableObject {
         reconcileInteractiveRunState(session)
         updateBindingsFromSession(session)
 
-        return try await withCheckedThrowingContinuation { continuation in
-            session.askUserContinuation = continuation
-            schedulePendingAskUserTimeout(
-                for: session,
-                interactionID: interaction.id,
-                timeoutSeconds: interaction.timeoutSeconds,
-                startedAt: interaction.askedAt
-            )
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard !Task.isCancelled else {
+                    session.pendingAskUser = nil
+                    reconcileInteractiveRunState(session)
+                    updateBindingsFromSession(session)
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                session.askUserContinuation = continuation
+                schedulePendingAskUserTimeout(
+                    for: session,
+                    interactionID: interaction.id,
+                    timeoutSeconds: interaction.timeoutSeconds,
+                    startedAt: interaction.askedAt
+                )
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.cancelAskUserInteraction(tabID: tabID, interactionID: interaction.id)
+            }
         }
     }
 
@@ -15385,6 +15446,21 @@ final class AgentModeViewModel: ObservableObject {
             pending.timeoutStartedAt = nil
             session.pendingAskUser = pending
         }
+    }
+
+    @discardableResult
+    func cancelAskUserInteraction(tabID: UUID, interactionID: UUID) -> Bool {
+        guard let session = sessions[tabID],
+              session.pendingAskUser?.interaction.id == interactionID,
+              let continuation = session.askUserContinuation
+        else { return false }
+        invalidatePendingAskUserTimeout(for: session)
+        session.pendingAskUser = nil
+        session.askUserContinuation = nil
+        reconcileInteractiveRunState(session)
+        updateBindingsFromSession(session)
+        continuation.resume(throwing: CancellationError())
+        return true
     }
 
     func submitAskUserResponse(tabID: UUID, interactionID: UUID) {

@@ -33,6 +33,10 @@ final class MCPWindowToolCatalogService: WindowScopedService {
         self.sharedBindingRuntime = sharedBindingRuntime
     }
 
+    var longRunningInteractionAdapter: DomainLongRunningInteractionAdapter? {
+        providers.compactMap { ($0 as? MCPAskUserToolProvider)?.domainInteractionAdapter }.first
+    }
+
     var tools: [Tool] {
         get async {
             #if DEBUG || EDIT_FLOW_PERF

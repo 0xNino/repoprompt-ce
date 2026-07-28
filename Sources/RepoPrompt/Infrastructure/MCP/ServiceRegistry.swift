@@ -30,9 +30,15 @@ enum ServiceRegistry {
         let bindings: [MCPDomainToolBinding]
         do {
             let runtime = AppDomainRuntimeComposition.shared.runtime
+            let interactionAdapter = (service as? MCPWindowToolCatalogService)?.longRunningInteractionAdapter
             bindings = try tools.map {
                 let domainBinding = try $0.domainBinding()
-                let longRunningBinding = runtime.longRunningToolProvider.wrapping(domainBinding)
+                let longRunningBinding = runtime.longRunningToolProvider.wrapping(
+                    domainBinding,
+                    interactionAdapter: domainBinding.definition.name == MCPWindowToolName.askUser
+                        ? interactionAdapter
+                        : nil
+                )
                 return try runtime.protectedMutationProvider.protectedBinding(longRunningBinding)
             }
         } catch {

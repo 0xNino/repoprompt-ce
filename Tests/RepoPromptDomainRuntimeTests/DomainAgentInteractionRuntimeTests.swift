@@ -90,11 +90,113 @@ final class DomainAgentRunSessionStoreTests: XCTestCase {
         XCTAssertFalse(remainsActive)
     }
 
+    func testShutdownAtomicallyDetachesWaitersAcrossConcurrentSettlementRaces() async throws {
+        let fixture = makeStoreFixture()
+        let store = fixture.store
+        let sessionID = UUID()
+        let registration = await store.register(sessionID: sessionID)
+        let epoch = try acceptedEpoch(await store.beginEpoch(
+            registration: registration,
+            activationID: UUID(),
+            expectedCurrentEpoch: nil,
+            transitionKind: .initial
+        ))
+        let cursor = DomainAgentSessionWaitCursor(registration: registration, epoch: epoch)
+        let waiter = Task {
+            await store.waitUntilInteresting(cursor: cursor, timeoutSeconds: 10)
+        }
+        while await store.test_waiterCount(registration: registration) == 0 {
+            await Task.yield()
+        }
+        await store.installCancellationHandler(registration: registration) {
+            try? await Task.sleep(for: .milliseconds(80))
+        }
+
+        let shutdown = Task {
+            await store.shutdown(deadline: .milliseconds(20))
+        }
+        while await store.hasActiveRegistration(sessionID: sessionID) {
+            await Task.yield()
+        }
+
+        let terminal = makeSnapshot(sessionID: sessionID, status: .cancelled)
+        async let publication = store.publishTerminal(
+            .init(epoch: epoch, snapshot: terminal),
+            registration: registration,
+            commitID: UUID(),
+            successorKind: nil
+        )
+        async let ingest: Void = store.noteSnapshot(terminal, cursor: cursor)
+        async let wake: Void = store.wakeCurrentWaiters(terminal, cursor: cursor, reason: .steeringRequested)
+        waiter.cancel()
+        let drainWait = await store.waitUntilInteresting(cursor: cursor, timeoutSeconds: 10)
+
+        let waiterDisposition = await waiter.value
+        let publicationResult = await publication
+        await ingest
+        await wake
+        let shutdownResult = await shutdown.value
+        let waiterCount = await store.test_waiterCount(registration: registration)
+        XCTAssertEqual(waiterDisposition, .cancelled)
+        XCTAssertEqual(drainWait, .cancelled)
+        XCTAssertEqual(publicationResult, .rejected(reason: "stale_activation"))
+        XCTAssertEqual(shutdownResult.interruptedSessionIDs, [sessionID])
+        XCTAssertEqual(waiterCount, 0)
+    }
+
+    func testCancellationHandlerInstallationRemovalAndShutdownDrainAreExactlyFenced() async {
+        let fixture = makeStoreFixture()
+        let store = fixture.store
+        let recorder = InvocationRecorder()
+        let removed = await store.register(sessionID: UUID())
+        let removedInstalled = await store.installCancellationHandler(registration: removed) {
+            await recorder.record("removed")
+        }
+        XCTAssertTrue(removedInstalled)
+        await store.removeCancellationHandler(registration: removed)
+
+        let active = await store.register(sessionID: UUID())
+        let activeInstalled = await store.installCancellationHandler(registration: active) {
+            await recorder.record("active")
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(activeInstalled)
+        let stale = DomainAgentSessionRegistration(
+            runtimeID: active.runtimeID,
+            runtimeGeneration: active.runtimeGeneration,
+            sessionID: active.sessionID,
+            generation: active.generation &+ 1
+        )
+        let staleInstalled = await store.installCancellationHandler(registration: stale) {
+            await recorder.record("stale")
+        }
+        XCTAssertFalse(staleInstalled)
+
+        let shutdown = Task {
+            await store.shutdown(deadline: .milliseconds(100))
+        }
+        while await store.hasActiveRegistration(sessionID: active.sessionID) {
+            await Task.yield()
+        }
+        let installedDuringDrain = await store.installCancellationHandler(
+            registration: active
+        ) {
+            await recorder.record("during-drain")
+        }
+        XCTAssertFalse(installedDuringDrain)
+        let result = await shutdown.value
+        let calls = await recorder.values()
+        XCTAssertEqual(calls, ["active"])
+        XCTAssertTrue(result.cooperativeSessionIDs.contains(active.sessionID))
+        XCTAssertTrue(result.cooperativeSessionIDs.contains(removed.sessionID))
+    }
+
     func testRestartRestoresMetadataDormantAndRequiresExplicitResumeClaim() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
+        let profile = "m5-session-restart"
         let firstIdentity = makeIdentity(runtimeID: UUID(), generation: 4)
-        let first = DomainAgentRunSessionStore(identity: firstIdentity, storageDirectory: root)
+        let first = makeSessionStore(identity: firstIdentity, root: root, profile: profile)
         await first.bootstrap()
         let sessionID = UUID()
         let registration = await first.register(sessionID: sessionID)
@@ -107,7 +209,7 @@ final class DomainAgentRunSessionStoreTests: XCTestCase {
         _ = await first.shutdown(deadline: .milliseconds(10))
 
         let secondIdentity = makeIdentity(runtimeID: UUID(), generation: 5)
-        let second = DomainAgentRunSessionStore(identity: secondIdentity, storageDirectory: root)
+        let second = makeSessionStore(identity: secondIdentity, root: root, profile: profile)
         await second.bootstrap()
         let restoredActive = await second.hasActiveRegistration(sessionID: sessionID)
         XCTAssertFalse(restoredActive)
@@ -115,6 +217,8 @@ final class DomainAgentRunSessionStoreTests: XCTestCase {
         let restored = try XCTUnwrap(restoredMetadata.first(where: { $0.sessionID == sessionID }))
         XCTAssertFalse(restored.isLive)
         XCTAssertEqual(restored.state, .dormant)
+        XCTAssertEqual(restored.owningRuntimeID, firstIdentity.runtimeID)
+        XCTAssertEqual(restored.owningRuntimeGeneration, firstIdentity.lifecycleGeneration)
         guard case let .accepted(claim) = await second.claimResumableSession(sessionID: sessionID) else {
             return XCTFail("Expected an explicit resumable claim")
         }
@@ -124,6 +228,247 @@ final class DomainAgentRunSessionStoreTests: XCTestCase {
         let claimedActive = await second.hasActiveRegistration(sessionID: sessionID)
         XCTAssertTrue(claimedActive)
         _ = await second.shutdown(deadline: .milliseconds(10))
+    }
+
+    func testCorruptAndFutureMetadataRemainBytePreservedAndDegradedReadOnly() async throws {
+        for (profile, data, expectedHealth) in [
+            (
+                "m5-corrupt",
+                Data("{not-json".utf8),
+                DomainAgentSessionPersistenceHealth.degradedReadOnly(
+                    reason: "agent_session_metadata_decode_failed"
+                )
+            ),
+            (
+                "m5-future",
+                try JSONSerialization.data(withJSONObject: [
+                    "version": 999,
+                    "profileIdentifier": "m5-future",
+                    "revision": 1,
+                    "sessions": [],
+                    "updatedAt": 0
+                ], options: [.sortedKeys]),
+                DomainAgentSessionPersistenceHealth.degradedReadOnly(
+                    reason: "future_agent_session_metadata"
+                )
+            )
+        ] {
+            let root = temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let identity = makeIdentity()
+            let persistence = makePersistence(identity: identity, root: root, profile: profile)
+            try await persistence.compareAndSwapAgentSessionMetadataData(expectedDigest: nil, data: data)
+            let store = makeSessionStore(identity: identity, root: root, profile: profile)
+            await store.bootstrap()
+            let degradedSnapshot = await store.snapshot()
+            XCTAssertEqual(degradedSnapshot.persistenceHealth, expectedHealth)
+            _ = await store.register(sessionID: UUID())
+            _ = await store.shutdown(deadline: .milliseconds(5))
+            let preserved = try await persistence.loadAgentSessionMetadataData()
+            XCTAssertEqual(preserved.data, data)
+        }
+    }
+
+    func testCASMergesDistinctSessionsAndRejectsCompetingOwnershipTransfer() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = "m5-cas"
+        let firstIdentity = makeIdentity(runtimeID: UUID(), generation: 1)
+        let secondIdentity = makeIdentity(runtimeID: UUID(), generation: 2)
+        let first = makeSessionStore(identity: firstIdentity, root: root, profile: profile)
+        let second = makeSessionStore(identity: secondIdentity, root: root, profile: profile)
+        await first.bootstrap()
+        await second.bootstrap()
+
+        let firstSessionID = UUID()
+        let secondSessionID = UUID()
+        _ = await first.register(sessionID: firstSessionID)
+        _ = await first.shutdown(deadline: .milliseconds(5))
+        _ = await second.register(sessionID: secondSessionID)
+        _ = await second.shutdown(deadline: .milliseconds(5))
+
+        let verifierIdentity = makeIdentity(runtimeID: UUID(), generation: 3)
+        let verifier = makeSessionStore(identity: verifierIdentity, root: root, profile: profile)
+        await verifier.bootstrap()
+        let mergedMetadata = await verifier.restoredMetadata()
+        let mergedIDs = Set(mergedMetadata.map(\.sessionID))
+        XCTAssertEqual(mergedIDs, [firstSessionID, secondSessionID])
+        _ = await verifier.shutdown(deadline: .milliseconds(5))
+
+        let conflictRoot = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: conflictRoot) }
+        let conflictProfile = "m5-cas-conflict"
+        let owner = makeSessionStore(identity: firstIdentity, root: conflictRoot, profile: conflictProfile)
+        let contender = makeSessionStore(identity: secondIdentity, root: conflictRoot, profile: conflictProfile)
+        await owner.bootstrap()
+        await contender.bootstrap()
+        let contestedSessionID = UUID()
+        _ = await owner.register(sessionID: contestedSessionID)
+        _ = await contender.register(sessionID: contestedSessionID)
+        _ = await owner.shutdown(deadline: .milliseconds(5))
+        _ = await contender.shutdown(deadline: .milliseconds(5))
+        let contenderSnapshot = await contender.snapshot()
+        XCTAssertEqual(
+            contenderSnapshot.persistenceHealth,
+            .degradedReadOnly(reason: "agent_session_ownership_conflict")
+        )
+        let conflictVerifier = makeSessionStore(
+            identity: verifierIdentity,
+            root: conflictRoot,
+            profile: conflictProfile
+        )
+        await conflictVerifier.bootstrap()
+        let conflictMetadata = await conflictVerifier.restoredMetadata()
+        let contested = try XCTUnwrap(
+            conflictMetadata.first { $0.sessionID == contestedSessionID }
+        )
+        XCTAssertEqual(contested.owningRuntimeID, firstIdentity.runtimeID)
+        _ = await conflictVerifier.shutdown(deadline: .milliseconds(5))
+    }
+
+    func testPersistedActiveOwnerCannotBeClaimedUntilItDurablyStops() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = "m5-live-owner"
+        let ownerIdentity = makeIdentity(runtimeID: UUID(), generation: 1)
+        let owner = makeSessionStore(identity: ownerIdentity, root: root, profile: profile)
+        await owner.bootstrap()
+        let sessionID = UUID()
+        _ = await owner.register(sessionID: sessionID)
+        try await Task.sleep(for: .milliseconds(250))
+
+        let contender = makeSessionStore(
+            identity: makeIdentity(runtimeID: UUID(), generation: 2),
+            root: root,
+            profile: profile
+        )
+        await contender.bootstrap()
+        let liveOwnerClaim = await contender.claimResumableSession(sessionID: sessionID)
+        XCTAssertEqual(liveOwnerClaim, .unavailable)
+
+        _ = await owner.shutdown(deadline: .milliseconds(20))
+        let successor = makeSessionStore(
+            identity: makeIdentity(runtimeID: UUID(), generation: 3),
+            root: root,
+            profile: profile
+        )
+        await successor.bootstrap()
+        guard case .accepted = await successor.claimResumableSession(sessionID: sessionID) else {
+            return XCTFail("A durably stopped owner should become explicitly claimable")
+        }
+        _ = await contender.shutdown(deadline: .milliseconds(10))
+        _ = await successor.shutdown(deadline: .milliseconds(10))
+    }
+
+    func testExternallyIntroducedDuplicateSessionIDsDegradeWithoutTrappingOrOverwrite() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = "m5-duplicate-document"
+        let identity = makeIdentity()
+        let store = makeSessionStore(identity: identity, root: root, profile: profile)
+        let persistence = makePersistence(identity: identity, root: root, profile: profile)
+        await store.bootstrap()
+        _ = await store.register(sessionID: UUID())
+        try await Task.sleep(for: .milliseconds(250))
+
+        let valid = try await persistence.loadAgentSessionMetadataData()
+        let validData = try XCTUnwrap(valid.data)
+        var object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: validData) as? [String: Any]
+        )
+        let sessions = try XCTUnwrap(object["sessions"] as? [[String: Any]])
+        object["sessions"] = sessions + sessions
+        let duplicateData = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        try await persistence.compareAndSwapAgentSessionMetadataData(
+            expectedDigest: valid.digest,
+            data: duplicateData
+        )
+
+        _ = await store.register(sessionID: UUID())
+        try await Task.sleep(for: .milliseconds(250))
+        let snapshot = await store.snapshot()
+        XCTAssertEqual(
+            snapshot.persistenceHealth,
+            .degradedReadOnly(reason: "agent_session_metadata_decode_failed")
+        )
+        let preserved = try await persistence.loadAgentSessionMetadataData()
+        XCTAssertEqual(preserved.data, duplicateData)
+        _ = await store.shutdown(deadline: .milliseconds(10))
+    }
+
+    func testMutationArrivingDuringFlushAdvancesCommittedBaseWithoutFalseConflict() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = "m5-flush-reentrancy"
+        let identity = makeIdentity()
+        let store = makeSessionStore(identity: identity, root: root, profile: profile)
+        await store.bootstrap()
+        let registration = await store.register(sessionID: UUID())
+        await store.test_setMetadataFlushBeforeCAS {
+            await store.test_setMetadataFlushBeforeCAS(nil)
+            _ = await store.beginEpoch(
+                registration: registration,
+                activationID: UUID(),
+                expectedCurrentEpoch: nil,
+                transitionKind: .initial
+            )
+        }
+        try await Task.sleep(for: .milliseconds(500))
+        let snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.persistenceHealth, .ready)
+        XCTAssertEqual(snapshot.pendingPersistenceCount, 0)
+        let persistence = makePersistence(identity: identity, root: root, profile: profile)
+        let persisted = try await persistence.loadAgentSessionMetadataData()
+        let data = try XCTUnwrap(persisted.data)
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        let sessions = try XCTUnwrap(object["sessions"] as? [[String: Any]])
+        XCTAssertEqual(sessions.first?["lastEpochOrdinal"] as? Int, 1)
+        _ = await store.shutdown(deadline: .milliseconds(10))
+    }
+
+    func testDurableMetadataIsBoundedAndTurnWritesAreCoalesced() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profile = "m5-retention"
+        let identity = makeIdentity()
+        let store = makeSessionStore(identity: identity, root: root, profile: profile)
+        await store.bootstrap()
+        let firstSessionID = UUID()
+        let registration = await store.register(sessionID: firstSessionID)
+        let epoch = try acceptedEpoch(await store.beginEpoch(
+            registration: registration,
+            activationID: UUID(),
+            expectedCurrentEpoch: nil,
+            transitionKind: .initial
+        ))
+        await store.noteSnapshot(
+            makeSnapshot(sessionID: firstSessionID, status: .running),
+            cursor: .init(registration: registration, epoch: epoch)
+        )
+        try await Task.sleep(for: .milliseconds(250))
+        let persistence = makePersistence(identity: identity, root: root, profile: profile)
+        let coalescedSnapshot = try await persistence.loadAgentSessionMetadataData()
+        let coalescedData = try XCTUnwrap(coalescedSnapshot.data)
+        let coalescedObject = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: coalescedData) as? [String: Any]
+        )
+        XCTAssertEqual(coalescedObject["revision"] as? Int, 1)
+
+        for _ in 0 ..< 520 {
+            _ = await store.register(sessionID: UUID())
+        }
+        _ = await store.shutdown(deadline: .milliseconds(5))
+        let snapshot = await store.snapshot()
+        XCTAssertEqual(snapshot.retainedMetadataCount, 512)
+        XCTAssertGreaterThan(snapshot.omittedRetentionCount, 0)
+        let boundedPersistenceSnapshot = try await persistence.loadAgentSessionMetadataData()
+        let boundedData = try XCTUnwrap(boundedPersistenceSnapshot.data)
+        let boundedObject = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: boundedData) as? [String: Any]
+        )
+        XCTAssertEqual((boundedObject["sessions"] as? [Any])?.count, 512)
     }
 
     private func acceptedEpoch(
@@ -197,6 +542,86 @@ final class DomainInteractionBrokerTests: XCTestCase {
         XCTAssertEqual(unavailable, .unavailable)
     }
 
+    func testConnectionCancellationSettlesOnlyTheExactPendingClient() async {
+        let broker = DomainInteractionBroker()
+        let cancelled = InvocationRecorder()
+        let firstClientID = UUID()
+        let secondClientID = UUID()
+        let provider = DomainInteractionProvider(
+            kind: .elicitation,
+            present: { request in
+                try? await Task.sleep(for: .milliseconds(50))
+                return .string(request.clientID?.uuidString ?? "missing")
+            },
+            cancel: { _ in await cancelled.record("cancel") }
+        )
+        await broker.installNegotiatedElicitationProvider(provider, clientID: firstClientID)
+        await broker.installNegotiatedElicitationProvider(provider, clientID: secondClientID)
+
+        let first = Task {
+            await broker.request(.init(
+                toolName: "ask_user",
+                clientID: firstClientID,
+                payload: [:],
+                deadline: Date().addingTimeInterval(1)
+            ))
+        }
+        let second = Task {
+            await broker.request(.init(
+                toolName: "ask_user",
+                clientID: secondClientID,
+                payload: [:],
+                deadline: Date().addingTimeInterval(1)
+            ))
+        }
+        while await broker.snapshot().pendingRequestIDs.count < 2 {
+            await Task.yield()
+        }
+        await broker.cancel(clientID: firstClientID)
+
+        let firstResult = await first.value
+        let secondResult = await second.value
+        let cancellationCount = await cancelled.values().count
+        let snapshot = await broker.snapshot()
+        XCTAssertEqual(firstResult, .cancelled)
+        XCTAssertEqual(
+            secondResult,
+            .response(.string(secondClientID.uuidString), provider: .elicitation)
+        )
+        XCTAssertEqual(cancellationCount, 1)
+        XCTAssertTrue(snapshot.pendingRequestIDs.isEmpty)
+    }
+
+    func testConnectionRemovalDuringAvailabilityBlocksLateWaiterCreation() async {
+        let broker = DomainInteractionBroker()
+        let clientID = UUID()
+        await broker.installNegotiatedElicitationProvider(
+            .init(
+                kind: .elicitation,
+                isAvailable: { _ in
+                    try? await Task.sleep(for: .milliseconds(30))
+                    return true
+                },
+                present: { _ in .string("must-not-present") }
+            ),
+            clientID: clientID
+        )
+        let request = Task {
+            await broker.request(.init(
+                toolName: "ask_user",
+                clientID: clientID,
+                payload: [:],
+                deadline: Date().addingTimeInterval(1)
+            ))
+        }
+        try? await Task.sleep(for: .milliseconds(5))
+        await broker.cancel(clientID: clientID)
+        let result = await request.value
+        let snapshot = await broker.snapshot()
+        XCTAssertEqual(result, .cancelled)
+        XCTAssertTrue(snapshot.pendingRequestIDs.isEmpty)
+    }
+
     func testCallerCancellationSettlesOnceAndLateProviderResponseCannotResurrectRequest() async {
         let broker = DomainInteractionBroker()
         let recorder = InvocationRecorder()
@@ -255,9 +680,30 @@ final class DomainCredentialAndChildLaunchTests: XCTestCase {
         } verify: {
             XCTAssertEqual($0 as? DomainCredentialEnvelopeError, .scopeMismatch)
         }
+        let issuedBytes = await store.test_ownedStorageBytes(envelopeID: descriptor.envelopeID)
+        XCTAssertEqual(issuedBytes, [1, 2, 3, 4])
         let payload = try await store.redeem(descriptor, scope: scope)
-        XCTAssertEqual(payload.bytes, [1, 2, 3, 4])
+        let consumedStoreBytes = await store.test_ownedStorageBytes(envelopeID: descriptor.envelopeID)
+        let consumedStoreIsZeroed = await store.test_isOwnedStorageZeroed(envelopeID: descriptor.envelopeID)
+        XCTAssertEqual(consumedStoreBytes, [0, 0, 0, 0])
+        XCTAssertEqual(consumedStoreIsZeroed, true)
+        XCTAssertEqual(payload.test_ownedStorageBytes(), [1, 2, 3, 4])
+        let consumed = try payload.withConsumedBytes { Array($0) }
+        XCTAssertEqual(consumed, [1, 2, 3, 4])
+        XCTAssertEqual(payload.test_ownedStorageBytes(), [0, 0, 0, 0])
+        XCTAssertTrue(payload.test_isOwnedStorageZeroed())
+        XCTAssertThrowsError(try payload.withConsumedBytes { Array($0) }) {
+            XCTAssertEqual($0 as? DomainCredentialPayloadError, .alreadyConsumed)
+        }
         XCTAssertEqual(payload.description, "<redacted credential payload: 4 bytes>")
+
+        let throwingDescriptor = try await store.issue(bytes: [9, 8, 7], scope: scope)
+        let throwingPayload = try await store.redeem(throwingDescriptor, scope: scope)
+        XCTAssertThrowsError(try throwingPayload.withConsumedBytes { _ -> Void in
+            throw TestError.expectedAcceptedEpoch
+        })
+        XCTAssertEqual(throwingPayload.test_ownedStorageBytes(), [0, 0, 0])
+        XCTAssertTrue(throwingPayload.test_isOwnedStorageZeroed())
         await XCTAssertThrowsErrorAsync {
             _ = try await store.redeem(descriptor, scope: scope)
         } verify: {
@@ -266,6 +712,10 @@ final class DomainCredentialAndChildLaunchTests: XCTestCase {
 
         let revoked = try await store.issue(bytes: [5], scope: scope)
         await store.revoke(revoked.envelopeID)
+        let revokedBytes = await store.test_ownedStorageBytes(envelopeID: revoked.envelopeID)
+        let revokedIsZeroed = await store.test_isOwnedStorageZeroed(envelopeID: revoked.envelopeID)
+        XCTAssertEqual(revokedBytes, [0])
+        XCTAssertEqual(revokedIsZeroed, true)
         await XCTAssertThrowsErrorAsync {
             _ = try await store.redeem(revoked, scope: scope)
         } verify: {
@@ -277,8 +727,16 @@ final class DomainCredentialAndChildLaunchTests: XCTestCase {
         } verify: {
             XCTAssertEqual($0 as? DomainCredentialEnvelopeError, .expired)
         }
+        let expiredBytes = await store.test_ownedStorageBytes(envelopeID: expired.envelopeID)
+        let expiredIsZeroed = await store.test_isOwnedStorageZeroed(envelopeID: expired.envelopeID)
+        XCTAssertEqual(expiredBytes, [0])
+        XCTAssertEqual(expiredIsZeroed, true)
         let shutdown = try await store.issue(bytes: [7], scope: scope)
         await store.shutdown()
+        let shutdownBytes = await store.test_ownedStorageBytes(envelopeID: shutdown.envelopeID)
+        let shutdownIsZeroed = await store.test_isOwnedStorageZeroed(envelopeID: shutdown.envelopeID)
+        XCTAssertEqual(shutdownBytes, [0])
+        XCTAssertEqual(shutdownIsZeroed, true)
         await XCTAssertThrowsErrorAsync {
             _ = try await store.redeem(shutdown, scope: scope)
         } verify: {
@@ -369,7 +827,7 @@ final class DomainCredentialAndChildLaunchTests: XCTestCase {
         )
         let descriptor = try XCTUnwrap(carrier.credentialEnvelope)
         let payload = try await runtime.credentialEnvelopeStore.redeem(descriptor, scope: scope)
-        XCTAssertEqual(payload.bytes, [7, 8])
+        XCTAssertEqual(try payload.withConsumedBytes { Array($0) }, [7, 8])
         await XCTAssertThrowsErrorAsync {
             _ = try await runtime.credentialEnvelopeStore.redeem(descriptor, scope: scope)
         } verify: {
@@ -470,16 +928,32 @@ final class DomainActivityAndLongRunningProviderTests: XCTestCase {
         do {
             _ = try await wrapped(["message": .string("hello")])
             XCTFail("Unattributed AI work must fail closed")
-        } catch {}
+        } catch {
+            XCTAssertEqual(error as? DomainMutationPolicyError, .principalMissing)
+        }
         let deniedCalls = await recorder.values()
         XCTAssertTrue(deniedCalls.isEmpty)
 
-        let security = makeRunSecurityContext(
+        let unroutedSecurity = makeRunSecurityContext(
             identity: runtime.identity,
             grantedTools: ["ask_oracle"],
             hasAuthoritativeRoutingContext: false
         )
-        let value = try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+        do {
+            _ = try await MCPDomainInvocationSecurityContext.$current.withValue(unroutedSecurity) {
+                try await wrapped(["message": .string("hello")])
+            }
+            XCTFail("Costed work without authoritative routing must fail closed")
+        } catch {
+            XCTAssertEqual(error as? DomainMutationPolicyError, .routingContextUnavailable)
+        }
+
+        let routedSecurity = makeRunSecurityContext(
+            identity: runtime.identity,
+            grantedTools: ["ask_oracle"],
+            hasAuthoritativeRoutingContext: true
+        )
+        let value = try await MCPDomainInvocationSecurityContext.$current.withValue(routedSecurity) {
             try await wrapped(["message": .string("hello")])
         }
         XCTAssertEqual(value, .string("ok"))
@@ -487,7 +961,68 @@ final class DomainActivityAndLongRunningProviderTests: XCTestCase {
         XCTAssertEqual(successfulCalls, ["token"])
         let activities = await runtime.activityCenter.snapshot()
         XCTAssertTrue(activities.active.isEmpty)
-        XCTAssertEqual(activities.recentTerminal.map(\.state), [.completed, .failed])
+        XCTAssertEqual(activities.recentTerminal.map(\.state), [.completed, .failed, .failed])
+    }
+
+    func testAskUserUsesInjectedWorkspaceTimeoutAndDismissesOnCallerCancellationOnce() async throws {
+        let runtime = makeRuntime(mode: .app)
+        try await runtime.start()
+        defer { Task { await runtime.shutdown() } }
+        let recorder = InteractionAdapterRecorder()
+        let binding = MCPDomainToolBinding(
+            definition: .init(
+                name: "ask_user",
+                description: "configured timeout fixture",
+                inputSchema: .object(["type": .string("object")])
+            )
+        ) { _ in
+            await recorder.recordPresentation(
+                requestID: DomainInteractionPresentationContext.requestID
+            )
+            try await Task.sleep(for: .seconds(30))
+            return .string("late")
+        }
+        let adapter = DomainLongRunningInteractionAdapter(
+            isAvailable: { request in
+                await recorder.recordDeadline(request.deadline)
+                return true
+            },
+            resolveDefaultTimeoutSeconds: { _ in 900 },
+            cancel: { requestID in
+                await recorder.recordCancellation(requestID: requestID)
+            }
+        )
+        let wrapped = runtime.longRunningToolProvider.wrapping(
+            binding,
+            interactionAdapter: adapter
+        )
+        let task = Task {
+            try await wrapped(["questions": .array([.object([
+                "id": .string("choice"),
+                "question": .string("Choose")
+            ])])])
+        }
+        for _ in 0 ..< 1_000 {
+            if await recorder.presentationRequestID() != nil { break }
+            await Task.yield()
+        }
+        let presentationRequestID = await recorder.presentationRequestID()
+        XCTAssertNotNil(presentationRequestID)
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Caller cancellation must settle ask_user as cancelled")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+        try? await Task.sleep(for: .milliseconds(20))
+        let snapshot = await recorder.snapshot()
+        XCTAssertEqual(snapshot.cancellationRequestIDs, [presentationRequestID].compactMap { $0 })
+        XCTAssertGreaterThan(snapshot.deadline?.timeIntervalSinceNow ?? 0, 800)
+        let brokerSnapshot = await runtime.interactionBroker.snapshot()
+        XCTAssertTrue(brokerSnapshot.pendingRequestIDs.isEmpty)
     }
 
     func testLongRunningProviderCoversFrozenFamiliesAndInteractionFallbackOrder() async throws {
@@ -517,10 +1052,7 @@ final class DomainActivityAndLongRunningProviderTests: XCTestCase {
             await appRecorder.record("app")
             return .string("app")
         }
-        let wrapped = runtime.longRunningToolProvider.wrapping(
-            binding,
-            interactionUIAvailable: false
-        )
+        let wrapped = runtime.longRunningToolProvider.wrapping(binding)
         await runtime.interactionBroker.installNegotiatedElicitationProvider(
             DomainInteractionProvider(kind: .elicitation) { _ in .string("elicitation") }
         )
@@ -546,6 +1078,42 @@ private enum TestError: Error {
     case expectedAcceptedEpoch
 }
 
+private actor InteractionAdapterRecorder {
+    struct Snapshot {
+        let deadline: Date?
+        let presentationRequestID: UUID?
+        let cancellationRequestIDs: [UUID]
+    }
+
+    private var deadline: Date?
+    private var presentedRequestID: UUID?
+    private var cancelledRequestIDs: [UUID] = []
+
+    func recordDeadline(_ deadline: Date) {
+        self.deadline = deadline
+    }
+
+    func recordPresentation(requestID: UUID?) {
+        presentedRequestID = requestID
+    }
+
+    func recordCancellation(requestID: UUID) {
+        cancelledRequestIDs.append(requestID)
+    }
+
+    func presentationRequestID() -> UUID? {
+        presentedRequestID
+    }
+
+    func snapshot() -> Snapshot {
+        Snapshot(
+            deadline: deadline,
+            presentationRequestID: presentedRequestID,
+            cancellationRequestIDs: cancelledRequestIDs
+        )
+    }
+}
+
 private actor InvocationRecorder {
     private var recorded: [String] = []
 
@@ -563,10 +1131,39 @@ private func makeStoreFixture() -> (
     store: DomainAgentRunSessionStore
 ) {
     let identity = makeIdentity()
+    let root = temporaryDirectory()
     return (
         identity,
-        DomainAgentRunSessionStore(identity: identity, storageDirectory: temporaryDirectory())
+        makeSessionStore(identity: identity, root: root, profile: "m5-store-fixture")
     )
+}
+
+private func makeSessionStore(
+    identity: DomainRuntimeIdentity,
+    root: URL,
+    profile: String
+) -> DomainAgentRunSessionStore {
+    DomainAgentRunSessionStore(
+        identity: identity,
+        persistence: makePersistence(identity: identity, root: root, profile: profile),
+        profileIdentifier: profile
+    )
+}
+
+private func makePersistence(
+    identity: DomainRuntimeIdentity,
+    root: URL,
+    profile: String
+) -> DomainPersistenceCoordinator {
+    let configuration = DomainRuntimeConfiguration(
+        mode: identity.mode,
+        profileIdentifier: profile,
+        storageDirectory: root,
+        eventDirectory: root.appendingPathComponent("Events"),
+        temporaryDirectory: root.appendingPathComponent("Temporary"),
+        externalReloadInterval: nil
+    )
+    return DomainPersistenceCoordinator(configuration: configuration, identity: identity)
 }
 
 private func makeIdentity(

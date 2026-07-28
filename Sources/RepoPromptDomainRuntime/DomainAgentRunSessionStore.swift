@@ -67,6 +67,58 @@ package enum DomainAgentSessionResumeClaimResult: Equatable, Sendable {
     case shuttingDown
 }
 
+package enum DomainAgentSessionPersistenceHealth: Equatable, Sendable {
+    case ready
+    case degradedReadOnly(reason: String)
+}
+
+package struct DomainAgentSessionStoreSnapshot: Equatable, Sendable {
+    package let persistenceHealth: DomainAgentSessionPersistenceHealth
+    package let retainedMetadataCount: Int
+    package let omittedRetentionCount: UInt64
+    package let pendingPersistenceCount: Int
+}
+
+private enum DomainAgentSessionMetadataDecodeError: Error {
+    case futureVersion
+    case wrongProfile
+    case corrupt
+
+    var reason: String {
+        switch self {
+        case .futureVersion:
+            "future_agent_session_metadata"
+        case .wrongProfile:
+            "wrong_agent_session_profile"
+        case .corrupt:
+            "agent_session_metadata_decode_failed"
+        }
+    }
+}
+
+private struct DomainAgentSessionMetadataDocument: Codable, Sendable {
+    static let schemaVersion = 1
+
+    let version: Int
+    let profileIdentifier: String
+    let revision: UInt64
+    let sessions: [DomainAgentSessionDurableMetadata]
+    let updatedAt: Date
+
+    init(
+        profileIdentifier: String,
+        revision: UInt64,
+        sessions: [DomainAgentSessionDurableMetadata],
+        updatedAt: Date
+    ) {
+        version = Self.schemaVersion
+        self.profileIdentifier = profileIdentifier
+        self.revision = revision
+        self.sessions = sessions
+        self.updatedAt = updatedAt
+    }
+}
+
 private actor DomainAgentCancellationCompletionTracker {
     private var completed: Set<UUID> = []
 
@@ -163,52 +215,59 @@ package actor DomainAgentRunSessionStore {
 
     private static let terminalSnapshotTTL: TimeInterval = 300
     private static let retainedCommittedEpochLimit = 32
+    private static let retainedMetadataLimit = 512
+    private static let retainedInactiveAge: TimeInterval = 30 * 24 * 60 * 60
+    private static let persistenceDebounce: Duration = .milliseconds(100)
+    private static let persistenceRetryLimit = 3
 
     private let identity: DomainRuntimeIdentity
-    private let metadataURL: URL
+    private let persistence: DomainPersistenceCoordinator
+    private let profileIdentifier: String
     private var records: [UUID: Record] = [:]
     private var durableMetadata: [UUID: DomainAgentSessionDurableMetadata] = [:]
+    private var persistedMetadataBase: [UUID: DomainAgentSessionDurableMetadata] = [:]
+    private var dirtyMetadataSessionIDs: Set<UUID> = []
     private var cancellationHandlers: [UUID: @Sendable () async -> Void] = [:]
+    private var persistenceHealth: DomainAgentSessionPersistenceHealth = .ready
+    private var persistedRevision: UInt64 = 0
+    private var omittedRetentionCount: UInt64 = 0
     private var nextGeneration: UInt64 = 1
     private var didBootstrap = false
     private var isShuttingDown = false
-    private var metadataPersistenceTask: Task<Void, Never>?
+    private var persistenceDebounceTask: Task<Void, Never>?
+    private var activePersistenceFlush: (id: UUID, task: Task<Bool, Never>)?
+    #if DEBUG
+        private var testMetadataFlushBeforeCAS: (@Sendable () async -> Void)?
+    #endif
 
-    package init(identity: DomainRuntimeIdentity, storageDirectory: URL) {
+    package init(
+        identity: DomainRuntimeIdentity,
+        persistence: DomainPersistenceCoordinator,
+        profileIdentifier: String
+    ) {
         self.identity = identity
-        metadataURL = storageDirectory
-            .appendingPathComponent("DomainRuntime", isDirectory: true)
-            .appendingPathComponent("v1", isDirectory: true)
-            .appendingPathComponent("agent-sessions.json")
+        self.persistence = persistence
+        self.profileIdentifier = profileIdentifier
     }
 
     package func bootstrap() async {
         guard !didBootstrap else { return }
         didBootstrap = true
-        let url = metadataURL
-        let decoded: [DomainAgentSessionDurableMetadata] = await Task.detached(priority: .utility) {
-            guard let data = try? Data(contentsOf: url),
-                  let values = try? JSONDecoder().decode([DomainAgentSessionDurableMetadata].self, from: data)
-            else {
-                return []
+        do {
+            let current = try await persistence.loadAgentSessionMetadataData()
+            if let data = current.data {
+                try bootstrapCurrentDocument(data)
+            } else {
+                try await bootstrapLegacyDocument()
             }
-            return values
-        }.value
-        for value in decoded {
-            // Persisted executions are metadata only. A new runtime must explicitly register a
-            // new activation before any session can be reported live.
-            durableMetadata[value.sessionID] = DomainAgentSessionDurableMetadata(
-                sessionID: value.sessionID,
-                owningRuntimeID: identity.runtimeID,
-                owningRuntimeGeneration: identity.lifecycleGeneration,
-                registrationGeneration: value.registrationGeneration,
-                lastEpochOrdinal: value.lastEpochOrdinal,
-                continuityGeneration: value.continuityGeneration,
-                state: value.state == .terminal ? .terminal : .dormant,
-                resumable: value.resumable,
-                updatedAt: value.updatedAt
-            )
-            nextGeneration = max(nextGeneration, value.registrationGeneration &+ 1)
+            pruneDurableMetadata(now: Date())
+            if !dirtyMetadataSessionIDs.isEmpty {
+                scheduleMetadataPersistence()
+            }
+        } catch let error as DomainAgentSessionMetadataDecodeError {
+            persistenceHealth = .degradedReadOnly(reason: error.reason)
+        } catch {
+            persistenceHealth = .degradedReadOnly(reason: "agent_session_metadata_io_failed")
         }
     }
 
@@ -216,10 +275,24 @@ package actor DomainAgentRunSessionStore {
         durableMetadata.values.sorted { $0.updatedAt > $1.updatedAt }
     }
 
-    package func claimResumableSession(sessionID: UUID) -> DomainAgentSessionResumeClaimResult {
+    package func snapshot() -> DomainAgentSessionStoreSnapshot {
+        DomainAgentSessionStoreSnapshot(
+            persistenceHealth: persistenceHealth,
+            retainedMetadataCount: durableMetadata.count,
+            omittedRetentionCount: omittedRetentionCount,
+            pendingPersistenceCount: dirtyMetadataSessionIDs.count
+        )
+    }
+
+    package func claimResumableSession(sessionID: UUID) async -> DomainAgentSessionResumeClaimResult {
         guard !isShuttingDown else { return .shuttingDown }
         guard records[sessionID] == nil else { return .alreadyActive }
-        guard let metadata = durableMetadata[sessionID], metadata.resumable else {
+        guard persistenceHealth == .ready,
+              let metadata = durableMetadata[sessionID],
+              metadata.resumable,
+              let persisted = persistedMetadataBase[sessionID],
+              persisted.state != .active
+        else {
             return .unavailable
         }
         let registration = makeRegistration(sessionID: sessionID)
@@ -228,7 +301,12 @@ package actor DomainAgentRunSessionStore {
         record.continuityGeneration = metadata.continuityGeneration
         records[sessionID] = record
         updateMetadata(for: record, state: .active, resumable: true)
-        scheduleMetadataPersistence()
+        guard await persistMetadataImmediately() else {
+            records.removeValue(forKey: sessionID)
+            durableMetadata[sessionID] = metadata
+            dirtyMetadataSessionIDs.remove(sessionID)
+            return .unavailable
+        }
         return .accepted(registration)
     }
 
@@ -551,6 +629,7 @@ package actor DomainAgentRunSessionStore {
         cursor: WaitCursor,
         timeoutSeconds: TimeInterval? = nil
     ) async -> WaitDisposition {
+        guard !isShuttingDown else { return .cancelled }
         guard let record = currentRecord(for: cursor.registration, operation: "wait") else {
             return .expired
         }
@@ -582,6 +661,10 @@ package actor DomainAgentRunSessionStore {
         let waiterID = UUID()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
+                guard !isShuttingDown else {
+                    continuation.resume(returning: .cancelled)
+                    return
+                }
                 guard var current = currentRecord(for: cursor.registration, operation: "wait_park") else {
                     continuation.resume(returning: .expired)
                     return
@@ -643,6 +726,7 @@ package actor DomainAgentRunSessionStore {
         registration: Registration,
         timeoutSeconds: TimeInterval? = nil
     ) async -> WaitDisposition {
+        guard !isShuttingDown else { return .cancelled }
         guard let cursor = currentCursor(for: registration) else { return .expired }
         return await waitUntilInteresting(cursor: cursor, timeoutSeconds: timeoutSeconds)
     }
@@ -684,12 +768,23 @@ package actor DomainAgentRunSessionStore {
         scheduleMetadataPersistence()
     }
 
+    @discardableResult
     package func installCancellationHandler(
         registration: Registration,
         handler: @escaping @Sendable () async -> Void
-    ) {
-        guard currentRecord(for: registration, operation: "install_cancellation") != nil else { return }
+    ) -> Bool {
+        guard !isShuttingDown,
+              currentRecord(for: registration, operation: "install_cancellation") != nil
+        else {
+            return false
+        }
         cancellationHandlers[registration.sessionID] = handler
+        return true
+    }
+
+    package func removeCancellationHandler(registration: Registration) {
+        guard currentRecord(for: registration, operation: "remove_cancellation") != nil else { return }
+        cancellationHandlers.removeValue(forKey: registration.sessionID)
     }
 
     package func shutdown(deadline: Duration = .seconds(5)) async -> DomainAgentSessionShutdownResult {
@@ -698,6 +793,7 @@ package actor DomainAgentRunSessionStore {
         }
         isShuttingDown = true
         let activeRecords = records
+        records.removeAll()
         let handlers = cancellationHandlers
         cancellationHandlers.removeAll()
         for record in activeRecords.values {
@@ -740,7 +836,6 @@ package actor DomainAgentRunSessionStore {
                 resumable: true
             )
         }
-        records.removeAll()
         await persistMetadata()
         return DomainAgentSessionShutdownResult(
             cooperativeSessionIDs: cooperative.sorted { $0.uuidString < $1.uuidString },
@@ -904,6 +999,9 @@ package actor DomainAgentRunSessionStore {
         else { return }
         records.removeValue(forKey: cursor.registration.sessionID)
         expireWaiters(record.waiters)
+        cancellationHandlers.removeValue(forKey: cursor.registration.sessionID)
+        updateMetadata(for: record, state: .dormant, resumable: true)
+        scheduleMetadataPersistence()
     }
 
     private func makeRegistration(sessionID: UUID) -> Registration {
@@ -955,50 +1053,263 @@ package actor DomainAgentRunSessionStore {
         resumable: Bool
     ) {
         guard let record else { return }
-        durableMetadata[record.registration.sessionID] = DomainAgentSessionDurableMetadata(
-            sessionID: record.registration.sessionID,
+        let sessionID = record.registration.sessionID
+        durableMetadata[sessionID] = DomainAgentSessionDurableMetadata(
+            sessionID: sessionID,
             owningRuntimeID: identity.runtimeID,
             owningRuntimeGeneration: identity.lifecycleGeneration,
             registrationGeneration: record.registration.generation,
             lastEpochOrdinal: record.currentEpoch?.ordinal ?? 0,
             continuityGeneration: record.currentEpoch?.continuityGeneration ?? record.continuityGeneration,
             state: state,
-            resumable: resumable,
+            resumable: resumable && persistenceHealth == .ready,
             updatedAt: Date()
+        )
+        if persistenceHealth == .ready {
+            dirtyMetadataSessionIDs.insert(sessionID)
+            pruneDurableMetadata(now: Date())
+        }
+    }
+
+    private func bootstrapCurrentDocument(_ data: Data) throws {
+        let document = try decodeDocument(data)
+        persistedRevision = document.revision
+        for value in document.sessions {
+            guard persistedMetadataBase[value.sessionID] == nil else {
+                throw DomainAgentSessionMetadataDecodeError.corrupt
+            }
+            persistedMetadataBase[value.sessionID] = value
+            durableMetadata[value.sessionID] = restoredProjection(value)
+            nextGeneration = max(nextGeneration, value.registrationGeneration &+ 1)
+        }
+    }
+
+    private func bootstrapLegacyDocument() async throws {
+        let legacy = try await persistence.loadLegacyAgentSessionMetadataData()
+        guard let data = legacy.data else { return }
+        guard let values = try? JSONDecoder().decode([DomainAgentSessionDurableMetadata].self, from: data) else {
+            throw DomainAgentSessionMetadataDecodeError.corrupt
+        }
+        for value in values {
+            guard durableMetadata[value.sessionID] == nil else {
+                throw DomainAgentSessionMetadataDecodeError.corrupt
+            }
+            persistedMetadataBase[value.sessionID] = value
+            durableMetadata[value.sessionID] = restoredProjection(value)
+            dirtyMetadataSessionIDs.insert(value.sessionID)
+            nextGeneration = max(nextGeneration, value.registrationGeneration &+ 1)
+        }
+    }
+
+    private func restoredProjection(
+        _ value: DomainAgentSessionDurableMetadata
+    ) -> DomainAgentSessionDurableMetadata {
+        DomainAgentSessionDurableMetadata(
+            sessionID: value.sessionID,
+            owningRuntimeID: value.owningRuntimeID,
+            owningRuntimeGeneration: value.owningRuntimeGeneration,
+            registrationGeneration: value.registrationGeneration,
+            lastEpochOrdinal: value.lastEpochOrdinal,
+            continuityGeneration: value.continuityGeneration,
+            state: value.state == .terminal ? .terminal : .dormant,
+            resumable: value.resumable,
+            updatedAt: value.updatedAt
         )
     }
 
-    private func scheduleMetadataPersistence() {
-        let snapshot = durableMetadata.values.sorted { $0.sessionID.uuidString < $1.sessionID.uuidString }
-        let url = metadataURL
-        let previous = metadataPersistenceTask
-        metadataPersistenceTask = Task {
-            await previous?.value
-            await Task.detached(priority: .utility) {
-                try? Self.writeMetadata(snapshot, to: url)
-            }.value
+    private func decodeDocument(_ data: Data) throws -> DomainAgentSessionMetadataDocument {
+        guard let document = try? JSONDecoder().decode(DomainAgentSessionMetadataDocument.self, from: data) else {
+            throw DomainAgentSessionMetadataDecodeError.corrupt
         }
+        guard document.version <= DomainAgentSessionMetadataDocument.schemaVersion else {
+            throw DomainAgentSessionMetadataDecodeError.futureVersion
+        }
+        guard document.version == DomainAgentSessionMetadataDocument.schemaVersion else {
+            throw DomainAgentSessionMetadataDecodeError.corrupt
+        }
+        guard document.profileIdentifier == profileIdentifier else {
+            throw DomainAgentSessionMetadataDecodeError.wrongProfile
+        }
+        var seenSessionIDs: Set<UUID> = []
+        for value in document.sessions {
+            guard seenSessionIDs.insert(value.sessionID).inserted else {
+                throw DomainAgentSessionMetadataDecodeError.corrupt
+            }
+        }
+        return document
+    }
+
+    private func pruneDurableMetadata(now: Date) {
+        let cutoff = now.addingTimeInterval(-Self.retainedInactiveAge)
+        let expired = durableMetadata.values.filter {
+            ($0.state == .dormant || $0.state == .terminal) && $0.updatedAt < cutoff
+        }
+        for metadata in expired {
+            durableMetadata.removeValue(forKey: metadata.sessionID)
+            if persistenceHealth == .ready {
+                dirtyMetadataSessionIDs.insert(metadata.sessionID)
+            }
+        }
+        guard durableMetadata.count > Self.retainedMetadataLimit else { return }
+        let retainedIDs = Set(durableMetadata.values.sorted { lhs, rhs in
+            let lhsPriority = lhs.state == .active || lhs.state == .interrupted ? 0 : 1
+            let rhsPriority = rhs.state == .active || rhs.state == .interrupted ? 0 : 1
+            if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
+            return lhs.updatedAt > rhs.updatedAt
+        }.prefix(Self.retainedMetadataLimit).map(\.sessionID))
+        let removed = durableMetadata.values.filter { !retainedIDs.contains($0.sessionID) }
+        for metadata in removed {
+            if metadata.state == .active || metadata.state == .interrupted {
+                omittedRetentionCount &+= 1
+            }
+            durableMetadata.removeValue(forKey: metadata.sessionID)
+            if persistenceHealth == .ready {
+                dirtyMetadataSessionIDs.insert(metadata.sessionID)
+            }
+        }
+    }
+
+    private func scheduleMetadataPersistence() {
+        guard didBootstrap,
+              persistenceHealth == .ready,
+              !dirtyMetadataSessionIDs.isEmpty,
+              persistenceDebounceTask == nil
+        else { return }
+        persistenceDebounceTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: Self.persistenceDebounce)
+            } catch {
+                return
+            }
+            await self?.runScheduledPersistence()
+        }
+    }
+
+    private func runScheduledPersistence() async {
+        persistenceDebounceTask = nil
+        _ = await persistMetadataImmediately()
+        if !dirtyMetadataSessionIDs.isEmpty {
+            scheduleMetadataPersistence()
+        }
+    }
+
+    private func persistMetadataImmediately() async -> Bool {
+        persistenceDebounceTask?.cancel()
+        persistenceDebounceTask = nil
+        if let activePersistenceFlush {
+            let completed = await activePersistenceFlush.task.value
+            if dirtyMetadataSessionIDs.isEmpty || !completed {
+                return completed
+            }
+        }
+        let flushID = UUID()
+        let task = Task { [weak self] in
+            await self?.performMetadataFlush() ?? false
+        }
+        activePersistenceFlush = (flushID, task)
+        let result = await task.value
+        if activePersistenceFlush?.id == flushID {
+            activePersistenceFlush = nil
+        }
+        return result
+    }
+
+    private func performMetadataFlush() async -> Bool {
+        guard persistenceHealth == .ready else { return false }
+        guard !dirtyMetadataSessionIDs.isEmpty else { return true }
+
+        for attempt in 0 ..< Self.persistenceRetryLimit {
+            let changedIDs = dirtyMetadataSessionIDs
+            let changes = changedIDs.map { sessionID in
+                (
+                    sessionID: sessionID,
+                    base: persistedMetadataBase[sessionID],
+                    value: durableMetadata[sessionID]
+                )
+            }
+            do {
+                let latest = try await persistence.loadAgentSessionMetadataData()
+                let latestDocument: DomainAgentSessionMetadataDocument
+                if let data = latest.data {
+                    latestDocument = try decodeDocument(data)
+                } else {
+                    latestDocument = DomainAgentSessionMetadataDocument(
+                        profileIdentifier: profileIdentifier,
+                        revision: 0,
+                        sessions: [],
+                        updatedAt: Date.distantPast
+                    )
+                }
+                var merged = Dictionary(
+                    uniqueKeysWithValues: latestDocument.sessions.map { ($0.sessionID, $0) }
+                )
+                for change in changes {
+                    guard merged[change.sessionID] == change.base else {
+                        persistenceHealth = .degradedReadOnly(reason: "agent_session_ownership_conflict")
+                        return false
+                    }
+                    merged[change.sessionID] = change.value
+                }
+                let bounded = Self.boundedPersistedMetadata(Array(merged.values), now: Date())
+                let document = DomainAgentSessionMetadataDocument(
+                    profileIdentifier: profileIdentifier,
+                    revision: max(persistedRevision, latestDocument.revision) &+ 1,
+                    sessions: bounded,
+                    updatedAt: Date()
+                )
+                #if DEBUG
+                    await testMetadataFlushBeforeCAS?()
+                #endif
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                let data = try encoder.encode(document)
+                try await persistence.compareAndSwapAgentSessionMetadataData(
+                    expectedDigest: latest.digest,
+                    data: data
+                )
+                let committed = Dictionary(uniqueKeysWithValues: bounded.map { ($0.sessionID, $0) })
+                persistedRevision = document.revision
+                for change in changes {
+                    persistedMetadataBase[change.sessionID] = committed[change.sessionID]
+                    if durableMetadata[change.sessionID] == change.value {
+                        dirtyMetadataSessionIDs.remove(change.sessionID)
+                    }
+                }
+                return true
+            } catch DomainPersistenceError.externalDocumentConflict where attempt + 1 < Self.persistenceRetryLimit {
+                continue
+            } catch let error as DomainAgentSessionMetadataDecodeError {
+                persistenceHealth = .degradedReadOnly(reason: error.reason)
+                return false
+            } catch DomainPersistenceError.externalDocumentConflict {
+                persistenceHealth = .degradedReadOnly(reason: "agent_session_metadata_conflict")
+                return false
+            } catch {
+                persistenceHealth = .degradedReadOnly(reason: "agent_session_metadata_write_failed")
+                return false
+            }
+        }
+        persistenceHealth = .degradedReadOnly(reason: "agent_session_metadata_conflict")
+        return false
+    }
+
+    private static func boundedPersistedMetadata(
+        _ values: [DomainAgentSessionDurableMetadata],
+        now: Date
+    ) -> [DomainAgentSessionDurableMetadata] {
+        let cutoff = now.addingTimeInterval(-retainedInactiveAge)
+        return values.filter {
+            !(($0.state == .dormant || $0.state == .terminal) && $0.updatedAt < cutoff)
+        }.sorted { lhs, rhs in
+            let lhsPriority = lhs.state == .active || lhs.state == .interrupted ? 0 : 1
+            let rhsPriority = rhs.state == .active || rhs.state == .interrupted ? 0 : 1
+            if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
+            return lhs.updatedAt > rhs.updatedAt
+        }.prefix(retainedMetadataLimit).map { $0 }
     }
 
     private func persistMetadata() async {
-        scheduleMetadataPersistence()
-        await metadataPersistenceTask?.value
-    }
-
-    private nonisolated static func writeMetadata(
-        _ metadata: [DomainAgentSessionDurableMetadata],
-        to url: URL
-    ) throws {
-        let directory = url.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let data = try JSONEncoder().encode(metadata)
-        let temporary = directory.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
-        try data.write(to: temporary, options: .atomic)
-        if FileManager.default.fileExists(atPath: url.path) {
-            _ = try FileManager.default.replaceItemAt(url, withItemAt: temporary)
-        } else {
-            try FileManager.default.moveItem(at: temporary, to: url)
-        }
+        _ = await persistMetadataImmediately()
     }
 }
 
@@ -1011,6 +1322,12 @@ package actor DomainAgentRunSessionStore {
 
         package func test_expire(cursor: WaitCursor) {
             expire(cursor: cursor)
+        }
+
+        package func test_setMetadataFlushBeforeCAS(
+            _ hook: (@Sendable () async -> Void)?
+        ) {
+            testMetadataFlushBeforeCAS = hook
         }
 
         package func test_setTerminalCommitID(_ commitID: UUID, cursor: WaitCursor) {
