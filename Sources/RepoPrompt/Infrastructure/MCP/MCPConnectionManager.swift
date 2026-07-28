@@ -863,12 +863,17 @@ actor ServerNetworkManager {
     }
 
     private let bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming
+    private let bootstrapPeerPIDResolver: (@Sendable (Int32) -> Int?)?
     private var isRunningState: Bool = false
     private var lifecycleGeneration: UInt64 = 0
     private var isEnabledState: Bool = true
 
-    init(bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming = .production) {
+    init(
+        bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming = .production,
+        bootstrapPeerPIDResolver: (@Sendable (Int32) -> Int?)? = nil
+    ) {
         self.bootstrapLifecycleTiming = bootstrapLifecycleTiming
+        self.bootstrapPeerPIDResolver = bootstrapPeerPIDResolver
     }
 
     // Bootstrap socket server. Startup candidates remain separate until bind/listen and
@@ -1140,7 +1145,8 @@ actor ServerNetworkManager {
     private var transportTerminalConnections: Set<UUID> = []
     private var toolExecutionWatchdogEnvironment = MCPToolExecutionWatchdogEnvironment.continuous()
     private var connectionLifecycleGenerationByID: [UUID: UInt64] = [:]
-    private var bootstrapPeerPIDByConnectionID: [UUID: Int] = [:]
+    private var bootstrapClaimedPIDByConnectionID: [UUID: Int] = [:]
+    private var bootstrapObservedPeerPIDByConnectionID: [UUID: Int] = [:]
     private var terminalRecordClaimsByConnectionID: [UUID: MCPFirstTerminalRecordClaim] = [:]
     private var connectionTasks: [UUID: Task<Void, Never>] = [:]
     private var pendingConnections: [UUID: String] = [:]
@@ -4774,7 +4780,15 @@ actor ServerNetworkManager {
         connectionLog("Starting bootstrap socket server for lifecycle \(expectedLifecycleGeneration)...")
 
         let socketURL = resolvedBootstrapSocketURL()
-        let server = BootstrapSocketServer(socketURL: socketURL, logger: log)
+        let server = if let bootstrapPeerPIDResolver {
+            BootstrapSocketServer(
+                socketURL: socketURL,
+                logger: log,
+                peerPIDResolver: bootstrapPeerPIDResolver
+            )
+        } else {
+            BootstrapSocketServer(socketURL: socketURL, logger: log)
+        }
         bootstrapStartingSocketServer = server
         bootstrapStartingSocketServerLifecycleGeneration = expectedLifecycleGeneration
         #if DEBUG
@@ -4785,7 +4799,7 @@ actor ServerNetworkManager {
             #if DEBUG
                 print("[MCPStartup] calling BootstrapSocketServer.start socket=\(socketURL.path) generation=\(expectedLifecycleGeneration)")
             #endif
-            try await server.start { [weak self, weak server] clientFD, sessionToken, clientPid, clientName async -> BootstrapSocketServer.Admission in
+            try await server.start { [weak self, weak server] clientFD, sessionToken, processIdentity, clientName async -> BootstrapSocketServer.Admission in
                 guard let self, let server else {
                     return .reject(.rejected(reason: "Server unavailable", errorCode: "server_unavailable"))
                 }
@@ -4794,7 +4808,7 @@ actor ServerNetworkManager {
                     lifecycleGeneration: expectedLifecycleGeneration,
                     clientFD: clientFD,
                     sessionToken: sessionToken,
-                    clientPid: clientPid,
+                    processIdentity: processIdentity,
                     clientName: clientName
                 )
             }
@@ -4863,12 +4877,13 @@ actor ServerNetworkManager {
         lifecycleGeneration admissionLifecycleGeneration: UInt64,
         clientFD: Int32,
         sessionToken: String,
-        clientPid: Int,
+        processIdentity: BootstrapClientProcessIdentity,
         clientName: String?
     ) async -> BootstrapSocketServer.Admission {
         let connectionID = UUID()
-        connectionLog("Bootstrap socket connection: \(connectionID) from '\(clientName ?? "unknown")' (pid=\(clientPid), session=\(sessionToken.prefix(8))...)")
-        mcpACPLog("[MCP-ACP] bootstrap connection connection=\(connectionID) bootstrapClientName=\(clientName ?? "unknown") pid=\(clientPid)")
+        let clientPid = processIdentity.admissionPID
+        connectionLog("Bootstrap socket connection: \(connectionID) from '\(clientName ?? "unknown")' (claimedPid=\(processIdentity.claimedPID), observedPeerPid=\(processIdentity.observedKernelPID.map(String.init) ?? "unavailable"), session=\(sessionToken.prefix(8))...)")
+        mcpACPLog("[MCP-ACP] bootstrap connection connection=\(connectionID) bootstrapClientName=\(clientName ?? "unknown") claimedPid=\(processIdentity.claimedPID) observedPeerPid=\(processIdentity.observedKernelPID.map(String.init) ?? "unavailable")")
 
         guard isCurrentBootstrapAdmissionListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
             return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
@@ -4971,7 +4986,7 @@ actor ServerNetworkManager {
             connectionID: connectionID,
             lifecycleGeneration: admissionLifecycleGeneration,
             sessionToken: sessionToken,
-            clientPid: clientPid,
+            processIdentity: processIdentity,
             clientName: clientName
         )
     }
@@ -5042,7 +5057,7 @@ actor ServerNetworkManager {
         connectionID: UUID,
         lifecycleGeneration admissionLifecycleGeneration: UInt64,
         sessionToken: String,
-        clientPid: Int,
+        processIdentity: BootstrapClientProcessIdentity,
         clientName: String?
     ) -> BootstrapSocketServer.Admission {
         guard reserveBootstrapSlot(
@@ -5075,7 +5090,7 @@ actor ServerNetworkManager {
                     connectionID: connectionID,
                     lifecycleGeneration: admissionLifecycleGeneration,
                     sessionToken: sessionToken,
-                    clientPid: clientPid,
+                    processIdentity: processIdentity,
                     clientName: clientName
                 )
             },
@@ -5093,9 +5108,10 @@ actor ServerNetworkManager {
         connectionID: UUID,
         lifecycleGeneration admissionLifecycleGeneration: UInt64,
         sessionToken: String,
-        clientPid: Int,
+        processIdentity: BootstrapClientProcessIdentity,
         clientName: String?
     ) async {
+        let clientPid = processIdentity.admissionPID
         guard let reservation = bootstrapReservations[connectionID],
               reservation.lifecycleGeneration == admissionLifecycleGeneration,
               !reservation.isCommitting,
@@ -5142,6 +5158,7 @@ actor ServerNetworkManager {
                 connectionID: connectionID,
                 sessionToken: sessionToken,
                 clientPid: clientPid,
+                observedKernelPeerPID: processIdentity.observedKernelPID,
                 clientName: clientName,
                 clientFD: committedFD
             )
@@ -5229,7 +5246,7 @@ actor ServerNetworkManager {
             connectionID: connectionID,
             lifecycleGeneration: admissionLifecycleGeneration,
             sessionToken: sessionToken,
-            clientPid: clientPid,
+            processIdentity: processIdentity,
             clientName: clientName,
             manager: preparedConnection
         ) else {
@@ -5385,7 +5402,10 @@ actor ServerNetworkManager {
                 connectionID: connectionID,
                 lifecycleGeneration: lifecycleGeneration,
                 sessionToken: sessionToken,
-                clientPid: clientPid,
+                processIdentity: BootstrapClientProcessIdentity(
+                    claimedPID: clientPid,
+                    observedKernelPID: clientPid
+                ),
                 clientName: clientName
             )
             guard admission.publishTransferredFD?(clientFD) == true else {
@@ -5416,6 +5436,7 @@ actor ServerNetworkManager {
         connectionID: UUID,
         sessionToken: String,
         clientPid: Int,
+        observedKernelPeerPID: Int? = nil,
         clientName: String?,
         clientFD: Int32
     ) throws -> BootstrapSocketConnectionManager {
@@ -5432,6 +5453,7 @@ actor ServerNetworkManager {
             connectionID: connectionID,
             sessionToken: sessionToken,
             clientPid: clientPid,
+            observedKernelPeerPID: observedKernelPeerPID,
             clientName: clientName,
             purpose: purpose,
             codeMapsDisabled: codeMapsDisabled,
@@ -5447,10 +5469,11 @@ actor ServerNetworkManager {
         connectionID: UUID,
         lifecycleGeneration: UInt64,
         sessionToken: String,
-        clientPid: Int,
+        processIdentity: BootstrapClientProcessIdentity,
         clientName: String?,
         manager: BootstrapSocketConnectionManager
     ) -> Bool {
+        let clientPid = processIdentity.admissionPID
         guard isRunningState, self.lifecycleGeneration == lifecycleGeneration else {
             return false
         }
@@ -5471,7 +5494,10 @@ actor ServerNetworkManager {
         mcpACPLog("[MCP-ACP] registered bootstrap connection connection=\(connectionID) pendingClientName=\(clientName ?? "unknown")")
 
         connections[connectionID] = manager
-        bootstrapPeerPIDByConnectionID[connectionID] = clientPid
+        bootstrapClaimedPIDByConnectionID[connectionID] = processIdentity.claimedPID
+        if let observedKernelPID = processIdentity.observedKernelPID {
+            bootstrapObservedPeerPIDByConnectionID[connectionID] = observedKernelPID
+        }
         callLimiters[connectionID] = MCPConnectionCallLimiters(
             limit: limiterLimit(for: connectionID),
             controlLimit: controlLimiterLimit(for: connectionID),
@@ -5923,7 +5949,8 @@ actor ServerNetworkManager {
             connectionTasks[id]?.cancel()
             connections.removeValue(forKey: id)
             connectionLifecycleGenerationByID.removeValue(forKey: id)
-            bootstrapPeerPIDByConnectionID.removeValue(forKey: id)
+            bootstrapClaimedPIDByConnectionID.removeValue(forKey: id)
+            bootstrapObservedPeerPIDByConnectionID.removeValue(forKey: id)
             #if DEBUG
                 debugDomainPeerIdentityByConnectionID.removeValue(forKey: id)
             #endif
@@ -6362,7 +6389,7 @@ actor ServerNetworkManager {
     ) {
         guard connections[connectionID] != nil || connectionsBeingRemoved.contains(connectionID) else { return }
         transportTerminalConnections.insert(connectionID)
-        guard let peerPID = bootstrapPeerPIDByConnectionID[connectionID] else { return }
+        guard let peerPID = bootstrapObservedPeerPIDByConnectionID[connectionID] else { return }
 
         let candidate = MCPTerminalRecord(
             layer: .appAcceptedSocket,
@@ -6859,7 +6886,8 @@ actor ServerNetworkManager {
         // Remove from all collections
         connections.removeValue(forKey: id)
         connectionLifecycleGenerationByID.removeValue(forKey: id)
-        bootstrapPeerPIDByConnectionID.removeValue(forKey: id)
+        bootstrapClaimedPIDByConnectionID.removeValue(forKey: id)
+        bootstrapObservedPeerPIDByConnectionID.removeValue(forKey: id)
         connectionTasks.removeValue(forKey: id)
         pendingConnections.removeValue(forKey: id)
         connectionStats.removeValue(forKey: id)
@@ -9633,7 +9661,8 @@ actor ServerNetworkManager {
                 connections[connectionID] = connection
                 connectionLifecycleGenerationByID[connectionID] = lifecycleGeneration
                 if let bootstrapPeerPID {
-                    bootstrapPeerPIDByConnectionID[connectionID] = bootstrapPeerPID
+                    bootstrapClaimedPIDByConnectionID[connectionID] = bootstrapPeerPID
+                    bootstrapObservedPeerPIDByConnectionID[connectionID] = bootstrapPeerPID
                 }
                 pendingConnections[connectionID] = clientName
                 bindSessionToken(sessionToken, to: connectionID)
@@ -9646,6 +9675,20 @@ actor ServerNetworkManager {
                         fileSearchLimit: fileSearchLimiterLimit(for: connectionID)
                     )
                 }
+            }
+
+            func debugConnectionIDForSessionToken(_ sessionToken: String) -> UUID? {
+                existingConnectionID(forSessionToken: sessionToken)
+            }
+
+            func debugBootstrapProcessIdentityForTesting(
+                connectionID: UUID
+            ) -> BootstrapClientProcessIdentity? {
+                guard let claimedPID = bootstrapClaimedPIDByConnectionID[connectionID] else { return nil }
+                return BootstrapClientProcessIdentity(
+                    claimedPID: claimedPID,
+                    observedKernelPID: bootstrapObservedPeerPIDByConnectionID[connectionID]
+                )
             }
 
             func debugSetTerminalRecordDirectoryURLForTesting(_ directoryURL: URL?) {
@@ -13321,20 +13364,28 @@ actor ServerNetworkManager {
         let displayName = clientIdentifier(forConnection: connectionID) ?? "unknown"
         let stableKey = MCPClientIdentity.storageKey(displayName)
 
-        let peerIdentity: (processID: Int?, fingerprint: String?)
+        let peerIdentity: (observedProcessID: Int?, claimedProcessID: Int?, fingerprint: String?)
         #if DEBUG
             switch debugDomainPeerIdentityByConnectionID[connectionID] {
             case let .verified(processID, fingerprint):
-                peerIdentity = (processID, fingerprint)
+                peerIdentity = (processID, processID, fingerprint)
             case .unverified:
-                peerIdentity = (nil, nil)
+                peerIdentity = (nil, bootstrapClaimedPIDByConnectionID[connectionID], nil)
             case nil:
-                let processID = bootstrapPeerPIDByConnectionID[connectionID]
-                peerIdentity = (processID, processID.flatMap(Self.verifiedExecutableFingerprint))
+                let processID = bootstrapObservedPeerPIDByConnectionID[connectionID]
+                peerIdentity = (
+                    processID,
+                    bootstrapClaimedPIDByConnectionID[connectionID],
+                    processID.flatMap(Self.verifiedExecutableFingerprint)
+                )
             }
         #else
-            let processID = bootstrapPeerPIDByConnectionID[connectionID]
-            peerIdentity = (processID, processID.flatMap(Self.verifiedExecutableFingerprint))
+            let processID = bootstrapObservedPeerPIDByConnectionID[connectionID]
+            peerIdentity = (
+                processID,
+                bootstrapClaimedPIDByConnectionID[connectionID],
+                processID.flatMap(Self.verifiedExecutableFingerprint)
+            )
         #endif
         let kind: DomainClientPrincipalKind = policy.purpose == .unknown ? .appProxy : .runScoped
         let assurance: DomainClientPrincipalAssurance = peerIdentity.fingerprint == nil ? .displayNameOnly : .verifiedProcess
@@ -13404,10 +13455,11 @@ actor ServerNetworkManager {
             displayName: displayName,
             kind: kind,
             assurance: assurance,
-            processID: peerIdentity.processID.map(Int32.init),
+            processID: peerIdentity.observedProcessID.map(Int32.init),
             runID: runID,
             provider: stableKey,
-            verifiedIdentityFingerprint: peerIdentity.fingerprint
+            verifiedIdentityFingerprint: peerIdentity.fingerprint,
+            claimedProcessID: peerIdentity.claimedProcessID.map(Int32.init)
         )
         return DomainToolInvocationSecurityContext(
             principal: principal,

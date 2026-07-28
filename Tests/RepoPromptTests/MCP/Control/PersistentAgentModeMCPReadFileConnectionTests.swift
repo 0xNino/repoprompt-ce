@@ -2620,7 +2620,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertEqual(snapshot.capabilityToken, Fixture.sessionToken)
             XCTAssertEqual(snapshot.managerState, .ready)
             XCTAssertTrue(snapshot.managerViable)
-            XCTAssertEqual(snapshot.peerPID, Int(getpid()))
+            XCTAssertEqual(snapshot.peerPID, fixture.peerIdentity.bootstrapPeerPID)
             XCTAssertEqual(snapshot.runPurpose, .agentModeRun)
             XCTAssertEqual(snapshot.runID, fixture.runID)
             XCTAssertEqual(snapshot.connectionPolicy.restrictedTools, AgentModeMCPToolPolicy.restrictedTools)
@@ -3063,6 +3063,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     connectionID: connectionID,
                     sessionToken: sessionToken,
                     clientPid: Int(getpid()),
+                    observedKernelPeerPID: peerIdentity.bootstrapPeerPID,
                     clientName: AgentProviderKind.codexMCPClientID,
                     purpose: .agentModeRun,
                     codeMapsDisabled: false,
@@ -3653,6 +3654,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     connectionID: independentConnectionID,
                     sessionToken: Self.sessionToken + "-independent",
                     clientPid: Int(getpid()),
+                    observedKernelPeerPID: peerIdentity.bootstrapPeerPID,
                     clientName: "RepoPrompt Independent Selection Test",
                     purpose: .unknown,
                     codeMapsDisabled: false,
@@ -3798,6 +3800,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     connectionID: handoverConnectionID,
                     sessionToken: Self.sessionToken + "-handover",
                     clientPid: Int(getpid()),
+                    observedKernelPeerPID: peerIdentity.bootstrapPeerPID,
                     clientName: AgentProviderKind.codexMCPClientID,
                     purpose: .agentModeRun,
                     codeMapsDisabled: false,
@@ -4046,7 +4049,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         let capabilityToken: String?
         let managerState: ConnectionStateSnapshot
         let managerViable: Bool
-        let peerPID: Int
+        let peerPID: Int?
         let runPurpose: MCPRunPurpose
         let runID: UUID?
         let connectionPolicy: ConnectionPolicySnapshot

@@ -19,7 +19,10 @@ package struct DomainClientPrincipal: Codable, Hashable, Sendable {
     package let displayName: String
     package let kind: DomainClientPrincipalKind
     package let assurance: DomainClientPrincipalAssurance
+    /// Kernel-observed process identifier eligible for verified-process assurance.
     package let processID: Int32?
+    /// Client-declared handshake metadata. Never grants authority.
+    package let claimedProcessID: Int32?
     package let runID: UUID?
     package let provider: String?
     /// Kernel-derived executable identity. Display names and provider labels are never grant authority.
@@ -34,7 +37,8 @@ package struct DomainClientPrincipal: Codable, Hashable, Sendable {
         processID: Int32?,
         runID: UUID?,
         provider: String?,
-        verifiedIdentityFingerprint: String? = nil
+        verifiedIdentityFingerprint: String? = nil,
+        claimedProcessID: Int32? = nil
     ) {
         self.principalID = principalID
         self.stableKey = stableKey
@@ -42,6 +46,7 @@ package struct DomainClientPrincipal: Codable, Hashable, Sendable {
         self.kind = kind
         self.assurance = assurance
         self.processID = processID
+        self.claimedProcessID = claimedProcessID
         self.runID = runID
         self.provider = provider
         self.verifiedIdentityFingerprint = verifiedIdentityFingerprint
