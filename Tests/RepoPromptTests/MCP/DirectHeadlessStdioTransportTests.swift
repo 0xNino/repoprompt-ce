@@ -100,6 +100,44 @@ final class DirectHeadlessStdioTransportTests: XCTestCase {
         output.closeAll()
     }
 
+    func testInboundFrameQueueBackpressuresWithoutDroppingRequests() async throws {
+        var input = try PipeDescriptors.make()
+        var output = try PipeDescriptors.make()
+        let tracker = MCPDomainResponseDeliveryTracker()
+        let transport = MCPStdioServerTransport(
+            stdinFD: input.read,
+            stdoutFD: output.write,
+            pollIntervalMilliseconds: 5,
+            writeStallTimeout: .milliseconds(100),
+            maximumInboundFrameBytes: 1024,
+            maximumBufferedFrames: 2,
+            deliveryTracker: tracker
+        )
+        try await transport.connect()
+        let frames = (1 ... 3).map {
+            Data("{\"jsonrpc\":\"2.0\",\"id\":\($0),\"method\":\"tools/list\"}\n".utf8)
+        }
+        for frame in frames {
+            XCTAssertEqual(frame.withUnsafeBytes { Darwin.write(input.write, $0.baseAddress, $0.count) }, frame.count)
+        }
+        for _ in 0 ..< 100 where tracker.snapshot().pendingRequestCount < 2 {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(tracker.snapshot().pendingRequestCount, 2)
+
+        let stream = await transport.receive()
+        var iterator = stream.makeAsyncIterator()
+        _ = try await iterator.next()
+        for _ in 0 ..< 100 where tracker.snapshot().pendingRequestCount < 3 {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(tracker.snapshot().pendingRequestCount, 3)
+
+        await transport.disconnect()
+        input.closeAll()
+        output.closeAll()
+    }
+
     func testDisconnectAwaitsOwnedReaderAndRecordsCancellation() async throws {
         var input = try PipeDescriptors.make()
         var output = try PipeDescriptors.make()

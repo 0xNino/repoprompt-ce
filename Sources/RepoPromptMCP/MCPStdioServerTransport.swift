@@ -23,6 +23,7 @@ actor MCPStdioServerTransport: Transport {
     private let pollIntervalMilliseconds: Int32
     private let writeStallTimeout: Duration
     private let maximumInboundFrameBytes: Int
+    private let maximumBufferedFrames: Int
     private let initialParentPID: Int32
     private let parentPIDProvider: @Sendable () -> Int32
     private let deliveryTracker: MCPDomainResponseDeliveryTracker
@@ -37,6 +38,7 @@ actor MCPStdioServerTransport: Transport {
         pollIntervalMilliseconds: Int32 = 100,
         writeStallTimeout: Duration = .seconds(5),
         maximumInboundFrameBytes: Int = 16 * 1024 * 1024,
+        maximumBufferedFrames: Int = 64,
         parentPIDProvider: @escaping @Sendable () -> Int32 = { getppid() },
         deliveryTracker: MCPDomainResponseDeliveryTracker = MCPDomainResponseDeliveryTracker(),
         logger: Logger = Logger(label: "com.repoprompt.ce.mcp.headless-stdio")
@@ -46,6 +48,7 @@ actor MCPStdioServerTransport: Transport {
         self.pollIntervalMilliseconds = pollIntervalMilliseconds
         self.writeStallTimeout = writeStallTimeout
         self.maximumInboundFrameBytes = max(1, maximumInboundFrameBytes)
+        self.maximumBufferedFrames = max(1, maximumBufferedFrames)
         self.parentPIDProvider = parentPIDProvider
         initialParentPID = parentPIDProvider()
         self.deliveryTracker = deliveryTracker
@@ -70,7 +73,9 @@ actor MCPStdioServerTransport: Transport {
             throw TerminalError.stdoutWrite(errno: errno, bytesWritten: 0, totalBytes: 0)
         }
         var captured: AsyncThrowingStream<Data, Error>.Continuation?
-        let created = AsyncThrowingStream<Data, Error> { captured = $0 }
+        let created = AsyncThrowingStream<Data, Error>(
+            bufferingPolicy: .bufferingOldest(maximumBufferedFrames)
+        ) { captured = $0 }
         guard let captured else { throw TerminalError.cancelled }
         continuation = captured
         stream = created
@@ -148,8 +153,23 @@ actor MCPStdioServerTransport: Transport {
                     }
                     if !frame.isEmpty {
                         let data = Data(frame)
-                        deliveryTracker.recordAcceptedClientFrame(data)
-                        captured.yield(data)
+                        var enqueued = false
+                        while !enqueued, !Task.isCancelled {
+                            switch captured.yield(data) {
+                            case .enqueued:
+                                deliveryTracker.recordAcceptedClientFrame(data)
+                                enqueued = true
+                            case .dropped:
+                                // Buffering-oldest drops only the incoming element. Retain it here and
+                                // stop reading until the server consumes capacity, preserving request order.
+                                try? await Task.sleep(for: .milliseconds(1))
+                            case .terminated:
+                                return
+                            @unknown default:
+                                return
+                            }
+                        }
+                        if Task.isCancelled { break }
                     }
                 }
             }

@@ -234,9 +234,10 @@ Final bounded validation:
 
 - `make dev-test FILTER=DirectHeadless` — ticket `56e2a405-5409-41d0-a758-d07517039a35`, passed after the final nonblocking-frame, child-policy, and terminal-category hardening;
 - `ALLOW_ADHOC_SIGNING=1 make dev-build` — ticket `ec3e28af-8130-44af-ab02-30f72e90a623`, passed both products, packaged the app/helper, verified architectures/layout/signatures, and ran the embedded-helper smoke without launching the app;
-- `make dev-lint` — ticket `6464e35e-06cf-4f11-acf7-dc4812f398ec`, passed;
+- `make dev-lint` — tickets `6464e35e-06cf-4f11-acf7-dc4812f398ec` and final transport follow-up `1d43fe74-0549-479d-9c8a-bca0e07d9705`, passed;
 - `make guardrails` — passed, including headless-runtime/source-layout/contributor/legal/Codex guards;
-- ledger verification — 3,756 exact root/provider methods; list tickets `886fce93-6ad4-4530-970b-657038b0f742` and `dec91d0b-bdfe-4b4c-86c7-4b7ba9538a3b`;
+- ledger verification — 3,757 exact root/provider methods; final list tickets `c0e940e8-f493-48b2-b929-69902e829f32` and `9da7de5d-0f49-4939-a8c4-b35a32cec3ac`;
 - provider package — ticket `47b04d4e-466b-4e00-b243-2687bbc5cadf`, passed;
 - `make dev-codex-schema-check` — ticket `f9b2e28f-6703-41a7-bf5c-c98408b14837`, environment-blocked before comparison because the installed Codex CLI is `0.144.1` and the repository floor is `0.145.0`;
-- one bounded full `make dev-test` — ticket `35672252-0786-453b-b562-6a9a859cbf16`, completed with unrelated lower-stack/environment failures in codemap scheduler-priority timing, goal-feature defaults, and a bootstrap socket-lock cascade; no M6-focused suite failed, and the focused M6 rerun above is clean. Per the bounded verification policy this root run was not repeated.
+- one bounded full `make dev-test` — ticket `35672252-0786-453b-b562-6a9a859cbf16`, completed with unrelated lower-stack/environment failures in codemap scheduler-priority timing, goal-feature defaults, and a bootstrap socket-lock cascade; no M6-focused suite failed, and the focused M6 rerun above is clean. Per the bounded verification policy this root run was not repeated;
+- final design-review stdio closure — `make dev-test FILTER=DirectHeadlessStdioTransportTests`, ticket `2e1ff4c0-8bca-4abd-9df6-bfa2ef7603c6`, 6 passed, including bounded valid-frame backpressure with no drops.
