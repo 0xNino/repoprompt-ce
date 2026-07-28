@@ -1845,7 +1845,8 @@ private final class BridgeTaskResultBox: @unchecked Sendable {
                 connectionID: connectionID,
                 connection: connectionManager,
                 clientName: clientName,
-                sessionToken: sessionToken
+                sessionToken: sessionToken,
+                bootstrapPeerPID: Int(getpid())
             )
 
             let traces = BridgeTraceRecorder()
