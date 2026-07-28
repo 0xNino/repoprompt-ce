@@ -321,6 +321,11 @@ actor WorkspaceCodemapBindingEngine {
         let observedPredecessorAuthority: CodeMapRootManifestAuthority?
     }
 
+    private struct ManifestWriterFailureDisposition {
+        let terminalObservedStaleAuthority: Bool
+        let terminalCompletion: ManifestRevisionCompletion
+    }
+
     private struct ManifestWriterWorkKey: Hashable {
         let scope: PipelineScope
         let sessionID: UUID
@@ -7839,6 +7844,27 @@ actor WorkspaceCodemapBindingEngine {
         ), false)
     }
 
+    /// Keep the error downcast and optional projection outside the optimized async writer.
+    /// Swift 6.3.2 CopyPropagation otherwise produces invalid ownership SIL for this value.
+    @inline(never)
+    private func manifestWriterFailureDisposition(
+        _ error: any Error
+    ) -> ManifestWriterFailureDisposition {
+        guard let failure = error as? WorkspaceCodemapObservedStaleAuthorityError,
+              let observedAuthority = failure.observedPredecessorAuthority
+        else {
+            return ManifestWriterFailureDisposition(
+                terminalObservedStaleAuthority: false,
+                terminalCompletion: .failed
+            )
+        }
+        return ManifestWriterFailureDisposition(
+            terminalObservedStaleAuthority:
+            observedAuthority.authorityGeneration >= failure.currentAuthorityGeneration,
+            terminalCompletion: .staleAuthority(observedAuthority: observedAuthority)
+        )
+    }
+
     private func runManifestWriter(
         namespace: CodeMapRootManifestNamespace,
         writerID: UUID
@@ -8121,13 +8147,7 @@ actor WorkspaceCodemapBindingEngine {
                 #if DEBUG
                     manifestAttemptCompletedUptimeNanoseconds = uptimeNanoseconds()
                 #endif
-                let observedStaleAuthorityError = error as? WorkspaceCodemapObservedStaleAuthorityError
-                let terminalObservedStaleAuthority = observedStaleAuthorityError
-                    .flatMap { failure in
-                        failure.observedPredecessorAuthorityGeneration.map {
-                            $0 >= failure.currentAuthorityGeneration
-                        }
-                    } ?? false
+                let failureDisposition = manifestWriterFailureDisposition(error)
                 guard var currentWriter = currentManifestWriterState(
                     namespace: namespace,
                     writerID: writerID,
@@ -8142,7 +8162,7 @@ actor WorkspaceCodemapBindingEngine {
                 }
                 currentWriter.deferredWork.append(contentsOf: currentWriter.queuedWork.drain())
                 recordManifestWriterPeakQueuedItems(in: currentWriter)
-                if terminalObservedStaleAuthority ||
+                if failureDisposition.terminalObservedStaleAuthority ||
                     currentWriter.deferredFailureCount >= Self.maximumManifestWriterDeferredAttempts,
                     let exhaustedHead = currentWriter.deferredHeadBatch
                 {
@@ -8152,11 +8172,7 @@ actor WorkspaceCodemapBindingEngine {
                         exhaustedHead.items,
                         from: &currentWriter,
                         terminalWaiterRevision: exhaustedHead.highestRevision,
-                        terminalCompletion: observedStaleAuthorityError.flatMap {
-                            $0.observedPredecessorAuthority.map {
-                                .staleAuthority(observedAuthority: $0)
-                            }
-                        } ?? .failed
+                        terminalCompletion: failureDisposition.terminalCompletion
                     )
                 }
                 shedNewestDeferredManifestWorkIfNeeded(from: &currentWriter)
