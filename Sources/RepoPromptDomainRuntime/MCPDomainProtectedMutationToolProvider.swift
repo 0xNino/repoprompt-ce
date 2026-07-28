@@ -75,7 +75,12 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
                 context: securityContext,
                 toolName: operation.toolName,
                 action: operation.action,
-                workspaceID: securityContext.workspaceID
+                workspaceID: securityContext.workspaceID,
+                canonicalRoots: Self.canonicalRoots(
+                    operation: operation,
+                    arguments: arguments,
+                    securityContext: securityContext
+                )
             )
             try Task.checkCancellation()
             try await policyStore.revalidate(authorization)
@@ -167,31 +172,21 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
         policyStore: DomainMutationPolicyStore,
         journal: DomainMutationJournal
     ) async throws -> Value {
-        var effectiveArguments = arguments
+        let effectiveArguments = arguments
         let suppliedOperationID = arguments["operation_id"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let operationID = suppliedOperationID.flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString
-        effectiveArguments["operation_id"] = .string(operationID)
+        // Public operation_id is correlation-only. Journal ownership is keyed exclusively by
+        // the server-created request identity so continue/abort/retry remain recoverable.
+        let operationID = suppliedOperationID.flatMap { $0.isEmpty ? nil : $0 }
+            ?? securityContext.invocationID.uuidString
 
-        var authorizedRoots = securityContext.authorizedCanonicalRoots
-        if operation.toolName == "manage_worktree",
-           securityContext.principal.kind == .appProxy,
-           arguments["allow_external_path"]?.boolValue == true,
-           let path = arguments["path"]?.stringValue,
-           path.hasPrefix("/")
-        {
-            authorizedRoots.insert(URL(fileURLWithPath: path).deletingLastPathComponent().path)
-        }
-        let pathFence = try await DomainMutationPathFence.admit(
-            requestedPaths: requestedPaths(operation: operation, arguments: effectiveArguments),
-            authorizedRoots: authorizedRoots
-        )
-        let authorization = try await policyStore.authorize(
+        // Authenticate the operation before invoking the physical backend. Exact root scope is
+        // authorized again when that backend has translated and resolved the real target.
+        let initialAuthorization = try await policyStore.authorize(
             context: securityContext,
             toolName: operation.toolName,
             action: operation.action,
-            workspaceID: securityContext.workspaceID,
-            canonicalRoots: pathFence.coveredRoots
+            workspaceID: securityContext.workspaceID
         )
         try Task.checkCancellation()
 
@@ -199,9 +194,9 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
             operation: operation,
             arguments: effectiveArguments,
             workspaceID: securityContext.workspaceID,
-            pathFence: pathFence
+            pathFence: nil
         )
-        let key = "\(operation.toolName).\(operation.action):\(operationID)"
+        let key = "\(operation.toolName).\(operation.action):request:\(securityContext.mutationRequestKey)"
         let begin = try await journal.begin(
             key: key,
             operationID: operationID,
@@ -211,21 +206,32 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
             ownerInvocationID: securityContext.invocationID,
             workspaceID: securityContext.workspaceID,
             workspaceRevision: securityContext.workspaceRevision,
-            pathFence: pathFence
+            pathFence: nil
         )
         switch begin {
         case let .replay(result):
             return result
         case let .execute(ticket):
             let commitState = DomainMutationCommitState()
-            let controller = DomainMutationCommitController {
-                try await commitState.beginIfNeeded {
-                    try Task.checkCancellation()
-                    try await policyStore.revalidate(authorization)
-                    try await DomainMutationPathFence.revalidate(pathFence)
-                    try await journal.markCommitting(ticket)
+            let admissionState = DomainMutationPhysicalAdmissionState(
+                operation: operation,
+                securityContext: securityContext,
+                initialAuthorization: initialAuthorization,
+                requiresPhysicalAdmission: requiresPhysicalAdmission(operation),
+                policyStore: policyStore,
+                journal: journal,
+                ticket: ticket
+            )
+            let controller = DomainMutationCommitController(
+                admitPhysicalTargets: { paths, mappings in
+                    try await admissionState.admit(paths: paths, rootMappings: mappings)
+                },
+                willCommit: {
+                    try await commitState.beginIfNeeded {
+                        try await admissionState.prepareCommit()
+                    }
                 }
-            }
+            )
             do {
                 let result = try await MCPDomainMutationCommitContext.$controller.withValue(controller) {
                     try await binding(effectiveArguments)
@@ -256,25 +262,37 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
     }
 
     private static func isDurableMutationFamily(_ toolName: String) -> Bool {
-        ["file_actions", "apply_edits", "manage_worktree"].contains(toolName)
+        ["file_actions", "apply_edits", "manage_worktree", "prompt", "workspace_context"].contains(toolName)
     }
 
-    private static func requestedPaths(
+    private static func canonicalRoots(
         operation: DomainProtectedMutationOperation,
-        arguments: [String: Value]
-    ) -> [String] {
-        switch operation.toolName {
-        case "file_actions":
-            return [arguments["path"]?.stringValue, arguments["new_path"]?.stringValue].compactMap { $0 }
-        case "apply_edits":
-            return [arguments["path"]?.stringValue].compactMap { $0 }
-        case "manage_worktree":
-            return ["repo_root", "path", "worktree", "target"].compactMap { key in
-                guard let path = arguments[key]?.stringValue, path.hasPrefix("/") else { return nil }
-                return path
+        arguments: [String: Value],
+        securityContext: DomainToolInvocationSecurityContext
+    ) -> Set<String> {
+        var roots = securityContext.authorizedCanonicalRoots
+        if operation.toolName == "manage_workspaces",
+           ["add_folder", "create"].contains(operation.action),
+           let rawPath = arguments["folder_path"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !rawPath.isEmpty
+        {
+            let expanded = (rawPath as NSString).expandingTildeInPath
+            if expanded.hasPrefix("/") {
+                roots.insert(URL(fileURLWithPath: expanded).standardizedFileURL.path)
             }
+        }
+        return roots
+    }
+
+    private static func requiresPhysicalAdmission(_ operation: DomainProtectedMutationOperation) -> Bool {
+        switch operation.toolName {
+        case "file_actions", "apply_edits", "prompt", "workspace_context":
+            true
+        case "manage_worktree":
+            ["create", "apply", "continue", "abort"].contains(operation.action)
         default:
-            return []
+            false
         }
     }
 
@@ -282,14 +300,14 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
         operation: DomainProtectedMutationOperation,
         arguments: [String: Value],
         workspaceID: UUID?,
-        pathFence: DomainMutationPathFenceSnapshot
+        pathFence: DomainMutationPathFenceSnapshot?
     ) throws -> String {
         struct Payload: Encodable {
             let toolName: String
             let action: String
             let arguments: [String: Value]
             let workspaceID: UUID?
-            let pathFence: DomainMutationPathFenceSnapshot
+            let pathFence: DomainMutationPathFenceSnapshot?
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -330,5 +348,111 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
         try await Task.detached(priority: .utility) {
             try await journal.finishIndeterminateAfterCommit(ticket)
         }.value
+    }
+}
+
+private actor DomainMutationPhysicalAdmissionState {
+    private let operation: DomainProtectedMutationOperation
+    private let securityContext: DomainToolInvocationSecurityContext
+    private let requiresPhysicalAdmission: Bool
+    private let policyStore: DomainMutationPolicyStore
+    private let journal: DomainMutationJournal
+    private let ticket: DomainMutationJournalTicket
+    private var authorization: DomainMutationAuthorizationSnapshot
+    private var pathFence: DomainMutationPathFenceSnapshot?
+
+    init(
+        operation: DomainProtectedMutationOperation,
+        securityContext: DomainToolInvocationSecurityContext,
+        initialAuthorization: DomainMutationAuthorizationSnapshot,
+        requiresPhysicalAdmission: Bool,
+        policyStore: DomainMutationPolicyStore,
+        journal: DomainMutationJournal,
+        ticket: DomainMutationJournalTicket
+    ) {
+        self.operation = operation
+        self.securityContext = securityContext
+        self.requiresPhysicalAdmission = requiresPhysicalAdmission
+        self.policyStore = policyStore
+        self.journal = journal
+        self.ticket = ticket
+        authorization = initialAuthorization
+    }
+
+    func admit(
+        paths: [String],
+        rootMappings suppliedMappings: [DomainMutationPhysicalRootMapping]
+    ) async throws {
+        try Task.checkCancellation()
+        guard !paths.isEmpty else { throw DomainMutationPathFenceError.scopeUnavailable }
+        var mappings = suppliedMappings
+        if securityContext.principal.kind == .appProxy,
+           securityContext.principal.assurance == .verifiedProcess
+        {
+            for path in paths where !Self.isCovered(path, by: mappings.map(\.physicalRoot)) {
+                if let root = Self.nearestExistingAncestor(of: path) {
+                    mappings.append(.init(canonicalRoot: root, physicalRoot: root))
+                }
+            }
+        }
+        let matchingMappings = mappings.filter { mapping in
+            paths.contains { Self.isContained($0, by: mapping.physicalRoot) }
+        }
+        guard !matchingMappings.isEmpty else {
+            throw DomainMutationPathFenceError.pathOutsideAuthorizedRoots(paths[0])
+        }
+        let canonicalRoots = Set(matchingMappings.map { Self.standardized($0.canonicalRoot) })
+        let physicalRoots = Set(matchingMappings.map { Self.standardized($0.physicalRoot) })
+        let authorization = try await policyStore.authorize(
+            context: securityContext,
+            toolName: operation.toolName,
+            action: operation.action,
+            workspaceID: securityContext.workspaceID,
+            canonicalRoots: canonicalRoots
+        )
+        let fence = try await DomainMutationPathFence.admit(
+            requestedPaths: paths.map(Self.standardized),
+            authorizedRoots: physicalRoots
+        )
+        try await journal.attachPathFence(fence, to: ticket)
+        self.authorization = authorization
+        pathFence = fence
+    }
+
+    func prepareCommit() async throws {
+        try Task.checkCancellation()
+        if requiresPhysicalAdmission, pathFence == nil {
+            throw DomainMutationPathFenceError.scopeUnavailable
+        }
+        try await policyStore.revalidate(authorization)
+        if let pathFence {
+            try await DomainMutationPathFence.revalidate(pathFence)
+        }
+        try await journal.markCommitting(ticket)
+    }
+
+    private static func nearestExistingAncestor(of path: String) -> String? {
+        guard path.hasPrefix("/") else { return nil }
+        var cursor = URL(fileURLWithPath: path).standardizedFileURL
+        var isDirectory = ObjCBool(false)
+        while !FileManager.default.fileExists(atPath: cursor.path, isDirectory: &isDirectory) {
+            guard cursor.path != "/" else { return nil }
+            cursor.deleteLastPathComponent()
+        }
+        return isDirectory.boolValue ? cursor.path : cursor.deletingLastPathComponent().path
+    }
+
+    private static func isCovered(_ path: String, by roots: [String]) -> Bool {
+        roots.contains { isContained(path, by: $0) }
+    }
+
+    private static func isContained(_ path: String, by root: String) -> Bool {
+        let path = standardized(path)
+        let root = standardized(root)
+        return path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+    }
+
+    private static func standardized(_ path: String) -> String {
+        URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.path
     }
 }

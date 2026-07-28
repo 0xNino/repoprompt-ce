@@ -11,6 +11,8 @@ package struct DomainMutationPathIdentity: Codable, Hashable, Sendable {
 package struct DomainMutationPathFenceEntry: Codable, Hashable, Sendable {
     package let requestedPath: String
     package let resolvedPath: String
+    /// Identity of the target when it exists, otherwise its nearest existing parent.
+    package let existingAnchor: DomainMutationPathIdentity
     package let authorizedRoot: DomainMutationPathIdentity
 }
 
@@ -68,9 +70,11 @@ package enum DomainMutationPathFence {
                 }
             }
             for entry in snapshot.entries {
-                let currentPath = try resolvePotentialPath(entry.requestedPath)
-                guard currentPath == entry.resolvedPath,
-                      isContained(currentPath, by: entry.authorizedRoot.resolvedPath)
+                let resolution = try resolvePotentialPath(entry.requestedPath)
+                let currentAnchor = try identity(entry.existingAnchor.originalPath)
+                guard resolution.path == entry.resolvedPath,
+                      currentAnchor == entry.existingAnchor,
+                      isContained(resolution.path, by: entry.authorizedRoot.resolvedPath)
                 else {
                     throw DomainMutationPathFenceError.pathResolutionChanged(entry.requestedPath)
                 }
@@ -97,13 +101,14 @@ package enum DomainMutationPathFence {
             } else {
                 throw DomainMutationPathFenceError.relativePath(path)
             }
-            let resolved = try resolvePotentialPath(absolutePath)
-            guard let root = rootIdentities.first(where: { isContained(resolved, by: $0.resolvedPath) }) else {
+            let resolution = try resolvePotentialPath(absolutePath)
+            guard let root = rootIdentities.first(where: { isContained(resolution.path, by: $0.resolvedPath) }) else {
                 throw DomainMutationPathFenceError.pathOutsideAuthorizedRoots(path)
             }
             return DomainMutationPathFenceEntry(
                 requestedPath: absolutePath,
-                resolvedPath: resolved,
+                resolvedPath: resolution.path,
+                existingAnchor: resolution.anchor,
                 authorizedRoot: root
             )
         }
@@ -127,7 +132,9 @@ package enum DomainMutationPathFence {
         )
     }
 
-    private static func resolvePotentialPath(_ path: String) throws -> String {
+    private static func resolvePotentialPath(
+        _ path: String
+    ) throws -> (path: String, anchor: DomainMutationPathIdentity) {
         guard path.hasPrefix("/") else {
             throw DomainMutationPathFenceError.relativePath(path)
         }
@@ -142,11 +149,12 @@ package enum DomainMutationPathFence {
             missingComponents.insert(component, at: 0)
             cursor.deleteLastPathComponent()
         }
+        let anchor = try identity(cursor.path)
         var resolved = cursor.resolvingSymlinksInPath()
         for component in missingComponents {
             resolved.appendPathComponent(component)
         }
-        return resolved.standardizedFileURL.path
+        return (resolved.standardizedFileURL.path, anchor)
     }
 
     private static func isContained(_ path: String, by root: String) -> Bool {

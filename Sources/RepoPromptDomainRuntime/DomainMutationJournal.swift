@@ -52,6 +52,26 @@ package struct DomainMutationJournalRecord: Codable, Sendable {
             updatedAt: now
         )
     }
+
+    func attaching(pathFence: DomainMutationPathFenceSnapshot, now: Date) -> Self {
+        Self(
+            key: key,
+            operationID: operationID,
+            toolName: toolName,
+            action: action,
+            fingerprint: fingerprint,
+            ownerInvocationID: ownerInvocationID,
+            workspaceID: workspaceID,
+            workspaceRevision: workspaceRevision,
+            pathFence: pathFence,
+            status: status,
+            attempt: attempt,
+            resultData: resultData,
+            admittedAt: admittedAt,
+            leaseExpiresAt: leaseExpiresAt,
+            updatedAt: now
+        )
+    }
 }
 
 package struct DomainMutationJournalDocument: Codable, Sendable {
@@ -194,6 +214,19 @@ package actor DomainMutationJournal {
             }
         }
         throw DomainMutationJournalError.writerConflict
+    }
+
+    package func attachPathFence(
+        _ pathFence: DomainMutationPathFenceSnapshot,
+        to ticket: DomainMutationJournalTicket,
+        now: Date = Date()
+    ) async throws {
+        try await transition(ticket, now: now) { record in
+            guard record.status == .admitted else {
+                throw DomainMutationJournalError.ownershipLost(record.operationID)
+            }
+            return record.attaching(pathFence: pathFence, now: now)
+        }
     }
 
     package func markCommitting(
@@ -361,20 +394,54 @@ package actor DomainMutationCommitState {
     }
 }
 
+package struct DomainMutationPhysicalRootMapping: Hashable, Sendable {
+    package let canonicalRoot: String
+    package let physicalRoot: String
+
+    package init(canonicalRoot: String, physicalRoot: String) {
+        self.canonicalRoot = canonicalRoot
+        self.physicalRoot = physicalRoot
+    }
+}
+
 package struct DomainMutationCommitController: Sendable {
-    private let operation: @Sendable () async throws -> Void
+    private let admitOperation: @Sendable ([String], [DomainMutationPhysicalRootMapping]) async throws -> Void
+    private let commitOperation: @Sendable () async throws -> Void
+
+    package init(
+        admitPhysicalTargets: @Sendable @escaping ([String], [DomainMutationPhysicalRootMapping]) async throws -> Void = { _, _ in },
+        willCommit: @Sendable @escaping () async throws -> Void
+    ) {
+        admitOperation = admitPhysicalTargets
+        commitOperation = willCommit
+    }
 
     package init(operation: @Sendable @escaping () async throws -> Void) {
-        self.operation = operation
+        admitOperation = { _, _ in }
+        commitOperation = operation
+    }
+
+    package func admitPhysicalTargets(
+        _ paths: [String],
+        rootMappings: [DomainMutationPhysicalRootMapping]
+    ) async throws {
+        try await admitOperation(paths, rootMappings)
     }
 
     package func willCommit() async throws {
-        try await operation()
+        try await commitOperation()
     }
 }
 
 package enum MCPDomainMutationCommitContext {
     @TaskLocal package static var controller: DomainMutationCommitController?
+
+    package static func admitPhysicalTargets(
+        _ paths: [String],
+        rootMappings: [DomainMutationPhysicalRootMapping]
+    ) async throws {
+        try await controller?.admitPhysicalTargets(paths, rootMappings: rootMappings)
+    }
 
     package static func willCommit() async throws {
         try await controller?.willCommit()

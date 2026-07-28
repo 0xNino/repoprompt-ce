@@ -11,8 +11,8 @@ Gate 4A protects the mutation actions of `manage_selection`, `prompt`, `workspac
 | Concern | M4 authority | Compatibility boundary |
 |---|---|---|
 | mutation classification | `MCPDomainProtectedMutationToolProvider` | existing public names, input schemas, annotations, and physical app providers are unchanged |
-| invocation identity | immutable `DomainToolInvocationSecurityContext` installed by `MCPConnectionManager` | app proxy transport and run-scoped tool advertisement remain unchanged |
-| persistent headless grants | `DomainMutationPolicyStore`, schema version 1, CAS-written `Settings/protected-mutations.json` | verified app-proxy principals retain the app approval/policy behavior |
+| invocation identity | immutable `DomainToolInvocationSecurityContext` installed by `MCPConnectionManager`; connection generation is the coordinator-owned registration token | verified app-proxy transport and run-scoped tool advertisement remain unchanged across routing re-registration |
+| persistent headless grants | `DomainMutationPolicyStore`, schema version 1, CAS-written protected-mutation policy | grants bind to a kernel-verified executable fingerprint, and running brokers reload versioned snapshots before admission/precommit |
 | approval ordering and settlement | `DomainMutationApprovalBroker` | `WorkspaceApprovalManager` is an AppKit presenter and legacy policy façade |
 | policy administration | `repoprompt-mcp policy list|grant|revoke` | mutations require stdin and stderr TTYs plus an immediate `yes` confirmation |
 | construction | `ServiceRegistry` wraps every registered binding exactly once | app providers remain physical backends; no second mutation registration exists |
@@ -21,10 +21,11 @@ The runtime starts in an explicit construction stage. The 4A commit selected `m4
 
 ### Security ledger
 
-- Missing, display-name-only, or runtime-generation-mismatched principals default-deny before the physical backend.
-- Verified app-proxy principals preserve current app behavior.
-- Run-scoped verified principals require the tool in their immutable ephemeral grant, or a non-expired, non-revoked persistent grant matching `tool.action`, principal, optional provider/workspace, and canonical roots.
-- Authorization is revalidated and cancellation is checked immediately before backend execution.
+- Missing, display-name-only, runtime-generation-mismatched, stale-registration, unbound, or otherwise unresolved headless routing contexts default-deny before the physical backend; routing failures are never normalized into an authoritative empty-root scope.
+- Verified app-proxy principals preserve current app behavior, including the AppKit approval presenter and proxy backend.
+- Run-scoped verified principals require the tool in their immutable ephemeral grant, or a non-expired, non-revoked persistent grant matching `tool.action`, kernel-verified executable fingerprint, optional provider/workspace, and canonical roots.
+- All relevant 4A mutations carry canonical-root scope; `manage_workspaces.add_folder` and path-based create requests include the requested new root so a narrow grant cannot expand itself.
+- Authorization reloads the persisted versioned snapshot and is revalidated with cancellation immediately before backend execution, making a TTY CLI revoke visible to an already-running broker.
 - Persistent grant changes are TTY-administrator-only and compare-and-swap against the durable document.
 - Corrupt, future-version, wrong-profile, or externally-conflicted policy enters degraded read-only mode.
 - Approval requests have one FIFO active presenter, bounded deadlines, cancellation settlement, presenter-loss settlement, default-deny terminal mapping, and ignored late responses.
@@ -32,6 +33,21 @@ The runtime starts in an explicit construction stage. The 4A commit selected `m4
 ### MainActor ledger
 
 `DomainMutationPolicyStore`, `DomainMutationApprovalBroker`, and `MCPDomainProtectedMutationToolProvider` are domain-runtime concurrency authorities and do not depend on AppKit or `@MainActor`. `WorkspaceApprovalManager` remains `@MainActor` only as the compatibility presenter/policy façade. Physical selection, prompt, routing, and workspace backends retain their existing app isolation; the new security decision executes before entering them.
+
+### Review remediation and migration ledger
+
+| Review gate | Resolution |
+|---|---|
+| B1 registration namespace | invocation and routing use one coordinator-owned registration token; re-registration is observed through the app invocation seam and unresolved routing fails closed |
+| B2 physical target fence | app providers admit the translated/resolved physical target and root mapping, then revalidate exact target or nearest-existing-parent identity immediately precommit |
+| B3 correlation semantics | public `operation_id` is unchanged and correlation-only; a distinct server-owned request key drives journal ownership and recovery verbs remain retryable |
+| H1 live policy visibility | every admission/revalidation refreshes the versioned CAS snapshot, so external revoke/regrant is visible without relaunch |
+| H2 principal spoofing | persistent grants match a kernel-derived executable fingerprint; display/provider names are metadata only |
+| H3 export writes | `prompt.export` and `workspace_context.export` are durable fenced families |
+| H4 DEBUG assurance | DEBUG uses real peer verification by default and exposes an injected verified/unverified identity only to tests; no forced self-PID fallback remains |
+| H5 4A roots | canonical roots are passed for relevant 4A mutations and requested new workspace roots are included in authorization |
+
+No M5 AI/Agent execution authority, M6 direct host/backend, or M7 proxy cleanup moved in this remediation.
 
 ### Gate 4A focused evidence
 
@@ -57,16 +73,17 @@ Gate 4B activates `file_actions`, `apply_edits`, and mutating `manage_worktree` 
 
 | Concern | M4 authority | Commit boundary |
 |---|---|---|
-| root scope | immutable workspace roots/revision captured from `DomainRoutingCoordinator` | requested paths resolve within an authoritative canonical root at admission |
-| symlink/TOCTOU fence | `DomainMutationPathFence` | root device/inode and resolved requested path are revalidated immediately before physical mutation |
-| durable replay | `DomainMutationJournal`, schema version 1, CAS-written `Settings/protected-mutation-journal.json` | stable `operation_id` + deterministic request/scope fingerprint elects one writer and replays the exact result |
+| root scope | immutable logical roots/revision plus `WorkspaceRootBindingProjection` physical mappings | the app backend translates/resolves the exact physical target before admission; policy scope remains canonical/logical |
+| symlink/TOCTOU fence | `DomainMutationPathFence` | physical root and exact target/nearest-existing-parent device/inode plus resolution are revalidated immediately before physical mutation, detecting symlink and nonexistent-parent swaps |
+| durable settlement | `DomainMutationJournal`, schema version 1, CAS-written protected-mutation journal | a server-owned request mutation key elects one writer and settles its exact result; public `operation_id` remains correlation-only and can be reused |
 | file actions | existing `MCPServerViewModel.performFileAction` backend | hook follows freshness/argument validation and precedes create/trash/move I/O |
 | apply edits | existing `WorkspaceFileEditHost`/`WorkspaceFileMutationService` backend | hook follows path/edit/approval/existence resolution and immediately precedes overwrite/create store I/O |
-| worktrees | existing worktree provider and `VCSService` backends | hook follows selector, confirmation, or routed approval and precedes settings/Git/session mutation |
+| worktrees | existing worktree provider and `VCSService` backends | create/apply/continue/abort admit and revalidate their resolved repository/worktree endpoints before settings/Git/session mutation |
+| prompt/workspace exports | existing prompt-context provider and file writer | resolved export destinations use the same fence, journal, cancellation, and precommit hook as other filesystem writes |
 
 Relative file paths remain compatible when exactly one authoritative root is bound; ambiguous multi-root relative writes fail closed. Verified app-proxy external worktree creation retains its explicit `allow_external_path` behavior while headless grants remain root-scoped.
 
-Cancellation before the commit hook records `cancelledBeforeCommit` and permits the same stable operation to retry. Once the hook atomically moves the record to `committing`, cancellation or reply loss produces a partial-success diagnostic and durable `indeterminateAfterCommit`; restart refuses automatic reexecution. Applied records contain the encoded exact MCP result. Collision, active-owner, corrupt/future journal, CAS exhaustion, and interrupted commit all default-deny.
+Cancellation before the commit hook records `cancelledBeforeCommit` for the internal request key and permits a fresh retry. Once the hook atomically moves the record to `committing`, cancellation or reply loss produces a partial-success diagnostic and durable `indeterminateAfterCommit`; restart refuses automatic reexecution of that exact internal request. Applied records contain the encoded exact MCP result. Public correlation-ID reuse—including worktree merge IDs—does not collide with or poison later continue/abort/retry requests. Active-owner, corrupt/future journal, CAS exhaustion, and interrupted commit all default-deny.
 
 ### MainActor ledger
 
@@ -88,6 +105,25 @@ Cancellation before the commit hook records `cancelledBeforeCommit` and permits 
 | `make dev-lint` | passed, ticket `dd1728b2-2b3e-407d-bbd2-17c59604a89d` |
 | `make guardrails` | passed |
 
+
+### Review-remediation focused evidence (2026-07-27)
+
+| Validation | Result |
+|---|---|
+| `make dev-test FILTER=DomainProtectedMutationSecurityTests` | passed 8 live-policy/fingerprint/root-scope tests, ticket `1a669936-2f64-4372-af9d-40a3590758da` |
+| `make dev-test FILTER=DomainMutationApprovalBrokerTests` | passed 4 FIFO/cancellation/default-deny tests, ticket `b281e537-38d7-4b71-9d4e-2113f101f1d4` |
+| `make dev-test FILTER=WorkspaceApprovalCancellationTests` | passed 3 AppKit presenter compatibility tests, ticket `a9b18e6e-3cee-402c-8ada-496d7f5e776b` |
+| `make dev-test FILTER=DomainProtectedMutationJournalTests` | passed 7 internal-key/CAS/cancellation/physical-fence adversarial tests, ticket `d4c7737b-c8eb-4380-ab99-24df4929c06d` |
+| `make dev-test FILTER=MCPProtectedMutationInvocationIntegrationTests` | passed 2 actual socket/app-provider tests covering routing re-registration, injected unverified identity, correlation reuse, both export families, and bound-worktree translation, ticket `7ee8d9a1-776c-4488-81f7-2c24d76ce8f7` |
+| `make dev-test FILTER=HeadlessMCPDomainRuntimeM0ContractTests` | passed 3 catalog/contract tests, ticket `988e7068-5510-44b6-b8a0-83e1b4300970` |
+| routing generation/launch-token authority method | passed, ticket `18bc37ba-50ce-4f14-ab07-c41faaf78eda` |
+| `make dev-test FILTER=MCPFileActionPartialSuccessTests` | passed 3 file-action/apply-edits compatibility tests, ticket `238d5ff2-87ae-4906-89be-6d7d07ddea1f` |
+| `make dev-test FILTER=ManageWorktreeToolServiceTests` | passed 2 worktree compatibility tests, ticket `c35b7ea6-8ea7-478d-be00-57ee3baa4521` |
+| `make dev-test-list` + `verify-ledger` | passed; 3,645 exact root/provider IDs reconciled, list ticket `da0c0db8-a271-4719-b5e9-5f3e0011f978` |
+| `make dev-swift-build PRODUCT=RepoPrompt` | passed, ticket `fc625590-9fbf-46bb-837d-c720d1773e67` |
+| `make dev-swift-build PRODUCT=repoprompt-mcp` | passed, ticket `94086e9e-1dcc-478d-b1b9-46e601e596f6` |
+| `make dev-lint` | passed, ticket `c6cb6634-fd98-4c5e-b05a-68c8b18e8c56` |
+| `make guardrails` | passed |
 
 ## Explicit exclusions
 

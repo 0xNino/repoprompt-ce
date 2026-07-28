@@ -224,6 +224,15 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             )
         )
 
+        var mutationRootMappings = await context.lookupContext.domainMutationPhysicalRootMappings(
+            store: dependencies.promptVM.workspaceFileContextStore
+        )
+        let targetParent = plan.path.deletingLastPathComponent().standardizedFileURL.path
+        mutationRootMappings.append(.init(canonicalRoot: targetParent, physicalRoot: targetParent))
+        try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+            [context.repo.rootURL.standardizedFileURL.path, plan.path.standardizedFileURL.path],
+            rootMappings: mutationRootMappings
+        )
         try await MCPDomainMutationCommitContext.willCommit()
         let createResult = try await vcsService.createGitWorktreeWithResult(request: plan.createRequest, at: context.repo.rootURL)
         let created = createResult.descriptor

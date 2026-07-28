@@ -272,7 +272,17 @@ final class MCPPromptContextToolProvider {
         let rootRefs = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: .allLoaded)
         let effectiveContext = tabContext.map { MCPServerViewModel.ResolvedTabContextSnapshot(snapshot: $0, usesActiveTabCompatibility: false) } ?? resolvedContext
         let files = try await dependencies.buildExportSelectedFileInfos(effectiveContext, cfg, tabContext?.selection, pathDisplay)
-        let resolvedPath = try await dependencies.writePromptExportFile(rawPath, text)
+        let metadata = await dependencies.captureRequestMetadata()
+        let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+        let mutationRootMappings = await lookupContext.domainMutationPhysicalRootMappings(
+            store: dependencies.promptVM.workspaceFileContextStore
+        )
+        let physicalPath = lookupContext.translateInputPath(rawPath)
+        let resolvedPath = try await dependencies.writePromptExportFile(
+            physicalPath,
+            text,
+            mutationRootMappings
+        )
         _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
             userPath: resolvedPath,
             fallbackScope: .allLoaded
