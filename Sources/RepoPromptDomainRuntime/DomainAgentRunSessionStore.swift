@@ -238,6 +238,7 @@ package actor DomainAgentRunSessionStore {
     private var activePersistenceFlush: (id: UUID, task: Task<Bool, Never>)?
     #if DEBUG
         private var testMetadataFlushBeforeCAS: (@Sendable () async -> Void)?
+        private var testShutdownAfterDetach: (@Sendable () async -> Void)?
     #endif
 
     package init(
@@ -796,6 +797,9 @@ package actor DomainAgentRunSessionStore {
         records.removeAll()
         let handlers = cancellationHandlers
         cancellationHandlers.removeAll()
+        #if DEBUG
+            await testShutdownAfterDetach?()
+        #endif
         for record in activeRecords.values {
             record.expiryTask?.cancel()
             resume(record.waiters, with: .cancelled)
@@ -1318,6 +1322,25 @@ package actor DomainAgentRunSessionStore {
         package func test_waiterCount(registration: Registration) -> Int {
             guard records[registration.sessionID]?.registration == registration else { return 0 }
             return records[registration.sessionID]?.waiters.count ?? 0
+        }
+
+        package func test_waiterIDs(registration: Registration) -> [UUID] {
+            guard records[registration.sessionID]?.registration == registration else { return [] }
+            return records[registration.sessionID]?.waiters.map(\.id) ?? []
+        }
+
+        package func test_cancelWaiter(sessionID: UUID, waiterID: UUID) {
+            cancelWaiter(sessionID: sessionID, waiterID: waiterID)
+        }
+
+        package func test_shutdownOwnedState() -> (recordCount: Int, cancellationHandlerCount: Int) {
+            (records.count, cancellationHandlers.count)
+        }
+
+        package func test_setShutdownAfterDetach(
+            _ hook: (@Sendable () async -> Void)?
+        ) {
+            testShutdownAfterDetach = hook
         }
 
         package func test_expire(cursor: WaitCursor) {

@@ -69,9 +69,15 @@ final class DomainAgentRunSessionStoreTests: XCTestCase {
         let waiter = Task {
             await store.waitUntilInteresting(cursor: cursor, timeoutSeconds: 10)
         }
-        while await store.test_waiterCount(registration: cancelledRegistration) == 0 {
-            await Task.yield()
+        let clock = ContinuousClock()
+        let waiterDeadline = clock.now.advanced(by: .seconds(1))
+        while await store.test_waiterCount(registration: cancelledRegistration) == 0,
+              clock.now < waiterDeadline
+        {
+            try? await Task.sleep(for: .milliseconds(1))
         }
+        let waiterCount = await store.test_waiterCount(registration: cancelledRegistration)
+        XCTAssertEqual(waiterCount, 1)
         waiter.cancel()
         let cancelledDisposition = await waiter.value
         XCTAssertEqual(cancelledDisposition, .cancelled)
@@ -80,7 +86,6 @@ final class DomainAgentRunSessionStoreTests: XCTestCase {
         await store.installCancellationHandler(registration: interruptedRegistration) {
             try? await Task.sleep(for: .milliseconds(150))
         }
-        let clock = ContinuousClock()
         let started = clock.now
         let result = await store.shutdown(deadline: .milliseconds(20))
         let elapsed = started.duration(to: clock.now)
@@ -102,32 +107,60 @@ final class DomainAgentRunSessionStoreTests: XCTestCase {
             transitionKind: .initial
         ))
         let cursor = DomainAgentSessionWaitCursor(registration: registration, epoch: epoch)
+        let waiterSettled = BoundedAsyncSignal()
         let waiter = Task {
-            await store.waitUntilInteresting(cursor: cursor, timeoutSeconds: 10)
+            let disposition = await store.waitUntilInteresting(cursor: cursor, timeoutSeconds: 10)
+            await waiterSettled.signal()
+            return disposition
         }
-        while await store.test_waiterCount(registration: registration) == 0 {
-            await Task.yield()
+        let clock = ContinuousClock()
+        let waiterDeadline = clock.now.advanced(by: .seconds(1))
+        while await store.test_waiterCount(registration: registration) == 0, clock.now < waiterDeadline {
+            try? await Task.sleep(for: .milliseconds(1))
         }
-        let cancellationFence = CancellationFence()
-        await store.installCancellationHandler(registration: registration) {
-            await cancellationFence.holdUntilCancelled()
+        let waiterIDs = await store.test_waiterIDs(registration: registration)
+        guard let waiterID = waiterIDs.first else {
+            waiter.cancel()
+            _ = await waiter.value
+            XCTFail("waiter did not park before the bounded deadline")
+            return
         }
 
+        let handlerStarted = BoundedAsyncSignal()
+        let handlerCancelled = BoundedAsyncSignal()
+        let handlerHold = BoundedAsyncSignal()
+        await store.installCancellationHandler(registration: registration) {
+            await handlerStarted.signal()
+            await withTaskCancellationHandler {
+                _ = await handlerHold.wait(timeout: .seconds(2))
+            } onCancel: {
+                Task {
+                    await handlerCancelled.signal()
+                    await handlerHold.signal()
+                }
+            }
+        }
+
+        let detachReached = BoundedAsyncSignal()
+        let detachRelease = BoundedAsyncSignal()
+        await store.test_setShutdownAfterDetach {
+            await detachReached.signal()
+            _ = await detachRelease.wait(timeout: .seconds(2))
+        }
         let shutdown = Task {
             await store.shutdown(deadline: .milliseconds(20))
         }
-        let clock = ContinuousClock()
-        let startDeadline = clock.now.advanced(by: .seconds(1))
-        while !(await cancellationFence.hasStarted()), clock.now < startDeadline {
-            try? await Task.sleep(for: .milliseconds(1))
-        }
-        let handlerStarted = await cancellationFence.hasStarted()
-        XCTAssertTrue(handlerStarted)
-        while await store.hasActiveRegistration(sessionID: sessionID) {
-            await Task.yield()
-        }
+        let reachedDetachBoundary = await detachReached.wait(timeout: .seconds(1))
+        XCTAssertTrue(reachedDetachBoundary)
+
+        let detachedState = await store.test_shutdownOwnedState()
+        XCTAssertEqual(detachedState.recordCount, 0)
+        XCTAssertEqual(detachedState.cancellationHandlerCount, 0)
+        let settledBeforeRaces = await waiterSettled.wait(timeout: .milliseconds(20))
+        XCTAssertFalse(settledBeforeRaces)
 
         let terminal = makeSnapshot(sessionID: sessionID, status: .cancelled)
+        async let cancellation: Void = store.test_cancelWaiter(sessionID: sessionID, waiterID: waiterID)
         async let publication = store.publishTerminal(
             .init(epoch: epoch, snapshot: terminal),
             registration: registration,
@@ -136,22 +169,24 @@ final class DomainAgentRunSessionStoreTests: XCTestCase {
         )
         async let ingest: Void = store.noteSnapshot(terminal, cursor: cursor)
         async let wake: Void = store.wakeCurrentWaiters(terminal, cursor: cursor, reason: .steeringRequested)
-        waiter.cancel()
-        let drainWait = await store.waitUntilInteresting(cursor: cursor, timeoutSeconds: 10)
-
-        let waiterDisposition = await waiter.value
+        await cancellation
         let publicationResult = await publication
         await ingest
         await wake
+        waiter.cancel()
+        let drainWait = await store.waitUntilInteresting(cursor: cursor, timeoutSeconds: 10)
+        let settledByRaces = await waiterSettled.wait(timeout: .milliseconds(20))
+        XCTAssertFalse(settledByRaces)
+
+        await detachRelease.signal()
+        let waiterDisposition = await waiter.value
         let shutdownResult = await shutdown.value
-        let cancellationDeadline = clock.now.advanced(by: .seconds(1))
-        while !(await cancellationFence.observedCancellation()), clock.now < cancellationDeadline {
-            try? await Task.sleep(for: .milliseconds(1))
-        }
-        let handlerWasCancelled = await cancellationFence.observedCancellation()
-        await cancellationFence.release()
+        let observedHandlerStart = await handlerStarted.wait(timeout: .seconds(1))
+        let observedHandlerCancellation = await handlerCancelled.wait(timeout: .seconds(1))
+        await handlerHold.signal()
         let waiterCount = await store.test_waiterCount(registration: registration)
-        XCTAssertTrue(handlerWasCancelled)
+        XCTAssertTrue(observedHandlerStart)
+        XCTAssertTrue(observedHandlerCancellation)
         XCTAssertEqual(waiterDisposition, .cancelled)
         XCTAssertEqual(drainWait, .cancelled)
         XCTAssertEqual(publicationResult, .rejected(reason: "stale_activation"))
@@ -190,9 +225,13 @@ final class DomainAgentRunSessionStoreTests: XCTestCase {
         let shutdown = Task {
             await store.shutdown(deadline: .milliseconds(100))
         }
-        while await store.hasActiveRegistration(sessionID: active.sessionID) {
-            await Task.yield()
+        let clock = ContinuousClock()
+        let detachDeadline = clock.now.advanced(by: .seconds(1))
+        while await store.hasActiveRegistration(sessionID: active.sessionID), clock.now < detachDeadline {
+            try? await Task.sleep(for: .milliseconds(1))
         }
+        let remainsActiveDuringDrain = await store.hasActiveRegistration(sessionID: active.sessionID)
+        XCTAssertFalse(remainsActiveDuringDrain)
         let installedDuringDrain = await store.installCancellationHandler(
             registration: active
         ) {
@@ -1129,29 +1168,47 @@ private actor InteractionAdapterRecorder {
     }
 }
 
-private actor CancellationFence {
-    private var started = false
-    private var wasCancelled = false
-    private var released = false
+private actor BoundedAsyncSignal {
+    private var isSignalled = false
+    private var waiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
 
-    func holdUntilCancelled() async {
-        started = true
-        while !Task.isCancelled, !released {
-            await Task.yield()
+    func signal() {
+        guard !isSignalled else { return }
+        isSignalled = true
+        let continuations = Array(waiters.values)
+        waiters.removeAll()
+        for continuation in continuations {
+            continuation.resume(returning: true)
         }
-        wasCancelled = Task.isCancelled
     }
 
-    func hasStarted() -> Bool {
-        started
+    func wait(timeout: Duration) async -> Bool {
+        guard !isSignalled else { return true }
+        let waiterID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if isSignalled {
+                    continuation.resume(returning: true)
+                } else if Task.isCancelled {
+                    continuation.resume(returning: false)
+                } else {
+                    waiters[waiterID] = continuation
+                    Task { [weak self] in
+                        try? await Task.sleep(for: timeout)
+                        await self?.settle(waiterID: waiterID, result: false)
+                    }
+                }
+            }
+        } onCancel: {
+            Task {
+                await self.settle(waiterID: waiterID, result: false)
+            }
+        }
     }
 
-    func observedCancellation() -> Bool {
-        wasCancelled
-    }
-
-    func release() {
-        released = true
+    private func settle(waiterID: UUID, result: Bool) {
+        guard let continuation = waiters.removeValue(forKey: waiterID) else { return }
+        continuation.resume(returning: result)
     }
 }
 
