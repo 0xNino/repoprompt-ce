@@ -166,113 +166,15 @@ struct MCPResponseDeliverySnapshot: Equatable {
     }
 }
 
-enum MCPProgressDeliveryResult: Equatable {
-    case delivered
-    case failed
-    case connectionTerminal
+typealias MCPProgressDeliveryResult = RepoPromptDomainRuntime.MCPProgressDeliveryResult
+typealias MCPRequestProgressState = RepoPromptDomainRuntime.MCPRequestProgressState
+
+enum MCPRequestProgressContext {
+    case domain(MCPDomainRequestProgressHandle)
+    case direct(MCPRequestProgressState)
 }
 
-/// Request-scoped standard MCP progress state. Progress is advisory: one delivery
-/// may be in flight and one latest-wins update may be pending. Finalization stops
-/// admission and discards the pending update without waiting for transport I/O;
-/// the already in-flight notification may therefore trail the final result.
-actor MCPRequestProgressState {
-    private struct PendingDelivery {
-        let connection: any MCPServerConnection
-        let message: String?
-    }
-
-    private let token: ProgressToken
-    private var sequence: Double = 0
-    private var acceptsProgress = true
-    private var pendingDelivery: PendingDelivery?
-    private var deliveryWorker: Task<Void, Never>?
-    #if DEBUG
-        private var quiescenceContinuations: [CheckedContinuation<Void, Never>] = []
-    #endif
-
-    init(token: ProgressToken) {
-        self.token = token
-    }
-
-    /// Enqueues without waiting for transport delivery. While a notification is
-    /// in flight, repeated emissions coalesce into the single latest pending value.
-    func send(
-        through connection: any MCPServerConnection,
-        message: String?
-    ) {
-        guard acceptsProgress else { return }
-        pendingDelivery = PendingDelivery(connection: connection, message: message)
-        guard deliveryWorker == nil else { return }
-
-        deliveryWorker = Task { [weak self] in
-            await self?.deliverBurst()
-        }
-    }
-
-    /// Final results take priority over advisory progress. This cooperatively
-    /// prevents new sends and drops the one bounded pending update, but does not
-    /// cancel or await a socket write that is already in flight.
-    func invalidate() {
-        acceptsProgress = false
-        pendingDelivery = nil
-    }
-
-    private func deliverBurst() async {
-        // Re-evaluate admission after every suspended transport send so
-        // finalization can stop the burst before another delivery is dequeued.
-        while acceptsProgress, let delivery = pendingDelivery {
-            pendingDelivery = nil
-            sequence += 1
-            let progress = sequence
-
-            let result = await delivery.connection.deliverMCPProgress(
-                token: token,
-                progress: progress,
-                message: delivery.message
-            )
-            if result == .connectionTerminal {
-                acceptsProgress = false
-                pendingDelivery = nil
-                break
-            }
-        }
-
-        deliveryWorker = nil
-        #if DEBUG
-            let continuations = quiescenceContinuations
-            quiescenceContinuations = []
-            continuations.forEach { $0.resume() }
-        #endif
-    }
-
-    #if DEBUG
-        struct Snapshot: Equatable {
-            let acceptsProgress: Bool
-            let pendingDeliveryCount: Int
-            let workerActive: Bool
-            let assignedSequence: Double
-        }
-
-        func snapshot() -> Snapshot {
-            Snapshot(
-                acceptsProgress: acceptsProgress,
-                pendingDeliveryCount: pendingDelivery == nil ? 0 : 1,
-                workerActive: deliveryWorker != nil,
-                assignedSequence: sequence
-            )
-        }
-
-        func waitUntilQuiescent() async {
-            guard deliveryWorker != nil else { return }
-            await withCheckedContinuation { continuation in
-                quiescenceContinuations.append(continuation)
-            }
-        }
-    #endif
-}
-
-protocol MCPServerConnection: Actor {
+protocol MCPServerConnection: MCPDomainProgressTransport {
     func start(approvalHandler: @escaping (MCP.Client.Info) async -> Bool) async throws
     func stop() async
     /// Immediately severs transport delivery for a tool execution that ignored cancellation.
@@ -2317,7 +2219,7 @@ actor ServerNetworkManager {
     @TaskLocal
     static var currentConnectionID: UUID?
     @TaskLocal
-    static var currentProgressState: MCPRequestProgressState?
+    static var currentProgressState: MCPRequestProgressContext?
     @TaskLocal
     static var currentTabContextHint: MCPServerViewModel.TabContextHint?
     @TaskLocal
@@ -2950,10 +2852,38 @@ actor ServerNetworkManager {
         progressState: MCPRequestProgressState? = nil,
         operation: () async throws -> T
     ) async rethrows -> T {
+        try await withConnectionID(
+            connectionID,
+            lifecycleCorrelation: lifecycleCorrelation,
+            progressContext: progressState.map(MCPRequestProgressContext.direct),
+            operation: operation
+        )
+    }
+
+    nonisolated static func withConnectionID<T>(
+        _ connectionID: UUID?,
+        lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
+        progressHandle: MCPDomainRequestProgressHandle?,
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        try await withConnectionID(
+            connectionID,
+            lifecycleCorrelation: lifecycleCorrelation,
+            progressContext: progressHandle.map(MCPRequestProgressContext.domain),
+            operation: operation
+        )
+    }
+
+    private nonisolated static func withConnectionID<T>(
+        _ connectionID: UUID?,
+        lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?,
+        progressContext: MCPRequestProgressContext?,
+        operation: () async throws -> T
+    ) async rethrows -> T {
         // Nested window-tool dispatches re-establish the connection TaskLocal.
         // Preserve an already-authorized request progress state unless the caller
         // supplies a new one for a new top-level request.
-        let effectiveProgressState = progressState
+        let effectiveProgressState = progressContext
             ?? (connectionID == currentConnectionID ? currentProgressState : nil)
         return try await $currentProgressState.withValue(effectiveProgressState) {
             #if DEBUG || EDIT_FLOW_PERF
@@ -10155,10 +10085,19 @@ actor ServerNetworkManager {
         #endif
         guard let mgr = connections[connectionID] else { return }
         if let standardProgressState {
-            await standardProgressState.send(
-                through: mgr,
-                message: "\(tool) [\(stage)]: \(message)"
-            )
+            switch standardProgressState {
+            case let .domain(handle):
+                await domainHost.sendRequestProgress(
+                    handle,
+                    through: mgr,
+                    message: "\(tool) [\(stage)]: \(message)"
+                )
+            case let .direct(state):
+                await state.send(
+                    through: mgr,
+                    message: "\(tool) [\(stage)]: \(message)"
+                )
+            }
         } else if supportsRepoPromptControl {
             await mgr.sendProgress(tool: tool, kind: kind, stage: stage, message: message)
         }
@@ -11711,11 +11650,19 @@ actor ServerNetworkManager {
             let capturedPreResolvedWindowID = preResolvedWindowID
             let capturedArguments = dispatchArguments
             let capturedArgsForFormatter = argsForFormatter
-            let capturedProgressState = params._meta?.progressToken.map {
-                MCPRequestProgressState(token: $0)
+            let capturedProgressState: MCPDomainRequestProgressHandle? = if let progressToken = params._meta?.progressToken {
+                await domainHost.beginRequestProgress(
+                    connectionID: connectionID,
+                    invocationID: invocationID,
+                    token: progressToken
+                )
+            } else {
+                nil
             }
             func finalizeToolResult(_ result: CallTool.Result) async -> CallTool.Result {
-                await capturedProgressState?.invalidate()
+                if let capturedProgressState {
+                    await domainHost.finishRequestProgress(capturedProgressState)
+                }
                 return result
             }
 
@@ -11830,7 +11777,7 @@ actor ServerNetworkManager {
                         await Self.withConnectionID(
                             connectionID,
                             lifecycleCorrelation: lifecycleCorrelation,
-                            progressState: capturedProgressState
+                            progressHandle: capturedProgressState
                         ) {
                             await Self.$currentTabContextHint.withValue(capturedTabContextHint) {
                                 let permitPreDispatchEnvelopeState = EditFlowPerf.begin(

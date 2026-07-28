@@ -262,6 +262,52 @@ final class MCPDomainHostTests: XCTestCase {
         XCTAssertTrue(disabled.hiddenReasonsByToolName.isEmpty)
     }
 
+    func testHostOwnsRequestProgressLifecycleAcrossFinishAndConnectionCancellation() async throws {
+        let fixture = try await makeFixture()
+        let transport = DomainProgressRecorder()
+        let invocationID = UUID()
+        let optionalHandle = await fixture.runtime.domainHost.beginRequestProgress(
+            connectionID: fixture.connection.connectionID,
+            invocationID: invocationID,
+            token: .string("host-progress")
+        )
+        let handle = try XCTUnwrap(optionalHandle)
+
+        await fixture.runtime.domainHost.sendRequestProgress(
+            handle,
+            through: transport,
+            message: "first"
+        )
+        await transport.waitUntilCount(1)
+        await fixture.runtime.domainHost.finishRequestProgress(handle)
+        await fixture.runtime.domainHost.sendRequestProgress(
+            handle,
+            through: transport,
+            message: "late-after-finish"
+        )
+        try await Task.sleep(for: .milliseconds(5))
+        let messagesAfterFinish = await transport.messages()
+        XCTAssertEqual(messagesAfterFinish, ["first"])
+
+        let optionalCancelledHandle = await fixture.runtime.domainHost.beginRequestProgress(
+            connectionID: fixture.connection.connectionID,
+            invocationID: UUID(),
+            token: .integer(2)
+        )
+        let cancelledHandle = try XCTUnwrap(optionalCancelledHandle)
+        await fixture.runtime.domainHost.cancelInvocations(
+            connectionID: fixture.connection.connectionID
+        )
+        await fixture.runtime.domainHost.sendRequestProgress(
+            cancelledHandle,
+            through: transport,
+            message: "late-after-close"
+        )
+        try await Task.sleep(for: .milliseconds(5))
+        let messagesAfterCancellation = await transport.messages()
+        XCTAssertEqual(messagesAfterCancellation, ["first"])
+    }
+
     func testCancelledDrainCallerReturnsWithoutSpinning() async throws {
         let blocker = InvocationBlocker()
         let fixture = try await makeFixture(binding: Self.binding { arguments in
@@ -396,6 +442,34 @@ final class MCPDomainHostTests: XCTestCase {
             hasAuthoritativeRoutingContext: false,
             ephemeralGrantedToolNames: [MCPWindowToolName.readFile]
         )
+    }
+}
+
+private actor DomainProgressRecorder: MCPDomainProgressTransport {
+    private var recordedMessages: [String] = []
+    private var countWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+    func deliverMCPProgress(
+        token _: ProgressToken,
+        progress _: Double,
+        message: String?
+    ) -> MCPProgressDeliveryResult {
+        recordedMessages.append(message ?? "")
+        let ready = countWaiters.filter { recordedMessages.count >= $0.0 }
+        countWaiters.removeAll { recordedMessages.count >= $0.0 }
+        ready.forEach { $0.1.resume() }
+        return .delivered
+    }
+
+    func waitUntilCount(_ count: Int) async {
+        guard recordedMessages.count < count else { return }
+        await withCheckedContinuation { continuation in
+            countWaiters.append((count, continuation))
+        }
+    }
+
+    func messages() -> [String] {
+        recordedMessages
     }
 }
 

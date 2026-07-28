@@ -83,6 +83,11 @@ package actor MCPDomainHost {
         let task: Task<Value, Error>
     }
 
+    private struct RequestProgressRecord {
+        let handle: MCPDomainRequestProgressHandle
+        let state: MCPRequestProgressState
+    }
+
     package nonisolated let identity: DomainRuntimeIdentity
     package nonisolated let registry: MCPDomainToolRegistry
     package nonisolated let routingCoordinator: DomainRoutingCoordinator
@@ -98,6 +103,7 @@ package actor MCPDomainHost {
     private var lifecycle: MCPDomainHostLifecycle = .accepting
     private var activeInvocations: [UUID: ActiveInvocation] = [:]
     private var invocationIDsByConnection: [UUID: Set<UUID>] = [:]
+    private var requestProgressByStateID: [UUID: RequestProgressRecord] = [:]
 
     package init(
         identity: DomainRuntimeIdentity,
@@ -247,6 +253,42 @@ package actor MCPDomainHost {
         }
     }
 
+    package func beginRequestProgress(
+        connectionID: UUID,
+        invocationID: UUID,
+        token: ProgressToken
+    ) -> MCPDomainRequestProgressHandle? {
+        guard lifecycle == .accepting else { return nil }
+        let handle = MCPDomainRequestProgressHandle(
+            stateID: UUID(),
+            connectionID: connectionID,
+            invocationID: invocationID
+        )
+        requestProgressByStateID[handle.stateID] = RequestProgressRecord(
+            handle: handle,
+            state: MCPRequestProgressState(token: token)
+        )
+        return handle
+    }
+
+    package func sendRequestProgress(
+        _ handle: MCPDomainRequestProgressHandle,
+        through transport: any MCPDomainProgressTransport,
+        message: String?
+    ) async {
+        guard let record = requestProgressByStateID[handle.stateID],
+              record.handle == handle
+        else { return }
+        await record.state.send(through: transport, message: message)
+    }
+
+    package func finishRequestProgress(_ handle: MCPDomainRequestProgressHandle) async {
+        guard let record = requestProgressByStateID.removeValue(forKey: handle.stateID),
+              record.handle == handle
+        else { return }
+        await record.state.invalidate()
+    }
+
     package func acquireMutationResourceAdmission(
         _ resource: MCPDomainToolResourceAdmissionController.Resource
     ) async throws -> MCPDomainToolResourceAdmissionController.Lease {
@@ -259,7 +301,15 @@ package actor MCPDomainHost {
         try await smallReadAdmissionController.acquire(.window(windowID))
     }
 
-    package func cancelInvocations(connectionID: UUID) {
+    package func cancelInvocations(connectionID: UUID) async {
+        let progressRecords = requestProgressByStateID.values.filter {
+            $0.handle.connectionID == connectionID
+        }
+        for record in progressRecords {
+            requestProgressByStateID.removeValue(forKey: record.handle.stateID)
+            await record.state.invalidate()
+        }
+
         let invocationIDs = invocationIDsByConnection[connectionID] ?? []
         for invocationID in invocationIDs {
             activeInvocations[invocationID]?.task.cancel()
@@ -279,6 +329,11 @@ package actor MCPDomainHost {
 
     package func drain(timeout: Duration) async -> MCPDomainHostDrainResult {
         beginDrain()
+        let progressRecords = Array(requestProgressByStateID.values)
+        requestProgressByStateID.removeAll()
+        for record in progressRecords {
+            await record.state.invalidate()
+        }
         let initialCount = activeInvocations.count
         guard initialCount > 0 else {
             lifecycle = .drained
