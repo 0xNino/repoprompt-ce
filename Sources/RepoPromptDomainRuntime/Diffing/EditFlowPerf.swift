@@ -14,20 +14,20 @@ import RepoPromptShared
 /// - stage names are static;
 /// - dimensions are coarse counts/status labels only;
 /// - never pass raw paths, patterns, replacement text, file content, or diffs.
-enum EditFlowPerf {
-    struct LifecycleCorrelation {
-        let id: UUID
-        let captureEpoch: UInt64?
-        let requestIdentity: MCPRequestTimelineIdentity?
+package enum EditFlowPerf {
+    package struct LifecycleCorrelation {
+        package let id: UUID
+        package let captureEpoch: UInt64?
+        package let requestIdentity: MCPRequestTimelineIdentity?
     }
 
     @TaskLocal
-    static var currentLifecycleCorrelation: LifecycleCorrelation?
+    package static var currentLifecycleCorrelation: LifecycleCorrelation?
     @TaskLocal
-    static var currentFileSystemPublicationCorrelation: LifecycleCorrelation?
+    package static var currentFileSystemPublicationCorrelation: LifecycleCorrelation?
 
     #if DEBUG || EDIT_FLOW_PERF
-        struct IntervalState {
+        package struct IntervalState {
             let signpostState: OSSignpostIntervalState?
             #if DEBUG
                 let debugCaptureEpoch: UInt64?
@@ -37,10 +37,10 @@ enum EditFlowPerf {
             #endif
         }
     #else
-        struct IntervalState {}
+        package struct IntervalState {}
     #endif
 
-    struct Dimensions {
+    package struct Dimensions {
         var toolName: String?
         var runPurpose: String?
         var status: String?
@@ -136,7 +136,7 @@ enum EditFlowPerf {
         var publicationPending: Bool?
         var terminalBarrier: Bool?
 
-        init(
+        package init(
             toolName: String? = nil,
             runPurpose: String? = nil,
             status: String? = nil,
@@ -468,392 +468,392 @@ enum EditFlowPerf {
         }
     }
 
-    enum Stage {
-        enum MCPToolCall {
-            static let total: StaticString = "EditFlow.MCPToolCall.Total"
-            static let normalizeArgs: StaticString = "EditFlow.MCPToolCall.NormalizeArgs"
-            static let logicalContextResolution: StaticString = "EditFlow.MCPToolCall.LogicalContextResolution"
-            static let policyGating: StaticString = "EditFlow.MCPToolCall.PolicyGating"
-            static let effectivePolicySnapshot: StaticString = "EditFlow.MCPToolCall.EffectivePolicySnapshot"
-            static let routingSnapshot: StaticString = "EditFlow.MCPToolCall.RoutingSnapshot"
-            static let preLimiterEnvelope: StaticString = "EditFlow.MCPToolCall.PreLimiterEnvelope"
-            static let limiterResolution: StaticString = "EditFlow.MCPToolCall.LimiterResolution"
-            static let limiterEnvelope: StaticString = "EditFlow.MCPToolCall.LimiterEnvelope"
-            static let limiterWait: StaticString = "EditFlow.MCPToolCall.LimiterWait"
-            static let permitBodyEnvelope: StaticString = "EditFlow.MCPToolCall.PermitBodyEnvelope"
-            static let permitPreDispatchEnvelope: StaticString = "EditFlow.MCPToolCall.PermitPreDispatchEnvelope"
-            static let enabledStateSnapshot: StaticString = "EditFlow.MCPToolCall.EnabledStateSnapshot"
-            static let windowRunResolution: StaticString = "EditFlow.MCPToolCall.WindowRunResolution"
-            static let observerCallbacks: StaticString = "EditFlow.MCPToolCall.ObserverCallbacks"
-            static let ownershipPurposeResolution: StaticString = "EditFlow.MCPToolCall.OwnershipPurposeResolution"
-            static let toolCallRecording: StaticString = "EditFlow.MCPToolCall.ToolCallRecording"
-            static let runScopedTabRebindFallback: StaticString = "EditFlow.MCPToolCall.RunScopedTabRebindFallback"
-            static let legacyTabBindingCompatibility: StaticString = "EditFlow.MCPToolCall.LegacyTabBindingCompatibility"
-            static let serviceToolLookup: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup"
-            static let serviceToolLookupServiceToolsAwait: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.ServiceToolsAwait"
-            static let serviceToolLookupToolDefinitionScan: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.ToolDefinitionScan"
-            static let serviceToolLookupPublicWindowIDInjection: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.PublicWindowIDInjection"
-            static let serviceToolLookupAppSettingsToolsBuild: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.AppSettingsToolsBuild"
-            static let serviceToolLookupWindowRoutingToolsCacheActorBody: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.WindowRoutingToolsCacheActorBody"
-            static let serviceToolLookupWindowCatalogToolsActorBodyTotal: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.WindowCatalogToolsActorBodyTotal"
-            static let serviceToolLookupWindowCatalogToolsMaterialization: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.WindowCatalogToolsMaterialization"
-            static let domainHostQueueWait: StaticString = "EditFlow.MCPToolCall.DomainHost.QueueWait"
-            static let domainHostExecution: StaticString = "EditFlow.MCPToolCall.DomainHost.Execution"
-            static let dispatch: StaticString = "EditFlow.MCPToolCall.Dispatch"
-            static let resolvedProviderDispatch: StaticString = "EditFlow.MCPToolCall.ResolvedProviderDispatch"
-            static let handlerResultHandoff: StaticString = "EditFlow.MCPToolCall.HandlerResultHandoff"
-            static let permitPostDispatchEnvelope: StaticString = "EditFlow.MCPToolCall.PermitPostDispatchEnvelope"
-            static let completionObservers: StaticString = "EditFlow.MCPToolCall.CompletionObservers"
-            static let completionObserverResultEncoding: StaticString = "EditFlow.MCPToolCall.CompletionObserverResultEncoding"
-            static let completionObserverCallbacks: StaticString = "EditFlow.MCPToolCall.CompletionObserverCallbacks"
-            static let preToolFilesystemFlush: StaticString = "EditFlow.MCPToolCall.PreToolFilesystemFlush"
-            static let runToolSetup: StaticString = "EditFlow.MCPToolCall.RunToolSetup"
-            static let runToolRegistration: StaticString = "EditFlow.MCPToolCall.RunToolRegistration"
-            static let providerExecution: StaticString = "EditFlow.MCPToolCall.ProviderExecution"
-            static let runToolTimeoutEnvelope: StaticString = "EditFlow.MCPToolCall.RunToolTimeoutEnvelope"
-            static let runToolCompletionCleanup: StaticString = "EditFlow.MCPToolCall.RunToolCompletionCleanup"
-            static let formatResult: StaticString = "EditFlow.MCPToolCall.FormatResult"
+    package enum Stage {
+        package enum MCPToolCall {
+            package static let total: StaticString = "EditFlow.MCPToolCall.Total"
+            package static let normalizeArgs: StaticString = "EditFlow.MCPToolCall.NormalizeArgs"
+            package static let logicalContextResolution: StaticString = "EditFlow.MCPToolCall.LogicalContextResolution"
+            package static let policyGating: StaticString = "EditFlow.MCPToolCall.PolicyGating"
+            package static let effectivePolicySnapshot: StaticString = "EditFlow.MCPToolCall.EffectivePolicySnapshot"
+            package static let routingSnapshot: StaticString = "EditFlow.MCPToolCall.RoutingSnapshot"
+            package static let preLimiterEnvelope: StaticString = "EditFlow.MCPToolCall.PreLimiterEnvelope"
+            package static let limiterResolution: StaticString = "EditFlow.MCPToolCall.LimiterResolution"
+            package static let limiterEnvelope: StaticString = "EditFlow.MCPToolCall.LimiterEnvelope"
+            package static let limiterWait: StaticString = "EditFlow.MCPToolCall.LimiterWait"
+            package static let permitBodyEnvelope: StaticString = "EditFlow.MCPToolCall.PermitBodyEnvelope"
+            package static let permitPreDispatchEnvelope: StaticString = "EditFlow.MCPToolCall.PermitPreDispatchEnvelope"
+            package static let enabledStateSnapshot: StaticString = "EditFlow.MCPToolCall.EnabledStateSnapshot"
+            package static let windowRunResolution: StaticString = "EditFlow.MCPToolCall.WindowRunResolution"
+            package static let observerCallbacks: StaticString = "EditFlow.MCPToolCall.ObserverCallbacks"
+            package static let ownershipPurposeResolution: StaticString = "EditFlow.MCPToolCall.OwnershipPurposeResolution"
+            package static let toolCallRecording: StaticString = "EditFlow.MCPToolCall.ToolCallRecording"
+            package static let runScopedTabRebindFallback: StaticString = "EditFlow.MCPToolCall.RunScopedTabRebindFallback"
+            package static let legacyTabBindingCompatibility: StaticString = "EditFlow.MCPToolCall.LegacyTabBindingCompatibility"
+            package static let serviceToolLookup: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup"
+            package static let serviceToolLookupServiceToolsAwait: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.ServiceToolsAwait"
+            package static let serviceToolLookupToolDefinitionScan: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.ToolDefinitionScan"
+            package static let serviceToolLookupPublicWindowIDInjection: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.PublicWindowIDInjection"
+            package static let serviceToolLookupAppSettingsToolsBuild: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.AppSettingsToolsBuild"
+            package static let serviceToolLookupWindowRoutingToolsCacheActorBody: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.WindowRoutingToolsCacheActorBody"
+            package static let serviceToolLookupWindowCatalogToolsActorBodyTotal: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.WindowCatalogToolsActorBodyTotal"
+            package static let serviceToolLookupWindowCatalogToolsMaterialization: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.WindowCatalogToolsMaterialization"
+            package static let domainHostQueueWait: StaticString = "EditFlow.MCPToolCall.DomainHost.QueueWait"
+            package static let domainHostExecution: StaticString = "EditFlow.MCPToolCall.DomainHost.Execution"
+            package static let dispatch: StaticString = "EditFlow.MCPToolCall.Dispatch"
+            package static let resolvedProviderDispatch: StaticString = "EditFlow.MCPToolCall.ResolvedProviderDispatch"
+            package static let handlerResultHandoff: StaticString = "EditFlow.MCPToolCall.HandlerResultHandoff"
+            package static let permitPostDispatchEnvelope: StaticString = "EditFlow.MCPToolCall.PermitPostDispatchEnvelope"
+            package static let completionObservers: StaticString = "EditFlow.MCPToolCall.CompletionObservers"
+            package static let completionObserverResultEncoding: StaticString = "EditFlow.MCPToolCall.CompletionObserverResultEncoding"
+            package static let completionObserverCallbacks: StaticString = "EditFlow.MCPToolCall.CompletionObserverCallbacks"
+            package static let preToolFilesystemFlush: StaticString = "EditFlow.MCPToolCall.PreToolFilesystemFlush"
+            package static let runToolSetup: StaticString = "EditFlow.MCPToolCall.RunToolSetup"
+            package static let runToolRegistration: StaticString = "EditFlow.MCPToolCall.RunToolRegistration"
+            package static let providerExecution: StaticString = "EditFlow.MCPToolCall.ProviderExecution"
+            package static let runToolTimeoutEnvelope: StaticString = "EditFlow.MCPToolCall.RunToolTimeoutEnvelope"
+            package static let runToolCompletionCleanup: StaticString = "EditFlow.MCPToolCall.RunToolCompletionCleanup"
+            package static let formatResult: StaticString = "EditFlow.MCPToolCall.FormatResult"
         }
 
-        enum MCPWindowToolCatalog {
-            static let construction: StaticString = "EditFlow.MCPWindowToolCatalog.Construction"
-            static let invalidateToolsCache: StaticString = "EditFlow.MCPWindowToolCatalog.InvalidateToolsCache"
-            static let invalidationToolSummariesChange: StaticString = "EditFlow.MCPWindowToolCatalog.Invalidation.ToolSummariesChange"
-            static let invalidationToolRegistrationUpdate: StaticString = "EditFlow.MCPWindowToolCatalog.Invalidation.ToolRegistrationUpdate"
-            static let registrationUpdateWindowToolsEnabledDidSet: StaticString = "EditFlow.MCPWindowToolCatalog.RegistrationUpdate.WindowToolsEnabledDidSet"
-            static let registrationUpdateAgentBootstrap: StaticString = "EditFlow.MCPWindowToolCatalog.RegistrationUpdate.AgentBootstrap"
-            static let readinessWarmAccess: StaticString = "EditFlow.MCPWindowToolCatalog.ReadinessWarmAccess"
-            static let serviceRegistryToolsPublication: StaticString = "EditFlow.MCPWindowToolCatalog.ServiceRegistryToolsPublication"
-            static let codexTurnMCPServerEnable: StaticString = "EditFlow.MCPWindowToolCatalog.CodexTurnMCPServerEnable"
+        package enum MCPWindowToolCatalog {
+            package static let construction: StaticString = "EditFlow.MCPWindowToolCatalog.Construction"
+            package static let invalidateToolsCache: StaticString = "EditFlow.MCPWindowToolCatalog.InvalidateToolsCache"
+            package static let invalidationToolSummariesChange: StaticString = "EditFlow.MCPWindowToolCatalog.Invalidation.ToolSummariesChange"
+            package static let invalidationToolRegistrationUpdate: StaticString = "EditFlow.MCPWindowToolCatalog.Invalidation.ToolRegistrationUpdate"
+            package static let registrationUpdateWindowToolsEnabledDidSet: StaticString = "EditFlow.MCPWindowToolCatalog.RegistrationUpdate.WindowToolsEnabledDidSet"
+            package static let registrationUpdateAgentBootstrap: StaticString = "EditFlow.MCPWindowToolCatalog.RegistrationUpdate.AgentBootstrap"
+            package static let readinessWarmAccess: StaticString = "EditFlow.MCPWindowToolCatalog.ReadinessWarmAccess"
+            package static let serviceRegistryToolsPublication: StaticString = "EditFlow.MCPWindowToolCatalog.ServiceRegistryToolsPublication"
+            package static let codexTurnMCPServerEnable: StaticString = "EditFlow.MCPWindowToolCatalog.CodexTurnMCPServerEnable"
         }
 
-        enum ApplyEdits {
-            static let serviceRun: StaticString = "EditFlow.ApplyEdits.ServiceRun"
-            static let servicePreview: StaticString = "EditFlow.ApplyEdits.ServicePreview"
-            static let requestBuild: StaticString = "EditFlow.ApplyEdits.RequestBuild"
-            static let hostRead: StaticString = "EditFlow.ApplyEdits.HostRead"
-            static let hostWrite: StaticString = "EditFlow.ApplyEdits.HostWrite"
-            static let engineApply: StaticString = "EditFlow.ApplyEdits.EngineApply"
-            static let diffGeneration: StaticString = "EditFlow.ApplyEdits.DiffGeneration"
-            static let patchApply: StaticString = "EditFlow.ApplyEdits.PatchApply"
-            static let toolCardDiff: StaticString = "EditFlow.ApplyEdits.ToolCardDiff"
-            static let format: StaticString = "EditFlow.ApplyEdits.Format"
-            static let formatDecode: StaticString = "EditFlow.ApplyEdits.FormatDecode"
-            static let formatMarkdown: StaticString = "EditFlow.ApplyEdits.FormatMarkdown"
-            static let formatResource: StaticString = "EditFlow.ApplyEdits.FormatResource"
-            static let approvalWait: StaticString = "EditFlow.ApplyEdits.ApprovalWait"
-            static let flushDeltas: StaticString = "EditFlow.ApplyEdits.FlushDeltas"
+        package enum ApplyEdits {
+            package static let serviceRun: StaticString = "EditFlow.ApplyEdits.ServiceRun"
+            package static let servicePreview: StaticString = "EditFlow.ApplyEdits.ServicePreview"
+            package static let requestBuild: StaticString = "EditFlow.ApplyEdits.RequestBuild"
+            package static let hostRead: StaticString = "EditFlow.ApplyEdits.HostRead"
+            package static let hostWrite: StaticString = "EditFlow.ApplyEdits.HostWrite"
+            package static let engineApply: StaticString = "EditFlow.ApplyEdits.EngineApply"
+            package static let diffGeneration: StaticString = "EditFlow.ApplyEdits.DiffGeneration"
+            package static let patchApply: StaticString = "EditFlow.ApplyEdits.PatchApply"
+            package static let toolCardDiff: StaticString = "EditFlow.ApplyEdits.ToolCardDiff"
+            package static let format: StaticString = "EditFlow.ApplyEdits.Format"
+            package static let formatDecode: StaticString = "EditFlow.ApplyEdits.FormatDecode"
+            package static let formatMarkdown: StaticString = "EditFlow.ApplyEdits.FormatMarkdown"
+            package static let formatResource: StaticString = "EditFlow.ApplyEdits.FormatResource"
+            package static let approvalWait: StaticString = "EditFlow.ApplyEdits.ApprovalWait"
+            package static let flushDeltas: StaticString = "EditFlow.ApplyEdits.FlushDeltas"
         }
 
-        enum Search {
-            static let broadAdmissionWait: StaticString = "EditFlow.Search.BroadAdmissionWait"
-            static let broadAdmissionLeaseHold: StaticString = "EditFlow.Search.BroadAdmissionLeaseHold"
-            static let ingressFreshnessWait: StaticString = "EditFlow.Search.IngressFreshnessWait"
-            static let contentFreshnessValidation: StaticString = "EditFlow.Search.ContentFreshnessValidation"
-            static let contentFreshnessValidationStoreActorBody: StaticString = "EditFlow.Search.ContentFreshnessValidation.StoreActorBody"
-            static let contentFreshnessValidationRootActorBody: StaticString = "EditFlow.Search.ContentFreshnessValidation.RootActorBody"
-            static let contentScanTotal: StaticString = "EditFlow.Search.ContentScanTotal"
-            static let resultConstruction: StaticString = "EditFlow.Search.ResultConstruction"
-            static let entrypoint: StaticString = "EditFlow.Search.Entrypoint"
-            static let scopeFiltering: StaticString = "EditFlow.Search.ScopeFiltering"
-            static let actorSearchCall: StaticString = "EditFlow.Search.ActorSearchCall"
-            static let actorSearchUnified: StaticString = "EditFlow.Search.ActorSearchUnified"
-            static let contentBatch: StaticString = "EditFlow.Search.ContentBatch"
-            static let pathBatch: StaticString = "EditFlow.Search.PathBatch"
-            static let fileContentFetch: StaticString = "EditFlow.Search.FileContentFetch"
-            static let lineIndexCacheKey: StaticString = "EditFlow.Search.LineIndexCacheKey"
-            static let lineIndexLookup: StaticString = "EditFlow.Search.LineIndexLookup"
-            static let lineIndexBuild: StaticString = "EditFlow.Search.LineIndexBuild"
-            static let countOnlyFastPath: StaticString = "EditFlow.Search.CountOnlyFastPath"
-            static let regexFullBufferScan: StaticString = "EditFlow.Search.RegexFullBufferScan"
-            static let regexLineByLineScan: StaticString = "EditFlow.Search.RegexLineByLineScan"
-            static let literalScan: StaticString = "EditFlow.Search.LiteralScan"
-            static let materializeMatches: StaticString = "EditFlow.Search.MaterializeMatches"
-            static let catalogSnapshot: StaticString = "EditFlow.Search.CatalogSnapshot"
-            static let dtoBuild: StaticString = "EditFlow.Search.DTOBuild"
-            static let dtoRootRefSnapshotLookup: StaticString = "EditFlow.Search.DTOBuild.RootRefSnapshotLookup"
-            static let dtoDisplayResolverPreparation: StaticString = "EditFlow.Search.DTOBuild.DisplayResolverPreparation"
-            static let dtoPathDisplayProjection: StaticString = "EditFlow.Search.DTOBuild.PathDisplayProjection"
-            static let dtoCapAccounting: StaticString = "EditFlow.Search.DTOBuild.CapAccounting"
-            static let dtoAssembly: StaticString = "EditFlow.Search.DTOBuild.Assembly"
-            static let providerTotal: StaticString = "EditFlow.Search.ProviderTotal"
-            static let providerRequestMetadata: StaticString = "EditFlow.Search.ProviderRequestMetadata"
-            static let providerLookupContextResolution: StaticString = "EditFlow.Search.ProviderLookupContextResolution"
-            static let providerWorkspaceSearchAwait: StaticString = "EditFlow.Search.ProviderWorkspaceSearchAwait"
-            static let rootScopeAvailabilityGate: StaticString = "EditFlow.Search.RootScopeAvailabilityGate"
-            static let workspaceReadinessAcquireGate: StaticString = "EditFlow.Search.WorkspaceReadinessAcquireGate"
-            static let workspaceReadinessValidationGate: StaticString = "EditFlow.Search.WorkspaceReadinessValidationGate"
-            static let providerAutoSelection: StaticString = "EditFlow.Search.ProviderAutoSelection"
-            static let providerValueEncoding: StaticString = "EditFlow.Search.ProviderValueEncoding"
+        package enum Search {
+            package static let broadAdmissionWait: StaticString = "EditFlow.Search.BroadAdmissionWait"
+            package static let broadAdmissionLeaseHold: StaticString = "EditFlow.Search.BroadAdmissionLeaseHold"
+            package static let ingressFreshnessWait: StaticString = "EditFlow.Search.IngressFreshnessWait"
+            package static let contentFreshnessValidation: StaticString = "EditFlow.Search.ContentFreshnessValidation"
+            package static let contentFreshnessValidationStoreActorBody: StaticString = "EditFlow.Search.ContentFreshnessValidation.StoreActorBody"
+            package static let contentFreshnessValidationRootActorBody: StaticString = "EditFlow.Search.ContentFreshnessValidation.RootActorBody"
+            package static let contentScanTotal: StaticString = "EditFlow.Search.ContentScanTotal"
+            package static let resultConstruction: StaticString = "EditFlow.Search.ResultConstruction"
+            package static let entrypoint: StaticString = "EditFlow.Search.Entrypoint"
+            package static let scopeFiltering: StaticString = "EditFlow.Search.ScopeFiltering"
+            package static let actorSearchCall: StaticString = "EditFlow.Search.ActorSearchCall"
+            package static let actorSearchUnified: StaticString = "EditFlow.Search.ActorSearchUnified"
+            package static let contentBatch: StaticString = "EditFlow.Search.ContentBatch"
+            package static let pathBatch: StaticString = "EditFlow.Search.PathBatch"
+            package static let fileContentFetch: StaticString = "EditFlow.Search.FileContentFetch"
+            package static let lineIndexCacheKey: StaticString = "EditFlow.Search.LineIndexCacheKey"
+            package static let lineIndexLookup: StaticString = "EditFlow.Search.LineIndexLookup"
+            package static let lineIndexBuild: StaticString = "EditFlow.Search.LineIndexBuild"
+            package static let countOnlyFastPath: StaticString = "EditFlow.Search.CountOnlyFastPath"
+            package static let regexFullBufferScan: StaticString = "EditFlow.Search.RegexFullBufferScan"
+            package static let regexLineByLineScan: StaticString = "EditFlow.Search.RegexLineByLineScan"
+            package static let literalScan: StaticString = "EditFlow.Search.LiteralScan"
+            package static let materializeMatches: StaticString = "EditFlow.Search.MaterializeMatches"
+            package static let catalogSnapshot: StaticString = "EditFlow.Search.CatalogSnapshot"
+            package static let dtoBuild: StaticString = "EditFlow.Search.DTOBuild"
+            package static let dtoRootRefSnapshotLookup: StaticString = "EditFlow.Search.DTOBuild.RootRefSnapshotLookup"
+            package static let dtoDisplayResolverPreparation: StaticString = "EditFlow.Search.DTOBuild.DisplayResolverPreparation"
+            package static let dtoPathDisplayProjection: StaticString = "EditFlow.Search.DTOBuild.PathDisplayProjection"
+            package static let dtoCapAccounting: StaticString = "EditFlow.Search.DTOBuild.CapAccounting"
+            package static let dtoAssembly: StaticString = "EditFlow.Search.DTOBuild.Assembly"
+            package static let providerTotal: StaticString = "EditFlow.Search.ProviderTotal"
+            package static let providerRequestMetadata: StaticString = "EditFlow.Search.ProviderRequestMetadata"
+            package static let providerLookupContextResolution: StaticString = "EditFlow.Search.ProviderLookupContextResolution"
+            package static let providerWorkspaceSearchAwait: StaticString = "EditFlow.Search.ProviderWorkspaceSearchAwait"
+            package static let rootScopeAvailabilityGate: StaticString = "EditFlow.Search.RootScopeAvailabilityGate"
+            package static let workspaceReadinessAcquireGate: StaticString = "EditFlow.Search.WorkspaceReadinessAcquireGate"
+            package static let workspaceReadinessValidationGate: StaticString = "EditFlow.Search.WorkspaceReadinessValidationGate"
+            package static let providerAutoSelection: StaticString = "EditFlow.Search.ProviderAutoSelection"
+            package static let providerValueEncoding: StaticString = "EditFlow.Search.ProviderValueEncoding"
 
-            enum AutoSelect {
-                static let shapeEligibility: StaticString = "EditFlow.Search.AutoSelect.ShapeEligibility"
-                static let agentEligibility: StaticString = "EditFlow.Search.AutoSelect.AgentEligibility"
-                static let mutation: StaticString = "EditFlow.Search.AutoSelect.Mutation"
+            package enum AutoSelect {
+                package static let shapeEligibility: StaticString = "EditFlow.Search.AutoSelect.ShapeEligibility"
+                package static let agentEligibility: StaticString = "EditFlow.Search.AutoSelect.AgentEligibility"
+                package static let mutation: StaticString = "EditFlow.Search.AutoSelect.Mutation"
             }
         }
 
-        enum ReadFile {
-            static let providerTotal: StaticString = "EditFlow.ReadFile.ProviderTotal"
-            static let providerArgumentParsing: StaticString = "EditFlow.ReadFile.ProviderArgumentParsing"
-            static let providerRequestMetadata: StaticString = "EditFlow.ReadFile.ProviderRequestMetadata"
-            static let providerLookupContextResolution: StaticString = "EditFlow.ReadFile.ProviderLookupContextResolution"
-            static let providerPathTranslation: StaticString = "EditFlow.ReadFile.ProviderPathTranslation"
-            static let providerReadEnvelope: StaticString = "EditFlow.ReadFile.ProviderReadEnvelope"
-            static let providerReplyProjection: StaticString = "EditFlow.ReadFile.ProviderReplyProjection"
-            static let providerAutoSelect: StaticString = "EditFlow.ReadFile.ProviderAutoSelect"
-            static let providerValueEncoding: StaticString = "EditFlow.ReadFile.ProviderValueEncoding"
-            static let explicitIngressFreshnessWait: StaticString = "EditFlow.ReadFile.ExplicitIngressFreshnessWait"
-            static let exactCatalogShortcut: StaticString = "EditFlow.ReadFile.ExactCatalogShortcut"
-            static let storeReadContentForwardAwait: StaticString = "EditFlow.ReadFile.StoreReadContentForwardAwait"
-            static let folderResolutionGeneralLookupFallback: StaticString = "EditFlow.ReadFile.FolderResolutionGeneralLookupFallback"
-            static let pathLookupStaticSnapshotBuild: StaticString = "EditFlow.ReadFile.PathLookupStaticSnapshotBuild"
-            static let resolveReadableFile: StaticString = "EditFlow.ReadFile.ResolveReadableFile"
-            static let exactPathIssueDetection: StaticString = "EditFlow.ReadFile.ExactPathIssueDetection"
-            static let rootRefsLookup: StaticString = "EditFlow.ReadFile.RootRefsLookup"
-            static let folderResolution: StaticString = "EditFlow.ReadFile.FolderResolution"
-            static let externalFolderGuard: StaticString = "EditFlow.ReadFile.ExternalFolderGuard"
-            static let readableServiceResolution: StaticString = "EditFlow.ReadFile.ReadableServiceResolution"
-            static let exactCatalogLookupAwait: StaticString = "EditFlow.ReadFile.ExactCatalogLookupAwait"
-            static let exactCatalogLookupActorBody: StaticString = "EditFlow.ReadFile.ExactCatalogLookupActorBody"
-            static let explicitMaterialization: StaticString = "EditFlow.ReadFile.ExplicitMaterialization"
-            static let generalLookupFallback: StaticString = "EditFlow.ReadFile.GeneralLookupFallback"
-            static let externalFileFallback: StaticString = "EditFlow.ReadFile.ExternalFileFallback"
-            static let workspaceContentLoad: StaticString = "EditFlow.ReadFile.WorkspaceContentLoad"
-            static let splitPreservingLineEndings: StaticString = "EditFlow.ReadFile.SplitPreservingLineEndings"
-            static let buildSlice: StaticString = "EditFlow.ReadFile.BuildSlice"
+        package enum ReadFile {
+            package static let providerTotal: StaticString = "EditFlow.ReadFile.ProviderTotal"
+            package static let providerArgumentParsing: StaticString = "EditFlow.ReadFile.ProviderArgumentParsing"
+            package static let providerRequestMetadata: StaticString = "EditFlow.ReadFile.ProviderRequestMetadata"
+            package static let providerLookupContextResolution: StaticString = "EditFlow.ReadFile.ProviderLookupContextResolution"
+            package static let providerPathTranslation: StaticString = "EditFlow.ReadFile.ProviderPathTranslation"
+            package static let providerReadEnvelope: StaticString = "EditFlow.ReadFile.ProviderReadEnvelope"
+            package static let providerReplyProjection: StaticString = "EditFlow.ReadFile.ProviderReplyProjection"
+            package static let providerAutoSelect: StaticString = "EditFlow.ReadFile.ProviderAutoSelect"
+            package static let providerValueEncoding: StaticString = "EditFlow.ReadFile.ProviderValueEncoding"
+            package static let explicitIngressFreshnessWait: StaticString = "EditFlow.ReadFile.ExplicitIngressFreshnessWait"
+            package static let exactCatalogShortcut: StaticString = "EditFlow.ReadFile.ExactCatalogShortcut"
+            package static let storeReadContentForwardAwait: StaticString = "EditFlow.ReadFile.StoreReadContentForwardAwait"
+            package static let folderResolutionGeneralLookupFallback: StaticString = "EditFlow.ReadFile.FolderResolutionGeneralLookupFallback"
+            package static let pathLookupStaticSnapshotBuild: StaticString = "EditFlow.ReadFile.PathLookupStaticSnapshotBuild"
+            package static let resolveReadableFile: StaticString = "EditFlow.ReadFile.ResolveReadableFile"
+            package static let exactPathIssueDetection: StaticString = "EditFlow.ReadFile.ExactPathIssueDetection"
+            package static let rootRefsLookup: StaticString = "EditFlow.ReadFile.RootRefsLookup"
+            package static let folderResolution: StaticString = "EditFlow.ReadFile.FolderResolution"
+            package static let externalFolderGuard: StaticString = "EditFlow.ReadFile.ExternalFolderGuard"
+            package static let readableServiceResolution: StaticString = "EditFlow.ReadFile.ReadableServiceResolution"
+            package static let exactCatalogLookupAwait: StaticString = "EditFlow.ReadFile.ExactCatalogLookupAwait"
+            package static let exactCatalogLookupActorBody: StaticString = "EditFlow.ReadFile.ExactCatalogLookupActorBody"
+            package static let explicitMaterialization: StaticString = "EditFlow.ReadFile.ExplicitMaterialization"
+            package static let generalLookupFallback: StaticString = "EditFlow.ReadFile.GeneralLookupFallback"
+            package static let externalFileFallback: StaticString = "EditFlow.ReadFile.ExternalFileFallback"
+            package static let workspaceContentLoad: StaticString = "EditFlow.ReadFile.WorkspaceContentLoad"
+            package static let splitPreservingLineEndings: StaticString = "EditFlow.ReadFile.SplitPreservingLineEndings"
+            package static let buildSlice: StaticString = "EditFlow.ReadFile.BuildSlice"
 
-            enum AutoSelect {
-                static let total: StaticString = "EditFlow.ReadFile.AutoSelect.Total"
-                static let eligibilityResolution: StaticString = "EditFlow.ReadFile.AutoSelect.EligibilityResolution"
-                static let selectionProjection: StaticString = "EditFlow.ReadFile.AutoSelect.SelectionProjection"
-                static let fullFlowTotal: StaticString = "EditFlow.ReadFile.AutoSelect.FullFlowTotal"
-                static let fullRequestMetadata: StaticString = "EditFlow.ReadFile.AutoSelect.FullRequestMetadata"
-                static let fullLookupContext: StaticString = "EditFlow.ReadFile.AutoSelect.FullLookupContext"
-                static let fullSnapshotResolution: StaticString = "EditFlow.ReadFile.AutoSelect.FullSnapshotResolution"
-                static let structuralAddTotal: StaticString = "EditFlow.ReadFile.AutoSelect.StructuralAddTotal"
-                static let candidateResolutionTotal: StaticString = "EditFlow.ReadFile.AutoSelect.CandidateResolutionTotal"
-                static let structuralMerge: StaticString = "EditFlow.ReadFile.AutoSelect.StructuralMerge"
-                static let autoCodemapRecomputeTotal: StaticString = "EditFlow.ReadFile.AutoSelect.AutoCodemapRecomputeTotal"
-                static let selectedFileLookup: StaticString = "EditFlow.ReadFile.AutoSelect.SelectedFileLookup"
-                static let fullSliceClearing: StaticString = "EditFlow.ReadFile.AutoSelect.FullSliceClearing"
-                static let finalSelectionEquality: StaticString = "EditFlow.ReadFile.AutoSelect.FinalSelectionEquality"
-                static let persistence: StaticString = "EditFlow.ReadFile.AutoSelect.Persistence"
-                static let responseEnqueue: StaticString = "EditFlow.ReadFile.AutoSelect.ResponseEnqueue"
-                static let canonicalQueueWait: StaticString = "EditFlow.ReadFile.AutoSelect.CanonicalQueueWait"
-                static let canonicalMutation: StaticString = "EditFlow.ReadFile.AutoSelect.CanonicalMutation"
-                static let canonicalStoredCommit: StaticString = "EditFlow.ReadFile.AutoSelect.CanonicalStoredCommit"
-                static let mirrorEnqueue: StaticString = "EditFlow.ReadFile.AutoSelect.MirrorEnqueue"
-                static let mirrorQueueWait: StaticString = "EditFlow.ReadFile.AutoSelect.MirrorQueueWait"
-                static let mirrorApply: StaticString = "EditFlow.ReadFile.AutoSelect.MirrorApply"
-                static let drainWait: StaticString = "EditFlow.ReadFile.AutoSelect.DrainWait"
-                static let sliceFlowTotal: StaticString = "EditFlow.ReadFile.AutoSelect.SliceFlowTotal"
+            package enum AutoSelect {
+                package static let total: StaticString = "EditFlow.ReadFile.AutoSelect.Total"
+                package static let eligibilityResolution: StaticString = "EditFlow.ReadFile.AutoSelect.EligibilityResolution"
+                package static let selectionProjection: StaticString = "EditFlow.ReadFile.AutoSelect.SelectionProjection"
+                package static let fullFlowTotal: StaticString = "EditFlow.ReadFile.AutoSelect.FullFlowTotal"
+                package static let fullRequestMetadata: StaticString = "EditFlow.ReadFile.AutoSelect.FullRequestMetadata"
+                package static let fullLookupContext: StaticString = "EditFlow.ReadFile.AutoSelect.FullLookupContext"
+                package static let fullSnapshotResolution: StaticString = "EditFlow.ReadFile.AutoSelect.FullSnapshotResolution"
+                package static let structuralAddTotal: StaticString = "EditFlow.ReadFile.AutoSelect.StructuralAddTotal"
+                package static let candidateResolutionTotal: StaticString = "EditFlow.ReadFile.AutoSelect.CandidateResolutionTotal"
+                package static let structuralMerge: StaticString = "EditFlow.ReadFile.AutoSelect.StructuralMerge"
+                package static let autoCodemapRecomputeTotal: StaticString = "EditFlow.ReadFile.AutoSelect.AutoCodemapRecomputeTotal"
+                package static let selectedFileLookup: StaticString = "EditFlow.ReadFile.AutoSelect.SelectedFileLookup"
+                package static let fullSliceClearing: StaticString = "EditFlow.ReadFile.AutoSelect.FullSliceClearing"
+                package static let finalSelectionEquality: StaticString = "EditFlow.ReadFile.AutoSelect.FinalSelectionEquality"
+                package static let persistence: StaticString = "EditFlow.ReadFile.AutoSelect.Persistence"
+                package static let responseEnqueue: StaticString = "EditFlow.ReadFile.AutoSelect.ResponseEnqueue"
+                package static let canonicalQueueWait: StaticString = "EditFlow.ReadFile.AutoSelect.CanonicalQueueWait"
+                package static let canonicalMutation: StaticString = "EditFlow.ReadFile.AutoSelect.CanonicalMutation"
+                package static let canonicalStoredCommit: StaticString = "EditFlow.ReadFile.AutoSelect.CanonicalStoredCommit"
+                package static let mirrorEnqueue: StaticString = "EditFlow.ReadFile.AutoSelect.MirrorEnqueue"
+                package static let mirrorQueueWait: StaticString = "EditFlow.ReadFile.AutoSelect.MirrorQueueWait"
+                package static let mirrorApply: StaticString = "EditFlow.ReadFile.AutoSelect.MirrorApply"
+                package static let drainWait: StaticString = "EditFlow.ReadFile.AutoSelect.DrainWait"
+                package static let sliceFlowTotal: StaticString = "EditFlow.ReadFile.AutoSelect.SliceFlowTotal"
             }
         }
 
-        enum FileSystem {
-            static let contentLoadTotal: StaticString = "EditFlow.FileSystem.ContentLoadTotal"
-            static let contentLoadActorBody: StaticString = "EditFlow.FileSystem.ContentLoadActorBody"
-            static let contentReadRequestPreparation: StaticString = "EditFlow.FileSystem.ContentReadRequestPreparation"
-            static let contentReadOffActorAwait: StaticString = "EditFlow.FileSystem.ContentReadOffActorAwait"
-            static let contentModificationDateLookup: StaticString = "EditFlow.FileSystem.ContentModificationDateLookup"
-            static let contentReadWorkerPermitWait: StaticString = "EditFlow.FileSystem.ContentReadWorkerPermitWait"
-            static let contentReadWorkerBody: StaticString = "EditFlow.FileSystem.ContentReadWorkerBody"
+        package enum FileSystem {
+            package static let contentLoadTotal: StaticString = "EditFlow.FileSystem.ContentLoadTotal"
+            package static let contentLoadActorBody: StaticString = "EditFlow.FileSystem.ContentLoadActorBody"
+            package static let contentReadRequestPreparation: StaticString = "EditFlow.FileSystem.ContentReadRequestPreparation"
+            package static let contentReadOffActorAwait: StaticString = "EditFlow.FileSystem.ContentReadOffActorAwait"
+            package static let contentModificationDateLookup: StaticString = "EditFlow.FileSystem.ContentModificationDateLookup"
+            package static let contentReadWorkerPermitWait: StaticString = "EditFlow.FileSystem.ContentReadWorkerPermitWait"
+            package static let contentReadWorkerBody: StaticString = "EditFlow.FileSystem.ContentReadWorkerBody"
         }
 
-        enum Bootstrap {
-            static let handshakeIOQueueEnvelope: StaticString = "EditFlow.Bootstrap.HandshakeIOQueueEnvelope"
-            static let handshakeIOBlockingRead: StaticString = "EditFlow.Bootstrap.HandshakeIOBlockingRead"
-            static let admission: StaticString = "EditFlow.Bootstrap.Admission"
-            static let postAcceptStartup: StaticString = "EditFlow.Bootstrap.PostAcceptStartup"
+        package enum Bootstrap {
+            package static let handshakeIOQueueEnvelope: StaticString = "EditFlow.Bootstrap.HandshakeIOQueueEnvelope"
+            package static let handshakeIOBlockingRead: StaticString = "EditFlow.Bootstrap.HandshakeIOBlockingRead"
+            package static let admission: StaticString = "EditFlow.Bootstrap.Admission"
+            package static let postAcceptStartup: StaticString = "EditFlow.Bootstrap.PostAcceptStartup"
         }
 
-        enum WorkspaceDurability {
-            static let flushWait: StaticString = "EditFlow.WorkspaceDurability.FlushWait"
-            static let atomicWrite: StaticString = "EditFlow.WorkspaceDurability.AtomicWrite"
+        package enum WorkspaceDurability {
+            package static let flushWait: StaticString = "EditFlow.WorkspaceDurability.FlushWait"
+            package static let atomicWrite: StaticString = "EditFlow.WorkspaceDurability.AtomicWrite"
         }
 
-        enum Transcript {
-            static let scheduleRefresh: StaticString = "EditFlow.Transcript.ScheduleRefresh"
-            static let refreshTotal: StaticString = "EditFlow.Transcript.RefreshTotal"
-            static let importTranscript: StaticString = "EditFlow.Transcript.ImportTranscript"
-            static let incrementalImport: StaticString = "EditFlow.Transcript.IncrementalImport"
-            static let payloadMap: StaticString = "EditFlow.Transcript.PayloadMap"
-            static let sanitize: StaticString = "EditFlow.Transcript.Sanitize"
-            static let projectionBuild: StaticString = "EditFlow.Transcript.ProjectionBuild"
-            static let publish: StaticString = "EditFlow.Transcript.Publish"
-            static let toolProcessing: StaticString = "EditFlow.Transcript.ToolProcessing"
+        package enum Transcript {
+            package static let scheduleRefresh: StaticString = "EditFlow.Transcript.ScheduleRefresh"
+            package static let refreshTotal: StaticString = "EditFlow.Transcript.RefreshTotal"
+            package static let importTranscript: StaticString = "EditFlow.Transcript.ImportTranscript"
+            package static let incrementalImport: StaticString = "EditFlow.Transcript.IncrementalImport"
+            package static let payloadMap: StaticString = "EditFlow.Transcript.PayloadMap"
+            package static let sanitize: StaticString = "EditFlow.Transcript.Sanitize"
+            package static let projectionBuild: StaticString = "EditFlow.Transcript.ProjectionBuild"
+            package static let publish: StaticString = "EditFlow.Transcript.Publish"
+            package static let toolProcessing: StaticString = "EditFlow.Transcript.ToolProcessing"
         }
 
-        enum Parser {
-            static let chatContentParse: StaticString = "EditFlow.Parser.ChatContentParse"
-            static let diffParseChanges: StaticString = "EditFlow.Parser.DiffParseChanges"
-            static let diffRegexCacheLookup: StaticString = "EditFlow.Parser.DiffRegexCacheLookup"
+        package enum Parser {
+            package static let chatContentParse: StaticString = "EditFlow.Parser.ChatContentParse"
+            package static let diffParseChanges: StaticString = "EditFlow.Parser.DiffParseChanges"
+            package static let diffRegexCacheLookup: StaticString = "EditFlow.Parser.DiffRegexCacheLookup"
         }
 
-        enum Finalization {
-            static let watchdogArm: StaticString = "EditFlow.Finalization.WatchdogArm"
-            static let watchdogSkip: StaticString = "EditFlow.Finalization.WatchdogSkip"
-            static let watchdogCancel: StaticString = "EditFlow.Finalization.WatchdogCancel"
-            static let watchdogComplete: StaticString = "EditFlow.Finalization.WatchdogComplete"
+        package enum Finalization {
+            package static let watchdogArm: StaticString = "EditFlow.Finalization.WatchdogArm"
+            package static let watchdogSkip: StaticString = "EditFlow.Finalization.WatchdogSkip"
+            package static let watchdogCancel: StaticString = "EditFlow.Finalization.WatchdogCancel"
+            package static let watchdogComplete: StaticString = "EditFlow.Finalization.WatchdogComplete"
         }
 
-        enum UnifiedDiff {
-            static let parseForRender: StaticString = "EditFlow.UnifiedDiff.ParseForRender"
-            static let attributedBuild: StaticString = "EditFlow.UnifiedDiff.AttributedBuild"
+        package enum UnifiedDiff {
+            package static let parseForRender: StaticString = "EditFlow.UnifiedDiff.ParseForRender"
+            package static let attributedBuild: StaticString = "EditFlow.UnifiedDiff.AttributedBuild"
         }
 
-        enum Git {
-            static let hunkParsing: StaticString = "EditFlow.Git.HunkParsing"
-            static let mapLoadingExcerpting: StaticString = "EditFlow.Git.MapLoadingExcerpting"
-            static let dtoConstruction: StaticString = "EditFlow.Git.DTOConstruction"
+        package enum Git {
+            package static let hunkParsing: StaticString = "EditFlow.Git.HunkParsing"
+            package static let mapLoadingExcerpting: StaticString = "EditFlow.Git.MapLoadingExcerpting"
+            package static let dtoConstruction: StaticString = "EditFlow.Git.DTOConstruction"
         }
 
-        enum MCPProviderProjection {
-            static let workerBody: StaticString = "EditFlow.MCPProviderProjection.WorkerBody"
+        package enum MCPProviderProjection {
+            package static let workerBody: StaticString = "EditFlow.MCPProviderProjection.WorkerBody"
         }
     }
 
-    enum Lifecycle {
-        enum MCPToolCall {
-            static let received: StaticString = "MCP.ToolCall.Received"
-            static let routingSnapshotCompleted: StaticString = "MCP.ToolCall.RoutingSnapshotCompleted"
-            static let limiterWaitBegan: StaticString = "MCP.ToolCall.LimiterWaitBegan"
-            static let limiterAcquired: StaticString = "MCP.ToolCall.LimiterAcquired"
-            static let permitQueued: StaticString = "MCP.ToolCall.PermitQueued"
-            static let permitAcquired: StaticString = "MCP.ToolCall.PermitAcquired"
-            static let permitReleased: StaticString = "MCP.ToolCall.PermitReleased"
-            static let observerScheduled: StaticString = "MCP.ToolCall.ObserverScheduled"
-            static let observerEntered: StaticString = "MCP.ToolCall.ObserverEntered"
-            static let observerExited: StaticString = "MCP.ToolCall.ObserverExited"
-            static let mainActorScheduled: StaticString = "MCP.ToolCall.MainActorScheduled"
-            static let mainActorEntered: StaticString = "MCP.ToolCall.MainActorEntered"
-            static let mainActorExited: StaticString = "MCP.ToolCall.MainActorExited"
-            static let publicationOwnershipState: StaticString = "MCP.ToolCall.PublicationOwnershipState"
-            static let completionObserverReturned: StaticString = "MCP.ToolCall.CompletionObserverReturned"
-            static let formatResultReturned: StaticString = "MCP.ToolCall.FormatResultReturned"
-            static let resolvedProviderBegan: StaticString = "MCP.ToolCall.ResolvedProviderBegan"
-            static let resolvedProviderEnded: StaticString = "MCP.ToolCall.ResolvedProviderEnded"
-            static let resourceAdmissionReleased: StaticString = "MCP.ToolCall.ResourceAdmissionReleased"
-            static let handlerResultReady: StaticString = "MCP.ToolCall.HandlerResultReady"
+    package enum Lifecycle {
+        package enum MCPToolCall {
+            package static let received: StaticString = "MCP.ToolCall.Received"
+            package static let routingSnapshotCompleted: StaticString = "MCP.ToolCall.RoutingSnapshotCompleted"
+            package static let limiterWaitBegan: StaticString = "MCP.ToolCall.LimiterWaitBegan"
+            package static let limiterAcquired: StaticString = "MCP.ToolCall.LimiterAcquired"
+            package static let permitQueued: StaticString = "MCP.ToolCall.PermitQueued"
+            package static let permitAcquired: StaticString = "MCP.ToolCall.PermitAcquired"
+            package static let permitReleased: StaticString = "MCP.ToolCall.PermitReleased"
+            package static let observerScheduled: StaticString = "MCP.ToolCall.ObserverScheduled"
+            package static let observerEntered: StaticString = "MCP.ToolCall.ObserverEntered"
+            package static let observerExited: StaticString = "MCP.ToolCall.ObserverExited"
+            package static let mainActorScheduled: StaticString = "MCP.ToolCall.MainActorScheduled"
+            package static let mainActorEntered: StaticString = "MCP.ToolCall.MainActorEntered"
+            package static let mainActorExited: StaticString = "MCP.ToolCall.MainActorExited"
+            package static let publicationOwnershipState: StaticString = "MCP.ToolCall.PublicationOwnershipState"
+            package static let completionObserverReturned: StaticString = "MCP.ToolCall.CompletionObserverReturned"
+            package static let formatResultReturned: StaticString = "MCP.ToolCall.FormatResultReturned"
+            package static let resolvedProviderBegan: StaticString = "MCP.ToolCall.ResolvedProviderBegan"
+            package static let resolvedProviderEnded: StaticString = "MCP.ToolCall.ResolvedProviderEnded"
+            package static let resourceAdmissionReleased: StaticString = "MCP.ToolCall.ResourceAdmissionReleased"
+            package static let handlerResultReady: StaticString = "MCP.ToolCall.HandlerResultReady"
         }
 
-        enum MCPRunTool {
-            static let preflushBegan: StaticString = "MCP.RunTool.PreflushBegan"
-            static let preflushEnded: StaticString = "MCP.RunTool.PreflushEnded"
-            static let registrationScheduled: StaticString = "MCP.RunTool.RegistrationScheduled"
-            static let registrationMainActorEntered: StaticString = "MCP.RunTool.RegistrationMainActorEntered"
-            static let registrationEnded: StaticString = "MCP.RunTool.RegistrationEnded"
-            static let providerBegan: StaticString = "MCP.RunTool.ProviderBegan"
-            static let providerEnded: StaticString = "MCP.RunTool.ProviderEnded"
-            static let cleanupScheduled: StaticString = "MCP.RunTool.CleanupScheduled"
-            static let cleanupMainActorEntered: StaticString = "MCP.RunTool.CleanupMainActorEntered"
-            static let unregister: StaticString = "MCP.RunTool.Unregister"
-            static let idleWaitersResumed: StaticString = "MCP.RunTool.IdleWaitersResumed"
-            static let cleanupEnded: StaticString = "MCP.RunTool.CleanupEnded"
-            static let returned: StaticString = "MCP.RunTool.Return"
+        package enum MCPRunTool {
+            package static let preflushBegan: StaticString = "MCP.RunTool.PreflushBegan"
+            package static let preflushEnded: StaticString = "MCP.RunTool.PreflushEnded"
+            package static let registrationScheduled: StaticString = "MCP.RunTool.RegistrationScheduled"
+            package static let registrationMainActorEntered: StaticString = "MCP.RunTool.RegistrationMainActorEntered"
+            package static let registrationEnded: StaticString = "MCP.RunTool.RegistrationEnded"
+            package static let providerBegan: StaticString = "MCP.RunTool.ProviderBegan"
+            package static let providerEnded: StaticString = "MCP.RunTool.ProviderEnded"
+            package static let cleanupScheduled: StaticString = "MCP.RunTool.CleanupScheduled"
+            package static let cleanupMainActorEntered: StaticString = "MCP.RunTool.CleanupMainActorEntered"
+            package static let unregister: StaticString = "MCP.RunTool.Unregister"
+            package static let idleWaitersResumed: StaticString = "MCP.RunTool.IdleWaitersResumed"
+            package static let cleanupEnded: StaticString = "MCP.RunTool.CleanupEnded"
+            package static let returned: StaticString = "MCP.RunTool.Return"
         }
 
-        enum FileSystem {
-            static let callbackAccepted: StaticString = "FileSystem.CallbackAccepted"
-            static let serviceEnqueueEntered: StaticString = "FileSystem.ServiceEnqueueEntered"
-            static let servicePublish: StaticString = "FileSystem.ServicePublish"
-            static let contentLoadEntered: StaticString = "FileSystem.ContentLoadEntered"
-            static let contentReadRequestPrepared: StaticString = "FileSystem.ContentReadRequestPrepared"
-            static let contentReadOffActorScheduled: StaticString = "FileSystem.ContentReadOffActorScheduled"
-            static let contentReadWorkerReturned: StaticString = "FileSystem.ContentReadWorkerReturned"
-            static let contentLoadReturned: StaticString = "FileSystem.ContentLoadReturned"
-            static let contentReadWorkerPermitWaitBegan: StaticString = "FileSystem.ContentReadWorkerPermitWaitBegan"
-            static let contentReadWorkerPermitAcquired: StaticString = "FileSystem.ContentReadWorkerPermitAcquired"
-            static let contentReadWorkerPermitCancelled: StaticString = "FileSystem.ContentReadWorkerPermitCancelled"
-            static let contentReadWorkerOverloaded: StaticString = "FileSystem.ContentReadWorkerOverloaded"
+        package enum FileSystem {
+            package static let callbackAccepted: StaticString = "FileSystem.CallbackAccepted"
+            package static let serviceEnqueueEntered: StaticString = "FileSystem.ServiceEnqueueEntered"
+            package static let servicePublish: StaticString = "FileSystem.ServicePublish"
+            package static let contentLoadEntered: StaticString = "FileSystem.ContentLoadEntered"
+            package static let contentReadRequestPrepared: StaticString = "FileSystem.ContentReadRequestPrepared"
+            package static let contentReadOffActorScheduled: StaticString = "FileSystem.ContentReadOffActorScheduled"
+            package static let contentReadWorkerReturned: StaticString = "FileSystem.ContentReadWorkerReturned"
+            package static let contentLoadReturned: StaticString = "FileSystem.ContentLoadReturned"
+            package static let contentReadWorkerPermitWaitBegan: StaticString = "FileSystem.ContentReadWorkerPermitWaitBegan"
+            package static let contentReadWorkerPermitAcquired: StaticString = "FileSystem.ContentReadWorkerPermitAcquired"
+            package static let contentReadWorkerPermitCancelled: StaticString = "FileSystem.ContentReadWorkerPermitCancelled"
+            package static let contentReadWorkerOverloaded: StaticString = "FileSystem.ContentReadWorkerOverloaded"
         }
 
-        enum Search {
-            static let contentFreshnessStoreEntered: StaticString = "Search.ContentFreshnessStoreEntered"
-            static let contentFreshnessStoreReturned: StaticString = "Search.ContentFreshnessStoreReturned"
-            static let contentFreshnessRootEntered: StaticString = "Search.ContentFreshnessRootEntered"
-            static let contentFreshnessRootReturned: StaticString = "Search.ContentFreshnessRootReturned"
-            static let broadAdmissionWaitBegan: StaticString = "Search.BroadAdmissionWaitBegan"
-            static let broadAdmissionPermitAcquired: StaticString = "Search.BroadAdmissionPermitAcquired"
-            static let broadAdmissionPermitCancelled: StaticString = "Search.BroadAdmissionPermitCancelled"
-            static let broadAdmissionPermitReleased: StaticString = "Search.BroadAdmissionPermitReleased"
-            static let broadAdmissionOverloaded: StaticString = "Search.BroadAdmissionOverloaded"
-            static let broadAdmissionWaitExpired: StaticString = "Search.BroadAdmissionWaitExpired"
-            static let providerEntered: StaticString = "Search.ProviderEntered"
-            static let providerWorkspaceSearchReturned: StaticString = "Search.ProviderWorkspaceSearchReturned"
-            static let providerDTOReady: StaticString = "Search.ProviderDTOReady"
-            static let providerAutoSelectionReturned: StaticString = "Search.ProviderAutoSelectionReturned"
-            static let providerResultReady: StaticString = "Search.ProviderResultReady"
+        package enum Search {
+            package static let contentFreshnessStoreEntered: StaticString = "Search.ContentFreshnessStoreEntered"
+            package static let contentFreshnessStoreReturned: StaticString = "Search.ContentFreshnessStoreReturned"
+            package static let contentFreshnessRootEntered: StaticString = "Search.ContentFreshnessRootEntered"
+            package static let contentFreshnessRootReturned: StaticString = "Search.ContentFreshnessRootReturned"
+            package static let broadAdmissionWaitBegan: StaticString = "Search.BroadAdmissionWaitBegan"
+            package static let broadAdmissionPermitAcquired: StaticString = "Search.BroadAdmissionPermitAcquired"
+            package static let broadAdmissionPermitCancelled: StaticString = "Search.BroadAdmissionPermitCancelled"
+            package static let broadAdmissionPermitReleased: StaticString = "Search.BroadAdmissionPermitReleased"
+            package static let broadAdmissionOverloaded: StaticString = "Search.BroadAdmissionOverloaded"
+            package static let broadAdmissionWaitExpired: StaticString = "Search.BroadAdmissionWaitExpired"
+            package static let providerEntered: StaticString = "Search.ProviderEntered"
+            package static let providerWorkspaceSearchReturned: StaticString = "Search.ProviderWorkspaceSearchReturned"
+            package static let providerDTOReady: StaticString = "Search.ProviderDTOReady"
+            package static let providerAutoSelectionReturned: StaticString = "Search.ProviderAutoSelectionReturned"
+            package static let providerResultReady: StaticString = "Search.ProviderResultReady"
         }
 
-        enum ReadFile {
-            static let providerEntered: StaticString = "ReadFile.ProviderEntered"
-            static let explicitFreshnessBegan: StaticString = "ReadFile.ExplicitFreshnessBegan"
-            static let explicitFreshnessEnded: StaticString = "ReadFile.ExplicitFreshnessEnded"
-            static let exactCatalogLookupResolved: StaticString = "ReadFile.ExactCatalogLookupResolved"
-            static let exactCatalogShortcutResolved: StaticString = "ReadFile.ExactCatalogShortcutResolved"
-            static let folderResolutionReturned: StaticString = "ReadFile.FolderResolutionReturned"
-            static let readableServiceResolutionReturned: StaticString = "ReadFile.ReadableServiceResolutionReturned"
-            static let storeReadContentEntered: StaticString = "ReadFile.StoreReadContentEntered"
-            static let storeReadContentReturned: StaticString = "ReadFile.StoreReadContentReturned"
-            static let providerResultReady: StaticString = "ReadFile.ProviderResultReady"
+        package enum ReadFile {
+            package static let providerEntered: StaticString = "ReadFile.ProviderEntered"
+            package static let explicitFreshnessBegan: StaticString = "ReadFile.ExplicitFreshnessBegan"
+            package static let explicitFreshnessEnded: StaticString = "ReadFile.ExplicitFreshnessEnded"
+            package static let exactCatalogLookupResolved: StaticString = "ReadFile.ExactCatalogLookupResolved"
+            package static let exactCatalogShortcutResolved: StaticString = "ReadFile.ExactCatalogShortcutResolved"
+            package static let folderResolutionReturned: StaticString = "ReadFile.FolderResolutionReturned"
+            package static let readableServiceResolutionReturned: StaticString = "ReadFile.ReadableServiceResolutionReturned"
+            package static let storeReadContentEntered: StaticString = "ReadFile.StoreReadContentEntered"
+            package static let storeReadContentReturned: StaticString = "ReadFile.StoreReadContentReturned"
+            package static let providerResultReady: StaticString = "ReadFile.ProviderResultReady"
         }
 
-        enum Bootstrap {
-            static let socketAccepted: StaticString = "Bootstrap.SocketAccepted"
-            static let handshakeIOQueued: StaticString = "Bootstrap.HandshakeIOQueued"
-            static let handshakeIOBegan: StaticString = "Bootstrap.HandshakeIOBegan"
-            static let handshakeIOEnded: StaticString = "Bootstrap.HandshakeIOEnded"
-            static let admissionBegan: StaticString = "Bootstrap.AdmissionBegan"
-            static let admissionEnded: StaticString = "Bootstrap.AdmissionEnded"
-            static let acceptedResponseSent: StaticString = "Bootstrap.AcceptedResponseSent"
-            static let ownershipTransferred: StaticString = "Bootstrap.OwnershipTransferred"
-            static let postAcceptStartupBegan: StaticString = "Bootstrap.PostAcceptStartupBegan"
-            static let postAcceptStartupEnded: StaticString = "Bootstrap.PostAcceptStartupEnded"
+        package enum Bootstrap {
+            package static let socketAccepted: StaticString = "Bootstrap.SocketAccepted"
+            package static let handshakeIOQueued: StaticString = "Bootstrap.HandshakeIOQueued"
+            package static let handshakeIOBegan: StaticString = "Bootstrap.HandshakeIOBegan"
+            package static let handshakeIOEnded: StaticString = "Bootstrap.HandshakeIOEnded"
+            package static let admissionBegan: StaticString = "Bootstrap.AdmissionBegan"
+            package static let admissionEnded: StaticString = "Bootstrap.AdmissionEnded"
+            package static let acceptedResponseSent: StaticString = "Bootstrap.AcceptedResponseSent"
+            package static let ownershipTransferred: StaticString = "Bootstrap.OwnershipTransferred"
+            package static let postAcceptStartupBegan: StaticString = "Bootstrap.PostAcceptStartupBegan"
+            package static let postAcceptStartupEnded: StaticString = "Bootstrap.PostAcceptStartupEnded"
         }
 
-        enum WorkspaceIngress {
-            static let storeSinkScheduled: StaticString = "WorkspaceIngress.StoreSinkScheduled"
-            static let storeSinkBegan: StaticString = "WorkspaceIngress.StoreSinkBegan"
-            static let storeCanonicalApplyCompleted: StaticString = "WorkspaceIngress.StoreCanonicalApplyCompleted"
-            static let codemapInvalidationStage: StaticString = "WorkspaceIngress.CodemapInvalidationStage"
-            static let rootFlushBegan: StaticString = "WorkspaceIngress.RootFlushBegan"
-            static let rootFlushEnded: StaticString = "WorkspaceIngress.RootFlushEnded"
+        package enum WorkspaceIngress {
+            package static let storeSinkScheduled: StaticString = "WorkspaceIngress.StoreSinkScheduled"
+            package static let storeSinkBegan: StaticString = "WorkspaceIngress.StoreSinkBegan"
+            package static let storeCanonicalApplyCompleted: StaticString = "WorkspaceIngress.StoreCanonicalApplyCompleted"
+            package static let codemapInvalidationStage: StaticString = "WorkspaceIngress.CodemapInvalidationStage"
+            package static let rootFlushBegan: StaticString = "WorkspaceIngress.RootFlushBegan"
+            package static let rootFlushEnded: StaticString = "WorkspaceIngress.RootFlushEnded"
         }
 
-        enum ReadFileAutoSelect {
-            static let enqueueAccepted: StaticString = "ReadFile.AutoSelect.EnqueueAccepted"
-            static let enqueueCoalesced: StaticString = "ReadFile.AutoSelect.EnqueueCoalesced"
-            static let canonicalApplyBegan: StaticString = "ReadFile.AutoSelect.CanonicalApplyBegan"
-            static let canonicalApplyEnded: StaticString = "ReadFile.AutoSelect.CanonicalApplyEnded"
-            static let mirrorScheduled: StaticString = "ReadFile.AutoSelect.MirrorScheduled"
-            static let mirrorCoalesced: StaticString = "ReadFile.AutoSelect.MirrorCoalesced"
-            static let mirrorApplyBegan: StaticString = "ReadFile.AutoSelect.MirrorApplyBegan"
-            static let mirrorApplyEnded: StaticString = "ReadFile.AutoSelect.MirrorApplyEnded"
-            static let drainBegan: StaticString = "ReadFile.AutoSelect.DrainBegan"
-            static let drainEnded: StaticString = "ReadFile.AutoSelect.DrainEnded"
+        package enum ReadFileAutoSelect {
+            package static let enqueueAccepted: StaticString = "ReadFile.AutoSelect.EnqueueAccepted"
+            package static let enqueueCoalesced: StaticString = "ReadFile.AutoSelect.EnqueueCoalesced"
+            package static let canonicalApplyBegan: StaticString = "ReadFile.AutoSelect.CanonicalApplyBegan"
+            package static let canonicalApplyEnded: StaticString = "ReadFile.AutoSelect.CanonicalApplyEnded"
+            package static let mirrorScheduled: StaticString = "ReadFile.AutoSelect.MirrorScheduled"
+            package static let mirrorCoalesced: StaticString = "ReadFile.AutoSelect.MirrorCoalesced"
+            package static let mirrorApplyBegan: StaticString = "ReadFile.AutoSelect.MirrorApplyBegan"
+            package static let mirrorApplyEnded: StaticString = "ReadFile.AutoSelect.MirrorApplyEnded"
+            package static let drainBegan: StaticString = "ReadFile.AutoSelect.DrainBegan"
+            package static let drainEnded: StaticString = "ReadFile.AutoSelect.DrainEnded"
         }
 
-        enum WorkspaceDurability {
-            static let flushBegan: StaticString = "WorkspaceDurability.FlushBegan"
-            static let flushEnded: StaticString = "WorkspaceDurability.FlushEnded"
-            static let writeBegan: StaticString = "WorkspaceDurability.WriteBegan"
-            static let writeEnded: StaticString = "WorkspaceDurability.WriteEnded"
+        package enum WorkspaceDurability {
+            package static let flushBegan: StaticString = "WorkspaceDurability.FlushBegan"
+            package static let flushEnded: StaticString = "WorkspaceDurability.FlushEnded"
+            package static let writeBegan: StaticString = "WorkspaceDurability.WriteBegan"
+            package static let writeEnded: StaticString = "WorkspaceDurability.WriteEnded"
         }
     }
 
     #if DEBUG
-        struct DebugCaptureStageAggregate {
-            let stageName: String
-            let sanitizedDimensions: String
-            let sampleCount: Int
-            let p50MS: Double
-            let p95MS: Double
-            let maxMS: Double
-            let totalMS: Double
+        package struct DebugCaptureStageAggregate {
+            package let stageName: String
+            package let sanitizedDimensions: String
+            package let sampleCount: Int
+            package let p50MS: Double
+            package let p95MS: Double
+            package let maxMS: Double
+            package let totalMS: Double
 
-            var payload: [String: Any] {
+            package var payload: [String: Any] {
                 [
                     "stage_name": stageName,
                     "sanitized_dimensions": sanitizedDimensions,
@@ -870,15 +870,15 @@ enum EditFlowPerf {
             }
         }
 
-        struct DebugCaptureLifecycleEvent {
-            let ordinal: UInt64
-            let offsetMS: Double
-            let eventName: String
-            let correlationID: String
-            let requestIdentity: MCPRequestTimelineIdentity?
-            let sanitizedDimensions: String
+        package struct DebugCaptureLifecycleEvent {
+            package let ordinal: UInt64
+            package let offsetMS: Double
+            package let eventName: String
+            package let correlationID: String
+            package let requestIdentity: MCPRequestTimelineIdentity?
+            package let sanitizedDimensions: String
 
-            var payload: [String: Any] {
+            package var payload: [String: Any] {
                 [
                     "ordinal": ordinal,
                     "offset_ms": Self.roundedMS(offsetMS),
@@ -904,21 +904,21 @@ enum EditFlowPerf {
             }
         }
 
-        struct DebugCaptureSnapshot {
-            let label: String
-            let active: Bool
-            let startedAt: Date?
-            let finishedAt: Date?
-            let maxSamples: Int
-            let retainedSampleCount: Int
-            let droppedSampleCount: Int
-            let stages: [DebugCaptureStageAggregate]
-            let maxLifecycleEvents: Int
-            let retainedLifecycleEventCount: Int
-            let droppedLifecycleEventCount: Int
-            let lifecycleEvents: [DebugCaptureLifecycleEvent]
+        package struct DebugCaptureSnapshot {
+            package let label: String
+            package let active: Bool
+            package let startedAt: Date?
+            package let finishedAt: Date?
+            package let maxSamples: Int
+            package let retainedSampleCount: Int
+            package let droppedSampleCount: Int
+            package let stages: [DebugCaptureStageAggregate]
+            package let maxLifecycleEvents: Int
+            package let retainedLifecycleEventCount: Int
+            package let droppedLifecycleEventCount: Int
+            package let lifecycleEvents: [DebugCaptureLifecycleEvent]
 
-            func payload(includeTimeline: Bool = true) -> [String: Any] {
+            package func payload(includeTimeline: Bool = true) -> [String: Any] {
                 var result: [String: Any] = [
                     "label": label,
                     "active": active,
@@ -961,7 +961,7 @@ enum EditFlowPerf {
                 }
             }
 
-            private static let workloadMatrixCatalog: [[String: Any]] = [
+            private nonisolated(unsafe) static let workloadMatrixCatalog: [[String: Any]] = [
                 ["id": "same_connection_ordinary_burst", "connections": 1, "windows": 1, "transcript": "short"],
                 ["id": "same_connection_mixed_ordinary_search", "connections": 1, "windows": 1, "transcript": "short"],
                 ["id": "distinct_connections_one_window", "connections": 2, "windows": 1, "transcript": "short"],
@@ -970,7 +970,7 @@ enum EditFlowPerf {
             ]
         }
 
-        enum DebugCaptureBeginResult {
+        package enum DebugCaptureBeginResult {
             case started(DebugCaptureSnapshot)
             case busy(DebugCaptureSnapshot)
         }
@@ -993,7 +993,7 @@ enum EditFlowPerf {
 
             private let storage: AnyObject?
 
-            init() {
+            package init() {
                 if #available(macOS 15.0, *) {
                     storage = AtomicStorage()
                 } else {
@@ -1001,14 +1001,14 @@ enum EditFlowPerf {
                 }
             }
 
-            func loadIfAvailable() -> Bool? {
+            package func loadIfAvailable() -> Bool? {
                 if #available(macOS 15.0, *), let storage = storage as? AtomicStorage {
                     return storage.value.load(ordering: .acquiring)
                 }
                 return nil
             }
 
-            func store(_ active: Bool) {
+            package func store(_ active: Bool) {
                 if #available(macOS 15.0, *), let storage = storage as? AtomicStorage {
                     storage.value.store(active, ordering: .releasing)
                 }
@@ -1045,7 +1045,7 @@ enum EditFlowPerf {
                 return active
             }
 
-            func begin(label: String, maxSamples: Int) -> DebugCaptureBeginResult {
+            package func begin(label: String, maxSamples: Int) -> DebugCaptureBeginResult {
                 lock.lock()
                 defer { lock.unlock() }
                 guard !active else { return .busy(snapshotLocked()) }
@@ -1068,7 +1068,7 @@ enum EditFlowPerf {
                 return .started(snapshotLocked())
             }
 
-            func snapshot(finish: Bool) -> DebugCaptureSnapshot {
+            package func snapshot(finish: Bool) -> DebugCaptureSnapshot {
                 lock.lock()
                 defer { lock.unlock() }
                 if finish, active {
@@ -1079,7 +1079,7 @@ enum EditFlowPerf {
                 return snapshotLocked()
             }
 
-            func resetForTesting() {
+            package func resetForTesting() {
                 lock.lock()
                 active = false
                 activeHint.store(false)
@@ -1098,7 +1098,7 @@ enum EditFlowPerf {
                 lock.unlock()
             }
 
-            func startTimestampIfActive() -> DebugCaptureStart? {
+            package func startTimestampIfActive() -> DebugCaptureStart? {
                 if let active = activeHint.loadIfAvailable(), !active { return nil }
                 lock.lock()
                 defer { lock.unlock() }
@@ -1106,14 +1106,14 @@ enum EditFlowPerf {
                 return DebugCaptureStart(epoch: captureEpoch, startNanoseconds: DispatchTime.now().uptimeNanoseconds)
             }
 
-            func activeEpochIfActive() -> UInt64? {
+            package func activeEpochIfActive() -> UInt64? {
                 if let active = activeHint.loadIfAvailable(), !active { return nil }
                 lock.lock()
                 defer { lock.unlock() }
                 return active ? captureEpoch : nil
             }
 
-            func shouldRecordLifecycleEvent(_ correlation: LifecycleCorrelation) -> Bool {
+            package func shouldRecordLifecycleEvent(_ correlation: LifecycleCorrelation) -> Bool {
                 guard let correlationEpoch = correlation.captureEpoch else { return false }
                 if let active = activeHint.loadIfAvailable(), !active { return false }
                 lock.lock()
@@ -1121,7 +1121,7 @@ enum EditFlowPerf {
                 return active && correlationEpoch == captureEpoch
             }
 
-            func recordLifecycleEvent(
+            package func recordLifecycleEvent(
                 eventName: String,
                 correlation: LifecycleCorrelation,
                 sanitizedDimensions: String
@@ -1154,7 +1154,7 @@ enum EditFlowPerf {
                 retainedLifecycleEventCount += 1
             }
 
-            func record(stageName: String, sanitizedDimensions: String, captureEpoch: UInt64, startNanoseconds: UInt64) {
+            package func record(stageName: String, sanitizedDimensions: String, captureEpoch: UInt64, startNanoseconds: UInt64) {
                 let elapsedNanoseconds = DispatchTime.now().uptimeNanoseconds - startNanoseconds
                 let elapsedMS = Double(elapsedNanoseconds) / 1_000_000.0
                 lock.lock()
@@ -1225,21 +1225,21 @@ enum EditFlowPerf {
             }
         }
 
-        private static let debugCaptureRecorder = DebugCaptureRecorder()
+        private nonisolated(unsafe) static let debugCaptureRecorder = DebugCaptureRecorder()
 
-        static var isDebugCaptureActive: Bool {
+        package static var isDebugCaptureActive: Bool {
             debugCaptureRecorder.isActive
         }
 
-        static func beginDebugCapture(label: String, maxSamples: Int) -> DebugCaptureBeginResult {
+        package static func beginDebugCapture(label: String, maxSamples: Int) -> DebugCaptureBeginResult {
             debugCaptureRecorder.begin(label: label, maxSamples: maxSamples)
         }
 
-        static func debugCaptureSnapshot(finish: Bool) -> DebugCaptureSnapshot {
+        package static func debugCaptureSnapshot(finish: Bool) -> DebugCaptureSnapshot {
             debugCaptureRecorder.snapshot(finish: finish)
         }
 
-        static func resetDebugCaptureForTesting() {
+        package static func resetDebugCaptureForTesting() {
             debugCaptureRecorder.resetForTesting()
         }
     #endif
@@ -1255,7 +1255,7 @@ enum EditFlowPerf {
             return ["1", "true", "yes", "y", "on"].contains(value)
         }()
 
-        static var isEnabled: Bool {
+        package static var isEnabled: Bool {
             environmentEnabled || UserDefaults.standard.bool(forKey: "editFlowPerfEnabled")
         }
 
@@ -1286,13 +1286,13 @@ enum EditFlowPerf {
         }
 
         @discardableResult
-        static func begin(_ name: StaticString) -> IntervalState? {
+        package static func begin(_ name: StaticString) -> IntervalState? {
             guard isEnabled || shouldCaptureIntervals else { return nil }
             return makeIntervalState(name, dimensions: Dimensions())
         }
 
         @discardableResult
-        static func begin(_ name: StaticString, _ dimensions: @autoclosure () -> Dimensions) -> IntervalState? {
+        package static func begin(_ name: StaticString, _ dimensions: @autoclosure () -> Dimensions) -> IntervalState? {
             guard isEnabled || shouldCaptureIntervals else { return nil }
             let renderedDimensions = dimensions()
             if isEnabled {
@@ -1301,7 +1301,7 @@ enum EditFlowPerf {
             return makeIntervalState(name, dimensions: renderedDimensions)
         }
 
-        static func end(_ name: StaticString, _ state: IntervalState?) {
+        package static func end(_ name: StaticString, _ state: IntervalState?) {
             guard let state else { return }
             #if DEBUG
                 if let captureEpoch = state.debugCaptureEpoch,
@@ -1320,7 +1320,7 @@ enum EditFlowPerf {
             }
         }
 
-        static func end(_ name: StaticString, _ state: IntervalState?, _ dimensions: @autoclosure () -> Dimensions) {
+        package static func end(_ name: StaticString, _ state: IntervalState?, _ dimensions: @autoclosure () -> Dimensions) {
             guard let state else { return }
             let renderedDimensions = dimensions()
             if isEnabled {
@@ -1343,18 +1343,18 @@ enum EditFlowPerf {
             }
         }
 
-        static func event(_ name: StaticString) {
+        package static func event(_ name: StaticString) {
             guard isEnabled else { return }
             signposter.emitEvent(name)
         }
 
-        static func event(_ name: StaticString, _ dimensions: @autoclosure () -> Dimensions) {
+        package static func event(_ name: StaticString, _ dimensions: @autoclosure () -> Dimensions) {
             guard isEnabled else { return }
             logDimensions(dimensions())
             signposter.emitEvent(name)
         }
 
-        static func makeLifecycleCorrelationIfActive(
+        package static func makeLifecycleCorrelationIfActive(
             requestIdentity: MCPRequestTimelineIdentity? = MCPRequestTimelineContext.current
         ) -> LifecycleCorrelation? {
             #if DEBUG
@@ -1375,7 +1375,7 @@ enum EditFlowPerf {
             #endif
         }
 
-        static func lifecycleEvent(
+        package static func lifecycleEvent(
             _ name: StaticString,
             correlation: LifecycleCorrelation? = currentLifecycleCorrelation,
             _ dimensions: @autoclosure () -> Dimensions = Dimensions()
@@ -1403,7 +1403,7 @@ enum EditFlowPerf {
             #endif
         }
 
-        static func measure<T>(
+        package static func measure<T>(
             _ name: StaticString,
             operation: () throws -> T
         ) rethrows -> T {
@@ -1412,7 +1412,7 @@ enum EditFlowPerf {
             return try operation()
         }
 
-        static func measure<T>(
+        package static func measure<T>(
             _ name: StaticString,
             _ dimensions: @autoclosure () -> Dimensions,
             operation: () throws -> T
@@ -1422,7 +1422,7 @@ enum EditFlowPerf {
             return try operation()
         }
 
-        static func measure<T>(
+        package static func measure<T>(
             _ name: StaticString,
             operation: () async throws -> T
         ) async rethrows -> T {
@@ -1431,7 +1431,7 @@ enum EditFlowPerf {
             return try await operation()
         }
 
-        static func measure<T>(
+        package static func measure<T>(
             _ name: StaticString,
             _ dimensions: @autoclosure () -> Dimensions,
             operation: () async throws -> T
@@ -1446,48 +1446,48 @@ enum EditFlowPerf {
             logger.debug("dimensions \(dimensions.logDescription, privacy: .public)")
         }
     #else
-        static var isEnabled: Bool {
+        package static var isEnabled: Bool {
             false
         }
 
         @discardableResult
         @inline(__always)
-        static func begin(_ name: StaticString) -> IntervalState? {
+        package static func begin(_ name: StaticString) -> IntervalState? {
             nil
         }
 
         @discardableResult
         @inline(__always)
-        static func begin(_ name: StaticString, _ dimensions: @autoclosure () -> Dimensions) -> IntervalState? {
+        package static func begin(_ name: StaticString, _ dimensions: @autoclosure () -> Dimensions) -> IntervalState? {
             nil
         }
 
         @inline(__always)
-        static func end(_ name: StaticString, _ state: IntervalState?) {}
+        package static func end(_ name: StaticString, _ state: IntervalState?) {}
 
         @inline(__always)
-        static func end(_ name: StaticString, _ state: IntervalState?, _ dimensions: @autoclosure () -> Dimensions) {}
+        package static func end(_ name: StaticString, _ state: IntervalState?, _ dimensions: @autoclosure () -> Dimensions) {}
 
         @inline(__always)
-        static func event(_ name: StaticString) {}
+        package static func event(_ name: StaticString) {}
 
         @inline(__always)
-        static func event(_ name: StaticString, _ dimensions: @autoclosure () -> Dimensions) {}
+        package static func event(_ name: StaticString, _ dimensions: @autoclosure () -> Dimensions) {}
 
         @inline(__always)
-        static func makeLifecycleCorrelationIfActive() -> LifecycleCorrelation? {
+        package static func makeLifecycleCorrelationIfActive() -> LifecycleCorrelation? {
             nil
         }
 
         @inline(__always)
-        static func lifecycleEvent(
+        package static func lifecycleEvent(
             _ name: StaticString,
             correlation: LifecycleCorrelation? = currentLifecycleCorrelation,
             _ dimensions: @autoclosure () -> Dimensions = Dimensions()
         ) {}
 
         @inline(__always)
-        static func measure<T>(
+        package static func measure<T>(
             _ name: StaticString,
             operation: () throws -> T
         ) rethrows -> T {
@@ -1495,7 +1495,7 @@ enum EditFlowPerf {
         }
 
         @inline(__always)
-        static func measure<T>(
+        package static func measure<T>(
             _ name: StaticString,
             _ dimensions: @autoclosure () -> Dimensions,
             operation: () throws -> T
@@ -1504,7 +1504,7 @@ enum EditFlowPerf {
         }
 
         @inline(__always)
-        static func measure<T>(
+        package static func measure<T>(
             _ name: StaticString,
             operation: () async throws -> T
         ) async rethrows -> T {
@@ -1512,7 +1512,7 @@ enum EditFlowPerf {
         }
 
         @inline(__always)
-        static func measure<T>(
+        package static func measure<T>(
             _ name: StaticString,
             _ dimensions: @autoclosure () -> Dimensions,
             operation: () async throws -> T

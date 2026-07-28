@@ -2,6 +2,7 @@ import Foundation
 
 package enum DomainClientPrincipalKind: String, Codable, CaseIterable, Sendable {
     case appProxy = "app_proxy"
+    case directStdio = "direct_stdio"
     case runScoped = "run_scoped"
     case ttyAdministrator = "tty_administrator"
 }

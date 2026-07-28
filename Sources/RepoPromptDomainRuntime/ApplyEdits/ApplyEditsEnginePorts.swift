@@ -1,6 +1,6 @@
 import Foundation
 
-protocol DiffChunkGenerator {
+package protocol DiffChunkGenerator {
     func makeDiffChunks(
         filePath: String,
         originalText: String,
@@ -11,10 +11,10 @@ protocol DiffChunkGenerator {
     ) async throws -> [DiffChunk]
 }
 
-protocol DiffChunkApplier {
+package protocol DiffChunkApplier {
     func apply(chunks: [DiffChunk], to originalText: String) throws -> String
 }
 
-protocol UnifiedDiffRendering {
+package protocol UnifiedDiffRendering {
     func render(filePath: String, chunks: [DiffChunk]) -> String
 }

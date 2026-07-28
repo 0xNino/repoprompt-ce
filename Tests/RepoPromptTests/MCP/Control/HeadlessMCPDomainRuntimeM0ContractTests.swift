@@ -528,8 +528,10 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
                 if m3SharedReadTools.contains(tool) {
                     XCTAssertTrue(hops.contains("MCPDomainReadToolProvider"), tool)
                     XCTAssertTrue(hops.contains("MCPWindowToolRuntime"), tool)
-                    let definitions = try source("Sources/RepoPromptDomainRuntime/MCPDomainReadToolDefinitions.swift")
-                    XCTAssertTrue(definitions.contains("name: \"\(tool)\""), "\(tool) shared schema")
+                    XCTAssertNotNil(
+                        MCPDomainCanonicalToolDefinitions.definition(named: tool),
+                        "\(tool) shared schema"
+                    )
                     let appProviders = hops.filter { $0.hasSuffix("ToolProvider") && $0 != "MCPDomainReadToolProvider" }
                     XCTAssertFalse(appProviders.isEmpty, "\(tool) app backend")
                     for provider in appProviders {

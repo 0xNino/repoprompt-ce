@@ -120,6 +120,70 @@ final class MCPDomainHostTests: XCTestCase {
         XCTAssertEqual(final.activeInvocationCount, 0)
     }
 
+    func testTerminalConnectionFenceIsReleasedOnlyAfterRoutingRemovalAndSettlement() async throws {
+        let blocker = InvocationBlocker()
+        let fixture = try await makeFixture(binding: Self.binding { _ in
+            await blocker.wait()
+            return .string("settled")
+        })
+        let resolution = try await fixture.runtime.domainHost.resolve(
+            toolName: MCPWindowToolName.readFile,
+            scope: .window(id: 1)
+        )
+        let invocationID = UUID()
+        let invocation = MCPDomainHostInvocation(
+            invocationID: invocationID,
+            connectionID: fixture.connection.connectionID,
+            resolution: resolution,
+            arguments: [:],
+            securityContext: securityContext(
+                identity: fixture.runtime.identity,
+                connection: fixture.connection,
+                invocationID: invocationID
+            )
+        )
+        let task = Task { try await fixture.runtime.domainHost.invoke(invocation) }
+        await blocker.awaitStarted()
+
+        await fixture.runtime.domainHost.cancelInvocations(
+            connectionID: fixture.connection.connectionID,
+            connectionGeneration: fixture.connection.generation
+        )
+        _ = await fixture.runtime.routingCoordinator.unregisterConnection(
+            fixture.connection,
+            operationID: UUID()
+        )
+        await fixture.runtime.domainHost.releaseConnection(
+            connectionID: fixture.connection.connectionID,
+            connectionGeneration: fixture.connection.generation
+        )
+        var snapshot = await fixture.runtime.domainHost.snapshot()
+        XCTAssertEqual(snapshot.terminalConnectionFenceCount, 1)
+
+        await blocker.resume()
+        _ = try await task.value
+        snapshot = await fixture.runtime.domainHost.snapshot()
+        XCTAssertEqual(snapshot.terminalConnectionFenceCount, 0)
+    }
+
+    func testTerminalConnectionFenceReleasesImmediatelyWhenNoInvocationIsActive() async throws {
+        let fixture = try await makeFixture()
+        await fixture.runtime.domainHost.cancelInvocations(
+            connectionID: fixture.connection.connectionID,
+            connectionGeneration: fixture.connection.generation
+        )
+        _ = await fixture.runtime.routingCoordinator.unregisterConnection(
+            fixture.connection,
+            operationID: UUID()
+        )
+        await fixture.runtime.domainHost.releaseConnection(
+            connectionID: fixture.connection.connectionID,
+            connectionGeneration: fixture.connection.generation
+        )
+        let snapshot = await fixture.runtime.domainHost.snapshot()
+        XCTAssertEqual(snapshot.terminalConnectionFenceCount, 0)
+    }
+
     func testDrainRacingSuspendedAdmissionRejectsLateInvocation() async throws {
         let admissionGate = InvocationBlocker()
         let fixture = try await makeFixture()

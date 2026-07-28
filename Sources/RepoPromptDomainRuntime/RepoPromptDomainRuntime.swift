@@ -109,15 +109,18 @@ package actor MCPDomainRuntime {
     package nonisolated let configuration: DomainRuntimeConfiguration
     package nonisolated let toolRegistry: MCPDomainToolRegistry
     package nonisolated let domainHost: MCPDomainHost
+    package nonisolated let persistenceCoordinator: DomainPersistenceCoordinator
     package nonisolated let workspaceStore: DomainWorkspaceStore
     package nonisolated let contextStore: DomainContextStore
     package nonisolated let routingCoordinator: DomainRoutingCoordinator
+    package nonisolated let standaloneScopeCoordinator: DomainStandaloneScopeCoordinator
     package nonisolated let readSideEffectCoordinator: DomainReadSideEffectCoordinator
     package nonisolated let mutationPolicyStore: DomainMutationPolicyStore
     package nonisolated let mutationApprovalBroker: DomainMutationApprovalBroker
     package nonisolated let mutationJournal: DomainMutationJournal
     package nonisolated let protectedMutationProvider: MCPDomainProtectedMutationToolProvider
     package nonisolated let agentSessionStore: DomainAgentRunSessionStore
+    package nonisolated let agentWorktreeBindingStore: DomainAgentWorktreeBindingStore
     package nonisolated let interactionBroker: DomainInteractionBroker
     package nonisolated let activityCenter: DomainActivityCenter
     package nonisolated let credentialEnvelopeStore: DomainCredentialEnvelopeStore
@@ -153,6 +156,7 @@ package actor MCPDomainRuntime {
             configuration: configuration,
             identity: runtimeIdentity
         )
+        persistenceCoordinator = persistence
         let authority = DomainWorkspaceContextAuthority(
             identity: runtimeIdentity,
             persistence: persistence,
@@ -169,6 +173,12 @@ package actor MCPDomainRuntime {
             metrics: configuration.metrics
         )
         self.routingCoordinator = routingCoordinator
+        standaloneScopeCoordinator = DomainStandaloneScopeCoordinator(
+            identity: runtimeIdentity,
+            workspaceStore: workspaceStore,
+            contextStore: contextStore,
+            routingCoordinator: routingCoordinator
+        )
         domainHost = MCPDomainHost(
             identity: runtimeIdentity,
             registry: toolRegistry,
@@ -196,6 +206,10 @@ package actor MCPDomainRuntime {
         )
         agentSessionStore = DomainAgentRunSessionStore(
             identity: runtimeIdentity,
+            persistence: persistence,
+            profileIdentifier: configuration.profileIdentifier
+        )
+        agentWorktreeBindingStore = DomainAgentWorktreeBindingStore(
             persistence: persistence,
             profileIdentifier: configuration.profileIdentifier
         )
@@ -231,6 +245,7 @@ package actor MCPDomainRuntime {
         await startTask?.value
         await mutationPolicyStore.bootstrap()
         await agentSessionStore.bootstrap()
+        await agentWorktreeBindingStore.bootstrap()
         guard lifecycle == .starting else { return }
         startTask = nil
         let workspaceSnapshot = await workspaceAuthority.snapshot()

@@ -1,36 +1,36 @@
 import Foundation
 
-enum ApplyEditsStatus: String, Equatable {
+package enum ApplyEditsStatus: String, Equatable {
     case success
     case partial
     case failed
 }
 
-struct ApplyEditsStats: Equatable {
-    let linesChanged: Int
-    let chunks: Int
+package struct ApplyEditsStats: Equatable {
+    package let linesChanged: Int
+    package let chunks: Int
 }
 
-struct ApplyEditsLineStats: Equatable {
-    let addedLines: Int
-    let deletedLines: Int
+package struct ApplyEditsLineStats: Equatable {
+    package let addedLines: Int
+    package let deletedLines: Int
 }
 
-struct ApplyEditsResult: Equatable {
-    let updatedText: String
-    let diffChunks: [DiffChunk]
-    let unifiedDiff: String?
-    let toolCardUnifiedDiff: String?
-    let stats: ApplyEditsStats?
-    let note: String?
-    let fileCreated: Bool
-    let fileOverwritten: Bool
-    let editsRequested: Int
-    let editsApplied: Int
-    let status: ApplyEditsStatus
-    let outcomes: [EditOutcome]?
+package struct ApplyEditsResult: Equatable {
+    package let updatedText: String
+    package let diffChunks: [DiffChunk]
+    package let unifiedDiff: String?
+    package let toolCardUnifiedDiff: String?
+    package let stats: ApplyEditsStats?
+    package let note: String?
+    package let fileCreated: Bool
+    package let fileOverwritten: Bool
+    package let editsRequested: Int
+    package let editsApplied: Int
+    package let status: ApplyEditsStatus
+    package let outcomes: [EditOutcome]?
 
-    func withFileMetadata(created: Bool, overwritten: Bool) -> ApplyEditsResult {
+    package func withFileMetadata(created: Bool, overwritten: Bool) -> ApplyEditsResult {
         ApplyEditsResult(
             updatedText: updatedText,
             diffChunks: diffChunks,
@@ -48,8 +48,8 @@ struct ApplyEditsResult: Equatable {
     }
 }
 
-extension ApplyEditsResult {
-    func toolCardLineStats() -> ApplyEditsLineStats? {
+package extension ApplyEditsResult {
+    package func toolCardLineStats() -> ApplyEditsLineStats? {
         guard !diffChunks.isEmpty else { return nil }
         var addedLines = 0
         var deletedLines = 0
@@ -71,7 +71,7 @@ extension ApplyEditsResult {
     /// UI-safe unified diff source:
     /// - Prefer explicit verbose diff when present.
     /// - Otherwise synthesize from applied diff chunks for tool-card rendering.
-    func unifiedDiffForToolCard(filePath: String) -> String? {
+    package func unifiedDiffForToolCard(filePath: String) -> String? {
         if let toolCardUnifiedDiff, !toolCardUnifiedDiff.isEmpty {
             return toolCardUnifiedDiff
         }

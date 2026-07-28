@@ -90,7 +90,7 @@ package actor MCPDomainToolRegistry {
             guard let entry = MCPDomainToolCatalog.entry(named: name) else {
                 throw MCPDomainToolRegistryError.unknownToolName(name)
             }
-            guard entry.scope == scope.kind else {
+            guard entry.supports(registrationScope: scope) else {
                 throw MCPDomainToolRegistryError.scopeMismatch(
                     toolName: name,
                     expected: entry.scope,

@@ -29,8 +29,8 @@ public struct Edit {
 /// High‑level utility that applies a batch of `{search,content}` edits to the
 /// same file and returns the combined diff chunks **plus** per‑edit outcomes.
 /// The `previews` return slot is retained for source compatibility and is empty.
-enum DiffBatchGenerator {
-    static func generate(
+package enum DiffBatchGenerator {
+    package static func generate(
         originalLines orig: [String],
         edits: [Edit],
         precision prec: DiffPrecision,

@@ -12405,6 +12405,8 @@ actor ServerNetworkManager {
                                         return .application
                                     case .window:
                                         return chosenID.map(MCPDomainToolRegistrationScope.window)
+                                    case .standalone:
+                                        return nil
                                     }
                                 }()
                                 var resolvedTool = singleWindowFallbackResolvedTool

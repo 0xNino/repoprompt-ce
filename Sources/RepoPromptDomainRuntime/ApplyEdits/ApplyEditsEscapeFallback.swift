@@ -1,19 +1,19 @@
 import Foundation
 
-struct ApplyEditsEscapeFallback {
+package struct ApplyEditsEscapeFallback {
     private let decoder: EscapeDecoder
     private let mode: EscapeDecodingMode
 
-    init(decoder: EscapeDecoder = EscapeDecoder(), mode: EscapeDecodingMode = .cStyle) {
+    package init(decoder: EscapeDecoder = EscapeDecoder(), mode: EscapeDecodingMode = .cStyle) {
         self.decoder = decoder
         self.mode = mode
     }
 
-    func resolveSingle(search: String, replace: String, in originalText: String) -> (search: String, replace: String, usedFallback: Bool) {
+    package func resolveSingle(search: String, replace: String, in originalText: String) -> (search: String, replace: String, usedFallback: Bool) {
         resolve(search: search, replace: replace, in: originalText)
     }
 
-    func resolveBatch(edits: [ApplyEditsOperation], in originalText: String) -> (edits: [ApplyEditsOperation], usedFallbackCount: Int) {
+    package func resolveBatch(edits: [ApplyEditsOperation], in originalText: String) -> (edits: [ApplyEditsOperation], usedFallbackCount: Int) {
         var fallbackCount = 0
         let resolvedEdits = edits.map { edit in
             let resolved = resolve(search: edit.search, replace: edit.replace, in: originalText)

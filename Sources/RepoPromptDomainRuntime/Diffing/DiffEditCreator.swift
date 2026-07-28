@@ -2,19 +2,19 @@
 
 import Foundation
 
-struct DiffEdit {
-    enum EditType {
+package struct DiffEdit {
+    package enum EditType {
         case addition
         case deletion
         case equal
     }
 
-    let type: EditType
-    let lines: [String]
+    package let type: EditType
+    package let lines: [String]
 }
 
-class DiffEditCreator {
-    static func myersDiff(
+package class DiffEditCreator {
+    package static func myersDiff(
         oldLines: [String],
         newLines: [String],
         maximumEditDistance: Int? = nil

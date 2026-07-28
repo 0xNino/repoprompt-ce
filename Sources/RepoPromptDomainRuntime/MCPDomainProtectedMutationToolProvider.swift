@@ -287,8 +287,10 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
 
     private static func requiresPhysicalAdmission(_ operation: DomainProtectedMutationOperation) -> Bool {
         switch operation.toolName {
-        case "file_actions", "apply_edits", "prompt", "workspace_context":
+        case "file_actions", "apply_edits":
             true
+        case "prompt", "workspace_context":
+            operation.action == "export"
         case "manage_worktree":
             ["create", "apply", "continue", "abort"].contains(operation.action)
         default:

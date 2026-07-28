@@ -1,6 +1,6 @@
 import Foundation
 
-enum DiffGenerationError: Error {
+package enum DiffGenerationError: Error {
     case emptyContent
     case invalidSelector
     case noMatchFound
@@ -13,7 +13,7 @@ enum DiffGenerationError: Error {
 /// Conform to LocalizedError so `error.localizedDescription` is informative
 /// instead of the default "The operation couldn’t be completed …" message.
 extension DiffGenerationError: LocalizedError {
-    var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case .emptyContent:
             "file content is empty – nothing to edit"
@@ -36,11 +36,11 @@ extension DiffGenerationError: LocalizedError {
 
 /// Provide stable error codes for logging/bridging if needed.
 extension DiffGenerationError: CustomNSError {
-    static var errorDomain: String {
+    package static var errorDomain: String {
         "RepoPrompt.DiffGenerationError"
     }
 
-    var errorCode: Int {
+    package var errorCode: Int {
         switch self {
         case .emptyContent: 1
         case .invalidSelector: 2
@@ -57,11 +57,11 @@ public enum DiffPrecision: String, CaseIterable {
     case high = "High"
 }
 
-class DiffGenerationUtility {
+package class DiffGenerationUtility {
     /// Controls whether detailed logging is enabled. Set to true for debugging diff generation.
-    static let enableDetailedLogging: Bool = false
+    package static let enableDetailedLogging: Bool = false
 
-    struct LineData {
+    package struct LineData {
         let original: String
         let cleaned: String // truncated version for n-grams
         let removedTags: String // truncated version for partial checks
@@ -69,7 +69,7 @@ class DiffGenerationUtility {
     }
 
     /// 🚩 Public façade
-    static func generateDiff(
+    package static func generateDiff(
         fileContent: [String],
         lineIndexMap: [String: [Int]]?,
         startSelector: [String]?,
@@ -157,7 +157,7 @@ class DiffGenerationUtility {
         return [DiffChunk(lines: removals, startLine: 0)]
     }
 
-    static func generateRewriteDiff(fileContent: [String], newContent: [String]) -> [DiffChunk] {
+    package static func generateRewriteDiff(fileContent: [String], newContent: [String]) -> [DiffChunk] {
         let diffEdits = DiffEditCreator.myersDiff(oldLines: fileContent, newLines: newContent)
         var diffLines = convertDiffEditsToLines(diffEdits)
 
@@ -275,7 +275,7 @@ class DiffGenerationUtility {
      */
 
     /// 🚩 Offset-aware search-block diff
-    static func generateDiffWithSearchBlock(
+    package static func generateDiffWithSearchBlock(
         fileContent: [String],
         searchBlock: [String],
         newContent: [String],
@@ -495,7 +495,7 @@ class DiffGenerationUtility {
 
     /// Finds the best match for a selector in the given content using an n-gram similarity search,
     /// then refines that match in a smaller window.
-    static func findBestMatchUsingNGrams(selector: [LineData], in content: [LineData], lineIndexMap: [String: [Int]], mcpAmbiguityCheck: Bool = false) async throws -> Int {
+    package static func findBestMatchUsingNGrams(selector: [LineData], in content: [LineData], lineIndexMap: [String: [Int]], mcpAmbiguityCheck: Bool = false) async throws -> Int {
         // 1) Basic validation - ensure inputs are valid
         guard !selector.isEmpty else {
             throw DiffGenerationError.invalidSelector
@@ -875,7 +875,7 @@ class DiffGenerationUtility {
     /// Collapse runs of “banner / ruler” glyphs so stylistic comment rulers
     /// don’t upset hashing (e.g. “────────”, “━━━”, “–––”, “___” → “-”).
     @inline(__always)
-    static func collapseSeparatorRuns(_ s: String) -> String {
+    package static func collapseSeparatorRuns(_ s: String) -> String {
         let pattern = #"[-_–—─━═]{2,}"#
         return s.replacingOccurrences(
             of: pattern,
@@ -930,13 +930,13 @@ class DiffGenerationUtility {
     /// Canonicalises a raw source line for hashing / comparison.
     /// Returns `nil` when the line is empty *after* normalisation.
     @inline(__always)
-    static func canonicalKey(_ raw: String) -> String? {
+    package static func canonicalKey(_ raw: String) -> String? {
         let key = normalized(raw)
         return key.isEmpty ? nil : key
     }
 
     /// Returns the strict & loose hash keys plus the cleaned text for a line.
-    static func processLine(
+    package static func processLine(
         _ raw: String,
         precision: DiffPrecision = .normal
     ) -> LineData {
@@ -984,7 +984,7 @@ class DiffGenerationUtility {
     /// Builds a lookup table that stores **both** a strict and a loose key for every
     /// file line so that tiny punctuation / case drift does not force a fallback to
     /// the expensive fuzzy path.
-    static func buildLineIndexMapHigh(content: [LineData]) -> [String: [Int]] {
+    package static func buildLineIndexMapHigh(content: [LineData]) -> [String: [Int]] {
         var map: [String: [Int]] = [:]
         map.reserveCapacity(content.count * 2)
         for (i, ln) in content.enumerated() {
@@ -1239,7 +1239,7 @@ class DiffGenerationUtility {
     ///
     /// The function touches at most a few hundred strings, so CPU / RAM overhead
     /// is negligible compared to the n-gram routine it replaces.
-    static func matchSelectorFast(
+    package static func matchSelectorFast(
         selector: [LineData],
         content: [LineData],
         lineIndex: [String: [Int]],
@@ -1413,7 +1413,7 @@ class DiffGenerationUtility {
     /// Copy of matchSelectorFast that throws on ambiguous matches instead of returning the best one.
     /// Behaviour is otherwise identical to matchSelectorFast (including the tiny-selector
     /// fuzzy-probe fallback); only the ambiguity check differs.
-    static func matchSelectorFastWithAmbiguityCheck(
+    package static func matchSelectorFastWithAmbiguityCheck(
         selector: [LineData],
         content: [LineData],
         lineIndex: [String: [Int]],
@@ -1554,9 +1554,9 @@ class DiffGenerationUtility {
         return nil
     }
 
-    private static func withTimeout<T>(
+    private static func withTimeout<T: Sendable>(
         seconds: Double,
-        operation: @escaping () async throws -> T
+        operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
         try await withThrowingTaskGroup(of: T.self) { group in
             group.addTask {

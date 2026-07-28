@@ -1,10 +1,10 @@
 // Utility array helpers used across the app
 import Foundation
 
-extension Array {
+package extension Array {
     /// Splits array into consecutive windows of at most `size`.
     /// Returns [] when size <= 0, per tests.
-    func chunked(into size: Int) -> [[Element]] {
+    package func chunked(into size: Int) -> [[Element]] {
         guard size > 0 else { return [] }
         var result: [[Element]] = []
         result.reserveCapacity((count + size - 1) / size)
@@ -18,7 +18,7 @@ extension Array {
     }
 }
 
-extension Array where Element: Hashable {
+package extension Array where Element: Hashable {
     /// Removes duplicate elements while preserving the first occurrence order.
     /// Operates in-place and runs in O(n).
     mutating func removeDuplicatesInPlace() {

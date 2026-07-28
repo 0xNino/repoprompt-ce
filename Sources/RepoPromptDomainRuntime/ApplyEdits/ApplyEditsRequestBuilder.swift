@@ -2,8 +2,10 @@ import Foundation
 import Logging
 import MCP
 
-struct ApplyEditsRequestBuilder {
-    func build(from args: [String: Value]) throws -> ApplyEditsRequest {
+package struct ApplyEditsRequestBuilder {
+    package init() {}
+
+    package func build(from args: [String: Value]) throws -> ApplyEditsRequest {
         let normalized = MCPToolArgsNormalizer.normalize(
             params: args,
             originalToolName: "apply_edits",
@@ -12,7 +14,7 @@ struct ApplyEditsRequestBuilder {
         return try buildFromPayload(normalized.payload)
     }
 
-    func buildFromNormalizedPayload(_ payload: [String: Value]) throws -> ApplyEditsRequest {
+    package func buildFromNormalizedPayload(_ payload: [String: Value]) throws -> ApplyEditsRequest {
         try buildFromPayload(payload)
     }
 
@@ -286,7 +288,7 @@ struct ApplyEditsRequestBuilder {
 private enum ApplyEditsEchoGuard {
     private static let logger = Logger(label: "com.repoprompt.mcp.applyedits.guard")
 
-    static func validate(replacement: String, path: String) throws {
+    package static func validate(replacement: String, path: String) throws {
         let reasons = hardRejectReasons(replacement)
         guard reasons.isEmpty else {
             let message = "Refusing to apply edit: replacement for '\(path)' contains tool-call artifacts. "

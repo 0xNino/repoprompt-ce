@@ -1,27 +1,27 @@
 import Foundation
 
 /// Optional config struct for controlling various thresholds.
-enum IndentationConfig {
+package enum IndentationConfig {
     /// Maximum absolute shift we allow (in spaces) before falling back or clamping.
-    static let maxAllowedShift: Int = 12
+    package static let maxAllowedShift: Int = 12
     /// Acceptable slope range for affine transforms.
-    static let slopeMin: Double = 0.5
-    static let slopeMax: Double = 2.0
+    package static let slopeMin: Double = 0.5
+    package static let slopeMax: Double = 2.0
     /// Multiplier for median absolute deviation outlier filtering.
-    static let outlierMultiplier: Double = 2.5
+    package static let outlierMultiplier: Double = 2.5
     /// If average indent difference is below this threshold, we consider them "already aligned."
-    static let preCheckThreshold: Double = 1.5
+    package static let preCheckThreshold: Double = 1.5
 
     /// Maximum number of lines to consider when gathering line pairs
     /// (helps prevent O(n^2) blowups on large blocks).
-    static let maxLinePairs: Int = 50
+    package static let maxLinePairs: Int = 50
 
     /// Guard: how many adjacent-indent "shape" sign flips we allow (0.0–1.0 of edges).
-    static let shapeFlipTolerance: Double = 0.4
+    package static let shapeFlipTolerance: Double = 0.4
     /// Guard: max per-edge change as a multiple of a single indent unit.
-    static let shapeEdgeMagnitudeMultiplier: Double = 2.0
+    package static let shapeEdgeMagnitudeMultiplier: Double = 2.0
     /// Hard cap on any absolute shift (in spaces); used to bound effectiveMaxShift.
-    static let hardMaxAllowedShift: Int = maxAllowedShift * 2
+    package static let hardMaxAllowedShift: Int = maxAllowedShift * 2
 }
 
 /**
@@ -33,14 +33,14 @@ enum IndentationConfig {
  - indentSize: The detected indentation size (e.g. 4 spaces or the numeric tab count)
  */
 private struct IndentCache {
-    let rawLines: [String]
-    let indentLevels: [Int]
-    let trimmedLines: [String]
+    package let rawLines: [String]
+    package let indentLevels: [Int]
+    package let trimmedLines: [String]
 
-    let indentType: String
-    let indentSize: Int
+    package let indentType: String
+    package let indentSize: Int
 
-    init(_ lines: [String]) {
+    package init(_ lines: [String]) {
         rawLines = lines
         var levels: [Int] = []
         var trimmed: [String] = []
@@ -62,7 +62,7 @@ private struct IndentCache {
 }
 
 /// A utility for re-indenting snippets to match existing code blocks, optimized to reduce repeated computations.
-class IndentCorrectionUtility {
+package class IndentCorrectionUtility {
     // MARK: - Config Constants
 
     private static let MAX_SHIFT = IndentationConfig.maxAllowedShift
@@ -77,7 +77,7 @@ class IndentCorrectionUtility {
      Attempt to re-indent `newSnippet` so it matches `oldBlock`, leveraging `searchBlock` if possible.
      If everything fails or the transform degrades indentation, fallback to the original snippet lines.
      */
-    static func reIndentUsingSearchBlock(
+    package static func reIndentUsingSearchBlock(
         oldBlock: [String],
         searchBlock: [String],
         newSnippet: [String],
@@ -871,7 +871,7 @@ class IndentCorrectionUtility {
 
     // MARK: - Debug Logging
 
-    static func shouldLogIndentDebug() -> Bool {
+    package static func shouldLogIndentDebug() -> Bool {
         false
     }
 }

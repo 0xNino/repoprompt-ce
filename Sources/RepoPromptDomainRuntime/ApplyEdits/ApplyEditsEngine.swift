@@ -1,11 +1,21 @@
 import Foundation
 
-struct ApplyEditsEngine {
-    let diffEngine: DiffChunkGenerator
-    let patchApplier: DiffChunkApplier
-    let unifiedDiffRenderer: UnifiedDiffRendering
+package struct ApplyEditsEngine {
+    package let diffEngine: DiffChunkGenerator
+    package let patchApplier: DiffChunkApplier
+    package let unifiedDiffRenderer: UnifiedDiffRendering
 
-    static var `default`: ApplyEditsEngine {
+    package init(
+        diffEngine: DiffChunkGenerator,
+        patchApplier: DiffChunkApplier,
+        unifiedDiffRenderer: UnifiedDiffRendering
+    ) {
+        self.diffEngine = diffEngine
+        self.patchApplier = patchApplier
+        self.unifiedDiffRenderer = unifiedDiffRenderer
+    }
+
+    package static var `default`: ApplyEditsEngine {
         ApplyEditsEngine(
             diffEngine: DefaultDiffChunkGenerator(),
             patchApplier: DefaultDiffChunkApplier(),
@@ -13,7 +23,7 @@ struct ApplyEditsEngine {
         )
     }
 
-    func apply(
+    package func apply(
         request: ApplyEditsRequest,
         to originalText: String,
         options: ApplyEditsExecutionOptions = .default
@@ -420,8 +430,10 @@ struct ApplyEditsEngine {
     }
 }
 
-struct DefaultDiffChunkGenerator: DiffChunkGenerator {
-    func makeDiffChunks(
+package struct DefaultDiffChunkGenerator: DiffChunkGenerator {
+    package init() {}
+
+    package func makeDiffChunks(
         filePath: String,
         originalText: String,
         search: String?,
@@ -498,8 +510,8 @@ struct DefaultDiffChunkGenerator: DiffChunkGenerator {
             }
         }
 
-        let encodedSearch = DiffParserUtils.splitContentToLines(searchRaw, usesSpaces)
-        let encodedNew = DiffParserUtils.splitContentToLines(replRaw, usesSpaces)
+        let encodedSearch = ApplyEditsDiffParserUtils.splitContentToLines(searchRaw, usesSpaces)
+        let encodedNew = ApplyEditsDiffParserUtils.splitContentToLines(replRaw, usesSpaces)
 
         let tabPromotionEnabled = String.shouldPromoteLeadingEscapedTabs(
             path: filePath,
@@ -563,8 +575,10 @@ struct DefaultDiffChunkGenerator: DiffChunkGenerator {
     }
 }
 
-struct DefaultDiffChunkApplier: DiffChunkApplier {
-    func apply(chunks: [DiffChunk], to originalText: String) throws -> String {
+package struct DefaultDiffChunkApplier: DiffChunkApplier {
+    package init() {}
+
+    package func apply(chunks: [DiffChunk], to originalText: String) throws -> String {
         guard !chunks.isEmpty else {
             throw ApplyEditsError.internalError("diff generation produced no changes.")
         }
@@ -577,8 +591,10 @@ struct DefaultDiffChunkApplier: DiffChunkApplier {
     }
 }
 
-struct DefaultUnifiedDiffRenderer: UnifiedDiffRendering {
-    func render(filePath: String, chunks: [DiffChunk]) -> String {
+package struct DefaultUnifiedDiffRenderer: UnifiedDiffRendering {
+    package init() {}
+
+    package func render(filePath: String, chunks: [DiffChunk]) -> String {
         let decodedChunks = chunks.map { $0.withDecodedIndentation() }
         return UnifiedDiffGenerator.buildFromEditChunks(
             filePath: filePath,

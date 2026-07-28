@@ -3,7 +3,7 @@ import Foundation
 /// Lightweight utility that remembers, _per distinct processed search block_,
 /// the next line from which a subsequent match should start.
 /// The processed key is identical to the one used by `DiffGenerationUtility`.
-struct DiffEditCursor {
+package struct DiffEditCursor {
     /// processedKey → next start line (1‑based, 0 == unrestricted)
     private var map: [String: Int] = [:]
 

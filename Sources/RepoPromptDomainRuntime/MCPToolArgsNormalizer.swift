@@ -8,32 +8,32 @@ import MCP
 // MARK: - Argument Normalization
 
 /// Result of normalizing MCP tool call arguments
-struct NormalizedArgs {
+package struct NormalizedArgs {
     /// Cleaned argument payload with hidden routing fields removed.
-    var payload: [String: Value]
+    package var payload: [String: Value]
     /// Extracted tab ID if present (for tab binding)
-    var tabID: UUID?
+    package var tabID: UUID?
     /// Extracted window ID if present (for window routing)
-    var windowID: Int?
+    package var windowID: Int?
     /// Extracted logical context ID if present (canonical public binding handle)
-    var contextID: UUID?
+    package var contextID: UUID?
     /// Extracted working directories if present (bind_context-only selector)
-    var workingDirs: [String]
+    package var workingDirs: [String]
     /// Whether caller requested raw JSON output (skip markdown formatting)
-    var rawJSON: Bool = false
+    package var rawJSON: Bool = false
     /// Warnings generated during normalization (e.g., unwrapped tool-name wrapper)
-    var warnings: [String]
+    package var warnings: [String]
 }
 
 /// Pure, stateless helpers for argument sanitization
-enum MCPToolArgsNormalizer {
+package enum MCPToolArgsNormalizer {
     /// Normalize MCP tool call arguments by:
     /// 1. Parsing JSON strings
     /// 2. Unwrapping Codex-style "args" wrappers
     /// 3. Unwrapping tool-name wrappers (e.g., {"apply_edits": {...}})
     /// 4. Stripping hidden routing fields
     /// 5. Repairing malformed replacement keys
-    static func normalize(
+    package static func normalize(
         params: [String: Value]?,
         originalToolName: String,
         canonicalToolName: String
@@ -232,7 +232,7 @@ enum MCPToolArgsNormalizer {
 
     /// Repair malformed edit arguments where replacement text became a property name
     /// Example: {"search": "...", "\tprivate func...": "..."} → {"search": "...", "replace": "..."}
-    static func repairMalformedReplacement(in args: [String: Value]) -> (repaired: [String: Value], didRepair: Bool) {
+    package static func repairMalformedReplacement(in args: [String: Value]) -> (repaired: [String: Value], didRepair: Bool) {
         // Try standard replacement keys first
         let replacementKeys: Set = ["replace", "with", "content"]
         for key in replacementKeys {

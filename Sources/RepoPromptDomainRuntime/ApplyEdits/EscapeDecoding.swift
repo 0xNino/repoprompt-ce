@@ -1,13 +1,13 @@
 import Foundation
 
-enum EscapeDecodingMode: Equatable {
+package enum EscapeDecodingMode: Equatable {
     case none
     case cStyle
     case smartHeuristic
 }
 
-struct EscapeDecoder {
-    func decode(_ text: String, mode: EscapeDecodingMode) -> String {
+package struct EscapeDecoder {
+    package func decode(_ text: String, mode: EscapeDecodingMode) -> String {
         switch mode {
         case .none:
             return text

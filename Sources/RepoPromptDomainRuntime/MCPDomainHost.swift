@@ -67,6 +67,7 @@ package struct MCPDomainHostSnapshot: Equatable, Sendable {
     package let connectionsWithActiveInvocationsCount: Int
     package let activeResourceAdmissionLeaseCount: Int
     package let resourceAdmissionWaiterCount: Int
+    package let terminalConnectionFenceCount: Int
 }
 
 package struct MCPDomainHostDrainResult: Equatable, Sendable {
@@ -109,6 +110,7 @@ package actor MCPDomainHost {
     private var invocationIDsByConnection: [UUID: Set<UUID>] = [:]
     private var requestProgressByStateID: [UUID: RequestProgressRecord] = [:]
     private var terminalConnectionGenerationByID: [UUID: UInt64] = [:]
+    private var releasedConnectionGenerationByID: [UUID: UInt64] = [:]
 
     package init(
         identity: DomainRuntimeIdentity,
@@ -351,6 +353,20 @@ package actor MCPDomainHost {
         }
     }
 
+    /// Releases the terminal-generation fence after routing has removed this exact
+    /// connection generation. If cancelled work is still settling, cleanup is deferred
+    /// until the last matching invocation leaves the active map.
+    package func releaseConnection(
+        connectionID: UUID,
+        connectionGeneration: UInt64
+    ) {
+        releasedConnectionGenerationByID[connectionID] = max(
+            releasedConnectionGenerationByID[connectionID] ?? 0,
+            connectionGeneration
+        )
+        pruneTerminalConnectionFenceIfSafe(connectionID: connectionID)
+    }
+
     package func beginDrain() {
         guard lifecycle == .accepting else { return }
         lifecycle = .draining
@@ -417,7 +433,8 @@ package actor MCPDomainHost {
             activeInvocationCount: activeInvocations.count,
             connectionsWithActiveInvocationsCount: invocationIDsByConnection.count,
             activeResourceAdmissionLeaseCount: admission.activeLeaseCount,
-            resourceAdmissionWaiterCount: admission.waiterCount
+            resourceAdmissionWaiterCount: admission.waiterCount,
+            terminalConnectionFenceCount: terminalConnectionGenerationByID.count
         )
     }
 
@@ -488,7 +505,21 @@ package actor MCPDomainHost {
         if invocationIDsByConnection[invocation.connectionID]?.isEmpty == true {
             invocationIDsByConnection.removeValue(forKey: invocation.connectionID)
         }
+        pruneTerminalConnectionFenceIfSafe(connectionID: invocation.connectionID)
         markDrainedIfSettled()
+    }
+
+    private func pruneTerminalConnectionFenceIfSafe(connectionID: UUID) {
+        guard let terminalGeneration = terminalConnectionGenerationByID[connectionID],
+              let releasedGeneration = releasedConnectionGenerationByID[connectionID],
+              releasedGeneration >= terminalGeneration
+        else { return }
+        let hasUnsettledGeneration = activeInvocations.values.contains {
+            $0.connectionID == connectionID && $0.connectionGeneration <= releasedGeneration
+        }
+        guard !hasUnsettledGeneration else { return }
+        terminalConnectionGenerationByID.removeValue(forKey: connectionID)
+        releasedConnectionGenerationByID.removeValue(forKey: connectionID)
     }
 
     private func isConnectionGenerationTerminal(

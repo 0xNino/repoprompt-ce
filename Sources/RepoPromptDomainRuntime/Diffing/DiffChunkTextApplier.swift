@@ -1,7 +1,7 @@
 import Foundation
 
-enum DiffChunkTextApplier {
-    static func apply(chunks: [DiffChunk], to originalText: String) throws -> String {
+package enum DiffChunkTextApplier {
+    package static func apply(chunks: [DiffChunk], to originalText: String) throws -> String {
         guard !chunks.isEmpty else {
             return originalText
         }

@@ -7,9 +7,10 @@
 
 import Darwin
 import Foundation
+import RepoPromptC
 
 public extension String {
-    internal static func truncateModelName(_ text: String, maxLength: Int = 40) -> String {
+    package static func truncateModelName(_ text: String, maxLength: Int = 40) -> String {
         if text.count <= maxLength {
             return text
         }
@@ -25,14 +26,14 @@ public extension String {
         return "…\(text[startIndex...])"
     }
 
-    internal func similarity(to other: String) -> Double {
+    package func similarity(to other: String) -> Double {
         similarityFast(to: other)
     }
 
     /// Fast similarity calculation using hybrid approach
     /// - For strings ≤ 64 chars: optimized Levenshtein with single row
     /// - For longer strings: Dice coefficient (linear time, allocation-free)
-    internal func similarityFast(to other: String) -> Double {
+    package func similarityFast(to other: String) -> Double {
         withCString { aPtr in
             other.withCString { bPtr in
                 repo_similarity_score(aPtr, bPtr)
@@ -40,7 +41,7 @@ public extension String {
         }
     }
 
-    internal func isSimilar(to other: String, threshold: Double) -> Bool {
+    package func isSimilar(to other: String, threshold: Double) -> Bool {
         let trimmedSelf = trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedOther = other.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -62,7 +63,7 @@ public extension String {
         return trimmedSelf.similarityFast(to: trimmedOther) >= threshold
     }
 
-    internal func longestCommonSubsequence(with other: String) -> String {
+    package func longestCommonSubsequence(with other: String) -> String {
         withCString { aPtr in
             other.withCString { bPtr in
                 guard let cRes = repo_longest_common_subsequence(aPtr, bPtr) else {
@@ -83,7 +84,7 @@ public extension String {
 
     /// Public, full-distance call (preserves previous API surface).
     /// Falls back to the optimized core without a cap.
-    internal func levenshteinDistance(to other: String) -> Int {
+    package func levenshteinDistance(to other: String) -> Int {
         withCString { aPtr in
             other.withCString { bPtr in
                 Int(repo_levenshtein_distance(aPtr, bPtr, -1))
@@ -93,7 +94,7 @@ public extension String {
 
     /// Public capped-distance overload. Returns `maxAllowedDistance + 1` when the true
     /// edit distance is guaranteed to exceed the supplied cap (useful for fast threshold checks).
-    internal func levenshteinDistance(to other: String, maxAllowedDistance: Int) -> Int {
+    package func levenshteinDistance(to other: String, maxAllowedDistance: Int) -> Int {
         withCString { aPtr in
             other.withCString { bPtr in
                 Int(repo_levenshtein_distance(aPtr, bPtr, Int32(maxAllowedDistance)))
@@ -101,7 +102,7 @@ public extension String {
         }
     }
 
-    internal func splitIntoLines(usesSpaces: Bool, indentSize: Int) -> [String] {
+    package func splitIntoLines(usesSpaces: Bool, indentSize: Int) -> [String] {
         let (lines, _) = String.splitContentPreservingLineEndings(self)
         return lines.map { line in
             // Since we assume spaces, use encodeIndentationAsSpaces
@@ -109,7 +110,7 @@ public extension String {
         }
     }
 
-    static func splitContentPreservingLineEndings(_ content: String) -> ([String], String) {
+    package static func splitContentPreservingLineEndings(_ content: String) -> ([String], String) {
         content.withCString { contentPtr in
             guard let result = repo_split_content_preserving_endings(contentPtr) else {
                 return ([], "\n")
@@ -133,7 +134,7 @@ public extension String {
         }
     }
 
-    static func encodeIndentationAsTabs(_ line: String) -> String {
+    package static func encodeIndentationAsTabs(_ line: String) -> String {
         // Separate the leading whitespace from the rest of the line
         let indentation = line.prefix { $0.isWhitespace }
         let contentStart = line.index(line.startIndex, offsetBy: indentation.count)
@@ -157,7 +158,7 @@ public extension String {
         }
     }
 
-    static func encodeIndentation(_ line: String, fallbackIndentationType: String = "s") -> String {
+    package static func encodeIndentation(_ line: String, fallbackIndentationType: String = "s") -> String {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         let indentation = line.prefix(while: { $0.isWhitespace })
 
@@ -194,7 +195,7 @@ public extension String {
     /// Examples:
     ///   "    foo" encoded as tabs becomes "<t1>foo"
     ///   "\tbar" encoded as spaces becomes "<s4>bar"
-    static func encodeIndentationWithConversion(_ line: String, desiredIndentationType: String = "s") -> String {
+    package static func encodeIndentationWithConversion(_ line: String, desiredIndentationType: String = "s") -> String {
         // Get the content without leading/trailing whitespace.
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         // Capture the leading whitespace.
@@ -260,13 +261,13 @@ public extension String {
         }
     }
 
-    static func encodeIndentationAsSpacesPreservingLineEndings(_ text: String) -> String {
+    package static func encodeIndentationAsSpacesPreservingLineEndings(_ text: String) -> String {
         let (lines, lineEnding) = String.splitContentPreservingLineEndings(text)
         let encodedLines = lines.map { String.encodeIndentationAsSpaces($0) }
         return encodedLines.joined(separator: lineEnding)
     }
 
-    static func encodeIndentationAsSpaces(_ line: String) -> String {
+    package static func encodeIndentationAsSpaces(_ line: String) -> String {
         // Split leading whitespace and remainder
         line.withCString { cLine in
             guard let raw = repo_encode_indentation(cLine, CChar(115)) else {
@@ -277,7 +278,7 @@ public extension String {
         }
     }
 
-    static func decodeIndentation(_ encodedLine: String) -> String {
+    package static func decodeIndentation(_ encodedLine: String) -> String {
         let parts = encodedLine.split(separator: ">", maxSplits: 1) // anchor placeholder
         _ = parts // silence unused-var warning
         return encodedLine.withCString { cLine in
@@ -289,7 +290,7 @@ public extension String {
         }
     }
 
-    static func decodeIndentationPreservingAllLineEndings(_ content: String) -> String {
+    package static func decodeIndentationPreservingAllLineEndings(_ content: String) -> String {
         let linesWithEndings = splitContentPreservingAllLineEndings(content)
         let decoded: [String] = linesWithEndings.map { pair in
             let decodedLine = decodeIndentation(pair.line)
@@ -298,7 +299,7 @@ public extension String {
         return decoded.joined()
     }
 
-    static func trimCommonLeadingWhitespacePreservingLineEndings(_ content: String) -> String {
+    package static func trimCommonLeadingWhitespacePreservingLineEndings(_ content: String) -> String {
         content.withCString { ptr in
             guard let raw = repo_trim_common_leading_whitespace_preserving_endings(ptr) else {
                 return content
@@ -310,7 +311,7 @@ public extension String {
 
     /// Extracts the indentation type and count from an encoded indentation string.
     /// For example, given "<t4>some code", it returns ("t", 4).
-    static func getIndentationEncoding(from encodedLine: String) -> (type: String, count: Int) {
+    package static func getIndentationEncoding(from encodedLine: String) -> (type: String, count: Int) {
         // Split the line at the first ">" to isolate the encoding tag.
         let parts = encodedLine.split(separator: ">", maxSplits: 1)
         guard let tag = parts.first, tag.count >= 2 else {
@@ -330,7 +331,7 @@ public extension String {
 
     /// Given an array of encoded lines, returns the indentation type and size
     /// from the first non-empty decoded line. If none found, defaults to spaces (size 4).
-    static func detectIndentationTypeFromEncodedLines(_ lines: [String]) -> (type: String, size: Int) {
+    package static func detectIndentationTypeFromEncodedLines(_ lines: [String]) -> (type: String, size: Int) {
         for line in lines {
             let decoded = String.decodeIndentation(line)
             if !decoded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -341,7 +342,7 @@ public extension String {
         return ("s", 4)
     }
 
-    static func splitContentPreservingAllLineEndings(_ content: String) -> [(line: String, ending: String)] {
+    package static func splitContentPreservingAllLineEndings(_ content: String) -> [(line: String, ending: String)] {
         guard !content.isEmpty else { return [] }
 
         var result: [(String, String)] = []
@@ -384,7 +385,7 @@ public extension String {
         return result
     }
 
-    static func removeIndentationTag(_ encodedLine: String) -> String {
+    package static func removeIndentationTag(_ encodedLine: String) -> String {
         // Only split if there’s an actual '>' in the first few characters
         guard encodedLine.hasPrefix("<s") || encodedLine.hasPrefix("<t"),
               let closeIndex = encodedLine.firstIndex(of: ">")
@@ -397,7 +398,7 @@ public extension String {
         return String(encodedLine[nextIndex...])
     }
 
-    static func detectIndentationTypeFromLines(_ lines: [String]) -> (type: String, size: Int) {
+    package static func detectIndentationTypeFromLines(_ lines: [String]) -> (type: String, size: Int) {
         var tabCount = 0
         var spaceCount = 0
         var spaceSizes: [Int] = []
@@ -441,12 +442,12 @@ public extension String {
         }
     }
 
-    static func detectIndentationType(_ content: String) -> (type: String, size: Int) {
+    package static func detectIndentationType(_ content: String) -> (type: String, size: Int) {
         let (lines, _) = splitContentPreservingLineEndings(content)
         return detectIndentationTypeFromLines(lines)
     }
 
-    internal func ranges(of substring: String, options: String.CompareOptions = []) -> [Range<Index>] {
+    package func ranges(of substring: String, options: String.CompareOptions = []) -> [Range<Index>] {
         var ranges: [Range<Index>] = []
         var startIndex = startIndex
 
@@ -460,7 +461,7 @@ public extension String {
         return ranges
     }
 
-    internal func escapedString() -> String {
+    package func escapedString() -> String {
         withCString { ptr in
             guard let raw = repo_escape_string(ptr) else { return self }
             defer { free(raw) }
@@ -468,7 +469,7 @@ public extension String {
         }
     }
 
-    internal func unescaped() -> String {
+    package func unescaped() -> String {
         withCString { ptr in
             guard let raw = repo_unescape_string(ptr) else { return self }
             defer { free(raw) }
@@ -479,7 +480,7 @@ public extension String {
     /// Static regex for indentation level extraction
     private static let indentationLevelRegex = try! NSRegularExpression(pattern: "^<([st])(\\d+)>")
 
-    static func getIndentationLevel(from line: String) -> Int {
+    package static func getIndentationLevel(from line: String) -> Int {
         guard let match = indentationLevelRegex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
               let countRange = Range(match.range(at: 2), in: line)
         else {
@@ -492,7 +493,7 @@ public extension String {
     private static let indentationDeltaRegex = try! NSRegularExpression(pattern: "^<([st])(\\d+)>(.*)$")
 
     /// Apply a delta to the indentation level of a line. If no tag is found, assume `<s0>`.
-    static func applyIndentationDelta(to line: String, delta: Int) -> String {
+    package static func applyIndentationDelta(to line: String, delta: Int) -> String {
         guard let match = indentationDeltaRegex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) else {
             let newIndent = Swift.max(0, delta)
             return "<s\(newIndent)>\(line)"
@@ -512,7 +513,7 @@ public extension String {
     /// and returns the mode of (targetIndent - sourceIndent).
     ///
     /// If either line is empty (or effectively empty) we skip it.
-    static func computeIndentationDeltaForBlocks(_ source: [String], _ target: [String]) -> Int {
+    package static func computeIndentationDeltaForBlocks(_ source: [String], _ target: [String]) -> Int {
         guard !source.isEmpty, !target.isEmpty else { return 0 }
 
         var deltas: [Int: Int] = [:]
@@ -543,14 +544,14 @@ public extension String {
     /// Applies the given indentation delta to each line in the block,
     /// preserving the same tag type (<s or <t>) as found in the line.
     /// If no tag is found, defaults to `<s0>` style plus delta (or zero if negative).
-    static func applyIndentationDeltaToBlock(_ lines: [String], _ delta: Int) -> [String] {
+    package static func applyIndentationDeltaToBlock(_ lines: [String], _ delta: Int) -> [String] {
         lines.map { line in
             String.applyIndentationDelta(to: line, delta: delta)
         }
     }
 
     /// If snippet uses tabs and file uses spaces (or vice versa), convert.
-    static func matchIndentation(_ line: String, snippetIndentType: String, fileIndentType: String) -> String {
+    package static func matchIndentation(_ line: String, snippetIndentType: String, fileIndentType: String) -> String {
         if snippetIndentType == "t", fileIndentType == "s" {
             return String.convertTabsToSpaces(line)
         } else if snippetIndentType == "s", fileIndentType == "t" {
@@ -560,7 +561,7 @@ public extension String {
     }
 
     /// Convert a line containing tabs to the same line with spaces (4 spaces per tab).
-    static func convertTabsToSpaces(_ line: String) -> String {
+    package static func convertTabsToSpaces(_ line: String) -> String {
         // Decode existing indentation tags (e.g. <t4>, <s8>) so we get actual tabs/spaces in the string
         let decoded = String.decodeIndentation(line)
         // Replace all tab characters with 4 spaces
@@ -570,7 +571,7 @@ public extension String {
     }
 
     /// Convert a line containing spaces (groups of 4) to the same line with tabs (1 tab per 4 spaces).
-    static func convertSpacesToTabs(_ line: String) -> String {
+    package static func convertSpacesToTabs(_ line: String) -> String {
         let decoded = String.decodeIndentation(line)
         let fourSpaces = String(repeating: " ", count: 4)
         let replaced = decoded.replacingOccurrences(of: fourSpaces, with: "\t")
@@ -583,7 +584,7 @@ public extension String {
     ///
     /// If `snippet` has only one line, we apply a single uniform delta to all lines
     /// by making `blockDelta` = `topLineDelta`.
-    static func computeTwoStageIndentationDelta(
+    package static func computeTwoStageIndentationDelta(
         source: [String],
         snippet: [String]
     ) -> (topLineDelta: Int, blockDelta: Int) {
@@ -620,7 +621,7 @@ public extension String {
     ///  - `blockDelta` to lines [1..N]
     /// If during application we detect that lines with different original indentation
     /// have collapsed to the same indentation, we short-circuit and skip all adjustment.
-    static func applyTwoStageIndentationDeltaToBlock(
+    package static func applyTwoStageIndentationDeltaToBlock(
         _ lines: [String],
         topLineDelta: Int,
         blockDelta: Int
@@ -712,7 +713,7 @@ public extension String {
      but the `transformed` snippet has only 1 or fewer.
      This indicates that the transform effectively flattened multi-level indentation.
      */
-    static func snippetCollapsedMultiLevels(
+    package static func snippetCollapsedMultiLevels(
         original: [String],
         transformed: [String]
     ) -> Bool {
@@ -735,7 +736,7 @@ public extension String {
     ///  4) Fuzzy similarity using `String.similarity(to:)` with a tight threshold (e.g., 0.9)
     ///
     /// Returns nil if nothing meets that threshold.
-    static func findClosestPath(_ requested: String, among allowed: [String]) -> String? {
+    package static func findClosestPath(_ requested: String, among allowed: [String]) -> String? {
         // 1) Direct exact match
         if allowed.contains(requested) {
             return requested
@@ -822,7 +823,7 @@ public extension String {
     }
 
     /// Decodes common HTML entities like <, >, &, etc.
-    internal func decodingHTMLEntities() -> String {
+    package func decodingHTMLEntities() -> String {
         withCString { ptr in
             guard let raw = repo_decode_html_entities(ptr) else { return self }
             defer { free(raw) }
@@ -830,23 +831,8 @@ public extension String {
         }
     }
 
-    internal func oldDecodingHTMLEntities() -> String {
-        guard let data = data(using: .utf8) else {
-            return self
-        }
-
-        guard let decoded = try? NSAttributedString(
-            data: data,
-            options: [
-                .documentType: NSAttributedString.DocumentType.html,
-                .characterEncoding: String.Encoding.utf8.rawValue
-            ],
-            documentAttributes: nil
-        ) else {
-            return self
-        }
-
-        return decoded.string
+    package func oldDecodingHTMLEntities() -> String {
+		decodingHTMLEntities()
     }
 
     /*
@@ -880,11 +866,11 @@ public extension String {
      }
      */
 
-    internal func diceCoefficient(against other: String) -> Double {
+    package func diceCoefficient(against other: String) -> Double {
         diceCoefficientFast(self, other)
     }
 
-    internal func isFuzzyMatch(to other: String, threshold: Double = 0.65) -> Bool {
+    package func isFuzzyMatch(to other: String, threshold: Double = 0.65) -> Bool {
         if range(of: other, options: .caseInsensitive) != nil { return true }
         if abs(count - other.count) > 6 { return false }
         return diceCoefficientFast(self, other) >= threshold
@@ -893,7 +879,7 @@ public extension String {
     // MARK: – Allocation‑free Dice coefficient ------------------------------------
 
     @inline(__always)
-    internal func diceCoefficientFast(_ a: String, _ b: String) -> Double {
+    package func diceCoefficientFast(_ a: String, _ b: String) -> Double {
         a.withCString { aPtr in
             b.withCString { bPtr in
                 repo_dice_coefficient(aPtr, bPtr)
@@ -907,7 +893,7 @@ public extension String {
     /// This keeps the algorithm deterministic while avoiding the cost of
     /// `NSRegularExpression` – it's a straightforward linear scan.
     @inline(__always)
-    internal func condensingWhitespace() -> String {
+    package func condensingWhitespace() -> String {
         withCString { ptr in
             guard let raw = repo_condense_whitespace(ptr) else { return self }
             defer { free(raw) }
@@ -917,7 +903,7 @@ public extension String {
 
     /// 64‑bit FNV‑1a (mirrors the helper in DiffGenerationUtility)
     @inline(__always)
-    internal func fnv1a64() -> UInt64 {
+    package func fnv1a64() -> UInt64 {
         withCString { ptr in
             repo_fnv1a64(ptr)
         }
@@ -925,7 +911,7 @@ public extension String {
 
     /// Fuzzy space matching - spaces in pattern match any amount of whitespace in text
     @inline(__always)
-    internal func fuzzySpaceMatch(_ text: String, caseInsensitive: Bool = false) -> Bool {
+    package func fuzzySpaceMatch(_ text: String, caseInsensitive: Bool = false) -> Bool {
         withCString { patternPtr in
             text.withCString { textPtr in
                 repo_fuzzy_space_match(patternPtr, textPtr, caseInsensitive ? 1 : 0) != 0
@@ -935,7 +921,7 @@ public extension String {
 
     /// Generates a canonical key for string comparison
     @inline(__always)
-    internal static func canonicalKey(_ raw: String) -> String? {
+    package static func canonicalKey(_ raw: String) -> String? {
         raw.withCString { ptr in
             guard let result = repo_canonical_key(ptr) else { return nil }
             defer { free(result) }
@@ -945,7 +931,7 @@ public extension String {
 
     /// Finds the best dice coefficient match among candidates
     @inline(__always)
-    internal static func bulkDiceBestMatch(pattern: String, candidates: [String], threshold: Double) -> (index: Int, score: Double)? {
+    package static func bulkDiceBestMatch(pattern: String, candidates: [String], threshold: Double) -> (index: Int, score: Double)? {
         guard !candidates.isEmpty else { return nil }
 
         // For now, use a simple approach that keeps strings alive
@@ -979,7 +965,7 @@ public extension String {
     ///   "<s0>\\t\\tfoo"  → "<s8>foo"    (4-space tab stop)
     ///   "<t1>\\tbar"     → "<t2>bar"
     ///   "<s4>\\u0009baz" → "<s8>baz"
-    static func promoteEscapedTabsInEncodedLine(_ line: String, spacesTabStop: Int = 4, enabled: Bool = true) -> String {
+    package static func promoteEscapedTabsInEncodedLine(_ line: String, spacesTabStop: Int = 4, enabled: Bool = true) -> String {
         guard enabled else { return line }
         guard
             let match = encodedIndentRegex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line))
@@ -1007,7 +993,7 @@ public extension String {
     }
 
     /// Vectorized promotion over a block of encoded lines (idempotent).
-    static func promoteEscapedTabsInEncodedLines(_ lines: [String], spacesTabStop: Int = 4, enabled: Bool = true) -> [String] {
+    package static func promoteEscapedTabsInEncodedLines(_ lines: [String], spacesTabStop: Int = 4, enabled: Bool = true) -> [String] {
         guard enabled else { return lines }
         return lines.map { promoteEscapedTabsInEncodedLine($0, spacesTabStop: spacesTabStop, enabled: enabled) }
     }
@@ -1019,7 +1005,7 @@ public extension String {
     ]
 
     /// Returns false for TeX/LaTeX paths (and for strong LaTeX markers in content).
-    static func shouldPromoteLeadingEscapedTabs(
+    package static func shouldPromoteLeadingEscapedTabs(
         path: String,
         searchRaw: String? = nil,
         replaceRaw: String? = nil
@@ -1042,7 +1028,7 @@ public extension String {
 
     /// Scan for encoded lines whose *content* still begins with a literal "\t" or "\u0009".
     /// Useful for diagnostics/logging. Returns zero-based indices.
-    static func findLinesWithLeadingEscapedTabs(_ lines: [String]) -> [Int] {
+    package static func findLinesWithLeadingEscapedTabs(_ lines: [String]) -> [Int] {
         var bad: [Int] = []
         for (i, line) in lines.enumerated() {
             guard
@@ -1060,7 +1046,7 @@ public extension String {
     /// Returns a substring starting at `offset` (character-based) and,
     /// if `length` is supplied, spanning at most that many characters.
     /// All indices are clipped safely – never crashes on out-of-range values.
-    internal func slice(from offset: Int = 0, length: Int? = nil) -> String {
+    package func slice(from offset: Int = 0, length: Int? = nil) -> String {
         guard !isEmpty else { return "" }
         let safeStart = Swift.max(0, offset)
         guard safeStart < count else { return "" }

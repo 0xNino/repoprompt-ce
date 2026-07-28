@@ -123,8 +123,24 @@ package struct DomainRunLaunchReservationRequest: Sendable {
     }
 }
 
+package struct DomainRunLaunchRedemption: Equatable, Sendable {
+    package let binding: DomainConnectionBindingSnapshot
+    package let restrictedTools: Set<String>
+    package let additionalTools: Set<String>
+
+    package init(
+        binding: DomainConnectionBindingSnapshot,
+        restrictedTools: Set<String>,
+        additionalTools: Set<String>
+    ) {
+        self.binding = binding
+        self.restrictedTools = restrictedTools
+        self.additionalTools = additionalTools
+    }
+}
+
 package enum DomainRunLaunchRedemptionResult: Equatable, Sendable {
-    case accepted(DomainConnectionBindingSnapshot)
+    case accepted(DomainRunLaunchRedemption)
     case unknown
     case expired
     case alreadyConsumed
@@ -541,7 +557,11 @@ package actor DomainRoutingCoordinator {
         tokenRecords[digest] = record
         pendingRunContexts.removeValue(forKey: record.request.runID)
         revision &+= 1
-        return .accepted(binding)
+        return .accepted(DomainRunLaunchRedemption(
+            binding: binding,
+            restrictedTools: record.request.restrictedTools,
+            additionalTools: record.request.additionalTools
+        ))
     }
 
     package func revokeLaunchToken(_ tokenID: UUID) {

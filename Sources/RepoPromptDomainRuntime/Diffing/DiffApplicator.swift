@@ -1,7 +1,6 @@
 import Foundation
-import SwiftUI
 
-enum DiffApplicationError: Error {
+package enum DiffApplicationError: Error {
     case lineMismatch(expected: String, actual: String, line: Int)
     case outOfBounds(line: Int, contentSize: Int)
     case contextMismatch(expected: String, actual: String, line: Int)
@@ -10,14 +9,14 @@ enum DiffApplicationError: Error {
     case changeNotApplied
 }
 
-enum EditOperation {
+package enum EditOperation {
     case keep(String)
     case insert(String)
     case delete(String)
 }
 
-enum DiffApplicator {
-    static func apply(_ diffChunk: DiffChunk, to content: [String], startingAt startLine: Int) throws -> [String] {
+package enum DiffApplicator {
+    package static func apply(_ diffChunk: DiffChunk, to content: [String], startingAt startLine: Int) throws -> [String] {
         guard startLine >= 0, startLine <= content.count else {
             throw DiffApplicationError.outOfBounds(line: startLine, contentSize: content.count)
         }
@@ -54,7 +53,7 @@ enum DiffApplicator {
         return result
     }
 
-    static func revert(_ diffChunk: DiffChunk, from content: [String], startingAt startLine: Int) throws -> [String] {
+    package static func revert(_ diffChunk: DiffChunk, from content: [String], startingAt startLine: Int) throws -> [String] {
         // Handle the case of an empty file
         if content.isEmpty {
             return []
@@ -145,7 +144,7 @@ enum DiffApplicator {
         return result
     }
 
-    static func myersDiff(a: [String], b: [String]) throws -> [EditOperation] {
+    package static func myersDiff(a: [String], b: [String]) throws -> [EditOperation] {
         let n = a.count
         let m = b.count
         let max = n + m
@@ -219,7 +218,7 @@ enum DiffApplicator {
         return editOperations.reversed()
     }
 
-    static func ratio(_ a: [String], _ b: [String]) -> Double {
+    package static func ratio(_ a: [String], _ b: [String]) -> Double {
         let lcs = longestCommonSubsequence(a.joined(separator: "\n"), b.joined(separator: "\n"))
         return Double(2 * lcs.count) / Double(a.joined(separator: "\n").count + b.joined(separator: "\n").count)
     }

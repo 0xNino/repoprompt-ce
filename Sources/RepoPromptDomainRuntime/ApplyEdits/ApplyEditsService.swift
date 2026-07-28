@@ -1,10 +1,15 @@
 import Foundation
 
-struct ApplyEditsService {
-    let engine: ApplyEditsEngine
-    let host: FileEditHost
+package struct ApplyEditsService {
+    package let engine: ApplyEditsEngine
+    package let host: FileEditHost
 
-    func run(
+    package init(engine: ApplyEditsEngine, host: FileEditHost) {
+        self.engine = engine
+        self.host = host
+    }
+
+    package func run(
         _ request: ApplyEditsRequest,
         options: ApplyEditsExecutionOptions = .default
     ) async throws -> ApplyEditsResult {
@@ -33,7 +38,7 @@ struct ApplyEditsService {
         return result.withFileMetadata(created: !previewResult.exists, overwritten: false)
     }
 
-    func preview(
+    package func preview(
         _ request: ApplyEditsRequest,
         options: ApplyEditsExecutionOptions = .default
     ) async throws -> (exists: Bool, originalText: String?, result: ApplyEditsResult) {

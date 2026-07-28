@@ -35,11 +35,24 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             "Window catalog should keep .git providers ordered as git, manage_worktree."
         )
 
-        if ProcessInfo.processInfo.environment["RECORD_MCP_WINDOW_TOOL_CATALOG"] == "1" {
-            print(Self.renderGolden(signatures))
-        }
-
         XCTAssertEqual(signatures, Self.expectedSignatures)
+    }
+
+    func testShippingAppRegistrationUsesCanonicalTwentySevenSchemaFingerprints() async throws {
+        let window = Self.makeWindowWithoutAutoStart()
+        let expected = try Dictionary(uniqueKeysWithValues: MCPDomainCanonicalToolDefinitions.definitions.map {
+            try ($0.name, MCPDomainToolFingerprint(definition: $0))
+        })
+        try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+        let registration = try await ServiceRegistry.register(
+            window.mcpServer.windowMCPToolCatalogService
+        )
+        let snapshot = await AppDomainRuntimeComposition.shared.runtime.toolRegistry.snapshot()
+
+        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definitions.count, 27)
+        XCTAssertEqual(snapshot.fingerprintsByToolName, expected)
+        XCTAssertEqual(Set(snapshot.toolNames), Set(MCPDomainToolCatalog.orderedToolNames))
+        await ServiceRegistry.unregister(registration.handle)
     }
 
     func testLongRunningAppRegistrationPreservesTypedAuthoritativeRoutingDenial() async throws {

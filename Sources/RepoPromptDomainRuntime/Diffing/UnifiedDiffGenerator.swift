@@ -8,19 +8,19 @@
 import Foundation
 
 /// Generates standard unified diff format from file changes
-enum UnifiedDiffGenerator {
+package enum UnifiedDiffGenerator {
     // MARK: - Configuration Constants
 
     private static let gapToSplitMultiplier: Int = 2 // ≥ ctx*2 → split
 
     // MARK: - Diff Stats Helpers
 
-    static func diffChunks(oldLines: [String], newLines: [String], context: Int = 3) -> [DiffChunk] {
+    package static func diffChunks(oldLines: [String], newLines: [String], context: Int = 3) -> [DiffChunk] {
         guard oldLines != newLines else { return [] }
         return generateRewriteDiff(fileContent: oldLines, newContent: newLines, context: context)
     }
 
-    static func stats(from chunks: [DiffChunk]) -> (linesChanged: Int, chunks: Int) {
+    package static func stats(from chunks: [DiffChunk]) -> (linesChanged: Int, chunks: Int) {
         let linesChanged = chunks.reduce(0) { sum, chunk in
             let adds = chunk.lines.count(where: { $0.type == .addition })
             let rems = chunk.lines.count(where: { $0.type == .removal })
@@ -29,7 +29,7 @@ enum UnifiedDiffGenerator {
         return (linesChanged, chunks.count)
     }
 
-    static func build(filePath: String, chunks: [DiffChunk], context: Int = 3) -> String {
+    package static func build(filePath: String, chunks: [DiffChunk], context: Int = 3) -> String {
         _ = context
         guard !chunks.isEmpty else { return "" }
         let headerPath = filePath.hasPrefix("/") ? String(filePath.dropFirst()) : filePath
@@ -53,14 +53,14 @@ enum UnifiedDiffGenerator {
     // MARK: - Fast path: build unified diff from precomputed DiffChunks
 
     /// Diff chunks produced by DiffGenerationUtility (used by apply_edits) use 0-based startLine.
-    enum StartLineBase {
+    package enum StartLineBase {
         case zeroBased
         case oneBased
     }
 
     /// Builds a unified diff directly from already-generated chunks (no Myers re-diff).
     /// This is the key optimization for verbose apply_edits.
-    static func buildFromEditChunks(
+    package static func buildFromEditChunks(
         filePath: String,
         chunks: [DiffChunk],
         startLineBase: StartLineBase = .zeroBased
@@ -99,7 +99,7 @@ enum UnifiedDiffGenerator {
     ///   - filePath: Path shown in the header (relative)
     ///   - context: Number of context lines to include around each hunk (default = 3)
     /// - Returns: A ready-to-display/export unified diff string
-    static func build(
+    package static func build(
         oldLines: [String]?,
         newLines: [String]?,
         filePath: String,
@@ -146,7 +146,7 @@ enum UnifiedDiffGenerator {
     // MARK: - Whitespace-only change filtering
 
     /// Remove whitespace-only add/remove pairs from diff chunks.
-    static func removeWhitespaceOnlyChanges(from chunks: [DiffChunk]) -> [DiffChunk] {
+    package static func removeWhitespaceOnlyChanges(from chunks: [DiffChunk]) -> [DiffChunk] {
         var output: [DiffChunk] = []
         for chunk in chunks {
             let lines = chunk.lines
