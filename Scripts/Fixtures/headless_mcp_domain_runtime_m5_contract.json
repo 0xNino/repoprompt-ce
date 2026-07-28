@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "milestone": "M5",
+  "base_milestone": "M4B",
+  "migrated_tools": [
+    "oracle_utils",
+    "ask_oracle",
+    "oracle_send",
+    "context_builder",
+    "ask_user",
+    "agent_explore",
+    "agent_run",
+    "agent_manage",
+    "share_thoughts",
+    "set_status",
+    "wait_for_next_user_instruction"
+  ],
+  "authority": {
+    "session_store": "DomainAgentRunSessionStore",
+    "interaction": "DomainInteractionBroker",
+    "activity": "DomainActivityCenter",
+    "credential_fallback": "DomainCredentialEnvelopeStore",
+    "shared_provider": "MCPDomainLongRunningToolProvider",
+    "app_registration_composition": "ServiceRegistry wraps physical bindings through longRunningToolProvider then protectedMutationProvider",
+    "physical_backend_owner": "injected app/provider adapter; never lifecycle authority"
+  },
+  "session_fences": [
+    "runtime_id",
+    "runtime_generation",
+    "registration_generation",
+    "activation_id",
+    "epoch_ordinal",
+    "continuity_generation",
+    "terminal_commit_id"
+  ],
+  "session_lifecycle": {
+    "parked_wait_cancellation": "exact waiter returns cancelled",
+    "terminal_snapshot_ttl_seconds": 300,
+    "retained_committed_epoch_limit": 32,
+    "shutdown": "bounded cancellation request followed by interrupted metadata",
+    "durable_restore": "metadata only; nonterminal records become dormant",
+    "resume": "explicit claim creates a new runtime-owned registration",
+    "false_transient_restoration_allowed": false
+  },
+  "interaction": {
+    "precedence": ["negotiated_elicitation", "app_ui", "immediate_unavailable"],
+    "settlement": "exactly_once_generation_fenced",
+    "terminal_paths": ["response", "timed_out", "cancelled", "unavailable", "failed"],
+    "late_response": "ignored_and_counted"
+  },
+  "child_launch": {
+    "carrier": "DomainChildLaunchCarrier",
+    "harness": "DomainPrivateChildLaunchHarness",
+    "endpoint_environment_key": "REPOPROMPT_MCP_PRIVATE_ENDPOINT",
+    "token_environment_key": "REPOPROMPT_MCP_LAUNCH_TOKEN",
+    "credential_envelope_environment_key": "REPOPROMPT_MCP_CREDENTIAL_ENVELOPE",
+    "token_use": "single_use_runtime_generation_fenced",
+    "real_private_endpoint": "deferred_to_M6B"
+  },
+  "credentials": {
+    "packaged_child_keychain_evidence": "unresolved_M0_procedure_record",
+    "fallback": "parent_owned_in_memory_minimum_scope_single_use_envelope",
+    "persisted_secret_bytes": false,
+    "redacted_descriptions": true,
+    "zero_on_consume_revoke_shutdown": true
+  },
+  "approval": {
+    "ai_cost_action": "ai_cost",
+    "external_process_action": "external_process",
+    "app_proxy": "verified_process_compatibility",
+    "headless": "explicit_ephemeral_or_persistent_grant",
+    "revalidation": "immediately_before_physical_backend"
+  },
+  "activity": {
+    "publication": "monotonic_sequence",
+    "terminal_commit": "exactly_once",
+    "runtime_snapshot_counts": true,
+    "shutdown_active_state": "cancelled"
+  },
+  "public_contract": {
+    "schema_behavior": "wrapped_binding_definition_preserved",
+    "proxy_behavior_changed": false,
+    "catalog_changed": false
+  },
+  "excluded": [
+    "M6 host extraction",
+    "M6 direct stdio backend",
+    "M6 real private child listener",
+    "M7 automatic cutover",
+    "M7 compatibility cleanup"
+  ]
+}
