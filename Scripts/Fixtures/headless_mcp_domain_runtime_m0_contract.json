@@ -68,6 +68,14 @@
         "required_properties": []
       }
     },
+    "m4_protected_mutations": {
+      "construction_stage": "m4a",
+      "gate_4a_families": ["manage_selection", "prompt", "workspace_context", "bind_context", "manage_workspaces"],
+      "gate_4b_families": ["file_actions", "apply_edits", "manage_worktree"],
+      "definition_and_registration_authority": "MCPDomainProtectedMutationToolProvider",
+      "schema_parity": "wrapped_binding_definition_preserved",
+      "dual_mutation_prevention": "ServiceRegistry_wraps_each_binding_once"
+    },
     "action_execution_evidence": {
       "status": "explicitly_unmeasured_in_m0",
       "scope": "per-action success/error result and exact JSON-RPC envelope",
@@ -308,7 +316,13 @@
     "workspace_operations": ["create_workspace", "delete_workspace", "add_folder", "remove_folder"],
     "terminal_results": ["approved", "denied", "timeout"],
     "cancellation_result": "denied",
-    "existing_test": "RepoPromptTests.WorkspaceApprovalCancellationTests/testCancellationSettlesPromptExactlyOnceAndResolvesDenied"
+    "authority": "DomainMutationApprovalBroker",
+    "presenter": "WorkspaceApprovalManager",
+    "ordering": "single_fifo_active_request",
+    "late_response": "ignored",
+    "presenter_loss": "default_deny",
+    "existing_test": "RepoPromptTests.WorkspaceApprovalCancellationTests/testCancellationSettlesPromptExactlyOnceAndResolvesDenied",
+    "m4_owner_test": "RepoPromptDomainRuntimeTests.DomainMutationApprovalBrokerTests/testRequestsArePresentedAndSettledInFIFOOrder"
   },
   "main_actor": {
     "mcp_local_declaration_count": 42,
@@ -564,6 +578,8 @@
     ],
     "non_main_actors": ["MCPBootstrapLease", "MCPReplayState", "BootstrapSocketMCPTransport"],
     "m3_non_main_actor_hops": ["MCPDomainReadToolProvider", "DomainReadSideEffectCoordinator"],
+    "m4_non_main_actor_authorities": ["DomainMutationPolicyStore", "DomainMutationApprovalBroker", "MCPDomainProtectedMutationToolProvider"],
+    "m4_main_actor_presenter": "WorkspaceApprovalManager",
     "m3_shared_read_tools": ["get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "oracle_chat_log", "git", "history"],
     "m3_context_requirements": {
       "workspace_independent": ["history", "oracle_chat_log"],
@@ -679,7 +695,13 @@
       {
         "owner": "WorkspaceApprovalManager",
         "backing": "UserDefaults",
-        "classification": "runtime_policy_migration_candidate"
+        "classification": "app_presenter_and_legacy_policy_compatibility"
+      },
+      {
+        "owner": "DomainMutationPolicyStore",
+        "backing": "versioned_file_with_compare_and_swap",
+        "path": "~/Library/Application Support/RepoPrompt CE/Settings/protected-mutations.json",
+        "classification": "protected_mutation_grant_authority"
       },
       {
         "owner": "ApplyEditsApprovalStore",
@@ -735,7 +757,7 @@
       },
       {
         "state": "approval_and_tool_policy",
-        "current_authority": "UserDefaults",
+        "current_authority": "DomainMutationPolicyStore_plus_legacy_app_policy_facades",
         "dirty_revision_required": true,
         "saved_revision_required": true,
         "migration_milestone": "M4"

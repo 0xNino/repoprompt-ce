@@ -15,6 +15,7 @@ package struct DomainRuntimeConfiguration: Sendable {
     package let legacyRuntimeDefaults: [String: Data]
     package let externalReloadInterval: Duration?
     package let metrics: DomainRuntimeMetricsSink
+    package let protectedMutationStage: DomainProtectedMutationStage
 
     package init(
         mode: DomainRuntimeMode,
@@ -25,7 +26,8 @@ package struct DomainRuntimeConfiguration: Sendable {
         temporaryDirectory: URL,
         legacyRuntimeDefaults: [String: Data] = [:],
         externalReloadInterval: Duration? = .seconds(1),
-        metrics: DomainRuntimeMetricsSink = .disabled
+        metrics: DomainRuntimeMetricsSink = .disabled,
+        protectedMutationStage: DomainProtectedMutationStage = .m3Compatibility
     ) {
         self.mode = mode
         self.profileIdentifier = profileIdentifier
@@ -37,6 +39,7 @@ package struct DomainRuntimeConfiguration: Sendable {
         self.legacyRuntimeDefaults = legacyRuntimeDefaults
         self.externalReloadInterval = externalReloadInterval
         self.metrics = metrics
+        self.protectedMutationStage = protectedMutationStage
     }
 }
 
@@ -100,6 +103,9 @@ package actor MCPDomainRuntime {
     package nonisolated let contextStore: DomainContextStore
     package nonisolated let routingCoordinator: DomainRoutingCoordinator
     package nonisolated let readSideEffectCoordinator: DomainReadSideEffectCoordinator
+    package nonisolated let mutationPolicyStore: DomainMutationPolicyStore
+    package nonisolated let mutationApprovalBroker: DomainMutationApprovalBroker
+    package nonisolated let protectedMutationProvider: MCPDomainProtectedMutationToolProvider
 
     private let workspaceAuthority: DomainWorkspaceContextAuthority
     private var lifecycle: DomainRuntimeLifecycle = .created
@@ -146,6 +152,17 @@ package actor MCPDomainRuntime {
             metrics: configuration.metrics
         )
         readSideEffectCoordinator = DomainReadSideEffectCoordinator(identity: runtimeIdentity)
+        let mutationPolicyStore = DomainMutationPolicyStore(
+            persistence: persistence,
+            identity: runtimeIdentity,
+            profileIdentifier: configuration.profileIdentifier
+        )
+        self.mutationPolicyStore = mutationPolicyStore
+        mutationApprovalBroker = DomainMutationApprovalBroker()
+        protectedMutationProvider = MCPDomainProtectedMutationToolProvider(
+            stage: configuration.protectedMutationStage,
+            policyStore: mutationPolicyStore
+        )
     }
 
     package func start() async throws {
@@ -163,6 +180,7 @@ package actor MCPDomainRuntime {
             throw DomainRuntimeLifecycleError.stoppedRuntimeCannotRestart
         }
         await startTask?.value
+        await mutationPolicyStore.bootstrap()
         guard lifecycle == .starting else { return }
         startTask = nil
         let workspaceSnapshot = await workspaceAuthority.snapshot()
@@ -186,6 +204,7 @@ package actor MCPDomainRuntime {
         publishSnapshot()
         externalReloadTask?.cancel()
         externalReloadTask = nil
+        await mutationApprovalBroker.shutdown()
         await readSideEffectCoordinator.shutdown()
         await routingCoordinator.shutdown()
         lifecycle = .stopped

@@ -301,6 +301,12 @@ package struct DomainPersistenceCoordinator: Sendable {
     private var settingsDirectory: URL { runtimeRoot.appendingPathComponent("settings", isDirectory: true) }
     private var rollbackRoot: URL { runtimeRoot.appendingPathComponent("rollback", isDirectory: true) }
     private var policyURL: URL { settingsDirectory.appendingPathComponent("runtime-policy.json") }
+    private var protectedMutationPolicyURL: URL {
+        settingsDirectory.appendingPathComponent("protected-mutations.json")
+    }
+    private var protectedMutationPolicyLockURL: URL {
+        lockDirectory.appendingPathComponent("protected-mutations.lock")
+    }
     private var catalogURL: URL { runtimeRoot.appendingPathComponent("workspace-catalog.json") }
     private var indexURL: URL { workspaceRoot.appendingPathComponent("workspacesIndex.json") }
 
@@ -334,6 +340,36 @@ package struct DomainPersistenceCoordinator: Sendable {
                 health: .degradedReadOnly(reason: "bootstrap_cancelled"),
                 catalogRevision: 0
             )
+        }
+    }
+
+    package func loadProtectedMutationPolicyData() async throws -> Data? {
+        try await DomainBlockingIO.run { cancellation in
+            try cancellation.check()
+            let worker = blockingWorker(cancellation)
+            guard worker.fileManager.fileExists(atPath: worker.protectedMutationPolicyURL.path) else {
+                return nil
+            }
+            return try Data(contentsOf: worker.protectedMutationPolicyURL)
+        }
+    }
+
+    package func compareAndSwapProtectedMutationPolicyData(
+        expectedDigest: String?,
+        data: Data
+    ) async throws {
+        try await DomainBlockingIO.run { cancellation in
+            let worker = blockingWorker(cancellation)
+            try cancellation.check()
+            try worker.withLock(at: worker.protectedMutationPolicyLockURL) {
+                try cancellation.check()
+                let currentData = try? Data(contentsOf: worker.protectedMutationPolicyURL)
+                let currentDigest = currentData.map(DomainContentDigest.sha256)
+                guard currentDigest == expectedDigest else {
+                    throw DomainPersistenceError.externalDocumentConflict
+                }
+                try DomainPersistenceLock.atomicWrite(data, to: worker.protectedMutationPolicyURL)
+            }
         }
     }
 

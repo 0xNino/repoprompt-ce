@@ -12756,13 +12756,22 @@ actor ServerNetworkManager {
                                     EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookup, serviceToolLookupState)
                                     endPermitPreDispatchEnvelopeIfNeeded()
 
+                                    let invocationSecurityContext = await self.domainInvocationSecurityContext(
+                                        connectionID: connectionID,
+                                        invocationID: invocationID,
+                                        toolName: toolName
+                                    )
                                     let resolvedOperation: @Sendable () async throws -> Value = {
                                         #if DEBUG
                                             if let operation = await self.debugResolvedToolOperationOverrides[toolName] {
                                                 return try await operation()
                                             }
                                         #endif
-                                        return try await resolvedTool.binding(effectiveArgs)
+                                        return try await MCPDomainInvocationSecurityContext.$current.withValue(
+                                            invocationSecurityContext
+                                        ) {
+                                            try await resolvedTool.binding(effectiveArgs)
+                                        }
                                     }
 
                                     // Window-scoped bindings retain exact registry generation ownership.
@@ -13266,6 +13275,60 @@ actor ServerNetworkManager {
             source: source,
             hasHandshake: ctx.hasHandshake,
             lastUpdated: ctx.lastUpdated
+        )
+    }
+
+    private func domainInvocationSecurityContext(
+        connectionID: UUID,
+        invocationID: UUID,
+        toolName: String
+    ) -> DomainToolInvocationSecurityContext {
+        let policy = effectivePolicyState(for: connectionID)
+        let runID = runIDByConnectionID[connectionID]
+        let displayName = clientIdentifier(forConnection: connectionID) ?? "unknown"
+        let stableKey = MCPClientIdentity.storageKey(displayName)
+        let peerPID: Int?
+        #if DEBUG
+            peerPID = bootstrapPeerPIDByConnectionID[connectionID] ?? Int(ProcessInfo.processInfo.processIdentifier)
+        #else
+            peerPID = bootstrapPeerPIDByConnectionID[connectionID]
+        #endif
+        let kind: DomainClientPrincipalKind = policy.purpose == .unknown ? .appProxy : .runScoped
+        let assurance: DomainClientPrincipalAssurance = peerPID == nil ? .displayNameOnly : .verifiedProcess
+        let roleAllows = AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
+            toolName: toolName,
+            taskLabelKind: policy.taskLabelKind,
+            allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
+        )
+        let gatedAllows = !MCPPolicyGatedTools.names.contains(toolName)
+            || policy.additional.contains(toolName)
+        let ephemeralGrantedToolNames: Set<String> = if !policy.restricted.contains(toolName),
+                                                        roleAllows,
+                                                        gatedAllows
+        {
+            [toolName]
+        } else {
+            []
+        }
+        let runtimeIdentity = AppDomainRuntimeComposition.shared.runtime.identity
+        let principal = DomainClientPrincipal(
+            principalID: connectionID,
+            stableKey: stableKey,
+            displayName: displayName,
+            kind: kind,
+            assurance: assurance,
+            processID: peerPID.map(Int32.init),
+            runID: runID,
+            provider: stableKey
+        )
+        return DomainToolInvocationSecurityContext(
+            principal: principal,
+            connectionID: connectionID,
+            connectionGeneration: connectionLifecycleGenerationByID[connectionID] ?? 0,
+            invocationID: invocationID,
+            runtimeID: runtimeIdentity.runtimeID,
+            runtimeGeneration: runtimeIdentity.lifecycleGeneration,
+            ephemeralGrantedToolNames: ephemeralGrantedToolNames
         )
     }
 
