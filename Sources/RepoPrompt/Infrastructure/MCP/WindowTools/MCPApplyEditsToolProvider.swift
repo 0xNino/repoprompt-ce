@@ -11,11 +11,16 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
     private typealias EditSummary = ToolResultDTOs.EditSummary
 
     private let runtime: MCPAppToolBinder
-    private let dependencies: MCPAppPhysicalCapabilityAdapters
+    private typealias Dependencies = (
+        context: MCPAppPhysicalCapabilityAdapters.Context,
+        selection: MCPAppPhysicalCapabilityAdapters.Selection
+    )
 
-    init(runtime: MCPAppToolBinder, dependencies: MCPAppPhysicalCapabilityAdapters) {
+    private let dependencies: Dependencies
+
+    init(runtime: MCPAppToolBinder, context: MCPAppPhysicalCapabilityAdapters.Context, selection: MCPAppPhysicalCapabilityAdapters.Selection) {
         self.runtime = runtime
-        self.dependencies = dependencies
+        dependencies = (context: context, selection: selection)
     }
 
     func buildTools() -> [Tool] {
@@ -86,8 +91,8 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
             let suppliedOperationID = args["operation_id"]?.stringValue?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let operationID = suppliedOperationID.flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString
-            let metadata = await dependencies.captureRequestMetadata()
-            let (resolvedContext, lookupContext) = try await dependencies.resolveMutationFileToolContext(
+            let metadata = await dependencies.context.captureRequestMetadata()
+            let (resolvedContext, lookupContext) = try await dependencies.selection.resolveMutationFileToolContext(
                 metadata,
                 MCPWindowToolName.applyEdits
             )
@@ -98,14 +103,14 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
             }
             if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(
                 for: lookupContext,
-                store: dependencies.promptVM.workspaceFileContextStore
+                store: dependencies.context.promptVM.workspaceFileContextStore
             ) {
                 return Self.retryableFailureSummary(request: request, failure: failure)
             }
             let effectivePath = lookupContext.translateInputPath(request.path)
             let displayPath = lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: effectivePath, display: .relative) ?? request.path
             do {
-                _ = try await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                _ = try await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
                     userPath: effectivePath,
                     fallbackScope: lookupContext.rootScope,
                     timeout: .seconds(MCPTimeoutPolicy.workspaceFreshnessWaitTimeoutSeconds)
@@ -116,14 +121,14 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
                     failure: .workspaceFreshnessUnavailable()
                 )
             }
-            if let issue = await dependencies.promptVM.workspaceFileContextStore.exactPathResolutionIssue(for: effectivePath, kind: .file, rootScope: lookupContext.rootScope) {
+            if let issue = await dependencies.context.promptVM.workspaceFileContextStore.exactPathResolutionIssue(for: effectivePath, kind: .file, rootScope: lookupContext.rootScope) {
                 throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
             }
-            let store = await MainActor.run { dependencies.promptVM.workspaceFileContextStore }
+            let store = await MainActor.run { dependencies.context.promptVM.workspaceFileContextStore }
             let mutationRootMappings = await lookupContext.domainMutationPhysicalRootMappings(store: store)
             let host = WorkspaceFileEditHost(
                 store: store,
-                selectionCoordinator: dependencies.selectionCoordinator,
+                selectionCoordinator: dependencies.context.selectionCoordinator,
                 lookupRootScope: lookupContext.rootScope,
                 createPathResolutionPolicy: .canonicalAliasFirst,
                 selectCreatedFiles: true,
@@ -138,7 +143,7 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
             }
             let virtualTabID: UUID? = resolvedContext.snapshot.tabID
             let availableTabIDs = await MainActor.run {
-                Set(dependencies.workspaceManager?.activeWorkspace?.composeTabs.map(\.id) ?? [])
+                Set(dependencies.context.workspaceManager?.activeWorkspace?.composeTabs.map(\.id) ?? [])
             }
             let tabID = try Self.resolveApplyEditsAgentModeTabID(
                 runPurpose: runPurpose,
@@ -162,14 +167,14 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
             #endif
 
             let approvalScope: ApplyEditsApprovalScope? = if runPurpose == .agentModeRun, let tabID {
-                ApplyEditsApprovalScope(windowID: dependencies.windowID, tabID: tabID)
+                ApplyEditsApprovalScope(windowID: dependencies.context.windowID, tabID: tabID)
             } else {
                 nil
             }
 
             var shouldRequireApproval = false
             if let approvalScope {
-                let autoEditEnabled = await dependencies.applyEditsApprovalStore.autoEditEnabled(for: approvalScope)
+                let autoEditEnabled = await dependencies.context.applyEditsApprovalStore.autoEditEnabled(for: approvalScope)
                 shouldRequireApproval = !autoEditEnabled
             }
 
@@ -187,7 +192,7 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
                 let reviewUnifiedDiff = previewResult.unifiedDiffForToolCard(filePath: displayPath)
                     ?? "No textual diff available for this apply_edits request."
 
-                let decision = await dependencies.applyEditsApprovalStore.requestReview(
+                let decision = await dependencies.context.applyEditsApprovalStore.requestReview(
                     scope: approvalScope,
                     path: displayPath,
                     unifiedDiff: reviewUnifiedDiff,
@@ -295,7 +300,7 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
                 freshness: freshness
             )
         } catch let error as FileManagerError {
-            throw await dependencies.mapFileManagerErrorToMCP(error, MCPWindowToolName.applyEdits, requestPath)
+            throw await dependencies.context.mapFileManagerErrorToMCP(error, MCPWindowToolName.applyEdits, requestPath)
         } catch let error as ApplyEditsError {
             throw Self.mapApplyEditsError(error)
         } catch let error as MCPError {
@@ -311,7 +316,7 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
     ) async -> String {
         await EditFlowPerf.measure(EditFlowPerf.Stage.ApplyEdits.flushDeltas) {
             do {
-                _ = try await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                _ = try await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
                     userPath: userPath,
                     fallbackScope: rootScope,
                     timeout: .seconds(2)

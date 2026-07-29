@@ -12,7 +12,9 @@ struct MCPFileActionMutationAcknowledgement {
     let freshness: String
 }
 
-struct MCPAppPhysicalCapabilityAdapters {
+/// Namespace for independently injected app-process capability families.
+/// No provider receives an unrestricted aggregate of every app capability.
+enum MCPAppPhysicalCapabilityAdapters {
     struct ContextBuilderTabResolution {
         let identity: WorkspaceSelectionIdentity
         let nestedTabContext: MCPServerViewModel.TabContextSnapshot
@@ -115,8 +117,7 @@ struct MCPAppPhysicalCapabilityAdapters {
     ) async throws -> Void
     typealias ResolveTabContextSnapshot = @MainActor @Sendable (
         _ metadata: MCPServerViewModel.RequestMetadata,
-        _ toolName: String,
-        _ policy: MCPServerViewModel.TabContextResolutionPolicy
+        _ toolName: String
     ) throws -> MCPServerViewModel.ResolvedTabContextSnapshot
     typealias UpdateCurrentTabContext = @MainActor @Sendable (
         _ toolName: String,
@@ -281,15 +282,15 @@ struct MCPAppPhysicalCapabilityAdapters {
         _ requestedPath: String,
         _ resolvedPhysicalPath: String,
         _ metadata: MCPServerViewModel.RequestMetadata
-    ) async -> Void
-    typealias DrainReadFileAutoSelection = @MainActor @Sendable (_ metadata: MCPServerViewModel.RequestMetadata, _ requirement: MCPReadFileAutoSelectionCoordinator.DrainRequirement) async -> MCPReadFileAutoSelectionCoordinator.DrainResult
+    ) async throws -> Void
+    typealias DrainReadFileAutoSelection = @MainActor @Sendable (_ metadata: MCPServerViewModel.RequestMetadata, _ requirement: MCPReadFileAutoSelectionCoordinator.DrainRequirement) async throws -> MCPReadFileAutoSelectionCoordinator.DrainResult
     typealias EnqueueFileSearchAutoSelection = @MainActor @Sendable (
         _ mode: SearchMode,
         _ contextLines: Int,
         _ reply: ToolResultDTOs.SearchResultDTO,
         _ resolvedPhysicalPaths: [String],
         _ metadata: MCPServerViewModel.RequestMetadata
-    ) async -> Void
+    ) async throws -> Void
     typealias WorkspaceContextMessage = @MainActor @Sendable (_ operation: String?, _ path: String?) async -> String
     typealias ParseCopyPresetSelector = @Sendable (_ value: Value?) -> MCPServerViewModel.CopyPresetSelector?
     typealias ResolveCopyPreset = @MainActor @Sendable (_ selector: MCPServerViewModel.CopyPresetSelector) -> CopyPreset?
@@ -313,94 +314,102 @@ struct MCPAppPhysicalCapabilityAdapters {
     ) async throws -> String
     typealias LatestTokenBreakdown = @MainActor @Sendable () -> TokenCountingViewModel.TokenBreakdown
 
-    let executeOracleUtils: ExecuteTool
-    let executeAskOracle: ExecuteTool
-    let executeOracleSend: ExecuteTool
-    let executeOracleChatLog: ExecuteTool
+    struct Execution {
+        let executeOracleUtils: ExecuteTool
+        let executeAskOracle: ExecuteTool
+        let executeOracleSend: ExecuteTool
+        let executeOracleChatLog: ExecuteTool
+        let executeAgentExplore: ExecuteTool
+        let executeAgentRun: ExecuteTool
+        let executeAgentManage: ExecuteTool
+        let requireTargetWindow: RequireTargetWindow
+        let requireCurrentTabContext: RequireCurrentTabContext
+        let requireAgentModeConnection: RequireAgentModeConnection
+        let resolveAgentModeTabID: ResolveAgentModeTabID
+        let resolveContextBuilderTab: ResolveContextBuilderTab
+        let bindTabForConnection: BindTabForConnection
+        let buildTabSelectionReply: BuildTabSelectionReply
+        let sendStageProgress: SendStageProgress
+        let makeOracleExportDestination: MakeOracleExportDestination
+        let resolveDefaultOracleExportPath: ResolveDefaultOracleExportPath
+        let writeGeneratedOracleExportFile: WriteGeneratedOracleExportFile
+        let beforeContextBuilderFinalReviewAuthorization: BeforeContextBuilderFinalReviewAuthorization
+        let didFinalizeContextBuilderReview: DidFinalizeContextBuilderReview
+        let runMCPPlanOrQuestion: RunMCPPlanOrQuestion
+    }
 
-    let executeAgentExplore: ExecuteTool
-    let executeAgentRun: ExecuteTool
-    let executeAgentManage: ExecuteTool
+    struct Context {
+        let windowID: Int
+        let promptVM: PromptViewModel
+        let workspaceManager: WorkspaceManagerViewModel?
+        let selectionCoordinator: WorkspaceSelectionCoordinator?
+        let applyEditsApprovalStore: ApplyEditsApprovalStore
+        let captureRequestMetadata: CaptureRequestMetadata
+        let resolveImplicitContextBuilderGitTarget: ResolveImplicitContextBuilderGitTarget
+        let validateContextBuilderGitArtifactSelection: ValidateContextBuilderGitArtifactSelection
+        let resolveTabContextSnapshot: ResolveTabContextSnapshot
+        let updateCurrentTabContext: UpdateCurrentTabContext
+        let selectedRecordsForCurrentTabContext: SelectedRecordsForCurrentTabContext
+        let physicalSelectionForCurrentTabContext: PhysicalSelectionForCurrentTabContext
+        let resolveSelectedFilesForCodeStructure: ResolveSelectedFilesForCodeStructure
+        let boundTabID: BoundTabID
+        let mapFileManagerErrorToMCP: MapFileManagerErrorToMCP
+        let ensureGitDataRootLoaded: EnsureGitDataRootLoaded
+        let logDebug: DebugLog
+        let commitPrimaryGitDiffArtifactsToCurrentTab: CommitPrimaryGitDiffArtifactsToCurrentTab
+        let replaceAdvertisedGitArtifactsForCurrentTab: ReplaceAdvertisedGitArtifactsForCurrentTab
+        let invalidateAdvertisedGitArtifactsForCurrentTab: InvalidateAdvertisedGitArtifactsForCurrentTab
+    }
 
-    let requireTargetWindow: RequireTargetWindow
-    let requireCurrentTabContext: RequireCurrentTabContext
-    let requireAgentModeConnection: RequireAgentModeConnection
-    let resolveAgentModeTabID: ResolveAgentModeTabID
-    let resolveContextBuilderTab: ResolveContextBuilderTab
-    let bindTabForConnection: BindTabForConnection
-    let buildTabSelectionReply: BuildTabSelectionReply
-    let sendStageProgress: SendStageProgress
-    let makeOracleExportDestination: MakeOracleExportDestination
-    let resolveDefaultOracleExportPath: ResolveDefaultOracleExportPath
-    let writeGeneratedOracleExportFile: WriteGeneratedOracleExportFile
-    let beforeContextBuilderFinalReviewAuthorization: BeforeContextBuilderFinalReviewAuthorization
-    let didFinalizeContextBuilderReview: DidFinalizeContextBuilderReview
-    let runMCPPlanOrQuestion: RunMCPPlanOrQuestion
+    struct Selection {
+        let workspaceSearch: WorkspaceSearch
+        let parseManageSelectionInputs: ParseManageSelectionInputs
+        let resolveFileToolLookupContext: ResolveFileToolLookupContext
+        let resolveMutationFileToolContext: ResolveMutationFileToolContext
+        let stabilizedVirtualSelection: StabilizedVirtualSelection
+        let freezePromptGitReviewContext: FreezePromptGitReviewContext
+        let buildCurrentSelectionReply: BuildCurrentSelectionReply
+        let buildSelectionPreviewReply: BuildSelectionPreviewReply
+        let buildSelectionMutationReply: BuildSelectionMutationReply
+        let buildManageSelectionSetSelection: BuildManageSelectionSetSelection
+        let resolveManageSelectionArtifactInputs: ResolveManageSelectionArtifactInputs
+        let validateManageSelectionArtifactFence: ValidateManageSelectionArtifactFence
+        let mutatePreResolvedFullFilePaths: MutatePreResolvedFullFilePaths
+        let commitManageSelectionArtifactMutation: CommitManageSelectionArtifactMutation
+        let addStoredSelectionPaths: AddStoredSelectionPaths
+        let removeStoredSelectionPaths: RemoveStoredSelectionPaths
+        let promoteStoredSelectionPaths: PromoteStoredSelectionPaths
+        let demoteStoredSelectionPaths: DemoteStoredSelectionPaths
+        let computeSelectionSlicesVirtual: ComputeSelectionSlicesVirtual
+        let persistResolvedTabContextSnapshot: PersistResolvedTabContextSnapshot
+        let makeSelectionHintError: MakeSelectionHintError
+    }
 
-    let windowID: Int
-    let promptVM: PromptViewModel
-    let workspaceManager: WorkspaceManagerViewModel?
-    let selectionCoordinator: WorkspaceSelectionCoordinator?
-    let applyEditsApprovalStore: ApplyEditsApprovalStore
-    let captureRequestMetadata: CaptureRequestMetadata
-    let resolveImplicitContextBuilderGitTarget: ResolveImplicitContextBuilderGitTarget
-    let validateContextBuilderGitArtifactSelection: ValidateContextBuilderGitArtifactSelection
-    let resolveTabContextSnapshot: ResolveTabContextSnapshot
-    let updateCurrentTabContext: UpdateCurrentTabContext
-    let selectedRecordsForCurrentTabContext: SelectedRecordsForCurrentTabContext
-    let physicalSelectionForCurrentTabContext: PhysicalSelectionForCurrentTabContext
-    let resolveSelectedFilesForCodeStructure: ResolveSelectedFilesForCodeStructure
-    let boundTabID: BoundTabID
-    let mapFileManagerErrorToMCP: MapFileManagerErrorToMCP
-    let ensureGitDataRootLoaded: EnsureGitDataRootLoaded
-    let logDebug: DebugLog
-    let commitPrimaryGitDiffArtifactsToCurrentTab: CommitPrimaryGitDiffArtifactsToCurrentTab
-    let replaceAdvertisedGitArtifactsForCurrentTab: ReplaceAdvertisedGitArtifactsForCurrentTab
-    let invalidateAdvertisedGitArtifactsForCurrentTab: InvalidateAdvertisedGitArtifactsForCurrentTab
+    struct Files {
+        let performFileAction: PerformFileAction
+        let buildCodeStructureDTO: BuildCodeStructureDTO
+        let resolveFilesForCodeStructure: ResolveFilesForCodeStructure
+        let buildStoreBackedFileTreeResult: BuildStoreBackedFileTreeResult
+        let readSelectedAuthorizedGitArtifact: ReadSelectedAuthorizedGitArtifact
+        let readFile: ReadFile
+        let enqueueReadFileAutoSelection: EnqueueReadFileAutoSelection
+        let drainReadFileAutoSelection: DrainReadFileAutoSelection
+        let enqueueFileSearchAutoSelection: EnqueueFileSearchAutoSelection
+        let workspaceContextMessage: WorkspaceContextMessage
+    }
 
-    let workspaceSearch: WorkspaceSearch
-    let parseManageSelectionInputs: ParseManageSelectionInputs
-    let resolveFileToolLookupContext: ResolveFileToolLookupContext
-    let resolveMutationFileToolContext: ResolveMutationFileToolContext
-    let stabilizedVirtualSelection: StabilizedVirtualSelection
-    let freezePromptGitReviewContext: FreezePromptGitReviewContext
-    let buildCurrentSelectionReply: BuildCurrentSelectionReply
-    let buildSelectionPreviewReply: BuildSelectionPreviewReply
-    let buildSelectionMutationReply: BuildSelectionMutationReply
-    let buildManageSelectionSetSelection: BuildManageSelectionSetSelection
-    let resolveManageSelectionArtifactInputs: ResolveManageSelectionArtifactInputs
-    let validateManageSelectionArtifactFence: ValidateManageSelectionArtifactFence
-    let mutatePreResolvedFullFilePaths: MutatePreResolvedFullFilePaths
-    let commitManageSelectionArtifactMutation: CommitManageSelectionArtifactMutation
-    let addStoredSelectionPaths: AddStoredSelectionPaths
-    let removeStoredSelectionPaths: RemoveStoredSelectionPaths
-    let promoteStoredSelectionPaths: PromoteStoredSelectionPaths
-    let demoteStoredSelectionPaths: DemoteStoredSelectionPaths
-    let computeSelectionSlicesVirtual: ComputeSelectionSlicesVirtual
-    let persistResolvedTabContextSnapshot: PersistResolvedTabContextSnapshot
-    let makeSelectionHintError: MakeSelectionHintError
-
-    let performFileAction: PerformFileAction
-    let buildCodeStructureDTO: BuildCodeStructureDTO
-    let resolveFilesForCodeStructure: ResolveFilesForCodeStructure
-    let buildStoreBackedFileTreeResult: BuildStoreBackedFileTreeResult
-    let readSelectedAuthorizedGitArtifact: ReadSelectedAuthorizedGitArtifact
-    let readFile: ReadFile
-    let enqueueReadFileAutoSelection: EnqueueReadFileAutoSelection
-    let drainReadFileAutoSelection: DrainReadFileAutoSelection
-    let enqueueFileSearchAutoSelection: EnqueueFileSearchAutoSelection
-    let workspaceContextMessage: WorkspaceContextMessage
-
-    let parseCopyPresetSelector: ParseCopyPresetSelector
-    let resolveCopyPreset: ResolveCopyPreset
-    let buildTabWorkspaceContext: BuildTabWorkspaceContext
-    let selectedFilesWithStats: SelectedFilesWithStats
-    let selectionCollectionsForCurrentTabContext: SelectionCollectionsForCurrentTabContext
-    let buildCopyPresetContextDTO: BuildCopyPresetContextDTO
-    let buildCopyPresetsListDTO: BuildCopyPresetsListDTO
-    let copyPresetDescriptorDTO: CopyPresetDescriptorDTO
-    let buildExportSelectedFileInfos: BuildExportSelectedFileInfos
-    let buildTabClipboardContent: BuildTabClipboardContent
-    let writePromptExportFile: WritePromptExportFile
-    let latestTokenBreakdown: LatestTokenBreakdown
+    struct Prompt {
+        let parseCopyPresetSelector: ParseCopyPresetSelector
+        let resolveCopyPreset: ResolveCopyPreset
+        let buildTabWorkspaceContext: BuildTabWorkspaceContext
+        let selectedFilesWithStats: SelectedFilesWithStats
+        let selectionCollectionsForCurrentTabContext: SelectionCollectionsForCurrentTabContext
+        let buildCopyPresetContextDTO: BuildCopyPresetContextDTO
+        let buildCopyPresetsListDTO: BuildCopyPresetsListDTO
+        let copyPresetDescriptorDTO: CopyPresetDescriptorDTO
+        let buildExportSelectedFileInfos: BuildExportSelectedFileInfos
+        let buildTabClipboardContent: BuildTabClipboardContent
+        let writePromptExportFile: WritePromptExportFile
+        let latestTokenBreakdown: LatestTokenBreakdown
+    }
 }

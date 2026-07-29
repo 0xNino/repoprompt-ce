@@ -245,6 +245,45 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         XCTAssertTrue(reply.codeStructure?.unmappedPaths?.isEmpty ?? true)
     }
 
+    func testActiveVisibleSelectionMarksMissingCachedFileTokensIncomplete() async throws {
+        let root = try makeTemporaryRoot(name: "ActiveVisibleIncomplete")
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let oldFile = root.appendingPathComponent("Old.swift")
+        let newFile = root.appendingPathComponent("New.swift")
+        try write(SwiftFixtureSource.emptyStruct("OldTokenBaseline"), to: oldFile)
+        try write(SwiftFixtureSource.emptyStruct("NewVisibleSelection"), to: newFile)
+
+        let tabID = UUID()
+        let oldSelection = StoredSelection(selectedPaths: [oldFile.path])
+        let newSelection = StoredSelection(selectedPaths: [newFile.path])
+        let (window, workspaceID) = await makeWindow(root: root, tabID: tabID, selection: oldSelection)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: root.path
+        )
+        await window.promptManager.tokenCountingViewModel.forceImmediateRecount()
+
+        var liveTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
+        liveTab.selection = newSelection
+        XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(liveTab, inWorkspaceID: workspaceID))
+
+        let reply = await window.mcpServer.buildTabSelectionReply(
+            from: newSelection,
+            includeBlocks: false,
+            display: .full,
+            virtualContext: nil,
+            lookupContextOverride: .visibleWorkspace
+        )
+
+        XCTAssertEqual(reply.files?.map(\.path), [newFile.path])
+        XCTAssertEqual(reply.tokenAccounting?.source, "active_tab_published")
+        XCTAssertEqual(reply.tokenAccounting?.status, "incomplete")
+        XCTAssertTrue(reply.tokenAccounting?.refreshPending == true)
+        XCTAssertTrue(reply.tokenAccounting?.incompleteComponents?.contains("files") == true)
+        XCTAssertEqual(reply.totalTokens, 0)
+    }
+
     func testMutationReplyRereadsLiveTabSelectionAfterProviderStabilization() async throws {
         let root = try makeTemporaryRoot(name: "MutationReply")
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
@@ -779,6 +818,70 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
     }
 
     #if DEBUG
+        func testActiveMCPTokenRepliesCompleteWhileBackgroundRecountIsBlockedAndCoalesce() async throws {
+            let root = try makeTemporaryRoot(name: "ActiveTokenCache")
+            defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+            let fileURL = root.appendingPathComponent("Cached.swift")
+            try write(SwiftFixtureSource.emptyStruct("ActiveCachedTokenType"), to: fileURL)
+
+            let tabID = UUID()
+            let selection = StoredSelection(selectedPaths: [fileURL.path])
+            let (window, _) = await makeWindow(root: root, tabID: tabID, selection: selection)
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                in: window,
+                path: root.path
+            )
+            let tokenCounter = window.promptManager.tokenCountingViewModel
+            await tokenCounter.forceImmediateRecount()
+            let recountGate = TokenAccountingGate()
+            tokenCounter.setBeforeTokenCalculationForTesting {
+                await recountGate.markStartedAndWaitForRelease()
+            }
+            defer {
+                Task { @MainActor in
+                    await recountGate.release()
+                    tokenCounter.setBeforeTokenCalculationForTesting(nil)
+                }
+            }
+
+            let baselineStarts = tokenCounter.tokenCalculationStartCountForTesting()
+            tokenCounter.markDirty(.selection)
+            await recountGate.waitUntilStarted()
+
+            let selectionReply = await window.mcpServer.buildTabSelectionReply(
+                from: selection,
+                includeBlocks: false,
+                display: .relative,
+                virtualContext: nil,
+                lookupContextOverride: .visibleWorkspace
+            )
+            let context = try window.mcpServer.makeTabContextSnapshot(
+                tabID: tabID,
+                workspaceID: window.workspaceManager.activeWorkspace?.id,
+                windowID: window.windowID,
+                runID: nil,
+                explicitlyBound: false,
+                captureActiveUIState: true,
+                flushActiveSelection: false
+            )
+            let workspaceReply = try await window.mcpServer.buildTabWorkspaceContext(
+                context: context,
+                include: ["selection", "tokens"],
+                display: .relative,
+                presentationActiveContext: true
+            )
+
+            XCTAssertEqual(selectionReply.tokenAccounting?.source, "active_tab_published")
+            XCTAssertTrue(selectionReply.tokenAccounting?.refreshPending == true)
+            XCTAssertEqual(workspaceReply.tokenAccounting?.source, "active_tab_published")
+            XCTAssertTrue(workspaceReply.tokenAccounting?.refreshPending == true)
+            XCTAssertEqual(tokenCounter.tokenCalculationStartCountForTesting(), baselineStarts + 1)
+
+            await recountGate.release()
+            tokenCounter.setBeforeTokenCalculationForTesting(nil)
+        }
+
         func testBoundMCPTokenRepliesCompleteWhileContentRefreshIsBlockedAndCoalesce() async throws {
             let root = try makeTemporaryRoot(name: "BoundTokenCache")
             defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }

@@ -297,30 +297,28 @@ struct MCPOracleToolService {
         let resolvedContext = try resolveTabContextSnapshot(metadata)
         var tabContext: OracleViewModel.OracleSendTabContext? = nil
 
-        do {
-            if runPurpose != .agentModeRun,
-               let chatIDString = args["chat_id"]?.stringValue,
-               !chatIDString.isEmpty
-            {
-                try rebindChatSessionIfNeeded(metadata, chatIDString)
-            }
+        if runPurpose != .agentModeRun,
+           let chatIDString = args["chat_id"]?.stringValue,
+           !chatIDString.isEmpty
+        {
+            try rebindChatSessionIfNeeded(metadata, chatIDString)
+        }
 
-            let context = try await requireCurrentTabContext(oracleSendToolName)
-            if runPurpose == .agentModeRun, let targetWindow {
-                let owner = await resolveAgentOracleOwner(tabID: context.tabID, targetWindow: targetWindow, tabContext: context)
-                tabContext = try await oracleSendTabContext(
-                    from: context,
-                    owner: owner,
-                    origin: .oracleSend,
-                    mode: modeRaw
-                )
-            } else {
-                tabContext = try await oracleSendTabContext(
-                    from: context,
-                    origin: .oracleSend,
-                    mode: modeRaw
-                )
-            }
+        let context = try await requireCurrentTabContext(oracleSendToolName)
+        if runPurpose == .agentModeRun, let targetWindow {
+            let owner = await resolveAgentOracleOwner(tabID: context.tabID, targetWindow: targetWindow, tabContext: context)
+            tabContext = try await oracleSendTabContext(
+                from: context,
+                owner: owner,
+                origin: .oracleSend,
+                mode: modeRaw
+            )
+        } else {
+            tabContext = try await oracleSendTabContext(
+                from: context,
+                origin: .oracleSend,
+                mode: modeRaw
+            )
         }
 
         let exportDestination: OracleExportDestination? = if exportResponse, let targetWindow {

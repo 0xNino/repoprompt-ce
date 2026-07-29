@@ -9,7 +9,6 @@ final class MCPHistoryToolProvider {
 
     init(
         runtime _: MCPAppToolBinder,
-        dependencies _: MCPAppPhysicalCapabilityAdapters? = nil,
         scannerFactory: @escaping @Sendable () -> any HistorySessionScanning = { HistorySessionScanner() }
     ) {
         scanner = scannerFactory()

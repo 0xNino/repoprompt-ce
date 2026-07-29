@@ -104,8 +104,9 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - New app-visible diagnostic surfaces go under `Sources/RepoPrompt/Features/Diagnostics` and must have a documented purpose and entry point.
 - New app/CLI protocol definitions shared by both executables go under `Sources/RepoPromptShared`.
 - MCP filesystem/product/build-flavor identity and external-client event wire DTOs are single-sourced under `Sources/RepoPromptShared/MCP`; app/helper targets may keep only local compile-flavor selection and app-only presentation behavior.
-- New app-local MCP/socket/routing helpers go under `Sources/RepoPrompt/Infrastructure/MCP`, not `Sources/RepoPrompt/Shared`.
-- New CLI-only implementation code goes under `Sources/RepoPromptMCP`.
+- New app-local MCP/socket/routing helpers go under `Sources/RepoPrompt/Infrastructure/MCP`, not `Sources/RepoPrompt/Shared`. App tool providers receive only the typed physical capability families they require; `MCPAppPhysicalCapabilityAdapters` is a namespace, not an umbrella dependency bag or dynamic-member façade.
+- Reusable AppKit-free physical workspace operations used by direct MCP belong in `RepoPromptDomainRuntime`; `RepoPromptMCP` may adapt them but must not copy read/search/tree/selection implementations. App presentation adapters may add UI-specific policy without becoming domain identity authority.
+- New CLI-only implementation code goes under `Sources/RepoPromptMCP`. Direct backend selection and stdio composition stay here; canonical schemas, workspace state roots, and reusable physical workspace operations do not.
 - App-owned test doubles, integration fixtures, sample projects, benchmark-only data, and XCTest-only helpers go under `Tests/RepoPromptTests`, not the app target. Pure CodeMap parser fixtures/goldens are the documented exception and belong only to `RepoPromptCodeMapCoreTests`.
 - Do not create directories named `Tests`, `TestSupport`, or `Fixtures` under `Sources/RepoPrompt`.
 - Do not put parser fixtures or sample parser inputs under `Sources/RepoPrompt/Infrastructure/SyntaxParsing`; keep only production parser/query code there.

@@ -9,6 +9,18 @@ extension AppDomainRuntimeComposition {
     @MainActor
     @discardableResult
     func register(
+        _ service: MCPAppToolCatalogRegistration
+    ) async throws -> MCPDomainToolRegistrationResult {
+        try await register(
+            service: service,
+            tools: service.materializeTools(),
+            interactionAdapter: service.longRunningInteractionAdapter
+        )
+    }
+
+    @MainActor
+    @discardableResult
+    func register(
         _ service: any Service
     ) async throws -> MCPDomainToolRegistrationResult {
         #if DEBUG || EDIT_FLOW_PERF
@@ -22,6 +34,17 @@ extension AppDomainRuntimeComposition {
                 EditFlowPerf.Stage.MCPToolCall.serviceToolLookupServiceToolsAwait,
                 serviceToolsAwaitState
             )
+        #endif
+        return try await register(service: service, tools: tools, interactionAdapter: nil)
+    }
+
+    @MainActor
+    private func register(
+        service: any Service,
+        tools: [Tool],
+        interactionAdapter: DomainLongRunningInteractionAdapter?
+    ) async throws -> MCPDomainToolRegistrationResult {
+        #if DEBUG || EDIT_FLOW_PERF
             let definitionScanState = EditFlowPerf.begin(
                 EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan
             )
@@ -29,7 +52,6 @@ extension AppDomainRuntimeComposition {
         let bindings: [MCPDomainToolBinding]
         do {
             let domainRuntime = runtime
-            let interactionAdapter = (service as? MCPAppToolCatalogRegistration)?.longRunningInteractionAdapter
             bindings = try tools.map {
                 let domainBinding = try $0.domainBinding()
                 let longRunningBinding = domainRuntime.longRunningToolProvider.wrapping(

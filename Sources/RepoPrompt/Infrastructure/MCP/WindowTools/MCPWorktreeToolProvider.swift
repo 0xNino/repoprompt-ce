@@ -8,18 +8,26 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     let group: MCPAppToolGroup = .git
 
     private let runtime: MCPAppToolBinder
-    let dependencies: MCPAppPhysicalCapabilityAdapters
+    typealias Dependencies = (
+        execution: MCPAppPhysicalCapabilityAdapters.Execution,
+        context: MCPAppPhysicalCapabilityAdapters.Context,
+        selection: MCPAppPhysicalCapabilityAdapters.Selection
+    )
+
+    let dependencies: Dependencies
     private let vcsService: VCSService
     private let resolver: GitRepoTargetResolver
 
     init(
         runtime: MCPAppToolBinder,
-        dependencies: MCPAppPhysicalCapabilityAdapters,
+        execution: MCPAppPhysicalCapabilityAdapters.Execution,
+        context: MCPAppPhysicalCapabilityAdapters.Context,
+        selection: MCPAppPhysicalCapabilityAdapters.Selection,
         vcsService: VCSService = .shared,
         resolver: GitRepoTargetResolver = GitRepoTargetResolver()
     ) {
         self.runtime = runtime
-        self.dependencies = dependencies
+        dependencies = (execution: execution, context: context, selection: selection)
         self.vcsService = vcsService
         self.resolver = resolver
     }
@@ -204,7 +212,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         let sessionID = bindAfterCreate ? try await resolveBindingSessionID(args: args) : nil
 
         if let sessionID {
-            try validateLiveSession(sessionID, in: dependencies.requireTargetWindow())
+            try validateLiveSession(sessionID, in: dependencies.execution.requireTargetWindow())
         }
 
         let existingWorktrees = try await vcsService.listGitWorktrees(at: context.repo.rootURL)
@@ -225,7 +233,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         )
 
         var mutationRootMappings = await context.lookupContext.domainMutationPhysicalRootMappings(
-            store: dependencies.promptVM.workspaceFileContextStore
+            store: dependencies.context.promptVM.workspaceFileContextStore
         )
         let targetParent = plan.path.deletingLastPathComponent().standardizedFileURL.path
         mutationRootMappings.append(.init(canonicalRoot: targetParent, physicalRoot: targetParent))
@@ -284,7 +292,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         let context = try await resolveRepositoryContext(args: args)
         let worktree = try await resolveWorktree(args: args, repo: context.repo, allRepos: context.allRepos, requireExplicit: true)
         let sessionID = try await resolveBindingSessionID(args: args)
-        try validateLiveSession(sessionID, in: dependencies.requireTargetWindow())
+        try validateLiveSession(sessionID, in: dependencies.execution.requireTargetWindow())
         try await MCPDomainMutationCommitContext.willCommit()
         let identity = try persistOrResolveVisualIdentity(for: worktree, args: args, persist: true)
         let bindingResult = try await applyBinding(
@@ -308,7 +316,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
 
     private func executeUnbind(args: [String: Value]) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
         let sessionID = try await resolveBindingSessionID(args: args)
-        let targetWindow = try dependencies.requireTargetWindow()
+        let targetWindow = try dependencies.execution.requireTargetWindow()
         let agentModeVM = targetWindow.agentModeViewModel
         let existing = agentModeVM.worktreeBindings(forAgentSessionID: sessionID)
         let removeAll = parseBool(args["all"]) ?? false
@@ -358,7 +366,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         args: [String: Value],
         source: String
     ) async throws -> (binding: ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO, previous: ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO?) {
-        let targetWindow = try dependencies.requireTargetWindow()
+        let targetWindow = try dependencies.execution.requireTargetWindow()
         let agentModeVM = targetWindow.agentModeViewModel
         let logicalRoot = try await logicalRoot(for: context)
         let existing = agentModeVM.worktreeBindings(forAgentSessionID: sessionID)
@@ -414,11 +422,10 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             return uuid
         }
 
-        let metadata = await dependencies.captureRequestMetadata()
-        let resolved = try dependencies.resolveTabContextSnapshot(
+        let metadata = await dependencies.context.captureRequestMetadata()
+        let resolved = try dependencies.context.resolveTabContextSnapshot(
             metadata,
-            MCPWindowToolName.manageWorktree,
-            .requireExplicitOrRunScoped
+            MCPWindowToolName.manageWorktree
         )
         guard let sessionID = resolved.snapshot.activeAgentSessionID else {
             throw MCPError.invalidParams("session_id is required because current MCP routing does not resolve an active Agent session.")
@@ -437,13 +444,13 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     }
 
     private func resolveRepositoryContext(args: [String: Value]) async throws -> RepositoryContext {
-        guard dependencies.workspaceManager?.activeWorkspace != nil else {
+        guard dependencies.context.workspaceManager?.activeWorkspace != nil else {
             throw MCPError.invalidParams("No active workspace in this window. Load a workspace before using manage_worktree.")
         }
 
-        let metadata = await dependencies.captureRequestMetadata()
-        let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-        let visibleRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
+        let metadata = await dependencies.context.captureRequestMetadata()
+        let lookupContext = await dependencies.selection.resolveFileToolLookupContext(metadata)
+        let visibleRoots = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
         let allRepos = try await discoverAllGitRepos(rootScope: lookupContext.rootScope)
         let defaultRepo = try await resolveDefaultGitRepo(rootScope: lookupContext.rootScope)
         let repo: GitRepoDescriptor
@@ -494,7 +501,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     }
 
     private func discoverAllGitRepos(rootScope: WorkspaceLookupRootScope) async throws -> [GitRepoDescriptor] {
-        let visibleRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: rootScope)
+        let visibleRoots = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(scope: rootScope)
         var repos: [GitRepoDescriptor] = []
         var seen = Set<String>()
         for root in visibleRoots {
@@ -510,7 +517,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     }
 
     private func resolveDefaultGitRepo(rootScope: WorkspaceLookupRootScope) async throws -> GitRepoDescriptor {
-        let visibleRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: rootScope)
+        let visibleRoots = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(scope: rootScope)
         for root in visibleRoots {
             if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: root.standardizedFullPath)) {
                 return GitRepoDescriptor(rootURL: resolved.rootURL)

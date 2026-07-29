@@ -97,6 +97,36 @@ final class TabContextRoutingTests: XCTestCase {
         }
     }
 
+    func testBindingResolverCapturesPresentationWindowAsConcreteLogicalContext() async throws {
+        let tabID = UUID()
+        let workspaceID = UUID()
+        let activeMatch = match(windowID: 23, tabID: tabID, workspaceID: workspaceID)
+        let resolver = makeResolver(
+            matchesByContextID: [:],
+            activeMatchByWindowID: [23: activeMatch]
+        )
+
+        let resolved = try await resolver.resolvePresentationWindowBinding(
+            connectionID: UUID(),
+            requestedWindowID: 23
+        )
+
+        XCTAssertEqual(resolved.windowID, 23)
+        XCTAssertEqual(resolved.logicalContext.tabID, tabID)
+        XCTAssertEqual(resolved.logicalContext.workspaceID, workspaceID)
+    }
+
+    func testBindingResolverRejectsPresentationWindowWithoutActiveContext() async {
+        let resolver = makeResolver(matchesByContextID: [:])
+
+        await XCTAssertThrowsErrorAsync {
+            try await resolver.resolvePresentationWindowBinding(
+                connectionID: UUID(),
+                requestedWindowID: 99
+            )
+        }
+    }
+
     func testBindingResolverRejectsConflictingContextIDAndLegacyTabID() async {
         let resolver = makeResolver(matchesByContextID: [:])
 
@@ -1250,8 +1280,7 @@ final class TabContextRoutingTests: XCTestCase {
                 clientName: "clear-auto-reset-test",
                 windowID: window.windowID
             ),
-            toolName: "manage_selection",
-            policy: .requireExplicitOrRunScoped
+            toolName: "manage_selection"
         )
         let nextFullAddSelection = StoredSelection(
             selectedPaths: ["/tmp/Full.swift"],
@@ -2024,7 +2053,7 @@ final class TabContextRoutingTests: XCTestCase {
                 targetWindow: window
             )
 
-            XCTAssertEqual(snapshot.route, .windowOnlyActiveCompose)
+            XCTAssertEqual(snapshot.route, .explicitWindowActiveCompose)
             XCTAssertEqual(snapshot.windowID, window.windowID)
             XCTAssertEqual(snapshot.workspaceID, workspaceID)
             XCTAssertEqual(snapshot.tabID, tabID)
@@ -2236,7 +2265,7 @@ final class TabContextRoutingTests: XCTestCase {
                     targetWindow: window
                 )
             }) { error in
-                XCTAssertTrue(String(describing: error).contains("requires either"), String(describing: error))
+                XCTAssertTrue(String(describing: error).contains("requires an explicit tab context"), String(describing: error))
             }
 
             func hint(
@@ -2391,7 +2420,7 @@ final class TabContextRoutingTests: XCTestCase {
                     "message": .string("inferred routing must not qualify")
                 ])
             }) { error in
-                XCTAssertTrue(String(describing: error).contains("requires either"), String(describing: error))
+                XCTAssertTrue(String(describing: error).contains("requires an explicit tab context"), String(describing: error))
             }
 
             let mismatchedHintConnectionID = UUID()
@@ -2477,7 +2506,7 @@ final class TabContextRoutingTests: XCTestCase {
                     "message": .string("missing active compose tab")
                 ])
             }) { error in
-                XCTAssertTrue(String(describing: error).contains("active project compose tab"), String(describing: error))
+                XCTAssertTrue(String(describing: error).contains("requires an explicit tab context"), String(describing: error))
             }
 
             XCTAssertEqual(dispatchCount, 0)
@@ -3342,6 +3371,7 @@ final class TabContextRoutingTests: XCTestCase {
 
     private func makeResolver(
         matchesByContextID: [UUID: [MCPContextBindingMatch]],
+        activeMatchByWindowID: [Int: MCPContextBindingMatch] = [:],
         existingWindowID: Int? = nil,
         reusableWindowID: Int? = nil,
         preferredLiveRunWindowID: Int? = nil,
@@ -3350,6 +3380,7 @@ final class TabContextRoutingTests: XCTestCase {
         MCPBindingResolver(
             collectMatchesForContextID: { contextID in matchesByContextID[contextID] ?? [] },
             collectMatchesForWorkingDirs: { _ in [] },
+            collectActiveMatchForWindowID: { windowID in activeMatchByWindowID[windowID] },
             existingWindowIDForConnection: { _ in existingWindowID },
             clientIdentifier: { _ in "test-client" },
             reusableWindowForClient: { _, _ in reusableWindowID },

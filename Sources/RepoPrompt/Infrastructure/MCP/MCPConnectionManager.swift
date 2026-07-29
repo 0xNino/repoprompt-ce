@@ -593,10 +593,6 @@ actor ServerNetworkManager {
         toolName == "bind_context" || isAppWideTool(toolName)
     }
 
-    nonisolated static func shouldSkipGenericTabBinding(for toolName: String) -> Bool {
-        toolName == "manage_workspaces" || toolName == "bind_context" || toolName == "context_builder" || isAppWideTool(toolName)
-    }
-
     nonisolated static func shouldSkipPerCallRunScopedTabRebindFallback(
         toolName: String,
         purpose: MCPRunPurpose
@@ -637,8 +633,8 @@ actor ServerNetworkManager {
             "**Alternatives:**\n" +
             "- `bind_context` with `{\"op\":\"list\"}` to see windows and context_id values\n" +
             "- `bind_context` with `{\"op\":\"bind\",\"context_id\":\"<id>\"}` to bind a specific tab context\n" +
-            "- `bind_context` with `{\"op\":\"bind\",\"window_id\":<id>}` to set window affinity only\n" +
-            "- Pass `_windowID` as a hidden parameter on any tool call for one-shot routing"
+            "- `bind_context` with `{\"op\":\"bind\",\"window_id\":<id>}` to capture and bind that window's current tab context\n" +
+            "- Pass `_windowID` as a hidden parameter on any tool call to capture that window's current tab for that call only"
     }
 
     nonisolated static func multiWindowSelectionGuidance(
@@ -667,37 +663,6 @@ actor ServerNetworkManager {
         }
         return "Window \(windowID) not found or MCP tools not enabled.\n" +
             "Call `bind_context` with `{\"op\":\"list\"}` to see available windows."
-    }
-
-    nonisolated static func tabBindingTroubleshooting(
-        purpose: MCPRunPurpose,
-        restrictedTools: Set<String>,
-        windowID: Int? = nil
-    ) -> [String] {
-        if purpose == .agentModeRun {
-            return [
-                "RepoPrompt could not route this Agent Mode MCP call to the active run.",
-                "Retry the tool call once. If it fails again, tell the user the RepoPrompt connection failed and ask them to restart this Agent Mode run."
-            ]
-        }
-        if restrictedTools.contains("bind_context") {
-            return [
-                "RepoPrompt could not route this restricted MCP connection.",
-                "Retry once. If it fails again, tell the user the RepoPrompt connection failed and ask them to restart the MCP client or Agent Mode run."
-            ]
-        }
-        if let windowID {
-            return [
-                "Call `bind_context` with `{\"op\":\"list\",\"window_id\":\(windowID)}` to see available context_id values in this window.",
-                "The tab may exist in a different window - verify `_windowID` is correct.",
-                "Use `bind_context` with `op=bind` for explicit tab binding with validation."
-            ]
-        }
-        return [
-            "Include `_windowID` alongside `_tabID` to specify the target window.",
-            "Or call `bind_context` with `{\"op\":\"bind\",\"window_id\":<window_id>}` first.",
-            "Or use `bind_context` with `op=bind` and a `context_id` for sticky tab binding."
-        ]
     }
 
     private nonisolated static func agentModeRoutingFailureGuidance() -> String {
@@ -6600,6 +6565,22 @@ actor ServerNetworkManager {
                     }
                 }
             },
+            collectActiveMatchForWindowID: { windowID in
+                await MainActor.run {
+                    guard let window = WindowStatesManager.shared.allWindows.first(where: { $0.windowID == windowID }),
+                          let workspace = window.workspaceManager.activeWorkspace,
+                          let tab = workspace.composeTabs.first(where: { $0.id == workspace.activeComposeTabID })
+                          ?? workspace.composeTabs.first
+                    else { return nil }
+                    return MCPContextBindingMatch(
+                        windowID: window.windowID,
+                        tabID: tab.id,
+                        workspaceID: workspace.id,
+                        workspaceName: workspace.name,
+                        repoPaths: workspace.repoPaths
+                    )
+                }
+            },
             existingWindowIDForConnection: { [self] connectionID in
                 presentationWindowByConnection[connectionID]
             },
@@ -7660,7 +7641,6 @@ actor ServerNetworkManager {
             private nonisolated func debugBindingKindString(_ kind: MCPServerViewModel.ConnectionBindingSnapshot.BindingKind) -> String {
                 switch kind {
                 case .tabContext: "tab_context"
-                case .windowOnly: "window_only"
                 case .unbound: "unbound"
                 }
             }
@@ -11097,13 +11077,24 @@ actor ServerNetworkManager {
                 defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.logicalContextResolution, logicalContextState) }
                 if !Self.shouldBypassLogicalContextPreResolution(for: toolName) {
                     do {
-                        if let logicalBinding = try await bindingResolver.resolveLogicalContextBinding(
-                            connectionID: connectionID,
-                            explicitContextID: extractedContextID,
-                            legacyTabID: extractedTabID,
-                            workingDirs: [],
-                            requestedWindowID: extractedWindowID
-                        ) {
+                        let logicalBinding: MCPLogicalContextBindingResolution? = if extractedContextID == nil,
+                                                                                     extractedTabID == nil,
+                                                                                     let extractedWindowID
+                        {
+                            try await bindingResolver.resolvePresentationWindowBinding(
+                                connectionID: connectionID,
+                                requestedWindowID: extractedWindowID
+                            )
+                        } else {
+                            try await bindingResolver.resolveLogicalContextBinding(
+                                connectionID: connectionID,
+                                explicitContextID: extractedContextID,
+                                legacyTabID: extractedTabID,
+                                workingDirs: [],
+                                requestedWindowID: extractedWindowID
+                            )
+                        }
+                        if let logicalBinding {
                             dispatchTabContextHint = MCPServerViewModel.TabContextHint(
                                 tabID: logicalBinding.logicalContext.tabID,
                                 workspaceID: logicalBinding.logicalContext.workspaceID,

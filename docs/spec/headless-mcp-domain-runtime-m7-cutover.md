@@ -1,138 +1,99 @@
-# Headless MCP domain runtime M7 — automatic cutover evidence
+# Headless MCP domain runtime M7 — conservative cutover contract and correction evidence
 
 Date: 2026-07-28
 
 Branch: `feature/headless-runtime-m7-cutover`
 Base: finalized M6 head `d3677c3e82d171affe08d35587e0bd9bd4561b0f`
+Review addressed: `docs/reviews/headless-runtime-m7-cutover-prepush-review-2026-07-28.md`
 
-## Final backend contract
+## Backend contract
 
-`repoprompt-mcp` accepts `--backend app|headless|auto`; MCP stdio defaults to
-`auto`. Selection is made exactly once before the first `initialize` read:
+`repoprompt-mcp` accepts `--backend app|headless|auto`; MCP stdio continues to default to `app`. The default must not move to `auto` until explicit live and release evidence demonstrates app-available/no-app behavior, state continuity, retries, and latency.
+
+`auto` remains an explicit preview mode. Selection is made exactly once before the first `initialize` read:
 
 - explicit `app` and `headless` never probe;
-- `auto` performs one bounded, connect-only probe of the well-known app socket;
+- explicit `auto` performs one bounded, connect-only probe of the well-known app socket;
 - an available app selects the existing proxy/reconnect path;
 - an unavailable app selects the M6 direct runtime;
 - no initialized process retries or switches backend;
-- interactive and exec modes remain app-backed.
+- interactive and exec modes are app-only and reject explicit `headless` and `auto`;
+- bare backend values and duplicate backend options fail with usage status.
 
-The probe verifies a Unix socket node, connects with a 150 ms bound, transmits
-no protocol bytes, closes its descriptor, and never examines the private M6
-child endpoint.
+The probe verifies a Unix socket node, connects with a 150 ms bound, transmits no protocol bytes, closes its descriptor, and never examines the private M6 child endpoint. All app-generated MCP configurations, including provider child configuration, explicitly pass `--backend app`.
 
-## Strangler cleanup
+## Canonical state and workspace semantics
 
-- Removed `ServiceRegistry`; app registration is an operation on the
-  process-owned `AppDomainRuntimeComposition`.
-- Retired the `MCPWindowToolRuntime`, context, dependency, catalog, and group
-  compatibility type/files. The retained app-only capabilities are named
-  `MCPAppPhysicalCapabilityAdapters`; they are explicit presentation/filesystem
-  adapters rather than a generic runtime dependency bag.
-- Replaced the mixed app-tool/shared-binding catalog merge with one ordered
-  domain-binding projection. App adapters first produce
-  `MCPDomainToolBinding`, then the canonical projection is materialized through
-  `MCPAppToolBinder`; duplicate names and non-canonical names fail closed.
-- Removed protected-mutation milestone staging and the migrated-tool-name
-  branching.
-- Removed implicit active-tab context resolution and its diagnostics/switches.
-  Tool execution now requires an explicit, restored, or exact run-scoped
-  binding; app context state is presentation projection only.
-- Removed window-participant ownership from `MCPService`. App launch starts the
-  process transport, window join/leave only attach presentation, and explicit
-  process shutdown owns teardown.
-- Removed the six participant-token lifecycle tests and their 15 obsolete
-  scenarios. One three-scenario owner test now covers initial process start,
-  detach/reattach without transport mutation, and explicit shutdown.
-- Extended `headless_runtime_guardrails.sh` to reject retired facades, routing
-  fallback switches, migration staging, duplicate headless authorities, UI
-  imports, and domain-owned `MainActor`.
+Default headless mode uses the canonical RepoPrompt CE application-support root and the same workspace storage root selected by the app. It never derives user state from the process current working directory and never invents `Headless/default` storage.
 
-## Focused evidence
+A nondefault named headless profile requires `REPOPROMPT_MCP_HEADLESS_PROFILE_DIR`. Explicit working roots may bootstrap a synthetic workspace only inside that intentional isolated profile. Empty or duplicate explicit roots fail closed.
 
-- Backend selection: conductor ticket
-  `c6fd56d3-64b6-438f-9947-c06b7cfe29ba`.
-- App catalog parity and canonical projection: ticket
-  `7e128736-db52-43f6-9ff6-5c9c49bc9a3a`, 19 tests passed.
-- Final tab routing: ticket `d056b382-273a-49fc-84d4-930869f7f1e3`,
-  55 tests passed.
-- Protected-mutation final policy: ticket
-  `4872973d-479f-4de4-97a0-a169fa13c5c5`, passed.
-- Selection freshness after fallback retirement: ticket
-  `65f1d12c-8275-40a5-a8b7-c047e16f9e73`, 20 tests passed.
-- Process-owned catalog/lifecycle: ticket
-  `a1422392-0f2e-46a4-b53e-e2093174ecaf`.
-- Direct no-app and private-child regression: ticket
-  `d1ab19e3-88b2-4498-b806-0d6b8d86ffb7`.
-- M0 ownership/duplicate-schema contract: ticket
-  `af4141c3-3c67-49c0-ad55-009444b5ed8d`, passed.
-- Complete domain-runtime owner suite: ticket
-  `dbcc872e-e6c1-4809-8888-fb12ae69fa06`, 102 tests passed.
-- Ask-user cancellation synchronization regression: ticket
-  `0714d4a9-99ea-463f-834e-6eafd9d738c8`, passed with bounded async
-  presentation/cancellation signals rather than scheduler polling.
-- Persistent explicit-context connection regression: ticket
-  `72c0a678-22c8-403d-b565-fbbfda32a00c`, 21 tests passed.
-- Dispatch/catalog diagnostic lifecycle contract: ticket
-  `37c94612-cd76-482a-b15a-d50f3ba2d873`, 23 tests passed.
-- Worktree explicit-context coverage:
-  - selection: `bed88890-848d-4534-ab0c-d50b7b9ca845`;
-  - stale-prunable binding: `0e86571b-887a-4045-897f-5dc17c91dbae`;
-  - merge: `f6d85d4e-090b-40a5-b6c2-f53918d214c5`.
-- Final product compilation:
-  - RepoPrompt: `a01104a0-6364-4781-85bb-edcec104b9ee`, passed.
-  - repoprompt-mcp: `7a38ce15-ba78-4097-ab80-6ac09d4b7548`, passed.
-- Provider package suite: `d197e11a-cc9b-45cd-8c7e-da69e40f84d4`,
-  passed.
-- Final formatter/lint:
-  - format: `77bd54ba-87a4-4424-919c-74955bc26c16`, no changes;
-  - lint: `22a4af9c-ad2e-4945-a07d-ebc9997231ca`, passed.
-- `Scripts/headless_runtime_guardrails.sh` passed after the final catalog rename.
+Direct workspace/read/search/tree/selection/prompt behavior is implemented by `MCPDomainCanonicalWorkspaceService` in `RepoPromptDomainRuntime`. `DirectHeadlessWorkspaceBackend` is a physical adapter that supplies snapshots, mutations, and path resolution; it no longer contains a second file-reading, search, tree, selection, or token-accounting implementation.
+
+## App admission and catalog semantics
+
+Public `bind_context` `window_id` and legacy working-directory window selection translate the selected presentation window to its exact active tab/workspace logical context at admission and persist that authoritative context. Hidden `_windowID` performs the same translation for one call. Both fail closed if the selected window has no active logical context. Later active-tab changes cannot redirect admitted work, and no active-tab execution fallback was restored.
+
+Provider-built app tools retain their existing `MCPAppToolBinder` envelope and are canonicalized without a second `runTool` wrapper. Raw shared bindings receive one envelope. Duplicate, invalid, or noncanonical catalog materialization throws a typed error during authoritative registration rather than trapping. Exact scope coverage again requires `read_file` to have only its single window registration scope.
+
+The app physical boundary is grouped into five typed capability families:
+
+- `MCPAppPhysicalCapabilityAdapters.Execution`
+- `MCPAppPhysicalCapabilityAdapters.Context`
+- `MCPAppPhysicalCapabilityAdapters.Selection`
+- `MCPAppPhysicalCapabilityAdapters.Files`
+- `MCPAppPhysicalCapabilityAdapters.Prompt`
+
+The retired flat closure dependency-bag contract is absent from the frozen ownership fixture and guarded against returning.
+
+## Lifecycle and cleanup
+
+- `MCPService.start()` is the process-owned transport start operation.
+- `join(windowID:)` and `leave(windowID:)` attach/detach presentation only and cannot start, stop, or resurrect transport.
+- Explicit shutdown remains stopped after a later window attachment.
+- `restoredBinding`, `TabContextResolutionPolicy`, `shouldSkipGenericTabBinding`, `tabBindingTroubleshooting`, window-only binding snapshots, migrated-tool branching, active-tab compatibility switches, and bare cleanup blocks are removed.
+- A missing connection ID in read-file auto-selection admission produces controlled invalid-params behavior rather than `preconditionFailure`.
+- Positive active-context token-accounting/coalescing tests cover the still-live `presentationActiveContext` branch.
+
+## Focused correction evidence
+
+- Backend selection policy: `f2ffd3f4-4176-4e82-be86-87bda55bf118` — 4 tests passed.
+- Runtime root/configuration: `76a5b7b8-e19a-457d-b13b-697fcdb6a952` — 5 tests passed.
+- Direct no-app/parser process: `b460deaf-8cf3-4e83-adec-3ff5c1bd133a` — 3 tests passed.
+- App child backend pin: `7e8abbe4-2f9b-4bb7-820b-21945d2c70f4` — passed.
+- Generated Codex integration configuration: `070321c4-5b74-4c1c-80e5-0bf50305a298` — 22 tests passed before the additional exact child-pin test above.
+- Authoritative routing admission: `f3687442-e9f5-4ceb-9eb8-894c0a24ac04` — 57 tests passed.
+- Restored active token-accounting tests passed (22; conductor ticket `0e3d3a65-f75e-4c21-ad4e-449e136abecc`).
+- Catalog single envelope: `8ed82cf1-c043-4d18-b04c-0689ae61f1e9` — passed.
+- Catalog duplicate failure: `d37a402b-fa8c-42ec-8966-ef742947882a` — passed.
+- Process-owned join/shutdown semantics: `b5ee8fa5-facc-4f7a-98e1-855faaa899d0` — passed.
+- Exact one-scope registration without window transport start: `ba50ff5d-7fa1-44d8-b7ab-2a624bfdcdd7` — passed.
+- Standalone canonical composition: `4e2db67d-7d5d-4e45-af5e-685d2b68148b` — 2 tests passed.
+- Frozen ownership/capability-family contract: `11d740c3-7edd-4d94-89d9-fd290e0724b9` — 3 tests passed.
+- Provider package: `02bfec08-19c9-4fbe-b68b-c126e122f849` — passed.
+- Products:
+  - RepoPrompt: `0fa57b39-7668-4f9d-96df-09ae6cc7af49` — passed.
+  - repoprompt-mcp: `9ed7685b-b8f3-458a-9cee-1861256f792e` — passed.
+- Final format: `5c2c153c-98c7-4e9d-bd4d-81da0796e11f` — passed.
+- Final lint: `4e258845-9ae2-420f-bd46-da7fa38a2df3` — passed.
+- `Scripts/headless_runtime_guardrails.sh` — passed after final formatting.
 
 ## Test-ledger reconciliation
 
-The curated ledger preserves metadata for final-policy renames, removes the
-active-tab fallback and window-participant scenarios because those production
-authorities no longer exist, and adds the four backend-selection tests plus the
-process-lifetime replacement. The removed window-participant methods are:
+The curated ledger adds reviewed rows for parser edges, canonical state roots, app-child backend pinning, exact window-context admission, catalog single-envelope/fail-closed behavior, and restored token accounting. It renames the old headless-only mode-rejection row to the broader non-app contract and updates the lifecycle row to include post-shutdown attachment.
 
-- `testMCPServiceConcurrentColdJoinsAreSingleFlight`
-- `testMCPServiceSupersededJoinCannotRemoveSameWindowRejoin`
-- `testMCPServiceCancelledJoinRemovesOnlyItsSharedStartClaim`
-- `testMCPServiceOverlappingShutdownsFormOneCompleteRestartBarrier`
-- `testMCPServiceFailedStartRollsBackParticipantsAndRetryStarts`
-- `testMCPServiceFullShutdownRestartFailureLeavesNoPhantomParticipants`
+Authoritative list tickets:
 
-The two active-presentation token tests and the active-tab fallback decision
-test are intentionally retired; bound-context freshness and token-accounting
-coverage remains.
+- root: `f2bde283-9275-449e-ac68-3aad38285c7b`;
+- provider: `c5fb9c47-56da-441b-92e2-2106d3c63857`.
 
-The final curated-ledger reconciliation passed with 3,755 exact IDs. Its
-authoritative list tickets are:
-
-- root: `956bc2d8-1b1d-4f3f-a0b4-2ba728975430`;
-- provider: `866d6f72-3605-41ad-808b-956510a58820`.
+Final exact-ID verification used fresh list tickets `bc4a0410-ffae-4315-8191-86c22fe06a16` and `68dae8ec-5d16-4926-92be-a6a984e73259` and passed with 3,768 methods.
 
 ## Remaining validation gates
 
-- `make dev-codex-schema-check` is locally blocked because installed Codex
-  `0.144.1` is below the repository's `0.145.0` schema floor (ticket
-  `9d12abdf-40ee-4381-8bf8-f19f6da47326`).
-- The root suite was attempted. M7-specific catalog, explicit-context,
-  diagnostics, and persistent-connection failures found by that run were
-  repaired and their owning suites pass above. A clean full rerun remains
-  blocked in this checkout by the already-running visible app owning the
-  bootstrap socket, plus an unrelated pre-existing
-  `CodexNativeSessionControllerGoalConfigTests` goals-default mismatch. The
-  task intentionally does not stop or relaunch that app.
-- The complete worktree smoke class similarly reaches its live bootstrap test
-  and cannot acquire the app-owned socket. Its non-live M7 owners pass via the
-  three focused tickets above; Context Builder export completed before the
-  blocked live method.
+- `make dev-codex-schema-check` remains locally blocked because installed Codex `0.144.1` is below the repository contract floor `0.145.0` (ticket `56f0f2d1-ba64-4c6e-ab9b-7b8070f00699`).
+- A full `ToolCatalogSnapshotTests` class attempt compiled and exercised the new exact tests, but entered bootstrap retry paths while a visible app owned the socket; it was canceled rather than stopping/relaunching the app. The new catalog, lifecycle, and exact-scope methods pass independently above.
+- No full root-suite rerun is claimed for this correction pass. The bounded focused owners, provider suite, exact ledger, products, lint, and guardrails pass.
+- No live app proxy/no-app auto matrix, packaging, release artifact, latency comparison, or state-loss/retry evidence was produced. The task explicitly forbids app relaunch and requires the branch to remain local.
 
-## Release-validation boundary
-
-Packaging/release validation owns four independent live probes: explicit app,
-explicit headless, `auto` with the app available, and `auto` without the app.
-This implementation task does not launch, relaunch, stop, or replace the
-visible app; orchestrated live evidence remains a release/design-review gate.
+These gaps are why `app` remains the default. Moving the default to `auto` is a later release decision, not part of this M7 correction.

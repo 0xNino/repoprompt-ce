@@ -290,7 +290,6 @@ extension MCPServerViewModel {
         case runInstall
         case runHandover
         case pendingRunScoped
-        case restoredBinding
         case explicitHint
     }
 
@@ -341,11 +340,6 @@ extension MCPServerViewModel {
         let windowID: Int?
     }
 
-    enum TabContextResolutionPolicy: Equatable {
-        /// Require a bound, run-scoped, or explicit hinted tab context.
-        case requireExplicitOrRunScoped
-    }
-
     enum TabContextResolution {
         case tabContextSnapshot(TabContextSnapshot, source: TabContextSnapshotSource)
 
@@ -358,7 +352,6 @@ extension MCPServerViewModel {
     struct ConnectionBindingSnapshot: Equatable {
         enum BindingKind: Equatable {
             case unbound
-            case windowOnly
             case tabContext
         }
 
@@ -372,13 +365,7 @@ extension MCPServerViewModel {
         let runID: UUID?
 
         var bindingKind: BindingKind {
-            if tabID != nil {
-                return .tabContext
-            }
-            if windowID != nil {
-                return .windowOnly
-            }
-            return .unbound
+            tabID == nil ? .unbound : .tabContext
         }
     }
 
@@ -979,7 +966,7 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    private func makeTabContextSnapshot(
+    func makeTabContextSnapshot(
         tabID: UUID,
         workspaceID requestedWorkspaceID: UUID?,
         windowID: Int,
@@ -1507,7 +1494,6 @@ extension MCPServerViewModel {
         from metadata: RequestMetadata,
         explicitHint: TabContextHint? = nil,
         toolName: String = "unknown",
-        policy: TabContextResolutionPolicy,
         startMirroring: Bool = true
     ) throws -> TabContextResolution {
         try resolveTabContext(
@@ -1516,7 +1502,6 @@ extension MCPServerViewModel {
             providedWindowID: metadata.windowID,
             explicitHint: explicitHint ?? metadata.tabContextHint,
             toolName: toolName,
-            policy: policy,
             runPurpose: metadata.runPurpose,
             startMirroring: startMirroring
         )
@@ -1540,14 +1525,12 @@ extension MCPServerViewModel {
         from metadata: RequestMetadata,
         explicitHint: TabContextHint? = nil,
         toolName: String,
-        policy: TabContextResolutionPolicy,
         startMirroring: Bool = true
     ) throws -> ResolvedTabContextSnapshot {
         switch try resolveTabContext(
             from: metadata,
             explicitHint: explicitHint,
             toolName: toolName,
-            policy: policy,
             startMirroring: startMirroring
         ) {
         case let .tabContextSnapshot(snapshot, source):
@@ -2019,8 +2002,7 @@ extension MCPServerViewModel {
         let purpose = metadata.runPurpose ?? .unknown
         var resolved = try? resolveTabContextSnapshot(
             from: metadata,
-            toolName: "file_tool_lookup_scope",
-            policy: .requireExplicitOrRunScoped
+            toolName: "file_tool_lookup_scope"
         )
         if var snapshot = resolved?.snapshot {
             if snapshot.runID == nil,
@@ -2341,8 +2323,7 @@ extension MCPServerViewModel {
     ) {
         var resolvedContext = try resolveTabContextSnapshot(
             from: metadata,
-            toolName: toolName,
-            policy: .requireExplicitOrRunScoped
+            toolName: toolName
         )
         let lookupContext = await resolveFileToolLookupContext(from: metadata)
         if resolvedContext.snapshot.activeAgentSessionID != nil,
@@ -2350,8 +2331,7 @@ extension MCPServerViewModel {
         {
             resolvedContext = try resolveTabContextSnapshot(
                 from: metadata,
-                toolName: toolName,
-                policy: .requireExplicitOrRunScoped
+                toolName: toolName
             )
         }
         return (resolvedContext, lookupContext)
@@ -2485,7 +2465,7 @@ extension MCPServerViewModel {
         switch resolvedContext.source {
         case .runInstall, .runHandover, .pendingRunScoped:
             return true
-        case .explicitBinding, .restoredBinding, .explicitHint, nil:
+        case .explicitBinding, .explicitHint, nil:
             return false
         }
     }
@@ -2520,8 +2500,7 @@ extension MCPServerViewModel {
         }
         let resolvedContext = try? resolveTabContextSnapshot(
             from: metadata,
-            toolName: "agent_session_spawn_source",
-            policy: .requireExplicitOrRunScoped
+            toolName: "agent_session_spawn_source"
         )
         return Self.spawnParentSourceTabIDForAgentSessionCreation(
             purpose: purpose,
@@ -2578,8 +2557,7 @@ extension MCPServerViewModel {
         guard purpose == .discoverRun else { return nil }
         let resolved = try resolveTabContextSnapshot(
             from: metadata,
-            toolName: "context_builder nested git target",
-            policy: .requireExplicitOrRunScoped
+            toolName: "context_builder nested git target"
         )
         guard Self.isExactRunScopedTabContext(resolved),
               resolved.snapshot.activeAgentSessionID != nil
@@ -2598,8 +2576,7 @@ extension MCPServerViewModel {
     ) async throws {
         let resolved = try resolveTabContextSnapshot(
             from: metadata,
-            toolName: "context_builder nested git publication",
-            policy: .requireExplicitOrRunScoped
+            toolName: "context_builder nested git publication"
         )
         guard Self.isExactRunScopedTabContext(resolved),
               let workspaceID = resolved.snapshot.workspaceID,
@@ -2631,7 +2608,7 @@ extension MCPServerViewModel {
 
     /// Resolves and freezes the exact compose tab whose immutable review package will be
     /// delegated to a child Agent run. This is intentionally separate from conversation-parent
-    /// resolution: a top-level window-only launch has no Agent parent but still has a packaging
+    /// resolution: a top-level explicit-window launch has no Agent parent but still has a packaging
     /// source.
     @MainActor
     func resolveAgentRunOracleReviewLaunchSnapshot(
@@ -2680,8 +2657,7 @@ extension MCPServerViewModel {
         if metadata.tabContextHint != nil || binding?.bindingKind == .tabContext || isRunScoped {
             resolved = try resolveTabContextSnapshot(
                 from: metadata,
-                toolName: "agent_run.start review source",
-                policy: .requireExplicitOrRunScoped
+                toolName: "agent_run.start review source"
             )
             if isRunScoped, !Self.isExactRunScopedTabContext(resolved) {
                 throw MCPError.invalidParams(
@@ -2690,9 +2666,9 @@ extension MCPServerViewModel {
             }
             route = isRunScoped ? .runScoped : .explicitTabContext
         } else {
-            guard binding?.bindingKind == .windowOnly || hasValidatedExplicitWindowRoute else {
+            guard hasValidatedExplicitWindowRoute else {
                 throw MCPError.invalidParams(
-                    "agent_run.start requires either an explicit tab context, an exact run-scoped tab, or a window-only connection bound to the target window."
+                    "agent_run.start requires an explicit tab context, an exact run-scoped tab, or an explicit request-scoped window route."
                 )
             }
             guard let workspace = targetWindow.workspaceManager.activeWorkspace,
@@ -2700,7 +2676,7 @@ extension MCPServerViewModel {
                   let activeComposeTabID = workspace.activeComposeTabID
             else {
                 throw MCPError.invalidParams(
-                    "agent_run.start could not resolve an active project compose tab for its window-only launch source."
+                    "agent_run.start could not capture an active project compose tab for its explicit window launch source."
                 )
             }
             resolved = try ResolvedTabContextSnapshot(
@@ -2715,7 +2691,7 @@ extension MCPServerViewModel {
                 ),
                 source: nil
             )
-            route = .windowOnlyActiveCompose
+            route = .explicitWindowActiveCompose
         }
 
         guard resolved.snapshot.windowID == targetWindow.windowID,
@@ -2867,7 +2843,6 @@ extension MCPServerViewModel {
         providedWindowID: Int?,
         explicitHint: TabContextHint? = nil,
         toolName: String = "unknown",
-        policy: TabContextResolutionPolicy,
         runPurpose: MCPRunPurpose? = nil,
         startMirroring: Bool = true
     ) throws -> TabContextResolution {
@@ -2884,10 +2859,10 @@ extension MCPServerViewModel {
         if let connectionID, let bound = tabContextByConnectionID[connectionID] {
             let requiredRunID = connectionIDToRunID[connectionID]
             let boundMatchesRunHint = requiredRunID.map { bound.runID == $0 } ?? true
-            let boundAllowedByPolicy = policy != .requireExplicitOrRunScoped || bound.runID != nil || bound.explicitlyBound
-            if !boundMatchesRunHint || !boundAllowedByPolicy {
+            let boundIsAuthoritative = bound.runID != nil || bound.explicitlyBound
+            if !boundMatchesRunHint || !boundIsAuthoritative {
                 let shouldPreserveRunHint = requiredRunID != nil && bound.runID == nil
-                tabContextLog("resolveTabContext released incompatible binding connectionID=\(connectionID) boundRun=\(bound.runID?.uuidString ?? "nil") requiredRun=\(requiredRunID?.uuidString ?? "nil") explicit=\(bound.explicitlyBound) policy=\(policy) preserveRunHint=\(shouldPreserveRunHint)")
+                tabContextLog("resolveTabContext released non-authoritative binding connectionID=\(connectionID) boundRun=\(bound.runID?.uuidString ?? "nil") requiredRun=\(requiredRunID?.uuidString ?? "nil") explicit=\(bound.explicitlyBound) preserveRunHint=\(shouldPreserveRunHint)")
                 releaseBinding(connectionID: connectionID, preserveConnectionRunIDMapping: shouldPreserveRunHint)
             } else if shouldKeepBinding(
                 connectionID: connectionID,
@@ -2909,10 +2884,7 @@ extension MCPServerViewModel {
                     beginMirroringForConnection(connectionID, context: bound)
                 }
                 tabContextLog("resolveTabContext using bound context connectionID=\(connectionID) runID=\(bound.runID?.uuidString ?? "nil") tab=\(bound.tabID)")
-                let source: TabContextSnapshotSource = {
-                    if bound.runID != nil { return .runInstall }
-                    return bound.explicitlyBound ? .explicitBinding : .restoredBinding
-                }()
+                let source: TabContextSnapshotSource = bound.runID == nil ? .explicitBinding : .runInstall
                 return .tabContextSnapshot(bound, source: source)
             } else {
                 tabContextLog("resolveTabContext released stale binding connectionID=\(connectionID) tab=\(bound.tabID) window=\(bound.windowID)")
@@ -2983,8 +2955,7 @@ extension MCPServerViewModel {
         do {
             let resolution = try resolveTabContext(
                 from: metadata,
-                toolName: toolName,
-                policy: .requireExplicitOrRunScoped
+                toolName: toolName
             )
             guard case let .tabContextSnapshot(context, _) = resolution else {
                 throw MCPError.invalidParams(Self.tabContextRoutingErrorMessage(toolName: toolName, runPurpose: purpose))

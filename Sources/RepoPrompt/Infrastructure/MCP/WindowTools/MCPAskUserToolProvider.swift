@@ -9,11 +9,11 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
     let group: MCPAppToolGroup = .askUser
 
     private let runtime: MCPAppToolBinder
-    private let dependencies: MCPAppPhysicalCapabilityAdapters
+    private let dependencies: MCPAppPhysicalCapabilityAdapters.Execution
 
-    init(runtime: MCPAppToolBinder, dependencies: MCPAppPhysicalCapabilityAdapters) {
+    init(runtime: MCPAppToolBinder, execution: MCPAppPhysicalCapabilityAdapters.Execution) {
         self.runtime = runtime
-        self.dependencies = dependencies
+        dependencies = execution
     }
 
     var domainInteractionAdapter: DomainLongRunningInteractionAdapter {
@@ -153,7 +153,7 @@ final class MCPAskUserToolProvider: MCPAppToolProviding {
     /// Execute the ask_user tool - routes to appropriate UI based on run purpose.
     private static func executeAskUser(
         args: [String: Value],
-        dependencies: MCPAppPhysicalCapabilityAdapters
+        dependencies: MCPAppPhysicalCapabilityAdapters.Execution
     ) async throws -> Value {
         // Get connection ID and determine run purpose for routing.
         guard let connectionID = ServerNetworkManager.currentConnectionID else {

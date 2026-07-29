@@ -4857,7 +4857,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 .session(for: packagingTabID)
                 .activeAgentSessionID
             let snapshot = AgentRunOracleReviewLaunchSnapshot(
-                route: oracleLaunchRoute ?? (sourceTabID == nil ? .windowOnlyActiveCompose : .runScoped),
+                route: oracleLaunchRoute ?? (sourceTabID == nil ? .explicitWindowActiveCompose : .runScoped),
                 windowID: targetWindow.windowID,
                 workspaceID: workspace.id,
                 tabID: packagingTabID,

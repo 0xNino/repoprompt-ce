@@ -1127,7 +1127,7 @@ class WindowState: ObservableObject {
 
     /// ------------------------------------------------------------------
     func startMCPServer() {
-        Task { try? await WindowState.sharedMCPService.join(windowID: windowID) }
+        Task { await WindowState.sharedMCPService.join(windowID: windowID) }
     }
 
     func stopMCPServer() {

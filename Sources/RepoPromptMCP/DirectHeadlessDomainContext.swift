@@ -183,19 +183,3 @@ actor DirectHeadlessDomainContext {
         return context
     }
 }
-
-extension DomainPhysicalToolRequest {
-    func mcpArguments() throws -> [String: Value] {
-        try JSONDecoder().decode([String: Value].self, from: argumentsJSON)
-    }
-}
-
-extension DomainPhysicalToolResult {
-    static func mcp(_ value: Value) throws -> DomainPhysicalToolResult {
-        try DomainPhysicalToolResult(json: JSONEncoder().encode(value))
-    }
-
-    static func object(_ value: [String: Value]) throws -> DomainPhysicalToolResult {
-        try mcp(.object(value))
-    }
-}

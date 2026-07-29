@@ -129,6 +129,7 @@ let package = Package(
             dependencies: [
                 "RepoPromptShared",
                 "RepoPromptC",
+                "RepoPromptCodeMapCore",
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "MCP", package: "swift-sdk")
             ],

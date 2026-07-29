@@ -2563,7 +2563,8 @@ func parseCLIMode() -> CLIMode {
     var execOptions = ExecOptions()
     var isInteractive = false
     var isExec = false
-    var backend = MCPBackend.auto
+    var backend = MCPBackend.app
+    var backendOptionWasExplicit = false
 
     var i = args.startIndex
     while i < args.endIndex {
@@ -2571,20 +2572,30 @@ func parseCLIMode() -> CLIMode {
 
         switch arg {
         case "--backend":
+            guard !backendOptionWasExplicit else {
+                fputs("Error: --backend may be specified only once.\n", stderr)
+                exit(2)
+            }
             i = args.index(after: i)
             guard i < args.endIndex, let parsed = MCPBackend(rawValue: args[i].lowercased()) else {
                 fputs("Error: --backend requires 'app', 'headless', or 'auto'.\n", stderr)
                 exit(2)
             }
             backend = parsed
+            backendOptionWasExplicit = true
 
         case let value where value.hasPrefix("--backend="):
+            guard !backendOptionWasExplicit else {
+                fputs("Error: --backend may be specified only once.\n", stderr)
+                exit(2)
+            }
             let raw = String(value.dropFirst("--backend=".count)).lowercased()
             guard let parsed = MCPBackend(rawValue: raw) else {
                 fputs("Error: --backend requires 'app', 'headless', or 'auto'.\n", stderr)
                 exit(2)
             }
             backend = parsed
+            backendOptionWasExplicit = true
 
         case "--raw-json":
             hasNonBackendUserArgs = true
@@ -2865,14 +2876,14 @@ func parseCLIMode() -> CLIMode {
             }
         }
 
-        if !arg.hasPrefix("--backend="), arg != "--backend", !MCPBackend.allCases.map(\.rawValue).contains(arg) {
+        if !arg.hasPrefix("--backend="), arg != "--backend" {
             hasNonBackendUserArgs = true
         }
         i = args.index(after: i)
     }
 
-    if backend == .headless, isExec || isInteractive {
-        fputs("Error: --backend headless is available only for MCP stdio server mode; interactive and exec remain app-backed.\n", stderr)
+    if backendOptionWasExplicit, backend != .app, isExec || isInteractive {
+        fputs("Error: --backend \(backend.rawValue) is available only for MCP stdio server mode; interactive and exec remain app-backed.\n", stderr)
         exit(2)
     }
 
@@ -3600,7 +3611,7 @@ if DirectHeadlessChildBridge.isRequested() {
 
 if case .proxy = mode {
     // Proxy/direct MCP mode is for a host-owned pipe or socket. Keep the ordinary terminal
-    // help behavior independent of the selected backend, including the default `auto` path.
+    // help behavior independent of the selected backend, including an explicit `auto` path.
     // Do not use a positive-timeout stdin probe here: hosts may send initialize later.
     let stdinIsTTY = isatty(STDIN_FILENO) != 0
     let stdoutIsTTY = isatty(STDOUT_FILENO) != 0

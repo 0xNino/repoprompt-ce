@@ -205,8 +205,7 @@ extension MCPServerViewModel {
         let metadata = await captureRequestMetadata()
         return try resolveTabContextSnapshot(
             from: metadata,
-            toolName: "export_selected_files",
-            policy: .requireExplicitOrRunScoped
+            toolName: "export_selected_files"
         )
     }
 

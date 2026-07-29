@@ -99,6 +99,7 @@ actor MCPService: Sendable {
     private var lifecycleGeneration: UInt64 = 0
     private var activeStartAttempt: StartAttempt?
     private var activeTeardownAttempt: TeardownAttempt?
+    private var joinedWindowIDs = Set<Int>()
     #if DEBUG
         private var teardownRequestCount = 0
     #endif
@@ -220,13 +221,16 @@ actor MCPService: Sendable {
         }
     }
 
-    func join(windowID: Int) async throws {
+    /// Attach presentation state only. Process transport ownership belongs to app startup
+    /// and explicit lifecycle actions; opening a window must never resurrect a stopped server.
+    func join(windowID: Int) async {
+        joinedWindowIDs.insert(windowID)
         mcpServiceLog("Window \(windowID) attached to process-owned MCP presentation")
-        try await start()
         updates.continuation.yield(state)
     }
 
     func leave(windowID: Int) async {
+        joinedWindowIDs.remove(windowID)
         mcpServiceLog("Window \(windowID) detached from process-owned MCP presentation")
         updates.continuation.yield(state)
     }
@@ -267,6 +271,10 @@ actor MCPService: Sendable {
     #if DEBUG
         func teardownRequestCountForTesting() -> Int {
             teardownRequestCount
+        }
+
+        func joinedWindowIDsForTesting() -> Set<Int> {
+            joinedWindowIDs
         }
     #endif
 

@@ -175,8 +175,7 @@ extension MCPServerViewModel {
         do {
             resolved = try resolveTabContextSnapshot(
                 from: metadata,
-                toolName: toolName,
-                policy: .requireExplicitOrRunScoped
+                toolName: toolName
             )
         } catch {
             return try domainReadUnavailable(

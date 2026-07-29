@@ -166,10 +166,11 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             windowID: 73,
             providers: [],
             sharedBindings: [binding],
-            runtime: runtime
+            runtime: runtime,
+            requiredToolNames: [definition.name]
         )
 
-        let tools = await catalog.tools
+        let tools = try catalog.materializeTools()
         let tool = try XCTUnwrap(tools.first)
         let value = try await tool(["path": .string("README.md")])
         let invocation = await recorder.snapshot()
@@ -181,6 +182,91 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertEqual(invocation?.arguments["path"]?.stringValue, "README.md")
     }
 
+    func testProviderCatalogExecutesOneAppRuntimeEnvelopePerCall() async throws {
+        let definition = try XCTUnwrap(
+            MCPDomainReadToolDefinitions.definitions.first { $0.name == MCPWindowToolName.readFile }
+        )
+        let recorder = SharedBindingRuntimeRecorder()
+        let runtime = MCPAppToolBinder(windowID: 74) { name, freshnessPolicy, arguments, implementation in
+            let providerManaged = if case .providerManaged = freshnessPolicy { true } else { false }
+            await recorder.record(name: name, providerManaged: providerManaged, arguments: arguments)
+            return try await implementation(
+                MCPAppToolInvocation(toolName: name, windowID: 74),
+                arguments
+            )
+        }
+        let provider = SingleEnvelopeToolProvider(runtime: runtime, definition: definition)
+        let catalog = MCPAppToolCatalogRegistration(
+            windowID: 74,
+            providers: [provider],
+            runtime: runtime,
+            requiredToolNames: [definition.name]
+        )
+
+        let tool = try XCTUnwrap(try catalog.materializeTools().first)
+        _ = try await tool(["path": .string("README.md")])
+
+        let invocationCount = await recorder.invocationCount()
+        XCTAssertEqual(invocationCount, 1)
+    }
+
+    func testAppCatalogRejectsDuplicateProviderToolsWithoutTrapping() throws {
+        let definition = try XCTUnwrap(
+            MCPDomainReadToolDefinitions.definitions.first { $0.name == MCPWindowToolName.readFile }
+        )
+        let runtime = MCPAppToolBinder(windowID: 75) { _, _, arguments, implementation in
+            try await implementation(
+                MCPAppToolInvocation(toolName: MCPWindowToolName.readFile, windowID: 75),
+                arguments
+            )
+        }
+        let catalog = MCPAppToolCatalogRegistration(
+            windowID: 75,
+            providers: [
+                SingleEnvelopeToolProvider(runtime: runtime, definition: definition),
+                SingleEnvelopeToolProvider(runtime: runtime, definition: definition)
+            ],
+            runtime: runtime,
+            requiredToolNames: [definition.name]
+        )
+
+        XCTAssertThrowsError(try catalog.materializeTools()) { error in
+            XCTAssertEqual(
+                error as? MCPAppToolCatalogMaterializationError,
+                .duplicateTool(MCPWindowToolName.readFile)
+            )
+        }
+    }
+
+    func testAppCatalogRejectsMissingCanonicalTools() async throws {
+        let definition = try XCTUnwrap(
+            MCPDomainReadToolDefinitions.definitions.first { $0.name == MCPWindowToolName.readFile }
+        )
+        let runtime = MCPAppToolBinder(windowID: 76) { _, _, arguments, implementation in
+            try await implementation(
+                MCPAppToolInvocation(toolName: MCPWindowToolName.readFile, windowID: 76),
+                arguments
+            )
+        }
+        let catalog = MCPAppToolCatalogRegistration(
+            windowID: 76,
+            providers: [SingleEnvelopeToolProvider(runtime: runtime, definition: definition)],
+            runtime: runtime
+        )
+
+        XCTAssertThrowsError(try catalog.materializeTools()) { error in
+            guard case let .missingCanonicalTools(names) = error as? MCPAppToolCatalogMaterializationError else {
+                return XCTFail("Expected missing canonical tool failure, got \(error)")
+            }
+            XCTAssertFalse(names.isEmpty)
+            XCTAssertFalse(names.contains(MCPWindowToolName.readFile))
+        }
+
+        let compatibilityProjection = await catalog.tools
+        XCTAssertTrue(compatibilityProjection.isEmpty)
+        XCTAssertNotNil(catalog.materializationErrorDescription)
+    }
+
     func testMCPServiceWindowAttachmentDoesNotControlProcessTransportLifetime() async throws {
         let startProbe = ControlledMCPServiceStartProbe(outcomes: [.success])
         let teardownProbe = ControlledMCPServiceTeardownProbe(attempts: 1)
@@ -189,13 +275,14 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             controllerFullShutdownOperation: { await teardownProbe.tearDown() }
         )
 
-        let firstAttach = Task { try await service.join(windowID: 101) }
+        let explicitStart = Task { try await service.start() }
         await startProbe.waitUntilAttemptCount(1)
         await startProbe.releaseAttempt(1)
-        try await firstAttach.value
+        try await explicitStart.value
 
+        await service.join(windowID: 101)
         await service.leave(windowID: 101)
-        try await service.join(windowID: 102)
+        await service.join(windowID: 102)
         let startCount = await startProbe.attemptCount
         let runningAfterDetach = await service.currentState().isRunning
         XCTAssertEqual(startCount, 1)
@@ -207,6 +294,14 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         await shutdown.value
         let runningAfterShutdown = await service.currentState().isRunning
         XCTAssertFalse(runningAfterShutdown)
+
+        await service.join(windowID: 103)
+        let startCountAfterReattach = await startProbe.attemptCount
+        let runningAfterReattach = await service.currentState().isRunning
+        let joinedWindows = await service.joinedWindowIDsForTesting()
+        XCTAssertEqual(startCountAfterReattach, 1)
+        XCTAssertFalse(runningAfterReattach)
+        XCTAssertEqual(joinedWindows, Set([102, 103]))
     }
 
     func testServerControllerAwaitsGlobalRegistrationAndFencesSupersededStart() async throws {
@@ -811,16 +906,18 @@ final class ToolCatalogSnapshotTests: XCTestCase {
                         catalog.activeScopesByToolName[toolName]?.contains(windowScope) == true
                     })
                     XCTAssertFalse(catalog.definitions.isEmpty)
-                    XCTAssertTrue(
-                        catalog.activeScopesByToolName[MCPWindowToolName.readFile]?.contains(windowScope) == true
+                    XCTAssertEqual(
+                        catalog.activeScopesByToolName[MCPWindowToolName.readFile],
+                        [windowScope],
+                        "read_file must have exactly one authoritative registration scope"
                     )
 
-                    let attributes = try FileManager.default.attributesOfItem(atPath: socketURL.path)
-                    XCTAssertEqual(attributes[.type] as? FileAttributeType, .typeSocket)
-
-                    await Self.assertBootstrapSocketOverrideError(.managerNotFullyStopped) {
-                        try await ServerNetworkManager.shared.debugRestoreBootstrapSocketURLOverride(expected: socketURL)
-                    }
+                    XCTAssertFalse(
+                        FileManager.default.fileExists(atPath: socketURL.path),
+                        "Window catalog registration must not start the process-owned bootstrap transport."
+                    )
+                    let transportState = await window.mcpServer.service.currentState()
+                    XCTAssertFalse(transportState.isRunning)
                 }
             }
         #else
@@ -1323,6 +1420,25 @@ private actor ServerControllerRegistrationOrderingProbe {
     }
 }
 
+@MainActor
+private final class SingleEnvelopeToolProvider: MCPAppToolProviding {
+    let group = MCPAppToolGroup.files
+    private let runtime: MCPAppToolBinder
+    private let definition: MCPDomainToolDefinition
+
+    init(runtime: MCPAppToolBinder, definition: MCPDomainToolDefinition) {
+        self.runtime = runtime
+        self.definition = definition
+    }
+
+    func buildTools() -> [RepoPromptApp.Tool] {
+        let binding = MCPDomainToolBinding(definition: definition) { arguments in
+            .object(["path": arguments["path"] ?? .null])
+        }
+        return [try! RepoPromptApp.Tool(domainBinding: binding, runtime: runtime)]
+    }
+}
+
 private actor SharedBindingRuntimeRecorder {
     struct Invocation {
         let name: String
@@ -1331,8 +1447,10 @@ private actor SharedBindingRuntimeRecorder {
     }
 
     private var invocation: Invocation?
+    private var count = 0
 
     func record(name: String, providerManaged: Bool, arguments: [String: Value]) {
+        count += 1
         invocation = Invocation(
             name: name,
             providerManaged: providerManaged,
@@ -1342,5 +1460,9 @@ private actor SharedBindingRuntimeRecorder {
 
     func snapshot() -> Invocation? {
         invocation
+    }
+
+    func invocationCount() -> Int {
+        count
     }
 }

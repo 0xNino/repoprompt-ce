@@ -9,11 +9,11 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
     let group: MCPAppToolGroup = .oracle
 
     private let runtime: MCPAppToolBinder
-    private let dependencies: MCPAppPhysicalCapabilityAdapters
+    private let dependencies: MCPAppPhysicalCapabilityAdapters.Execution
 
-    init(runtime: MCPAppToolBinder, dependencies: MCPAppPhysicalCapabilityAdapters) {
+    init(runtime: MCPAppToolBinder, execution: MCPAppPhysicalCapabilityAdapters.Execution) {
         self.runtime = runtime
-        self.dependencies = dependencies
+        dependencies = execution
     }
 
     func buildTools() -> [Tool] {

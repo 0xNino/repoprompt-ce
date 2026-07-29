@@ -117,18 +117,16 @@ actor DirectHeadlessMCPService {
     }
 
     func prepareRuntime() async throws -> PreparedRuntime {
-        let profile = sanitizedProfileIdentifier(environment["REPOPROMPT_MCP_HEADLESS_PROFILE"] ?? "default")
-        let profileRoot: URL = if let override = environment["REPOPROMPT_MCP_HEADLESS_PROFILE_DIR"], !override.isEmpty {
-            URL(fileURLWithPath: override, isDirectory: true)
-        } else {
-            FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/RepoPrompt CE/Headless", isDirectory: true)
-                .appendingPathComponent(profile, isDirectory: true)
-        }
-        let storage = profileRoot.appendingPathComponent("Runtime", isDirectory: true)
-        let events = profileRoot.appendingPathComponent("Events", isDirectory: true)
-        let temporary = profileRoot.appendingPathComponent("Temporary", isDirectory: true)
-        for directory in [profileRoot, storage, events, temporary] {
+        let locations = try DirectHeadlessRuntimeLocationResolver.resolve(
+            environment: environment,
+            currentDirectory: currentDirectory
+        )
+        for directory in [
+            locations.storageDirectory,
+            locations.workspaceStorageDirectory,
+            locations.eventDirectory,
+            locations.temporaryDirectory
+        ] {
             try FileManager.default.createDirectory(
                 at: directory,
                 withIntermediateDirectories: true,
@@ -139,10 +137,11 @@ actor DirectHeadlessMCPService {
         let childLaunchCoordinator = DirectHeadlessChildLaunchCoordinator()
         let runtime = MCPDomainRuntime(configuration: DomainRuntimeConfiguration(
             mode: .standalone,
-            profileIdentifier: profile,
-            storageDirectory: storage,
-            eventDirectory: events,
-            temporaryDirectory: temporary,
+            profileIdentifier: locations.profileIdentifier,
+            storageDirectory: locations.storageDirectory,
+            workspaceStorageDirectory: locations.workspaceStorageDirectory,
+            eventDirectory: locations.eventDirectory,
+            temporaryDirectory: locations.temporaryDirectory,
             hostDrainTimeout: .seconds(5)
         ), prepareChildLaunch: { toolName, arguments, securityContext in
             try await childLaunchCoordinator.prepare(
@@ -152,8 +151,13 @@ actor DirectHeadlessMCPService {
             )
         })
         try await runtime.start()
-        let workingDirectories = try resolvedWorkingDirectories()
-        try await ensureInitialWorkspace(runtime: runtime, roots: workingDirectories, storage: storage)
+        let workingDirectories = locations.workingDirectories
+        if locations.mayBootstrapIsolatedWorkspace {
+            try await ensureExplicitIsolatedWorkspace(
+                runtime: runtime,
+                roots: workingDirectories
+            )
+        }
 
         let scopeID = DomainStandaloneScopeID()
         let connectionID = UUID()
@@ -454,28 +458,12 @@ actor DirectHeadlessMCPService {
         _ = await prepared.runtime.shutdown()
     }
 
-    private func resolvedWorkingDirectories() throws -> [URL] {
-        let raw = environment["REPOPROMPT_MCP_WORKING_DIRS"]
-            .map { $0.split(separator: ":").map(String.init) }
-            ?? [currentDirectory.path]
-        var seen: Set<String> = []
-        return try raw.map { value in
-            let url = URL(fileURLWithPath: value).standardizedFileURL.resolvingSymlinksInPath()
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
-                  isDirectory.boolValue,
-                  seen.insert(url.path).inserted
-            else {
-                throw DomainStandaloneScopeError.invalidWorkingDirectory(value)
-            }
-            return url
-        }
-    }
-
-    private func ensureInitialWorkspace(
+    /// Explicit isolated profiles are test/preview sandboxes, so they may bootstrap a
+    /// workspace from explicitly supplied roots. The canonical default profile never
+    /// persists a workspace synthesized from cwd or other implicit process state.
+    private func ensureExplicitIsolatedWorkspace(
         runtime: MCPDomainRuntime,
-        roots: [URL],
-        storage: URL
+        roots: [URL]
     ) async throws {
         let catalog = await runtime.workspaceStore.snapshot()
         guard catalog.workspaces.isEmpty else { return }
@@ -495,7 +483,7 @@ actor DirectHeadlessMCPService {
             ]]
         ]
         let bytes = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
-        let fileURL = storage.appendingPathComponent("Workspaces", isDirectory: true)
+        let fileURL = runtime.configuration.workspaceStorageDirectory
             .appendingPathComponent("\(workspaceID.uuidString).json", isDirectory: false)
         let document = try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
         let outcome = await runtime.workspaceStore.execute(DomainWorkspaceCommandEnvelope(
@@ -509,16 +497,6 @@ actor DirectHeadlessMCPService {
                 outcome.diagnostic ?? outcome.errorCode?.rawValue ?? outcome.disposition.rawValue
             )
         }
-    }
-
-    private func sanitizedProfileIdentifier(_ value: String) -> String {
-        let allowed = value.unicodeScalars.map { scalar -> Character in
-            CharacterSet.alphanumerics.contains(scalar) || scalar == "-" || scalar == "_"
-                ? Character(String(scalar))
-                : "_"
-        }
-        let result = String(allowed).prefix(80)
-        return result.isEmpty ? "default" : String(result)
     }
 
     private static func successResult(_ value: Value) -> CallTool.Result {

@@ -241,13 +241,16 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         }
 
         let dependencies = try dictionary(manifest, key: "dependencies")
-        let expectedDependencies = try strings(dependencies, key: "stored_dependencies")
-        let sourceDependencies = try storedPropertyNames(
-            inStructNamed: "MCPAppPhysicalCapabilityAdapters",
-            source: source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAppPhysicalCapabilityAdapters.swift")
+        let expectedFamilies = try strings(dependencies, key: "families")
+        let adaptersSource = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAppPhysicalCapabilityAdapters.swift"
         )
-        XCTAssertEqual(sourceDependencies, expectedDependencies)
-        XCTAssertEqual(expectedDependencies.count, try integer(dependencies, key: "stored_dependency_count"))
+        XCTAssertTrue(adaptersSource.contains("enum MCPAppPhysicalCapabilityAdapters"))
+        XCTAssertFalse(adaptersSource.contains("@dynamicMemberLookup"))
+        XCTAssertEqual(expectedFamilies.count, try integer(dependencies, key: "family_count"))
+        for family in expectedFamilies {
+            XCTAssertTrue(adaptersSource.contains("struct \(family)"), "Missing typed capability family \(family)")
+        }
     }
 
     func testSDKCredentialAndPrivateChildContractsAreFailClosedEvidence() throws {
