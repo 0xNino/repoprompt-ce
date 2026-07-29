@@ -276,7 +276,8 @@
       "wait_for_next_user_instruction": ["agent_reasoning_control"],
       "history": []
     },
-    "resolved_tools_list": {
+    "resolved_tool_policy_projection_classification": "production_policy_projection_not_runtime_registry_evidence",
+    "resolved_tool_policy_projection": {
       "direct": ["app_settings", "bind_context", "manage_workspaces", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "oracle_utils", "oracle_send", "git", "manage_worktree", "context_builder", "agent_run", "agent_manage", "history"],
       "discovery": ["manage_selection", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "git", "ask_user", "history"],
       "agent_mode_generic_explore": ["app_settings", "get_code_structure", "get_file_tree", "read_file", "file_search", "git", "ask_user", "share_thoughts", "set_status", "wait_for_next_user_instruction", "history"],
@@ -297,7 +298,7 @@
     "workspace_operations": ["create_workspace", "delete_workspace", "add_folder", "remove_folder"],
     "terminal_results": ["approved", "denied", "timeout"],
     "cancellation_result": "denied",
-    "existing_test": "RepoPromptTests.WorkspaceApprovalCancellationTests/testCancellationSettlesPromptExactlyOnceAndResolvesDenied"
+    "existing_test": "RepoPromptTests.WorkspaceApprovalCancellationTests/testCancellingAwaitedApprovalResolvesDeniedAndClearsOverlay"
   },
   "main_actor": {
     "mcp_local_declaration_count": 42,
@@ -613,7 +614,7 @@
       "actions": ["accept", "decline", "cancel"],
       "classification": "SDK-supported and client-negotiated; never assumed"
     },
-    "fallback_evidence": ["RepoPromptTests.JSONRPCBridgeLedgerTests/testCleanEOFAndEOFWithOutstandingWorkAreDistinguished", "RepoPromptTests.ProcessLauncherDescriptorInheritanceTests/testProcessLauncherDoesNotInheritActiveUnixSocket"]
+    "fallback_evidence": ["RepoPromptTests.JSONRPCBridgeLedgerTests/testCleanEOFAndEOFWithOutstandingWorkAreDistinguished", "RepoPromptTests.ProcessLauncherDescriptorInheritanceTests/testActiveUnixSocketTransportIsNotInheritedAndObservesEOFWhileSpawnedChildRemainsAlive"]
   },
   "credential_gate": {
     "packaged_cli_path": "RepoPrompt.app/Contents/MacOS/repoprompt-mcp",
