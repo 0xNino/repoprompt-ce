@@ -1274,6 +1274,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     private let automaticCodemapReadinessRetryPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy
     private let automaticCodemapSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter
     private let automaticCodemapReadinessRetryDelay: Duration
+    private let defaultApplicationOpener: DefaultApplicationOpener
 
     init(
         alwaysReadableHomeDirectoryURL: URL? = nil,
@@ -1286,7 +1287,8 @@ class WorkspaceFilesViewModel: ObservableObject {
             maximumTotalWait: .seconds(10)
         ),
         automaticCodemapSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter = .production,
-        automaticCodemapReadinessRetryDelay: Duration = .milliseconds(400)
+        automaticCodemapReadinessRetryDelay: Duration = .milliseconds(400),
+        defaultApplicationOpener: DefaultApplicationOpener = .system
     ) {
         self.alwaysReadableHomeDirectoryURL = (alwaysReadableHomeDirectoryURL ?? FileManager.default.homeDirectoryForCurrentUser).standardizedFileURL
         self.workspaceFileContextStore = workspaceFileContextStore
@@ -1294,6 +1296,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         self.automaticCodemapReadinessRetryPolicy = automaticCodemapReadinessRetryPolicy
         self.automaticCodemapSelectionWaiter = automaticCodemapSelectionWaiter
         self.automaticCodemapReadinessRetryDelay = automaticCodemapReadinessRetryDelay
+        self.defaultApplicationOpener = defaultApplicationOpener
         // If you store sortMethod in user defaults, do that here
         if let loaded = SortMethod(rawValue: storedSortMethod) {
             currentSortMethod = loaded
@@ -11985,15 +11988,14 @@ extension WorkspaceFilesViewModel {
     @MainActor
     func openFileForMarkdownLink(_ target: MarkdownFileLinkTarget) async -> Bool {
         if let file = await resolveFileForMarkdownLink(target) {
-            file.openInDefaultApp()
-            return true
+            return await file.openInDefaultApp(using: defaultApplicationOpener)
         }
 
         let standardizedPath = (target.normalizedPath as NSString).standardizingPath
         guard standardizedPath.hasPrefix("/") else { return false }
 
         let fileURL = URL(fileURLWithPath: standardizedPath)
-        return NSWorkspace.shared.open(fileURL)
+        return await defaultApplicationOpener.open(fileURL)
     }
 
     @MainActor
