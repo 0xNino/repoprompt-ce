@@ -166,7 +166,27 @@ extension MCPServerViewModel {
             return DomainReadInvocationContext(handle: nil, connectionID: nil)
         }
 
-        let metadata = await captureRequestMetadata()
+        let metadata: RequestMetadata
+        if let admitted = MCPDomainAdmittedContextValues.current {
+            guard admitted.windowID == windowID else {
+                throw MCPError.internalError(
+                    "Admitted domain context window \(admitted.windowID) does not match provider window \(windowID)"
+                )
+            }
+            metadata = await RequestMetadata(
+                connectionID: admitted.connectionID,
+                clientName: nil,
+                windowID: admitted.windowID,
+                runPurpose: ServerNetworkManager.shared.runPurpose(for: admitted.connectionID),
+                tabContextHint: TabContextHint(
+                    tabID: admitted.contextID,
+                    workspaceID: admitted.workspaceID,
+                    windowID: admitted.windowID
+                )
+            )
+        } else {
+            metadata = await captureRequestMetadata()
+        }
         let connectionID = metadata.connectionID
 
         // App compatibility remains the physical fallback for graceful/no-workspace tools and

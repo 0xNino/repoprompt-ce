@@ -12352,6 +12352,19 @@ actor ServerNetworkManager {
                                         invocationID: invocationID,
                                         toolName: toolName
                                     )
+                                    let admittedDomainContext: MCPDomainAdmittedContext? = if let hint = capturedTabContextHint,
+                                                                                              let workspaceID = hint.workspaceID,
+                                                                                              let admittedWindowID = hint.windowID ?? chosenID
+                                    {
+                                        MCPDomainAdmittedContext(
+                                            connectionID: connectionID,
+                                            windowID: admittedWindowID,
+                                            workspaceID: workspaceID,
+                                            contextID: hint.tabID
+                                        )
+                                    } else {
+                                        nil
+                                    }
                                     let resolvedOperation: @Sendable () async throws -> Value = {
                                         #if DEBUG
                                             if let operation = await self.debugResolvedToolOperationOverrides[toolName] {
@@ -12363,7 +12376,8 @@ actor ServerNetworkManager {
                                             connectionID: connectionID,
                                             resolution: resolvedTool,
                                             arguments: effectiveArgs,
-                                            securityContext: invocationSecurityContext
+                                            securityContext: invocationSecurityContext,
+                                            admittedContext: admittedDomainContext
                                         ))
                                     }
 
