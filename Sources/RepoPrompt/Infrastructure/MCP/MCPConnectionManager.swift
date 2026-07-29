@@ -14595,7 +14595,22 @@ actor ServerNetworkManager {
                 )
             )
             do {
-                let result = try await withPermit(lane: lane, operation)
+                let result = try await withPermit(lane: lane) {
+                    let acquiredSnapshot = await self.diagnosticsSnapshot(for: lane)
+                    EditFlowPerf.lifecycleEvent(
+                        EditFlowPerf.Lifecycle.MCPToolCall.permitAcquired,
+                        correlation: lifecycleCorrelation,
+                        EditFlowPerf.Dimensions(
+                            toolName: toolName, outcome: "acquired",
+                            activeCount: acquiredSnapshot.activePermitCount,
+                            admissionClass: lane.rawValue,
+                            queueDepth: acquiredSnapshot.waiterCount,
+                            windowID: ownerWindowID, runID: ownerRunID, ownerResource: ownerResource,
+                            permitActive: true, publicationPending: false, terminalBarrier: false
+                        )
+                    )
+                    return try await operation()
+                }
                 let releasedSnapshot = await diagnosticsSnapshot(for: lane)
                 EditFlowPerf.lifecycleEvent(
                     EditFlowPerf.Lifecycle.MCPToolCall.permitReleased, correlation: lifecycleCorrelation,

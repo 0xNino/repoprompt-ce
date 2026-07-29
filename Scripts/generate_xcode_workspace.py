@@ -177,8 +177,20 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         raise GeneratorError("RepoPromptDomainRuntime must remain an internal regular target")
     if domain_runtime.get("path") != "Sources/RepoPromptDomainRuntime":
         raise GeneratorError("RepoPromptDomainRuntime target path drifted")
-    if _by_name_dependencies(domain_runtime):
-        raise GeneratorError("RepoPromptDomainRuntime must not depend on another local target")
+    domain_runtime_products = {
+        (dependency["product"][0], dependency["product"][1])
+        for dependency in domain_runtime.get("dependencies", [])
+        if dependency.get("product")
+    }
+    if (
+        _by_name_dependencies(domain_runtime) != ["RepoPromptShared", "RepoPromptC"]
+        or domain_runtime_products != {("Logging", "swift-log"), ("MCP", "swift-sdk")}
+        or len(domain_runtime.get("dependencies", [])) != 4
+    ):
+        raise GeneratorError(
+            "RepoPromptDomainRuntime dependencies must remain RepoPromptShared, RepoPromptC, "
+            "Logging, and pinned MCP"
+        )
 
     domain_runtime_tests = targets["RepoPromptDomainRuntimeTests"]
     if domain_runtime_tests.get("type") != "test":
