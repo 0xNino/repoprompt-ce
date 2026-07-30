@@ -140,6 +140,65 @@ final class MCPDomainToolRegistryTests: XCTestCase {
         XCTAssertTrue(changedAfterRemovalIsActive)
     }
 
+    func testRegistrationBatchRollsBackEarlierEntriesWhenLaterEntryFails() async throws {
+        let registry = MCPDomainToolRegistry()
+        let initial = await registry.snapshot()
+        let appSettingsID = MCPDomainToolRegistrationID(rawValue: 41)
+
+        await assertRegistryError(.scopeMismatch(
+            toolName: MCPWindowToolName.readFile,
+            expected: .window,
+            actual: .application
+        )) {
+            _ = try await registry.registerAtomically([
+                MCPDomainToolRegistrationRequest(
+                    registrationID: appSettingsID,
+                    scope: .application,
+                    bindings: [Self.binding(name: MCPGlobalToolName.appSettings)]
+                ),
+                MCPDomainToolRegistrationRequest(
+                    registrationID: .init(rawValue: 42),
+                    scope: .application,
+                    bindings: [Self.binding(name: MCPWindowToolName.readFile)]
+                ),
+            ])
+        }
+
+        let afterFailure = await registry.snapshot()
+        let presenceAfterFailure = await registry.scopePresence(
+            requiredToolNames: [MCPGlobalToolName.appSettings],
+            scope: .application
+        )
+        let rolledBackResolution = await registry.resolve(
+            toolName: MCPGlobalToolName.appSettings,
+            scope: .application
+        )
+        XCTAssertEqual(afterFailure.revision, initial.revision)
+        XCTAssertEqual(afterFailure.toolNames, initial.toolNames)
+        XCTAssertFalse(presenceAfterFailure.isComplete)
+        XCTAssertNil(rolledBackResolution)
+
+        let retry = try await registry.registerWithResult(
+            registrationID: appSettingsID,
+            scope: .application,
+            bindings: [Self.binding(name: MCPGlobalToolName.appSettings)]
+        )
+        let presenceAfterRetry = await registry.scopePresence(
+            requiredToolNames: [MCPGlobalToolName.appSettings],
+            scope: .application
+        )
+        XCTAssertEqual(retry.disposition, .inserted)
+        XCTAssertEqual(retry.handle.generation, 1, "A failed batch must restore generation ownership.")
+        XCTAssertTrue(presenceAfterRetry.isComplete)
+
+        _ = await registry.unregister(retry.handle)
+        let presenceAfterRemoval = await registry.scopePresence(
+            requiredToolNames: [MCPGlobalToolName.appSettings],
+            scope: .application
+        )
+        XCTAssertFalse(presenceAfterRemoval.isComplete, "Unregister must remove stale readiness index entries.")
+    }
+
     func testSnapshotsDeduplicateCanonicalDefinitionsAndResolutionStaysScopeSpecific() async throws {
         let registry = MCPDomainToolRegistry()
         let first = try await registry.register(
@@ -248,19 +307,87 @@ final class MCPDomainToolRegistryTests: XCTestCase {
 
     func testResolvedInvocationMayFinishAfterUnregisterButNewResolutionFails() async throws {
         let registry = MCPDomainToolRegistry()
+        let invocationGate = MCPDomainInvocationGate()
         let handle = try await registry.register(
             registrationID: .init(rawValue: 1),
             scope: .window(id: 1),
-            bindings: [Self.binding(name: MCPWindowToolName.readFile, result: "retained")]
+            bindings: [Self.binding(
+                name: MCPWindowToolName.readFile,
+                operation: { _ in try await invocationGate.invoke() }
+            )]
         )
         let initialResolution = await registry.resolve(toolName: MCPWindowToolName.readFile, scope: .window(id: 1))
         let resolved = try XCTUnwrap(initialResolution)
+        let admittedInvocation = Task { try await resolved.binding([:]) }
+        await invocationGate.waitUntilEntered()
+
         let removal = await registry.unregister(handle)
         let resolutionAfterRemoval = await registry.resolve(toolName: MCPWindowToolName.readFile, scope: .window(id: 1))
-        let retainedResult = try await resolved.binding([:])
+        let cancellationCount = await invocationGate.cancellationCount
         XCTAssertEqual(removal, .removed)
         XCTAssertNil(resolutionAfterRemoval)
+        XCTAssertEqual(cancellationCount, 0, "Registry unregister must not cancel already-admitted work.")
+
+        await invocationGate.release()
+        let retainedResult = try await admittedInvocation.value
         XCTAssertEqual(retainedResult.stringValue, "retained")
+    }
+
+    func testIndexedRegisterResolveAndUnregisterChurnRemainsBoundedAtScale() async throws {
+        for windowCount in [1, 10, 100] {
+            let registry = MCPDomainToolRegistry()
+            var handles: [MCPDomainToolRegistrationHandle] = []
+            for windowID in 1 ... windowCount {
+                handles.append(try await registry.register(
+                    registrationID: .init(rawValue: UInt(windowID)),
+                    scope: .window(id: windowID),
+                    bindings: [Self.binding(name: MCPWindowToolName.readFile)]
+                ))
+            }
+
+            let registered = await registry.diagnostics()
+            XCTAssertEqual(registered.registrationCount, windowCount)
+            XCTAssertEqual(registered.exactScopedToolCount, windowCount)
+            XCTAssertEqual(registered.canonicalToolCount, 1)
+            XCTAssertEqual(registered.canonicalRegistrationMembershipCount, windowCount)
+            XCTAssertEqual(registered.windowToolCount, 1)
+            XCTAssertEqual(registered.windowRegistrationMembershipCount, windowCount)
+            XCTAssertEqual(registered.scopePresenceCount, windowCount)
+
+            for windowID in 1 ... windowCount {
+                let resolved = await registry.resolve(
+                    toolName: MCPWindowToolName.readFile,
+                    scope: .window(id: windowID)
+                )
+                XCTAssertEqual(resolved?.scope, .window(id: windowID))
+            }
+            let initialUnique = await registry.resolveUniqueWindowTool(toolName: MCPWindowToolName.readFile)
+            XCTAssertEqual(initialUnique?.scope, windowCount == 1 ? .window(id: 1) : nil)
+
+            for handle in handles.dropLast() {
+                let removal = await registry.unregister(handle)
+                XCTAssertEqual(removal, .removed)
+            }
+            let finalUnique = await registry.resolveUniqueWindowTool(toolName: MCPWindowToolName.readFile)
+            XCTAssertEqual(finalUnique?.scope, .window(id: windowCount))
+            if let first = handles.first, windowCount > 1 {
+                let staleRemoval = await registry.unregister(first)
+                XCTAssertEqual(staleRemoval, .unchanged)
+            }
+            if let last = handles.last {
+                let finalRemoval = await registry.unregister(last)
+                XCTAssertEqual(finalRemoval, .removed)
+            }
+
+            let emptied = await registry.diagnostics()
+            XCTAssertEqual(emptied.registrationCount, 0)
+            XCTAssertEqual(emptied.exactScopedToolCount, 0)
+            XCTAssertEqual(emptied.canonicalToolCount, 0)
+            XCTAssertEqual(emptied.canonicalRegistrationMembershipCount, 0)
+            XCTAssertEqual(emptied.windowToolCount, 0)
+            XCTAssertEqual(emptied.windowRegistrationMembershipCount, 0)
+            XCTAssertEqual(emptied.scopePresenceCount, 0)
+        }
     }
 
     func testConcurrentWindowRegistrationsPublishOneCanonicalDefinition() async throws {
@@ -286,7 +413,8 @@ final class MCPDomainToolRegistryTests: XCTestCase {
     private static func binding(
         name: String,
         description: String = "fixture",
-        result: String = "ok"
+        result: String = "ok",
+        operation: (@Sendable ([String: Value]) async throws -> Value)? = nil
     ) -> MCPDomainToolBinding {
         MCPDomainToolBinding(
             definition: MCPDomainToolDefinition(
@@ -303,7 +431,7 @@ final class MCPDomainToolRegistryTests: XCTestCase {
                     openWorldHint: false
                 )
             ),
-            operation: { _ in .string(result) }
+            operation: operation ?? { _ in .string(result) }
         )
     }
 
@@ -319,6 +447,46 @@ final class MCPDomainToolRegistryTests: XCTestCase {
         } catch {
             XCTFail("Unexpected error: \(error)")
         }
+    }
+}
+
+private actor MCPDomainInvocationGate {
+    private var entered = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Value, Error>?
+    private(set) var cancellationCount = 0
+
+    func invoke() async throws -> Value {
+        entered = true
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                releaseContinuation = continuation
+            }
+        } onCancel: {
+            Task { await self.cancel() }
+        }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { continuation in
+            entryWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        releaseContinuation?.resume(returning: .string("retained"))
+        releaseContinuation = nil
+    }
+
+    private func cancel() {
+        cancellationCount += 1
+        releaseContinuation?.resume(throwing: CancellationError())
+        releaseContinuation = nil
     }
 }
 

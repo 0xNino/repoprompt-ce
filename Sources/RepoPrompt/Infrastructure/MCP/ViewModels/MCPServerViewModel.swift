@@ -2503,21 +2503,6 @@ final class MCPServerViewModel: ObservableObject {
             await apply(snap) // @MainActor method
         }
 
-        ToolAvailabilityStore.shared.$toolSummaries
-            .dropFirst()
-            .sink { [weak self] _ in
-                #if DEBUG || EDIT_FLOW_PERF
-                    let invalidationToolSummariesChangeState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.invalidationToolSummariesChange)
-                #endif
-                Task { [weak self] in
-                    await self?.refreshRegisteredWindowToolCatalog()
-                }
-                #if DEBUG || EDIT_FLOW_PERF
-                    EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.invalidationToolSummariesChange, invalidationToolSummariesChangeState)
-                #endif
-            }
-            .store(in: &cancellables)
-
         workspaceManager.$workspaces
             .dropFirst()
             .sink { [weak self] workspaces in
@@ -2866,15 +2851,6 @@ final class MCPServerViewModel: ObservableObject {
         if activeWindowToolRegistrationHandle == handle {
             activeWindowToolRegistrationHandle = nil
         }
-    }
-
-    @MainActor
-    private func refreshRegisteredWindowToolCatalog() async {
-        // Global availability publication can occur while the initial window enable
-        // is awaiting process registration. Only rebuild an already-active window;
-        // otherwise this callback would supersede the in-flight enable intent.
-        guard windowToolsRequested, windowToolsEnabled else { return }
-        _ = await setWindowToolsEnabled(true)
     }
 
     @MainActor

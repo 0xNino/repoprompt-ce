@@ -127,20 +127,13 @@ import XCTest
             await manager.waitUntilPostSwitchGitDataLoadComplete()
             manager.markWorkspaceDirty()
             manager.resetWorkspaceSaveDiagnosticsForTesting()
-            let preparedVersion = AsyncTestCondition<Int?>(nil)
 
             manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { workspaceID, _, remainingRetryCount in
-                if remainingRetryCount == 1 {
-                    await MainActor.run {
-                        guard let index = manager.workspaces.firstIndex(where: { $0.id == workspaceID }) else { return }
-                        manager.workspaces[index].currentPromptText = "newer state"
-                        manager.markWorkspaceDirty()
-                    }
-                } else {
-                    let version = await MainActor.run {
-                        manager.debugStateVersionForWorkspace(workspaceID)
-                    }
-                    preparedVersion.update { $0 = version }
+                guard remainingRetryCount == 1 else { return }
+                await MainActor.run {
+                    guard let index = manager.workspaces.firstIndex(where: { $0.id == workspaceID }) else { return }
+                    manager.workspaces[index].currentPromptText = "newer state"
+                    manager.markWorkspaceDirty()
                 }
             }
             await manager.pollAndSaveStateAsync()
@@ -152,10 +145,9 @@ import XCTest
                 at: manager.workspaceFileURL(for: workspace)
             )
             XCTAssertEqual(saved.currentPromptText, "newer state")
-            let expectedSavedVersion = preparedVersion.snapshot()
             XCTAssertEqual(
                 manager.debugLastSavedVersionForWorkspace(workspace.id),
-                expectedSavedVersion
+                manager.debugStateVersionForWorkspace(workspace.id)
             )
         }
 

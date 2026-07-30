@@ -64,6 +64,7 @@ final class AppGlobalMCPServiceComposition {
     }
 
     private let runtime: MCPDomainRuntime
+    private let networkManager: ServerNetworkManager
     private let appSettingsService: AppSettingsMCPService
     private let windowRoutingService: WindowRoutingService
     private var registrationHandles: RegistrationHandles?
@@ -76,6 +77,7 @@ final class AppGlobalMCPServiceComposition {
         networkManager: ServerNetworkManager
     ) {
         self.runtime = runtime
+        self.networkManager = networkManager
         appSettingsService = AppSettingsMCPService()
         windowRoutingService = WindowRoutingService(
             windowStates: windowStates,
@@ -105,13 +107,31 @@ final class AppGlobalMCPServiceComposition {
         }
 
         status = .registering
-        let task = Task { @MainActor [runtime, appSettingsService, windowRoutingService] in
+        let task = Task { @MainActor [runtime, networkManager, appSettingsService, windowRoutingService] in
             try await runtime.start()
-            let appSettings = try await ServiceRegistry.register(appSettingsService)
-            let windowRouting = try await windowRoutingService.registerDomainTools()
+            await windowRoutingService.prepareDomainTools()
+            let appSettingsTools = await appSettingsService.tools
+            let windowRoutingTools = await windowRoutingService.tools
+            let requests = try [
+                MCPDomainToolRegistrationRequest(
+                    registrationID: appSettingsService.domainRegistrationID,
+                    scope: .application,
+                    bindings: appSettingsTools.map { try $0.domainBinding() }
+                ),
+                MCPDomainToolRegistrationRequest(
+                    registrationID: windowRoutingService.domainRegistrationID,
+                    scope: .application,
+                    bindings: windowRoutingTools.map { try $0.domainBinding() }
+                )
+            ]
+            let results = try await runtime.toolRegistry.registerAtomically(requests)
+            if results.contains(where: { $0.disposition != .unchanged }) {
+                ToolAvailabilityStore.shared.registerTools(appSettingsTools + windowRoutingTools)
+                await networkManager.broadcastToolListChanged()
+            }
             return RegistrationHandles(
-                appSettings: appSettings.handle,
-                windowRouting: windowRouting.handle
+                appSettings: results[0].handle,
+                windowRouting: results[1].handle
             )
         }
         registrationTask = task

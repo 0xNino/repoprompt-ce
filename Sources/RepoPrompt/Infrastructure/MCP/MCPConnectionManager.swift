@@ -5745,10 +5745,6 @@ actor ServerNetworkManager {
                                 )
                                 return
                             }
-
-                            if let windowID {
-                                await MCPToolCatalogReadiness.shared.warmToolCache(windowID: windowID)
-                            }
                         }
                     } else {
                         self.pendingConnections.removeValue(forKey: connectionID)
@@ -9783,9 +9779,6 @@ actor ServerNetworkManager {
             guard isReady else {
                 throw MCPError.internalError("Tool catalog not ready. Please retry.")
             }
-            if let windowID {
-                await MCPToolCatalogReadiness.shared.warmToolCache(windowID: windowID)
-            }
 
             if hydratePersistedPolicy {
                 _ = await hydratePersistedAgentModePolicyForConnectionIfNeeded(
@@ -11163,11 +11156,6 @@ actor ServerNetworkManager {
                         + "window=\(windowID.map(String.init) ?? "ambiguous")"
                 )
                 throw MCPError.internalError("Tool catalog not ready. Please retry.")
-            }
-
-            // Warm tool cache if we have a bound window
-            if let windowID {
-                await MCPToolCatalogReadiness.shared.warmToolCache(windowID: windowID)
             }
 
             // Opportunistic persisted hydration for resumed agent-mode sessions.
