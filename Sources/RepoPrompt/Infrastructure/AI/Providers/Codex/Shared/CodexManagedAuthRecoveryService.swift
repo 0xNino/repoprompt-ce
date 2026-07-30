@@ -17,6 +17,14 @@ protocol CodexManagedAuthRecovering: Sendable {
     func startManagedChatgptLogin(
         openURL: @MainActor @escaping @Sendable (URL) -> Void
     ) async -> CodexManagedChatgptLoginResult
+    func startManagedChatgptDeviceCodeLogin(
+        presentDeviceCode: @MainActor @escaping @Sendable (CodexManagedChatgptDeviceCode, Bool) -> Void
+    ) async -> CodexManagedChatgptLoginResult
+}
+
+enum CodexManagedLoginFlow: Equatable {
+    case browser
+    case deviceCode
 }
 
 enum CodexManagedAuthRefreshResult: Equatable {
@@ -31,9 +39,19 @@ enum CodexManagedChatgptLoginResult: Equatable {
     case executableUnavailable(message: String)
 }
 
+struct CodexManagedChatgptDeviceCode: Equatable {
+    let loginID: String
+    let userCode: String
+    let verificationURL: URL
+}
+
 enum CodexManagedAuthRecoveryClassifier {
     static let loginActionTitle = "Login with ChatGPT"
-    static let manualLoginGuidanceMessage = "Codex authentication could not be refreshed automatically. Use 'Login with ChatGPT', then retry."
+    static let deviceCodeActionTitle = "Use device code instead"
+    static let separateSignInExplanation =
+        "RepoPrompt CE uses a separate Codex sign-in from any ~/.codex CLI credentials; sign in once here."
+    static let manualLoginGuidanceMessage =
+        "Codex authentication could not be refreshed automatically. Use 'Login with ChatGPT' or 'Use device code instead', then retry. \(separateSignInExplanation)"
 
     static func isRecoverable(issue: CodexNativeSessionController.ServerRequestIssue) -> Bool {
         guard issue.method == "account/chatgptAuthTokens/refresh" else { return false }
@@ -69,7 +87,8 @@ enum CodexManagedAuthRecoveryClassifier {
 
     static func preservesAsUserFacingGuidance(_ message: String) -> Bool {
         message == manualLoginGuidanceMessage
-            || message.localizedCaseInsensitiveContains("Login with ChatGPT")
+            || message.localizedCaseInsensitiveContains(loginActionTitle)
+            || message.localizedCaseInsensitiveContains(deviceCodeActionTitle)
     }
 }
 
@@ -78,20 +97,47 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         CodexProviderHelpers.makeOwnedNonAgentAppServerClient()
     }
 
-    private let clientFactory: @Sendable () -> any CodexManagedAuthRPCClient
-    private var inFlightRefreshTask: Task<CodexManagedAuthRefreshResult, Never>?
-    private var inFlightLoginTask: Task<CodexManagedChatgptLoginResult, Never>?
-    private let refreshRequestTimeout: TimeInterval = 30
-    private let loginValidationTimeout: TimeInterval = 300
-    private let loginPollInterval: TimeInterval = 0.5
+    private struct InFlightLogin {
+        let id: UUID
+        let flow: CodexManagedLoginFlow
+        let task: Task<CodexManagedChatgptLoginResult, Never>
+    }
 
-    init(clientFactory: @escaping @Sendable () -> any CodexManagedAuthRPCClient) {
+    private let clientFactory: @Sendable () -> any CodexManagedAuthRPCClient
+    private let refreshRequestTimeout: TimeInterval
+    private let browserLoginValidationTimeout: TimeInterval
+    private let deviceCodeLoginValidationTimeout: TimeInterval
+    private let loginPollInterval: TimeInterval
+    private let now: @Sendable () -> Date
+    private let sleep: @Sendable (TimeInterval) async throws -> Void
+    private var inFlightRefreshTask: Task<CodexManagedAuthRefreshResult, Never>?
+    private var inFlightLogin: InFlightLogin?
+    private var deviceCodePresenters: [UUID: @MainActor @Sendable (CodexManagedChatgptDeviceCode, Bool) -> Void] = [:]
+    private var currentDeviceCode: CodexManagedChatgptDeviceCode?
+
+    init(
+        clientFactory: @escaping @Sendable () -> any CodexManagedAuthRPCClient,
+        refreshRequestTimeout: TimeInterval = 30,
+        browserLoginValidationTimeout: TimeInterval = 300,
+        deviceCodeLoginValidationTimeout: TimeInterval = 15 * 60,
+        loginPollInterval: TimeInterval = 0.5,
+        now: @escaping @Sendable () -> Date = { Date() },
+        sleep: @escaping @Sendable (TimeInterval) async throws -> Void = { interval in
+            try await Task.sleep(nanoseconds: UInt64(max(0, interval) * 1_000_000_000))
+        }
+    ) {
         self.clientFactory = clientFactory
+        self.refreshRequestTimeout = refreshRequestTimeout
+        self.browserLoginValidationTimeout = browserLoginValidationTimeout
+        self.deviceCodeLoginValidationTimeout = deviceCodeLoginValidationTimeout
+        self.loginPollInterval = loginPollInterval
+        self.now = now
+        self.sleep = sleep
     }
 
     func refreshManagedAccount() async -> CodexManagedAuthRefreshResult {
-        if let inFlightLoginTask {
-            switch await inFlightLoginTask.value {
+        if let inFlightLogin {
+            switch await inFlightLogin.task.value {
             case .authenticated:
                 return .recovered
             case let .executableUnavailable(message):
@@ -137,69 +183,251 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
     func startManagedChatgptLogin(
         openURL: @MainActor @escaping @Sendable (URL) -> Void
     ) async -> CodexManagedChatgptLoginResult {
-        if let inFlightLoginTask {
-            return await inFlightLoginTask.value
+        await startManagedLogin(flow: .browser) { [
+            clientFactory,
+            refreshRequestTimeout,
+            browserLoginValidationTimeout,
+            loginPollInterval,
+            now,
+            sleep
+        ] in
+            let client = clientFactory()
+            return await Self.runLogin(
+                client: client,
+                flow: .browser,
+                requestTimeout: refreshRequestTimeout,
+                validationTimeout: browserLoginValidationTimeout,
+                pollInterval: loginPollInterval,
+                now: now,
+                sleep: sleep,
+                browserOpened: openURL,
+                deviceCodeStarted: nil
+            )
         }
-        if let inFlightRefreshTask {
-            switch await inFlightRefreshTask.value {
-            case .recovered:
-                return .authenticated
-            case let .executableUnavailable(message):
-                return .executableUnavailable(message: message)
-            case .requiresUserLogin:
-                break
-            }
+    }
+
+    func startManagedChatgptDeviceCodeLogin(
+        presentDeviceCode: @MainActor @escaping @Sendable (CodexManagedChatgptDeviceCode, Bool) -> Void
+    ) async -> CodexManagedChatgptLoginResult {
+        let presenterID = UUID()
+        deviceCodePresenters[presenterID] = presentDeviceCode
+        defer { deviceCodePresenters[presenterID] = nil }
+
+        if let currentDeviceCode, inFlightLogin?.flow == .deviceCode {
+            await presentDeviceCode(currentDeviceCode, false)
         }
 
-        let task = Task<CodexManagedChatgptLoginResult, Never> { [clientFactory, refreshRequestTimeout, loginValidationTimeout, loginPollInterval] in
+        return await startManagedLogin(flow: .deviceCode) { [
+            clientFactory,
+            refreshRequestTimeout,
+            deviceCodeLoginValidationTimeout,
+            loginPollInterval,
+            now,
+            sleep,
+            weak self
+        ] in
             let client = clientFactory()
-            defer {
-                Task { await client.stop() }
+            return await Self.runLogin(
+                client: client,
+                flow: .deviceCode,
+                requestTimeout: refreshRequestTimeout,
+                validationTimeout: deviceCodeLoginValidationTimeout,
+                pollInterval: loginPollInterval,
+                now: now,
+                sleep: sleep,
+                browserOpened: nil,
+                deviceCodeStarted: { [self] code in
+                    await self?.publishDeviceCode(code, initiatingPresenterID: presenterID)
+                }
+            )
+        }
+    }
+
+    private func startManagedLogin(
+        flow: CodexManagedLoginFlow,
+        operation: @escaping @Sendable () async -> CodexManagedChatgptLoginResult
+    ) async -> CodexManagedChatgptLoginResult {
+        var waitedForRefresh = false
+        while true {
+            if let slot = inFlightLogin {
+                if slot.flow == flow {
+                    return await slot.task.value
+                }
+                slot.task.cancel()
+                _ = await slot.task.value
+                if inFlightLogin?.id == slot.id {
+                    inFlightLogin = nil
+                    currentDeviceCode = nil
+                }
+                continue
             }
+
+            if !waitedForRefresh, let refreshTask = inFlightRefreshTask {
+                waitedForRefresh = true
+                switch await refreshTask.value {
+                case .recovered:
+                    return .authenticated
+                case let .executableUnavailable(message):
+                    return .executableUnavailable(message: message)
+                case .requiresUserLogin:
+                    continue
+                }
+            }
+
+            let id = UUID()
+            let task = Task<CodexManagedChatgptLoginResult, Never> {
+                await operation()
+            }
+            inFlightLogin = InFlightLogin(id: id, flow: flow, task: task)
+            let result = await task.value
+            if inFlightLogin?.id == id {
+                inFlightLogin = nil
+                currentDeviceCode = nil
+            }
+            return result
+        }
+    }
+
+    private func publishDeviceCode(
+        _ code: CodexManagedChatgptDeviceCode,
+        initiatingPresenterID: UUID
+    ) async {
+        currentDeviceCode = code
+        for (presenterID, presenter) in deviceCodePresenters {
+            await presenter(code, presenterID == initiatingPresenterID)
+        }
+    }
+
+    private static func runLogin(
+        client: any CodexManagedAuthRPCClient,
+        flow: CodexManagedLoginFlow,
+        requestTimeout: TimeInterval,
+        validationTimeout: TimeInterval,
+        pollInterval: TimeInterval,
+        now: @escaping @Sendable () -> Date,
+        sleep: @escaping @Sendable (TimeInterval) async throws -> Void,
+        browserOpened: (@MainActor @Sendable (URL) -> Void)?,
+        deviceCodeStarted: (@Sendable (CodexManagedChatgptDeviceCode) async -> Void)?
+    ) async -> CodexManagedChatgptLoginResult {
+        let cancellation = LoginCancellationState()
+        let result = await withTaskCancellationHandler {
             do {
-                await client.updateDefaultRequestTimeout(refreshRequestTimeout)
+                await client.updateDefaultRequestTimeout(requestTimeout)
                 try await client.startIfNeeded()
                 let notifications = await client.subscribeNotifications()
-                var state = LoginNotificationState()
+                let state = LoginNotificationState()
+                let loginID: String
+                let browserAuthURL: URL?
 
-                let startResponse = try await Self.startChatgptLogin(client: client, timeout: refreshRequestTimeout)
-                await openURL(startResponse.authURL)
+                switch flow {
+                case .browser:
+                    let startResponse = try await startChatgptLogin(
+                        client: client,
+                        flow: flow,
+                        timeout: requestTimeout
+                    )
+                    guard case let .browser(browser) = startResponse else {
+                        throw AIProviderError.invalidResponse(detail: "Codex returned an invalid ChatGPT login response.")
+                    }
+                    loginID = browser.loginID
+                    browserAuthURL = browser.authURL
+                    await cancellation.register(loginID: loginID, client: client, timeout: requestTimeout)
+                    try Task.checkCancellation()
+                    await browserOpened?(browser.authURL)
+                case .deviceCode:
+                    let startResponse = try await startChatgptLogin(
+                        client: client,
+                        flow: flow,
+                        timeout: requestTimeout
+                    )
+                    guard case let .deviceCode(deviceCode) = startResponse else {
+                        throw AIProviderError.invalidResponse(detail: "Codex returned an invalid ChatGPT device-code response.")
+                    }
+                    loginID = deviceCode.loginID
+                    browserAuthURL = nil
+                    await cancellation.register(loginID: loginID, client: client, timeout: requestTimeout)
+                    try Task.checkCancellation()
+                    await deviceCodeStarted?(deviceCode)
+                }
 
                 let notificationTask = Task {
                     var iterator = notifications.makeAsyncIterator()
                     while !Task.isCancelled, let notification = await iterator.next() {
-                        await state.consume(notification: notification, expectedLoginID: startResponse.loginID)
+                        await state.consume(notification: notification, expectedLoginID: loginID)
                     }
                 }
                 defer { notificationTask.cancel() }
 
-                let deadline = Date().addingTimeInterval(loginValidationTimeout)
-                while Date() < deadline {
-                    if let failure = await state.failureMessage {
-                        return .failed(message: failure)
+                // Race an event-driven wait for a failure notification against the
+                // success-polling loop so a failure notification is surfaced as soon as
+                // it arrives, rather than only being noticed on the next poll tick.
+                let deadline = now().addingTimeInterval(validationTimeout)
+                return try await withThrowingTaskGroup(of: CodexManagedChatgptLoginResult?.self) { group in
+                    group.addTask {
+                        guard let failure = await state.waitForFailure() else {
+                            return nil
+                        }
+                        return .failed(message: failureGuidance(flow: flow, message: failure, authURL: browserAuthURL))
                     }
-                    let readResult = try? await client.request(
-                        method: "account/read",
-                        params: ["refreshToken": false],
-                        timeout: refreshRequestTimeout
-                    )
-                    if let readResult, Self.isValidAccountReadResult(readResult) {
-                        return .authenticated
+                    group.addTask {
+                        while now() < deadline {
+                            try Task.checkCancellation()
+                            if try await accountIsAuthenticated(client: client, timeout: requestTimeout) {
+                                return .authenticated
+                            }
+                            let remaining = deadline.timeIntervalSince(now())
+                            if remaining > 0 {
+                                try await sleep(min(pollInterval, remaining))
+                            }
+                        }
+                        try Task.checkCancellation()
+                        if try await accountIsAuthenticated(client: client, timeout: requestTimeout) {
+                            return .authenticated
+                        }
+                        return .failed(message: timeoutGuidance(flow: flow, authURL: browserAuthURL))
                     }
-                    try? await Task.sleep(nanoseconds: UInt64(loginPollInterval * 1_000_000_000))
+                    while let candidate = try await group.next() {
+                        if let candidate {
+                            group.cancelAll()
+                            return candidate
+                        }
+                    }
+                    return .failed(message: timeoutGuidance(flow: flow, authURL: browserAuthURL))
                 }
-                return .failed(message: "Codex ChatGPT login did not complete in time. After finishing login in the browser, retry or use 'Login with ChatGPT' again.")
+            } catch is CancellationError {
+                await cancellation.cancel(client: client, timeout: requestTimeout)
+                return .failed(message: "Codex ChatGPT login was canceled before completion. Start the login again when ready.")
             } catch {
-                if let message = Self.executableUnavailableMessage(from: error) {
+                if let message = executableUnavailableMessage(from: error) {
                     return .executableUnavailable(message: message)
                 }
-                return .failed(message: error.localizedDescription)
+                return .failed(message: failureGuidance(flow: flow, message: error.localizedDescription, authURL: nil))
+            }
+        } onCancel: {
+            Task {
+                await cancellation.cancel(client: client, timeout: requestTimeout)
             }
         }
-        inFlightLoginTask = task
-        let result = await task.value
-        inFlightLoginTask = nil
+        await client.stop()
         return result
+    }
+
+    private static func accountIsAuthenticated(
+        client: any CodexManagedAuthRPCClient,
+        timeout: TimeInterval
+    ) async throws -> Bool {
+        do {
+            let result = try await client.request(
+                method: "account/read",
+                params: ["refreshToken": false],
+                timeout: timeout
+            )
+            return isAuthenticatedAccountReadResult(result)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return false
+        }
     }
 
     private static func executableUnavailableMessage(from error: Error) -> String? {
@@ -217,46 +445,131 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
 
     private static func startChatgptLogin(
         client: any CodexManagedAuthRPCClient,
+        flow: CodexManagedLoginFlow,
         timeout: TimeInterval
     ) async throws -> ManagedChatgptLoginStartResponse {
+        let type = flow == .browser ? "chatgpt" : "chatgptDeviceCode"
         do {
-            let response = try await client.request(
-                method: "account/login/start",
-                params: ["type": "chatgpt"],
-                timeout: timeout
-            )
-            if let parsed = parseManagedChatgptLoginStartResponse(response) {
-                return parsed
-            }
-            throw AIProviderError.invalidResponse(detail: "Codex returned an invalid ChatGPT login response.")
+            return try await requestLoginStart(client: client, type: type, timeout: timeout)
         } catch {
             if error.localizedDescription.localizedCaseInsensitiveContains("external auth is active") {
                 _ = try? await client.request(method: "account/logout", params: nil, timeout: timeout)
-                let response = try await client.request(
-                    method: "account/login/start",
-                    params: ["type": "chatgpt"],
-                    timeout: timeout
-                )
-                if let parsed = parseManagedChatgptLoginStartResponse(response) {
-                    return parsed
-                }
-                throw AIProviderError.invalidResponse(detail: "Codex returned an invalid ChatGPT login response.")
+                return try await requestLoginStart(client: client, type: type, timeout: timeout)
             }
             throw error
         }
     }
 
-    private static func parseManagedChatgptLoginStartResponse(_ response: [String: Any]) -> ManagedChatgptLoginStartResponse? {
-        guard let authURLString = stringValue(in: response, keys: ["authUrl", "auth_url"]),
+    private static func requestLoginStart(
+        client: any CodexManagedAuthRPCClient,
+        type: String,
+        timeout: TimeInterval
+    ) async throws -> ManagedChatgptLoginStartResponse {
+        let response = try await client.request(
+            method: "account/login/start",
+            params: ["type": type],
+            timeout: timeout
+        )
+        if type == "chatgpt", let parsed = parseManagedChatgptLoginStartResponse(response) {
+            return .browser(parsed)
+        }
+        if type == "chatgptDeviceCode", let parsed = parseManagedChatgptDeviceCodeStartResponse(response) {
+            return .deviceCode(parsed)
+        }
+        let detail = type == "chatgpt"
+            ? "Codex returned an invalid ChatGPT login response."
+            : "Codex returned an invalid ChatGPT device-code response."
+        throw AIProviderError.invalidResponse(detail: detail)
+    }
+
+    static func parseManagedChatgptLoginStartResponse(
+        _ response: [String: Any]
+    ) -> ManagedChatgptBrowserLoginStartResponse? {
+        guard let loginID = stringValue(in: response, keys: ["loginId", "login_id"]),
+              let authURLString = stringValue(in: response, keys: ["authUrl", "auth_url"]),
               let authURL = URL(string: authURLString),
               stringValue(in: response, keys: ["type"])?.lowercased() == "chatgpt"
         else {
             return nil
         }
-        return ManagedChatgptLoginStartResponse(
-            loginID: stringValue(in: response, keys: ["loginId", "login_id"]),
-            authURL: authURL
+        return ManagedChatgptBrowserLoginStartResponse(loginID: loginID, authURL: authURL)
+    }
+
+    static func parseManagedChatgptDeviceCodeStartResponse(
+        _ response: [String: Any]
+    ) -> CodexManagedChatgptDeviceCode? {
+        guard let loginID = stringValue(in: response, keys: ["loginId", "login_id"]),
+              let userCode = stringValue(in: response, keys: ["userCode", "user_code"]),
+              let verificationURLString = stringValue(
+                  in: response,
+                  keys: ["verificationUrl", "verification_url"]
+              ),
+              let verificationURL = URL(string: verificationURLString),
+              stringValue(in: response, keys: ["type"])?.lowercased() == "chatgptdevicecode"
+        else {
+            return nil
+        }
+        return CodexManagedChatgptDeviceCode(
+            loginID: loginID,
+            userCode: userCode,
+            verificationURL: verificationURL
         )
+    }
+
+    static func browserCallbackPort(from authURL: URL) -> Int? {
+        if authURL.host?.localizedCaseInsensitiveCompare("localhost") == .orderedSame {
+            return authURL.port
+        }
+        guard let components = URLComponents(url: authURL, resolvingAgainstBaseURL: false),
+              let redirectURI = components.queryItems?.first(where: {
+                  $0.name.localizedCaseInsensitiveCompare("redirect_uri") == .orderedSame
+              })?.value,
+              let redirectURL = URL(string: redirectURI),
+              redirectURL.host?.localizedCaseInsensitiveCompare("localhost") == .orderedSame
+        else {
+            return nil
+        }
+        return redirectURL.port
+    }
+
+    static func browserFailureGuidance(message: String, authURL: URL?) -> String {
+        var parts = [trimmedMessage(message, fallback: "Codex ChatGPT login failed.")]
+        if let authURL, let port = browserCallbackPort(from: authURL) {
+            parts.append(
+                "Codex was waiting for the browser callback on localhost:\(port). Another app may be occupying that port; check `lsof -iTCP:\(port) -sTCP:LISTEN`."
+            )
+        } else {
+            parts.append("The browser callback to Codex may not have reached the local app-server.")
+        }
+        parts.append("Try 'Use device code instead' to sign in without a localhost callback.")
+        parts.append(CodexManagedAuthRecoveryClassifier.separateSignInExplanation)
+        return parts.joined(separator: " ")
+    }
+
+    private static func failureGuidance(flow: CodexManagedLoginFlow, message: String, authURL: URL?) -> String {
+        switch flow {
+        case .browser:
+            browserFailureGuidance(message: message, authURL: authURL)
+        case .deviceCode:
+            "\(trimmedMessage(message, fallback: "Codex ChatGPT device-code login failed.")) Request a new device code and try again. \(CodexManagedAuthRecoveryClassifier.separateSignInExplanation)"
+        }
+    }
+
+    private static func timeoutGuidance(flow: CodexManagedLoginFlow, authURL: URL?) -> String {
+        switch flow {
+        case .browser:
+            browserFailureGuidance(
+                message: "Codex ChatGPT login did not complete in time. The managed account was checked once more and is still signed out.",
+                authURL: authURL
+            )
+        case .deviceCode:
+            "Codex ChatGPT device-code login did not complete before the code expired. The managed account was checked once more and is still signed out. Request a new device code and try again. \(CodexManagedAuthRecoveryClassifier.separateSignInExplanation)"
+        }
+    }
+
+    private static func trimmedMessage(_ message: String, fallback: String) -> String {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? fallback : trimmed
     }
 
     private static func isValidAccountReadResult(_ result: [String: Any]) -> Bool {
@@ -264,6 +577,10 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         if requiresOpenAIAuth == false {
             return true
         }
+        return isAuthenticatedAccountReadResult(result)
+    }
+
+    private static func isAuthenticatedAccountReadResult(_ result: [String: Any]) -> Bool {
         guard let account = result["account"], !(account is NSNull) else {
             return false
         }
@@ -288,38 +605,111 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         return nil
     }
 
-    private struct ManagedChatgptLoginStartResponse {
-        let loginID: String?
+    struct ManagedChatgptBrowserLoginStartResponse: Equatable {
+        let loginID: String
         let authURL: URL
     }
 
-    private actor LoginNotificationState {
-        private(set) var successSeen = false
-        private(set) var accountUpdatedToAuthenticated = false
-        private(set) var failureMessage: String?
+    private enum ManagedChatgptLoginStartResponse {
+        case browser(ManagedChatgptBrowserLoginStartResponse)
+        case deviceCode(CodexManagedChatgptDeviceCode)
+    }
 
-        func consume(notification: CodexAppServerClient.Notification, expectedLoginID: String?) {
+    private actor LoginCancellationState {
+        private var loginID: String?
+        private var cancellationRequested = false
+        private var cancellationTask: Task<Void, Never>?
+
+        func register(
+            loginID: String,
+            client: any CodexManagedAuthRPCClient,
+            timeout: TimeInterval
+        ) async {
+            self.loginID = loginID
+            if cancellationRequested {
+                await sendCancellationIfNeeded(client: client, timeout: timeout)
+            }
+        }
+
+        func cancel(client: any CodexManagedAuthRPCClient, timeout: TimeInterval) async {
+            cancellationRequested = true
+            await sendCancellationIfNeeded(client: client, timeout: timeout)
+        }
+
+        private func sendCancellationIfNeeded(
+            client: any CodexManagedAuthRPCClient,
+            timeout: TimeInterval
+        ) async {
+            if let cancellationTask {
+                await cancellationTask.value
+                return
+            }
+            guard let loginID else { return }
+            let task = Task {
+                _ = try? await client.request(
+                    method: "account/login/cancel",
+                    params: ["loginId": loginID],
+                    timeout: timeout
+                )
+            }
+            cancellationTask = task
+            await task.value
+        }
+    }
+
+    private actor LoginNotificationState {
+        private(set) var failureMessage: String?
+        private var pendingFailureWaiters: [CheckedContinuation<String?, Never>] = []
+
+        func consume(notification: CodexAppServerClient.Notification, expectedLoginID: String) {
+            guard notification.method == "account/login/completed" else { return }
             let params = Self.decodeParams(notification.params)
-            switch notification.method {
-            case "account/login/completed":
-                if let expectedLoginID,
-                   let notificationLoginID = Self.stringValue(in: params, keys: ["loginId", "login_id"]),
-                   notificationLoginID != expectedLoginID
-                {
-                    return
+            guard Self.stringValue(in: params, keys: ["loginId", "login_id"]) == expectedLoginID else {
+                return
+            }
+            guard Self.boolValue(in: params, keys: ["success"]) != true else { return }
+            let message = Self.stringValue(in: params, keys: ["error"]) ?? "Codex ChatGPT login failed."
+            failureMessage = message
+            resolvePendingWaiters(with: message)
+        }
+
+        /// Suspends until a failure notification is observed, resolving immediately
+        /// when one arrives instead of relying on the caller to poll. Returns `nil`
+        /// if cancelled before any failure notification is observed.
+        func waitForFailure() async -> String? {
+            if let failureMessage {
+                return failureMessage
+            }
+            return await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    registerWaiterIfStillPending(continuation)
                 }
-                if let success = Self.boolValue(in: params, keys: ["success"]), success {
-                    successSeen = true
-                } else {
-                    failureMessage = Self.stringValue(in: params, keys: ["error"]) ?? "Codex ChatGPT login failed."
-                }
-            case "account/updated":
-                let authMode = Self.stringValue(in: params, keys: ["authMode", "auth_mode"])
-                if authMode?.isEmpty == false {
-                    accountUpdatedToAuthenticated = true
-                }
-            default:
-                break
+            } onCancel: {
+                Task { await self.cancelPendingWaiters() }
+            }
+        }
+
+        private func registerWaiterIfStillPending(_ continuation: CheckedContinuation<String?, Never>) {
+            if let failureMessage {
+                continuation.resume(returning: failureMessage)
+                return
+            }
+            pendingFailureWaiters.append(continuation)
+        }
+
+        private func resolvePendingWaiters(with message: String) {
+            let waiters = pendingFailureWaiters
+            pendingFailureWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume(returning: message)
+            }
+        }
+
+        private func cancelPendingWaiters() {
+            let waiters = pendingFailureWaiters
+            pendingFailureWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume(returning: nil)
             }
         }
 

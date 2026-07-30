@@ -287,8 +287,10 @@ public class APISettingsViewModel: ObservableObject {
     @Published var isCodexConnected: Bool = UserDefaults.standard.bool(forKey: "CodexCLIConnected")
     @Published var codexError: String? = nil
     @Published private(set) var codexConnectionPhase: CodexConnectionPhase = UserDefaults.standard.bool(forKey: "CodexCLIConnected") ? .connected(resolvedExecutable: nil) : .idle
+    @Published private(set) var codexManagedLoginFlow: CodexManagedLoginFlow?
     @Published private(set) var availableCodexModels: [CodexAppServerClient.RemoteModel] = []
     private var codexLogCollector: CLIProcessLogCollector?
+    private var codexManagedLoginOperationID: UUID?
     // OpenCode CLI / ACP
     @Published var isOpenCodeConnected: Bool = UserDefaults.standard.bool(forKey: "OpenCodeCLIConnected")
     @Published var openCodeError: String? = nil
@@ -2920,12 +2922,16 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     func startCodexManagedChatgptLogin(
-        openURL: @MainActor @escaping (URL) -> Void
+        openURL: @MainActor @escaping @Sendable (URL) -> Void
     ) async throws -> Bool {
+        let operationID = beginCodexManagedLogin(flow: .browser)
+        defer { finishCodexManagedLogin(operationID: operationID) }
         await CLIEnvironmentCache.shared.invalidate()
+        guard codexManagedLoginOperationID == operationID else { return false }
         applyCodexConnectionPhase(.resolvingExecutable)
 
         let resolution = await CodexProviderHelpers.preflightCodexExecutable()
+        guard codexManagedLoginOperationID == operationID else { return false }
         guard resolution.status == .available else {
             await applyCodexConnectionState(
                 connected: false,
@@ -2939,6 +2945,7 @@ public class APISettingsViewModel: ObservableObject {
         applyCodexConnectionPhase(.loggingIn)
 
         let result = await CodexManagedAuthRecoveryService.shared.startManagedChatgptLogin(openURL: openURL)
+        guard codexManagedLoginOperationID == operationID else { return false }
         switch result {
         case .authenticated:
             await applyCodexConnectionState(
@@ -2965,6 +2972,74 @@ public class APISettingsViewModel: ObservableObject {
             )
             throw AIProviderError.invalidConfiguration(detail: message)
         }
+    }
+
+    func startCodexManagedChatgptDeviceCodeLogin(
+        presentDeviceCode: @MainActor @escaping @Sendable (CodexManagedChatgptDeviceCode, Bool) -> Void
+    ) async throws -> Bool {
+        let operationID = beginCodexManagedLogin(flow: .deviceCode)
+        defer { finishCodexManagedLogin(operationID: operationID) }
+        await CLIEnvironmentCache.shared.invalidate()
+        guard codexManagedLoginOperationID == operationID else { return false }
+        applyCodexConnectionPhase(.resolvingExecutable)
+
+        let resolution = await CodexProviderHelpers.preflightCodexExecutable()
+        guard codexManagedLoginOperationID == operationID else { return false }
+        guard resolution.status == .available else {
+            await applyCodexConnectionState(
+                connected: false,
+                error: resolution.userMessage,
+                phase: .executableUnavailable(message: resolution.userMessage),
+                updateModels: true
+            )
+            throw AIProviderError.invalidConfiguration(detail: resolution.userMessage)
+        }
+
+        applyCodexConnectionPhase(.loggingIn)
+
+        let result = await CodexManagedAuthRecoveryService.shared.startManagedChatgptDeviceCodeLogin(
+            presentDeviceCode: presentDeviceCode
+        )
+        guard codexManagedLoginOperationID == operationID else { return false }
+        switch result {
+        case .authenticated:
+            await applyCodexConnectionState(
+                connected: true,
+                error: nil,
+                phase: .connected(resolvedExecutable: resolution.displayDescription),
+                updateModels: true
+            )
+            return true
+        case let .failed(message):
+            await applyCodexConnectionState(
+                connected: false,
+                error: message,
+                phase: codexFailurePhase(for: message),
+                updateModels: true
+            )
+            throw AIProviderError.invalidConfiguration(detail: message)
+        case let .executableUnavailable(message):
+            await applyCodexConnectionState(
+                connected: false,
+                error: message,
+                phase: .executableUnavailable(message: message),
+                updateModels: true
+            )
+            throw AIProviderError.invalidConfiguration(detail: message)
+        }
+    }
+
+    private func beginCodexManagedLogin(flow: CodexManagedLoginFlow) -> UUID {
+        let operationID = UUID()
+        codexManagedLoginOperationID = operationID
+        codexManagedLoginFlow = flow
+        return operationID
+    }
+
+    private func finishCodexManagedLogin(operationID: UUID) {
+        guard codexManagedLoginOperationID == operationID else { return }
+        codexManagedLoginOperationID = nil
+        codexManagedLoginFlow = nil
     }
 
     func testCodexConnection() async throws -> Bool {
