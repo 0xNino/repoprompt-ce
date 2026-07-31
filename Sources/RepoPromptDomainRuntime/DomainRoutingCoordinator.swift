@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-package struct DomainWindowDescriptor: Codable, Equatable, Sendable {
+package struct DomainWindowDescriptor: Codable, Equatable {
     package let windowID: Int
     package let generation: UInt64
     package let activeWorkspaceID: UUID?
@@ -26,7 +26,7 @@ package struct DomainWindowDescriptor: Codable, Equatable, Sendable {
     }
 }
 
-package struct DomainConnectionRegistration: Codable, Hashable, Sendable {
+package struct DomainConnectionRegistration: Codable, Hashable {
     package let connectionID: UUID
     package let generation: UInt64
     package let runtimeID: UUID
@@ -38,19 +38,19 @@ package struct DomainConnectionRegistration: Codable, Hashable, Sendable {
     }
 }
 
-package enum DomainBinding: Codable, Equatable, Sendable {
+package enum DomainBinding: Codable, Equatable {
     case unbound
     case context(DomainContextIdentity, explicit: Bool)
     case appPresentationWindow(Int)
     case runScoped(runID: UUID, context: DomainContextIdentity)
 }
 
-package struct DomainConnectionBindingSnapshot: Codable, Equatable, Sendable {
+package struct DomainConnectionBindingSnapshot: Codable, Equatable {
     package let registration: DomainConnectionRegistration
     package let binding: DomainBinding
 }
 
-package struct DomainRoutingSnapshot: Codable, Equatable, Sendable {
+package struct DomainRoutingSnapshot: Codable, Equatable {
     package let runtimeID: UUID
     package let revision: UInt64
     package let windows: [DomainWindowDescriptor]
@@ -58,7 +58,7 @@ package struct DomainRoutingSnapshot: Codable, Equatable, Sendable {
     package let pendingRunContexts: [UUID: DomainContextIdentity]
 }
 
-package enum DomainRoutingDisposition: String, Codable, Sendable {
+package enum DomainRoutingDisposition: String, Codable {
     case applied
     case unchanged
     case conflict
@@ -66,24 +66,19 @@ package enum DomainRoutingDisposition: String, Codable, Sendable {
     case staleGeneration
 }
 
-package struct DomainRoutingOutcome: Codable, Equatable, Sendable {
+package struct DomainRoutingOutcome: Codable, Equatable {
     package let operationID: UUID
     package let disposition: DomainRoutingDisposition
     package let snapshot: DomainRoutingSnapshot
     package let diagnostic: String?
 }
 
-package struct DomainRunLaunchToken: Sendable {
+package struct DomainRunLaunchToken {
     package let tokenID: UUID
     package let material: String
-
-    init(tokenID: UUID, material: String) {
-        self.tokenID = tokenID
-        self.material = material
-    }
 }
 
-package struct DomainRunLaunchReservationRequest: Sendable {
+package struct DomainRunLaunchReservationRequest {
     package let runID: UUID
     package let context: DomainContextIdentity
     package let expectedContextRevision: UInt64
@@ -123,7 +118,7 @@ package struct DomainRunLaunchReservationRequest: Sendable {
     }
 }
 
-package enum DomainRunLaunchRedemptionResult: Equatable, Sendable {
+package enum DomainRunLaunchRedemptionResult: Equatable {
     case accepted(DomainConnectionBindingSnapshot)
     case unknown
     case expired
@@ -133,7 +128,8 @@ package enum DomainRunLaunchRedemptionResult: Equatable, Sendable {
     case revoked
 }
 
-package enum DomainRunLaunchTokenError: Error, Equatable, Sendable {
+package enum DomainRunLaunchTokenError: Error, Equatable {
+    case runtimeStopped
     case contextUnavailable
     case staleContextRevision(expected: UInt64, actual: UInt64)
     case randomGenerationFailed
@@ -143,13 +139,13 @@ package actor DomainRoutingCoordinator {
     static let maximumRoutingOperations = 4096
     static let maximumTokenRecords = 1024
 
-    private enum TokenState: Equatable, Sendable {
+    private enum TokenState: Equatable {
         case active
         case consumed
         case revoked
     }
 
-    private struct TokenRecord: Sendable {
+    private struct TokenRecord {
         let tokenID: UUID
         let digest: String
         let request: DomainRunLaunchReservationRequest
@@ -163,6 +159,7 @@ package actor DomainRoutingCoordinator {
     private let metrics: DomainRuntimeMetricsSink
     private let clock = ContinuousClock()
     private var revision: UInt64 = 0
+    private var isStopped = false
     private var windows: [Int: DomainWindowDescriptor] = [:]
     private var nextWindowGeneration: [Int: UInt64] = [:]
     private var connections: [UUID: DomainConnectionBindingSnapshot] = [:]
@@ -207,6 +204,7 @@ package actor DomainRoutingCoordinator {
         presentationRevision: UInt64,
         operationID: UUID
     ) -> DomainRoutingOutcome {
+        guard !isStopped else { return stoppedOutcome(operationID) }
         if let prior = routingOperations[operationID] { return prior }
         let generation = nextWindowGeneration[windowID, default: 0] &+ 1
         nextWindowGeneration[windowID] = generation
@@ -227,6 +225,7 @@ package actor DomainRoutingCoordinator {
         operationID: UUID,
         expectedRevision: UInt64? = nil
     ) -> DomainRoutingOutcome {
+        guard !isStopped else { return stoppedOutcome(operationID) }
         if let prior = routingOperations[operationID] { return prior }
         guard expectedRevision == nil || expectedRevision == revision else {
             return finish(operationID, disposition: .conflict, diagnostic: "routing_revision_mismatch")
@@ -260,6 +259,7 @@ package actor DomainRoutingCoordinator {
         generation: UInt64,
         operationID: UUID
     ) -> DomainRoutingOutcome {
+        guard !isStopped else { return stoppedOutcome(operationID) }
         if let prior = routingOperations[operationID] { return prior }
         guard let current = windows[windowID] else {
             return finish(operationID, disposition: .unchanged, diagnostic: nil)
@@ -283,6 +283,7 @@ package actor DomainRoutingCoordinator {
     }
 
     package func registerConnection(connectionID: UUID, operationID: UUID) -> DomainRoutingOutcome {
+        guard !isStopped else { return stoppedOutcome(operationID) }
         if let prior = routingOperations[operationID] { return prior }
         let generation = nextConnectionGeneration[connectionID, default: 0] &+ 1
         nextConnectionGeneration[connectionID] = generation
@@ -302,6 +303,7 @@ package actor DomainRoutingCoordinator {
         _ connection: DomainConnectionRegistration,
         operationID: UUID
     ) -> DomainRoutingOutcome {
+        guard !isStopped else { return stoppedOutcome(operationID) }
         if let prior = routingOperations[operationID] { return prior }
         guard let current = connections[connection.connectionID] else {
             return finish(operationID, disposition: .unchanged, diagnostic: nil)
@@ -320,6 +322,7 @@ package actor DomainRoutingCoordinator {
         operationID: UUID,
         expectedRevision: UInt64? = nil
     ) async -> DomainRoutingOutcome {
+        guard !isStopped else { return stoppedOutcome(operationID) }
         // Resolve the async context dependency first so validation and commit below run
         // without suspension: actor reentrancy cannot interleave routing-state changes
         // between the checks and the committed binding.
@@ -330,6 +333,7 @@ package actor DomainRoutingCoordinator {
         case .appPresentationWindow, .unbound:
             break
         }
+        guard !isStopped else { return stoppedOutcome(operationID) }
         if let prior = routingOperations[operationID] { return prior }
         guard expectedRevision == nil || expectedRevision == revision else {
             return finish(operationID, disposition: .conflict, diagnostic: "routing_revision_mismatch")
@@ -368,9 +372,11 @@ package actor DomainRoutingCoordinator {
     package func issueLaunchToken(
         _ request: DomainRunLaunchReservationRequest
     ) async throws -> DomainRunLaunchToken {
+        guard !isStopped else { throw DomainRunLaunchTokenError.runtimeStopped }
         guard let context = await contextStore.snapshot(request.context) else {
             throw DomainRunLaunchTokenError.contextUnavailable
         }
+        guard !isStopped else { throw DomainRunLaunchTokenError.runtimeStopped }
         guard context.revisions.workingRevision == request.expectedContextRevision else {
             throw DomainRunLaunchTokenError.staleContextRevision(
                 expected: request.expectedContextRevision,
@@ -473,6 +479,7 @@ package actor DomainRoutingCoordinator {
     }
 
     package func revokeLaunchToken(_ tokenID: UUID) {
+        guard !isStopped else { return }
         if let digest = tokenDigestsByID[tokenID], var record = tokenRecords[digest] {
             record.state = .revoked
             pendingRunContexts.removeValue(forKey: record.request.runID)
@@ -529,6 +536,8 @@ package actor DomainRoutingCoordinator {
     }
 
     package func shutdown() {
+        guard !isStopped else { return }
+        isStopped = true
         for (digest, var record) in tokenRecords {
             if case .active = record.state {
                 record.state = .revoked
@@ -539,6 +548,15 @@ package actor DomainRoutingCoordinator {
         windows.removeAll()
         connections.removeAll()
         revision &+= 1
+    }
+
+    private func stoppedOutcome(_ operationID: UUID) -> DomainRoutingOutcome {
+        DomainRoutingOutcome(
+            operationID: operationID,
+            disposition: .rejected,
+            snapshot: snapshot(),
+            diagnostic: "routing_coordinator_stopped"
+        )
     }
 
     private func finish(

@@ -313,6 +313,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var domainWorkspaceFileURLsByID: [UUID: URL] = [:]
     private var domainWorkspaceRevisionsByID: [UUID: DomainRevisionState] = [:]
     private var domainWorkspaceDigestsByID: [UUID: String] = [:]
+    private var workspaceRenameIntentByID: [UUID: UUID] = [:]
+    private var workspaceHiddenIntentByID: [UUID: UUID] = [:]
     private var domainWorkspaceCatalogRevision: UInt64 = 0
     #if DEBUG
         private var workspaceSavePreparationDidFinishHandlerForTesting:
@@ -1742,7 +1744,10 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
 
                 if FileManager.default.fileExists(atPath: wURL.path) {
-                    let loadResult = try Self.loadWorkspaceFromFileResult(at: wURL)
+                    let loadResult = try Self.loadWorkspaceFromFileResult(
+                        at: wURL,
+                        scheduleNormalizationWriteback: domainWorkspaceAuthorityClient == nil
+                    )
                     let ws = loadResult.workspace
                     #if DEBUG
                         decodedWorkspaceCount += 1
@@ -6384,19 +6389,21 @@ class WorkspaceManagerViewModel: ObservableObject {
         domainWorkspaceRevisionsByID.removeValue(forKey: workspace.id)
         domainWorkspaceDigestsByID.removeValue(forKey: workspace.id)
         domainWorkspaceFileURLsByID.removeValue(forKey: workspace.id)
+        workspaceRenameIntentByID.removeValue(forKey: workspace.id)
+        workspaceHiddenIntentByID.removeValue(forKey: workspace.id)
         if activeWorkspaceID == workspace.id {
             activeWorkspaceID = nil
         }
-        let workspaceDir = workspaceDirectory(for: workspace)
-        await Task.detached(priority: .utility) {
-            await GitDiffDataMaintenance.shared.deleteAllGitData(workspaceDirectory: workspaceDir)
-            if workspace.customStoragePath == nil,
-               FileManager.default.fileExists(atPath: workspaceDir.path)
-            {
-                try? FileManager.default.removeItem(at: workspaceDir)
-            }
-        }.value
         if saveLegacyIndex {
+            let workspaceDir = workspaceDirectory(for: workspace)
+            await Task.detached(priority: .utility) {
+                await GitDiffDataMaintenance.shared.deleteAllGitData(workspaceDirectory: workspaceDir)
+                if workspace.customStoragePath == nil,
+                   FileManager.default.fileExists(atPath: workspaceDir.path)
+                {
+                    try? FileManager.default.removeItem(at: workspaceDir)
+                }
+            }.value
             await rebuildAndSaveIndexAsync()
             await WorkspaceDiskWriter.shared.flush(url: workspaceIndexFileURL)
         }
@@ -6432,10 +6439,31 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         }
 
-        // Schedule async save of the specific workspace and index update, with flushes before notify
-        Task {
+        // Schedule async save of the specific workspace and index update, with flushes before notify.
+        // The intent token lets an authority projection replace the array element without
+        // losing this request, while a newer rename supersedes the older task.
+        let workspaceID = workspace.id
+        let intentID = UUID()
+        let intentDateModified = workspaces[index].dateModified
+        workspaceRenameIntentByID[workspaceID] = intentID
+        Task { @MainActor [weak self] in
+            guard let self,
+                  workspaceRenameIntentByID[workspaceID] == intentID,
+                  var workspaceToSave = workspaces.first(where: { $0.id == workspaceID })
+            else { return }
+            defer {
+                if workspaceRenameIntentByID[workspaceID] == intentID {
+                    workspaceRenameIntentByID.removeValue(forKey: workspaceID)
+                }
+            }
+            workspaceToSave.name = finalName
+            workspaceToSave.dateModified = max(workspaceToSave.dateModified, intentDateModified)
+            if let currentIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) {
+                workspaces[currentIndex].name = workspaceToSave.name
+                workspaces[currentIndex].dateModified = workspaceToSave.dateModified
+            }
             do {
-                let finalURL = try await saveWorkspaceToFileAsync(workspaces[index], source: .renameWorkspace)
+                let finalURL = try await saveWorkspaceToFileAsync(workspaceToSave, source: .renameWorkspace)
                 await WorkspaceDiskWriter.shared.flush(url: finalURL)
 
                 await rebuildAndSaveIndexAsync()
@@ -6459,9 +6487,28 @@ class WorkspaceManagerViewModel: ObservableObject {
         workspaces[index].isHiddenInMenus = hidden
         workspaces[index].dateModified = Date()
 
-        Task {
+        let workspaceID = workspace.id
+        let intentID = UUID()
+        let intentDateModified = workspaces[index].dateModified
+        workspaceHiddenIntentByID[workspaceID] = intentID
+        Task { @MainActor [weak self] in
+            guard let self,
+                  workspaceHiddenIntentByID[workspaceID] == intentID,
+                  var workspaceToSave = workspaces.first(where: { $0.id == workspaceID })
+            else { return }
+            defer {
+                if workspaceHiddenIntentByID[workspaceID] == intentID {
+                    workspaceHiddenIntentByID.removeValue(forKey: workspaceID)
+                }
+            }
+            workspaceToSave.isHiddenInMenus = hidden
+            workspaceToSave.dateModified = max(workspaceToSave.dateModified, intentDateModified)
+            if let currentIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) {
+                workspaces[currentIndex].isHiddenInMenus = workspaceToSave.isHiddenInMenus
+                workspaces[currentIndex].dateModified = workspaceToSave.dateModified
+            }
             do {
-                let finalURL = try await saveWorkspaceToFileAsync(workspaces[index], source: .setWorkspaceHidden)
+                let finalURL = try await saveWorkspaceToFileAsync(workspaceToSave, source: .setWorkspaceHidden)
                 await WorkspaceDiskWriter.shared.flush(url: finalURL)
 
                 await rebuildAndSaveIndexAsync()
@@ -8253,10 +8300,14 @@ class WorkspaceManagerViewModel: ObservableObject {
         return try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes).workspace
     }
 
-    nonisolated static func loadWorkspaceFromFileResult(at fileURL: URL) throws -> WorkspaceFileLoadResult {
+    nonisolated static func loadWorkspaceFromFileResult(
+        at fileURL: URL,
+        scheduleNormalizationWriteback: Bool = true
+    ) throws -> WorkspaceFileLoadResult {
         let cachedResult = try WorkspaceFileDecodeCache.shared.loadWorkspace(at: fileURL)
         let normalizationSaveTask: Task<Void, Never>?
-        if cachedResult.normalizationRequiresSave,
+        if scheduleNormalizationWriteback,
+           cachedResult.normalizationRequiresSave,
            WorkspaceFileDecodeCache.shared.claimNormalizationSave(for: cachedResult.cacheKey)
         {
             let workspaceToSave = cachedResult.workspace

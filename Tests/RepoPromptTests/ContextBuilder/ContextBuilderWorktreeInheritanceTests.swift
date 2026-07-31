@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 #if DEBUG
@@ -1858,20 +1859,55 @@ import XCTest
                     lease: lease,
                     contextBuilderProviderFactory: factory.makeProvider
                 )
+                let authorityRuntimeRoot = fixture.rootURL.appendingPathComponent(
+                    "inactive-workspace-domain-runtime",
+                    isDirectory: true
+                )
+                let authorityRuntime = MCPDomainRuntime(configuration: .init(
+                    mode: .standalone,
+                    profileIdentifier: "inactive-workspace-fixture-\(UUID().uuidString)",
+                    storageDirectory: authorityRuntimeRoot,
+                    workspaceStorageDirectory: authorityRuntimeRoot.appendingPathComponent("Workspaces", isDirectory: true),
+                    eventDirectory: authorityRuntimeRoot.appendingPathComponent("events", isDirectory: true),
+                    temporaryDirectory: authorityRuntimeRoot.appendingPathComponent("tmp", isDirectory: true),
+                    externalReloadInterval: nil
+                ))
                 let settings = GlobalSettingsStore.shared
                 let previousPresetSetting = settings.mcpShowModelPresets()
                 settings.setMCPShowModelPresets(false, commit: false)
                 defer { settings.setMCPShowModelPresets(previousPresetSetting, commit: false) }
 
                 do {
+                    try await authorityRuntime.start()
                     try await activateWorkspace(fixture.contextA)
                     let window = fixture.contextA.window
-                    let sourceWorkspaceB = try XCTUnwrap(
+                    var sourceWorkspaceB = try XCTUnwrap(
                         fixture.contextB.window.workspaceManager.workspaces.first {
                             $0.id == fixture.contextB.workspaceID
                         }
                     )
-                    _ = try await fixture.contextB.window.workspaceManager.saveWorkspaceToFileAsync(sourceWorkspaceB)
+                    let authorityDirectory = fixture.rootURL.appendingPathComponent(
+                        "inactive-workspace-authority-\(fixture.contextB.workspaceID.uuidString)",
+                        isDirectory: true
+                    )
+                    sourceWorkspaceB.customStoragePath = authorityDirectory
+                    let authorityURL = authorityDirectory.appendingPathComponent("workspace.json")
+                    let authorityClient = DomainWorkspaceAuthorityClient(
+                        store: authorityRuntime.workspaceStore,
+                        windowID: -643
+                    )
+                    let authorityCreate = try await authorityClient.create(
+                        sourceWorkspaceB,
+                        fileURL: authorityURL
+                    )
+                    XCTAssertTrue(
+                        [.applied, .unchanged, .deduplicated].contains(authorityCreate.disposition)
+                    )
+                    XCTAssertEqual(authorityCreate.workspace?.document.fileURL, authorityURL)
+                    XCTAssertEqual(
+                        try Data(contentsOf: authorityURL),
+                        authorityCreate.workspace?.document.documentBytes
+                    )
                     fixture.contextB.window.workspaceManager.workspaces.removeAll {
                         $0.id == fixture.contextB.workspaceID
                     }
@@ -2218,8 +2254,11 @@ import XCTest
                             visibleOracleSessionIDs.union([persisted.session.id])
                         )
                     }
+                    _ = await authorityRuntime.shutdown()
                     await fixture.cleanup()
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: authorityDirectory.path))
                 } catch {
+                    _ = await authorityRuntime.shutdown()
                     await fixture.cleanup()
                     throw error
                 }

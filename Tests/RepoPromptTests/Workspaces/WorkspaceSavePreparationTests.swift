@@ -214,6 +214,141 @@ import XCTest
             XCTAssertTrue(decoded.normalizationRequiresSave)
         }
 
+        func testDomainOwnedLoadSuppressesLegacyNormalizationWriteback() throws {
+            let root = try temporaryDirectory(named: "DomainOwnedNormalization")
+            let fileURL = root.appendingPathComponent("workspace.json")
+            let workspace = makeWorkspace(name: "Domain owned", storage: root)
+            var object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: JSONEncoder().encode(workspace)) as? [String: Any]
+            )
+            object["composeTabs"] = []
+            object["activeComposeTabID"] = UUID().uuidString
+            let originalBytes = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            try originalBytes.write(to: fileURL, options: .atomic)
+
+            let loaded = try WorkspaceManagerViewModel.loadWorkspaceFromFileResult(
+                at: fileURL,
+                scheduleNormalizationWriteback: false
+            )
+
+            XCTAssertTrue(loaded.normalizationRequiresSave)
+            XCTAssertNil(loaded.normalizationSaveTask)
+            XCTAssertEqual(try Data(contentsOf: fileURL), originalBytes)
+        }
+
+        func testConcurrentDistinctDomainCreatesBothCommit() async throws {
+            let root = try temporaryDirectory(named: "ConcurrentDomainCreates")
+            let workspaceRoot = root.appendingPathComponent("Workspaces", isDirectory: true)
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "concurrent-domain-creates-\(UUID().uuidString)",
+                storageDirectory: root,
+                workspaceStorageDirectory: workspaceRoot,
+                eventDirectory: root.appendingPathComponent("events"),
+                temporaryDirectory: root.appendingPathComponent("tmp"),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            defer { Task { _ = await runtime.shutdown() } }
+
+            let firstWorkspace = WorkspaceModel(name: "Concurrent A", repoPaths: ["/tmp/a"])
+            let secondWorkspace = WorkspaceModel(name: "Concurrent B", repoPaths: ["/tmp/b"])
+            let firstURL = workspaceRoot
+                .appendingPathComponent(
+                    DomainWorkspaceStoragePath.directoryName(
+                        name: firstWorkspace.name,
+                        id: firstWorkspace.id
+                    ),
+                    isDirectory: true
+                )
+                .appendingPathComponent("workspace.json")
+            let secondURL = workspaceRoot
+                .appendingPathComponent(
+                    DomainWorkspaceStoragePath.directoryName(
+                        name: secondWorkspace.name,
+                        id: secondWorkspace.id
+                    ),
+                    isDirectory: true
+                )
+                .appendingPathComponent("workspace.json")
+            let firstClient = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1001)
+            let secondClient = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -1002)
+            let firstTask = Task { @MainActor in
+                try await firstClient.create(firstWorkspace, fileURL: firstURL)
+            }
+            let secondTask = Task { @MainActor in
+                try await secondClient.create(secondWorkspace, fileURL: secondURL)
+            }
+
+            let firstOutcome = try await firstTask.value
+            let secondOutcome = try await secondTask.value
+            XCTAssertTrue([.applied, .unchanged, .deduplicated].contains(firstOutcome.disposition))
+            XCTAssertTrue([.applied, .unchanged, .deduplicated].contains(secondOutcome.disposition))
+            let catalog = await runtime.workspaceStore.snapshot()
+            XCTAssertEqual(
+                Set(catalog.workspaces.map(\.document.workspaceID)),
+                [firstWorkspace.id, secondWorkspace.id]
+            )
+            XCTAssertTrue(FileManager.default.fileExists(atPath: firstURL.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: secondURL.path))
+
+            let collisionOperationID = UUID()
+            let collisionA = WorkspaceModel(name: "Collision A", repoPaths: ["/tmp/collision-a"])
+            let collisionB = WorkspaceModel(name: "Collision B", repoPaths: ["/tmp/collision-b"])
+            let collisionAURL = workspaceRoot
+                .appendingPathComponent(
+                    DomainWorkspaceStoragePath.directoryName(name: collisionA.name, id: collisionA.id),
+                    isDirectory: true
+                )
+                .appendingPathComponent("workspace.json")
+            let collisionBURL = workspaceRoot
+                .appendingPathComponent(
+                    DomainWorkspaceStoragePath.directoryName(name: collisionB.name, id: collisionB.id),
+                    isDirectory: true
+                )
+                .appendingPathComponent("workspace.json")
+            let collisionATask = Task { @MainActor in
+                try await firstClient.create(
+                    collisionA,
+                    fileURL: collisionAURL,
+                    operationID: collisionOperationID
+                )
+            }
+            let collisionBTask = Task { @MainActor in
+                try await secondClient.create(
+                    collisionB,
+                    fileURL: collisionBURL,
+                    operationID: collisionOperationID
+                )
+            }
+            let collisionAOutcome = try await collisionATask.value
+            let collisionBOutcome = try await collisionBTask.value
+            let collisionOutcomes = [collisionAOutcome, collisionBOutcome]
+            XCTAssertEqual(
+                collisionOutcomes.count(where: {
+                    [.applied, .unchanged, .deduplicated].contains($0.disposition)
+                }),
+                1
+            )
+            XCTAssertEqual(
+                collisionOutcomes.count(where: { $0.errorCode == .operationIDCollision }),
+                1
+            )
+            let afterCollision = await runtime.workspaceStore.snapshot()
+            XCTAssertEqual(
+                afterCollision.workspaces.count(where: {
+                    $0.document.workspaceID == collisionA.id || $0.document.workspaceID == collisionB.id
+                }),
+                1
+            )
+            XCTAssertEqual(
+                [collisionAURL, collisionBURL].count(where: {
+                    FileManager.default.fileExists(atPath: $0.path)
+                }),
+                1
+            )
+        }
+
         func testDomainAuthoritySaveRetainsRetryBaselineAndIgnoresStaleLegacyList() async throws {
             let root = try temporaryDirectory(named: "DomainSaveInvariants")
             defer { try? FileManager.default.removeItem(at: root) }
@@ -411,6 +546,20 @@ import XCTest
             let authoritativeURL = resolved.document.fileURL
             let authoritativeDirectory = authoritativeURL.deletingLastPathComponent().standardizedFileURL
             let indexURL = root.appendingPathComponent("Workspaces/workspacesIndex.json")
+            let distractor = manager.createWorkspace(
+                name: "Deferred persistence distractor",
+                repoPaths: ["/tmp/distractor"]
+            )
+            _ = try await waitForDomainWorkspace(
+                runtime,
+                workspaceID: distractor.id,
+                description: "deferred persistence distractor creation"
+            )
+            let distractorCatalog = await runtime.workspaceStore.snapshot()
+            let distractorProjectionCompleted = await presentationBridge.waitUntilProjected(
+                through: distractorCatalog.publicationSequence
+            )
+            XCTAssertTrue(distractorProjectionCompleted)
             let renamedNotification = expectation(description: "rename publishes workspace list change after persistence")
             let renamedObserver = NotificationCenter.default.addObserver(
                 forName: .workspaceListDidChange,
@@ -429,6 +578,10 @@ import XCTest
             }
             defer { NotificationCenter.default.removeObserver(renamedObserver) }
             manager.renameWorkspace(accepted, newName: "  Runtime Renamed  ")
+            let renameTargetIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspaceID })
+            let renameDistractorIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == distractor.id })
+            manager.workspaces[renameTargetIndex].name = accepted.name
+            manager.workspaces.swapAt(renameTargetIndex, renameDistractorIndex)
             let renamed = try await waitForDomainWorkspace(
                 runtime,
                 workspaceID: workspaceID,
@@ -463,6 +616,27 @@ import XCTest
             )
             XCTAssertEqual(renamedModel.name, "Runtime Renamed")
 
+            manager.setWorkspaceHidden(renamedModel, hidden: true)
+            let hiddenTargetIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspaceID })
+            let hiddenDistractorIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == distractor.id })
+            manager.workspaces[hiddenTargetIndex].isHiddenInMenus = false
+            manager.workspaces.swapAt(hiddenTargetIndex, hiddenDistractorIndex)
+            let hidden = try await waitForDomainWorkspace(
+                runtime,
+                workspaceID: workspaceID,
+                description: "hidden-state publication after workspace reorder"
+            ) { snapshot in
+                snapshot.document.metadata.isHiddenInMenus
+            }
+            XCTAssertTrue(hidden.document.metadata.isHiddenInMenus)
+            let distractorAfterDeferredMutations = try await waitForDomainWorkspace(
+                runtime,
+                workspaceID: distractor.id,
+                description: "distractor remains unchanged"
+            )
+            XCTAssertEqual(distractorAfterDeferredMutations.document.metadata.name, distractor.name)
+            XCTAssertFalse(distractorAfterDeferredMutations.document.metadata.isHiddenInMenus)
+
             let indexData = try Data(contentsOf: indexURL)
             let indexEntries = try JSONDecoder().decode([WorkspaceIndexEntry].self, from: indexData)
             XCTAssertEqual(indexData, staleIndexData)
@@ -486,6 +660,21 @@ import XCTest
             let afterEmptyRename = await runtime.workspaceStore.snapshot()
             XCTAssertEqual(afterEmptyRename.publicationSequence, beforeEmptyRename.publicationSequence)
             XCTAssertEqual(manager.workspace(withID: workspaceID)?.name, "Runtime Renamed")
+
+            let deleteModel = try XCTUnwrap(manager.workspace(withID: workspaceID))
+            let deleteSucceeded = await manager.deleteWorkspaceAsync(deleteModel)
+            XCTAssertTrue(deleteSucceeded)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: authoritativeDirectory.path))
+            let afterDelete = await runtime.workspaceStore.snapshot()
+            let recreated = await runtime.workspaceStore.execute(.init(
+                operationID: UUID(),
+                expectedCatalogRevision: afterDelete.catalogRevision,
+                expectedWorkspaceRevision: 0,
+                origin: .standalone,
+                command: .createWorkspace(hidden.document)
+            ))
+            XCTAssertEqual(recreated.disposition, .applied)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: authoritativeURL.path))
         }
 
         func testCancelledWorkingCommitAdoptsAuthorityBaselineForNextSave() async throws {

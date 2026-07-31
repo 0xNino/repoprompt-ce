@@ -51,6 +51,10 @@ extension MCPServerViewModel {
     @MainActor
     func publishDomainRoutingBinding(connectionID: UUID, context: TabScopedContext) {
         guard let coordinator = domainRoutingCoordinator else { return }
+        if domainWindowPresentationRevision < .max {
+            domainWindowPresentationRevision += 1
+        }
+        let presentationRevision = domainWindowPresentationRevision
         let binding: DomainBinding = if let workspaceID = context.workspaceID {
             if let runID = context.runID {
                 .runScoped(
@@ -73,7 +77,7 @@ extension MCPServerViewModel {
             guard let descriptor = await ensureDomainWindowRegistered(
                 activeWorkspaceID: context.workspaceID,
                 activeContextID: context.tabID,
-                presentationRevision: context.selectionRevision
+                presentationRevision: presentationRevision
             ),
                 !domainRoutingWindowIsClosing
             else { return }
@@ -83,7 +87,7 @@ extension MCPServerViewModel {
                 activeWorkspaceID: context.workspaceID,
                 activeContextID: context.tabID,
                 isClosing: false,
-                presentationRevision: context.selectionRevision
+                presentationRevision: presentationRevision
             )
             let updated = await coordinator.registerWindow(updatedDescriptor, operationID: UUID())
             guard !domainRoutingWindowIsClosing, updated.disposition != .staleGeneration else { return }

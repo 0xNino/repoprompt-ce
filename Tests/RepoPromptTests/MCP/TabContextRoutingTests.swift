@@ -1731,6 +1731,78 @@ final class TabContextRoutingTests: XCTestCase {
     }
 
     @MainActor
+    func testDomainRoutingUsesWindowWideRevisionAcrossLowerSelectionRevision() async throws {
+        let authorityRoot = try makeTemporaryDirectory(named: "window-routing-revision")
+        let storageOverride = ScopedGlobalWorkspaceStorageOverride(authorityRoot: authorityRoot)
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app,
+            profileIdentifier: "window-routing-revision-\(UUID().uuidString)",
+            storageDirectory: authorityRoot,
+            eventDirectory: authorityRoot.appendingPathComponent("events"),
+            temporaryDirectory: authorityRoot.appendingPathComponent("tmp"),
+            externalReloadInterval: nil
+        ))
+        try await runtime.start()
+
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState(domainRuntime: runtime)
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        addTeardownBlock { @MainActor in
+            WindowStatesManager.shared.unregisterWindowState(window)
+            await window.tearDown()
+            _ = await runtime.shutdown()
+            storageOverride.restore()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        }
+        await window.workspaceManager.awaitInitialized()
+
+        let connectionID = UUID()
+        var first = MCPServerViewModel.TabContextSnapshot(
+            tabID: UUID(),
+            windowID: window.windowID,
+            workspaceID: nil,
+            promptText: "",
+            selection: StoredSelection(),
+            selectedMetaPromptIDs: [],
+            tabName: "First",
+            runID: nil,
+            explicitlyBound: false
+        )
+        first.selectionRevision = 50
+        window.mcpServer.publishDomainRoutingBinding(connectionID: connectionID, context: first)
+        await window.mcpServer.domainRoutingPublishTask?.value
+
+        var second = MCPServerViewModel.TabContextSnapshot(
+            tabID: UUID(),
+            windowID: window.windowID,
+            workspaceID: nil,
+            promptText: "",
+            selection: StoredSelection(),
+            selectedMetaPromptIDs: [],
+            tabName: "Second",
+            runID: nil,
+            explicitlyBound: false
+        )
+        second.selectionRevision = 0
+        window.mcpServer.publishDomainRoutingBinding(connectionID: connectionID, context: second)
+        await window.mcpServer.domainRoutingPublishTask?.value
+
+        let routing = await runtime.routingCoordinator.snapshot()
+        let descriptor = try XCTUnwrap(routing.windows.first { $0.windowID == window.windowID })
+        XCTAssertEqual(descriptor.activeContextID, second.tabID)
+        XCTAssertEqual(descriptor.presentationRevision, 2)
+        let connection = try XCTUnwrap(routing.connections.first {
+            $0.registration.connectionID == connectionID
+        })
+        guard case let .appPresentationWindow(boundWindowID) = connection.binding else {
+            return XCTFail("Expected the connection to retain its presentation-window binding")
+        }
+        XCTAssertEqual(boundWindowID, window.windowID)
+    }
+
+    @MainActor
     func testManageSelectionSetPersistsAcrossConnectionRebindAndWorkspaceSerialization() async throws {
         let authorityRoot = try makeTemporaryDirectory(named: "isolated-domain-authority")
         // Scope ownership is established before runtime startup can throw. A successful startup

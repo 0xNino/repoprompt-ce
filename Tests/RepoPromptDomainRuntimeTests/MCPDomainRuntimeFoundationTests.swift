@@ -10,7 +10,7 @@ final class MCPDomainToolCatalogTests: XCTestCase {
         XCTAssertEqual(MCPDomainToolCatalog.globalToolNames, [
             "app_settings",
             "bind_context",
-            "manage_workspaces",
+            "manage_workspaces"
         ])
         XCTAssertEqual(MCPDomainToolCatalog.windowToolNames.count, 24)
         XCTAssertEqual(Set(MCPDomainToolCatalog.classifications.keys), Set(MCPDomainToolCatalog.orderedToolNames))
@@ -43,7 +43,7 @@ final class MCPDomainToolCatalogTests: XCTestCase {
             .agentModeClaudeEngineer: ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
             .agentModeCodexEngineer: ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
             .agentModeOpenCodeEngineer: ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
-            .agentModeCursorEngineer: ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"],
+            .agentModeCursorEngineer: ["app_settings", "manage_selection", "file_actions", "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt", "apply_edits", "ask_oracle", "oracle_chat_log", "git", "manage_worktree", "context_builder", "ask_user", "agent_explore", "set_status", "history"]
         ]
         for profile in MCPClientToolPolicyProfile.allCases {
             XCTAssertEqual(
@@ -65,7 +65,7 @@ final class MCPDomainToolCatalogTests: XCTestCase {
 
 final class MCPDomainToolRegistryTests: XCTestCase {
     func testRegistrationIsAtomicAndRejectsUnknownScopeDuplicateAndFingerprintDrift() async throws {
-        let registry = MCPDomainToolRegistry(registryID: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!)
+        let registry = try MCPDomainToolRegistry(registryID: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000001")))
         let readFile = Self.binding(name: MCPWindowToolName.readFile)
         let initial = await registry.snapshot()
 
@@ -160,7 +160,7 @@ final class MCPDomainToolRegistryTests: XCTestCase {
                     registrationID: .init(rawValue: 42),
                     scope: .application,
                     bindings: [Self.binding(name: MCPWindowToolName.readFile)]
-                ),
+                )
             ])
         }
 
@@ -338,7 +338,7 @@ final class MCPDomainToolRegistryTests: XCTestCase {
             let registry = MCPDomainToolRegistry()
             var handles: [MCPDomainToolRegistrationHandle] = []
             for windowID in 1 ... windowCount {
-                handles.append(try await registry.register(
+                try await handles.append(registry.register(
                     registrationID: .init(rawValue: UInt(windowID)),
                     scope: .window(id: windowID),
                     bindings: [Self.binding(name: MCPWindowToolName.readFile)]
@@ -422,7 +422,7 @@ final class MCPDomainToolRegistryTests: XCTestCase {
                 description: description,
                 inputSchema: .object([
                     "properties": .object([:]),
-                    "type": .string("object"),
+                    "type": .string("object")
                 ]),
                 annotations: .init(
                     readOnlyHint: true,
@@ -494,11 +494,11 @@ final class MCPDomainToolFingerprintTests: XCTestCase {
     func testFingerprintCanonicalizesSchemaKeysAndTracksEveryMetadataField() throws {
         let first = definition(schema: .object([
             "properties": .object(["b": .string("two"), "a": .string("one")]),
-            "type": .string("object"),
+            "type": .string("object")
         ]))
         let reordered = definition(schema: .object([
             "type": .string("object"),
-            "properties": .object(["a": .string("one"), "b": .string("two")]),
+            "properties": .object(["a": .string("one"), "b": .string("two")])
         ]))
         XCTAssertEqual(
             try MCPDomainToolFingerprint(definition: first),
@@ -541,7 +541,7 @@ final class RepoPromptDomainRuntimeLifecycleTests: XCTestCase {
     func testInertRuntimeStartIsIdempotentAndStoppedInstanceCannotRestart() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("runtime-owner-test-\(UUID().uuidString)", isDirectory: true)
-        let runtime = MCPDomainRuntime(
+        let runtime = try MCPDomainRuntime(
             configuration: .init(
                 mode: .app,
                 profileIdentifier: "owner-test",
@@ -549,11 +549,11 @@ final class RepoPromptDomainRuntimeLifecycleTests: XCTestCase {
                 eventDirectory: directory,
                 temporaryDirectory: directory
             ),
-            runtimeID: UUID(uuidString: "00000000-0000-0000-0000-000000000010")!,
+            runtimeID: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000010")),
             lifecycleGeneration: 7,
             processID: 42,
             createdAt: Date(timeIntervalSince1970: 123),
-            registryID: UUID(uuidString: "00000000-0000-0000-0000-000000000011")!
+            registryID: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000011"))
         )
 
         let created = await runtime.snapshot()
@@ -573,6 +573,30 @@ final class RepoPromptDomainRuntimeLifecycleTests: XCTestCase {
         XCTAssertEqual(result.finalLifecycle, .stopped)
         let stopped = await runtime.snapshot()
         XCTAssertEqual(stopped.publicationSequence, 4)
+        let rejectedRouting = await runtime.routingCoordinator.openWindow(
+            windowID: 1,
+            activeWorkspaceID: nil,
+            activeContextID: nil,
+            presentationRevision: 1,
+            operationID: UUID()
+        )
+        XCTAssertEqual(rejectedRouting.disposition, .rejected)
+        XCTAssertEqual(rejectedRouting.diagnostic, "routing_coordinator_stopped")
+        XCTAssertTrue(rejectedRouting.snapshot.windows.isEmpty)
+        do {
+            _ = try await runtime.routingCoordinator.issueLaunchToken(.init(
+                runID: UUID(),
+                context: DomainContextIdentity(workspaceID: UUID(), contextID: UUID()),
+                expectedContextRevision: 0,
+                windowID: nil,
+                clientPrincipal: "stopped-runtime-test",
+                providerIdentifier: "fixture",
+                runPurpose: "must-fail-after-shutdown"
+            ))
+            XCTFail("Stopped routing coordinator issued a launch token")
+        } catch let error as DomainRunLaunchTokenError {
+            XCTAssertEqual(error, .runtimeStopped)
+        }
         do {
             try await runtime.start()
             XCTFail("Stopped runtime restarted")

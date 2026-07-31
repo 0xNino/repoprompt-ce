@@ -2,12 +2,12 @@ import Darwin
 import Foundation
 import os
 
-struct DomainPendingSave: Codable, Sendable {
+struct DomainPendingSave: Codable {
     let operationID: UUID
     let documentDigest: String
 }
 
-struct DomainWorkingJournal: Codable, Sendable {
+struct DomainWorkingJournal: Codable {
     static let schemaVersion = 1
 
     let version: Int
@@ -51,7 +51,7 @@ struct DomainWorkingJournal: Codable, Sendable {
     }
 }
 
-struct DomainSavedRevisionRecord: Codable, Sendable {
+struct DomainSavedRevisionRecord: Codable {
     static let schemaVersion = 1
 
     let version: Int
@@ -71,7 +71,7 @@ struct DomainSavedRevisionRecord: Codable, Sendable {
     }
 }
 
-struct DomainDeletionTombstone: Codable, Sendable {
+struct DomainDeletionTombstone: Codable {
     static let schemaVersion = 1
 
     let version: Int
@@ -89,7 +89,7 @@ struct DomainDeletionTombstone: Codable, Sendable {
     }
 }
 
-struct DomainFileMetadata: Equatable, Sendable {
+struct DomainFileMetadata: Equatable {
     let exists: Bool
     let byteCount: UInt64
     let modificationNanoseconds: Int64
@@ -105,7 +105,7 @@ struct DomainFileMetadata: Equatable, Sendable {
     )
 }
 
-enum DomainExternalDocumentProbe: Sendable {
+enum DomainExternalDocumentProbe {
     case unchanged(DomainFileMetadata)
     case changed(DomainWorkspaceDocument, DomainFileMetadata)
     case missing(DomainFileMetadata)
@@ -113,8 +113,8 @@ enum DomainExternalDocumentProbe: Sendable {
     case cancelled
 }
 
-struct DomainPersistenceBootstrap: Sendable {
-    struct Workspace: Sendable {
+struct DomainPersistenceBootstrap {
+    struct Workspace {
         let document: DomainWorkspaceDocument
         let savedDigest: String
         let revisions: DomainRevisionState
@@ -125,7 +125,7 @@ struct DomainPersistenceBootstrap: Sendable {
         let fileMetadata: DomainFileMetadata
     }
 
-    struct UnavailableWorkspace: Sendable {
+    struct UnavailableWorkspace {
         let workspaceID: UUID
         let fileURL: URL
         let reason: String
@@ -140,29 +140,29 @@ struct DomainPersistenceBootstrap: Sendable {
     let catalogRevision: UInt64
 }
 
-struct DomainPersistenceWorkspaceRefresh: Sendable {
+struct DomainPersistenceWorkspaceRefresh {
     let workspace: DomainPersistenceBootstrap.Workspace?
     let workspaceIsDeleted: Bool
     let health: DomainAuthorityHealth
     let catalogRevision: UInt64
 }
 
-struct DomainPersistenceWorkingCommit: Sendable {
+struct DomainPersistenceWorkingCommit {
     let journal: DomainWorkingJournal
     let catalogRevision: UInt64
 }
 
-struct DomainPersistenceSavedCommit: Sendable {
+struct DomainPersistenceSavedCommit {
     let journal: DomainWorkingJournal
     let catalogRevision: UInt64
 }
 
-struct DomainPersistenceDeleteCommit: Sendable {
+struct DomainPersistenceDeleteCommit {
     let catalogRevision: UInt64
     let tombstone: DomainDeletionTombstone
 }
 
-enum DomainPersistenceError: Error, Equatable, Sendable {
+enum DomainPersistenceError: Error, Equatable {
     case stateConflict(expected: UInt64, actual: UInt64)
     case externalDocumentConflict
     case futureJournal(Int)
@@ -198,7 +198,7 @@ private enum DomainBlockingIO {
                 DispatchQueue.global(qos: .utility).async {
                     do {
                         try cancellation.check()
-                        continuation.resume(returning: try operation(cancellation))
+                        try continuation.resume(returning: operation(cancellation))
                     } catch {
                         continuation.resume(throwing: error)
                     }
@@ -210,7 +210,7 @@ private enum DomainBlockingIO {
     }
 }
 
-package struct DomainPersistenceCoordinator: Sendable {
+package struct DomainPersistenceCoordinator {
     private struct RuntimeWorkspaceCatalog: Codable {
         static let schemaVersion = 1
 
@@ -296,14 +296,19 @@ package struct DomainPersistenceCoordinator: Sendable {
         self.cancellation = cancellation
     }
 
-    private var fileManager: FileManager { .default }
+    private var fileManager: FileManager {
+        .default
+    }
+
     private var encoder: JSONEncoder {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         return encoder
     }
 
-    private var decoder: JSONDecoder { JSONDecoder() }
+    private var decoder: JSONDecoder {
+        JSONDecoder()
+    }
 
     private func blockingWorker(_ cancellation: DomainBlockingCancellation) -> Self {
         Self(configuration: configuration, identity: identity, cancellation: cancellation)
@@ -334,15 +339,41 @@ package struct DomainPersistenceCoordinator: Sendable {
             .appendingPathComponent("\(safe)-\(digest)", isDirectory: true)
     }
 
-    private var journalDirectory: URL { runtimeRoot.appendingPathComponent("working-journals", isDirectory: true) }
-    private var revisionDirectory: URL { runtimeRoot.appendingPathComponent("revisions", isDirectory: true) }
-    private var deletionDirectory: URL { runtimeRoot.appendingPathComponent("deletion-tombstones", isDirectory: true) }
-    private var lockDirectory: URL { runtimeRoot.appendingPathComponent("locks", isDirectory: true) }
-    private var settingsDirectory: URL { runtimeRoot.appendingPathComponent("settings", isDirectory: true) }
-    private var rollbackRoot: URL { runtimeRoot.appendingPathComponent("rollback", isDirectory: true) }
-    private var policyURL: URL { settingsDirectory.appendingPathComponent("runtime-policy.json") }
-    private var catalogURL: URL { runtimeRoot.appendingPathComponent("workspace-catalog.json") }
-    private var indexURL: URL { workspaceRoot.appendingPathComponent("workspacesIndex.json") }
+    private var journalDirectory: URL {
+        runtimeRoot.appendingPathComponent("working-journals", isDirectory: true)
+    }
+
+    private var revisionDirectory: URL {
+        runtimeRoot.appendingPathComponent("revisions", isDirectory: true)
+    }
+
+    private var deletionDirectory: URL {
+        runtimeRoot.appendingPathComponent("deletion-tombstones", isDirectory: true)
+    }
+
+    private var lockDirectory: URL {
+        runtimeRoot.appendingPathComponent("locks", isDirectory: true)
+    }
+
+    private var settingsDirectory: URL {
+        runtimeRoot.appendingPathComponent("settings", isDirectory: true)
+    }
+
+    private var rollbackRoot: URL {
+        runtimeRoot.appendingPathComponent("rollback", isDirectory: true)
+    }
+
+    private var policyURL: URL {
+        settingsDirectory.appendingPathComponent("runtime-policy.json")
+    }
+
+    private var catalogURL: URL {
+        runtimeRoot.appendingPathComponent("workspace-catalog.json")
+    }
+
+    private var indexURL: URL {
+        workspaceRoot.appendingPathComponent("workspacesIndex.json")
+    }
 
     private func journalURL(_ workspaceID: UUID) -> URL {
         journalDirectory.appendingPathComponent("\(workspaceID.uuidString).json")
@@ -640,8 +671,16 @@ package struct DomainPersistenceCoordinator: Sendable {
             )
         }
         let isDeleted = (catalog.deletions ?? []).contains { $0.workspaceID == workspaceID }
-        let fileURL = catalog.entries.first { $0.workspaceID == workspaceID }?.fileURL
-            ?? fallbackFileURL
+        let matchingEntries = catalog.entries.filter { $0.workspaceID == workspaceID }
+        guard matchingEntries.count <= 1 else {
+            return DomainPersistenceWorkspaceRefresh(
+                workspace: nil,
+                workspaceIsDeleted: isDeleted,
+                health: .degradedReadOnly(reason: "duplicate_workspace_catalog_id"),
+                catalogRevision: catalog.revision
+            )
+        }
+        let fileURL = matchingEntries.first?.fileURL ?? fallbackFileURL
         return DomainPersistenceWorkspaceRefresh(
             workspace: isDeleted ? nil : loadWorkspace(workspaceID: workspaceID, fileURL: fileURL)?.workspace,
             workspaceIsDeleted: isDeleted,
@@ -709,9 +748,23 @@ package struct DomainPersistenceCoordinator: Sendable {
         var loaded: [DomainPersistenceBootstrap.Workspace] = []
         var unavailable: [DomainPersistenceBootstrap.UnavailableWorkspace] = []
         var loadedIDs = Set<UUID>()
+        let entriesByWorkspaceID = Dictionary(grouping: entries, by: \.workspaceID)
+        let duplicateWorkspaceIDs = Set(entriesByWorkspaceID.compactMap { workspaceID, matchingEntries in
+            matchingEntries.count > 1 ? workspaceID : nil
+        })
+        if !duplicateWorkspaceIDs.isEmpty {
+            globalHealth = .degradedReadOnly(reason: "duplicate_workspace_catalog_id")
+        }
         for entry in entries {
-            loadedIDs.insert(entry.workspaceID)
-            if let result = loadWorkspace(workspaceID: entry.workspaceID, fileURL: entry.fileURL) {
+            guard loadedIDs.insert(entry.workspaceID).inserted else { continue }
+            if duplicateWorkspaceIDs.contains(entry.workspaceID) {
+                unavailable.append(.init(
+                    workspaceID: entry.workspaceID,
+                    fileURL: entry.fileURL,
+                    reason: "duplicate_workspace_catalog_id",
+                    fileMetadata: fileMetadata(at: entry.fileURL)
+                ))
+            } else if let result = loadWorkspace(workspaceID: entry.workspaceID, fileURL: entry.fileURL) {
                 loaded.append(result.workspace)
             } else {
                 unavailable.append(.init(
@@ -772,31 +825,52 @@ package struct DomainPersistenceCoordinator: Sendable {
         let observedMetadata = fileMetadata(at: fileURL)
         let savedBytes = try? Data(contentsOf: fileURL)
         let savedBytesDigest = savedBytes.map(DomainContentDigest.sha256)
-        // Metadata is only a trusted "no external change" fast-path baseline when the
-        // on-disk bytes still match the journal's saved digest. Otherwise the first
-        // external-document probe must fall back to a full read + digest comparison,
-        // or an edit made while the runtime was down would be masked forever.
+        let savedDocument = savedBytes.flatMap {
+            decodeWorkspaceDocument($0, fileURL: fileURL, expectedWorkspaceID: workspaceID)
+        }
+        /// Metadata is only a trusted "no external change" fast-path baseline when the
+        /// on-disk bytes still match the journal's saved digest. Otherwise the first
+        /// external-document probe must fall back to a full read + digest comparison,
+        /// or an edit made while the runtime was down would be masked forever.
         func trustedMetadata(matching savedDigest: String) -> DomainFileMetadata {
             savedBytesDigest == savedDigest ? observedMetadata : .missing
         }
+        func degradedSavedWorkspace(
+            reason: String,
+            journal: DomainWorkingJournal? = nil
+        ) -> (workspace: DomainPersistenceBootstrap.Workspace, degradedReason: String?)? {
+            guard let savedDocument else { return nil }
+            let savedRevision = journal?.revisions.savedRevision ?? 0
+            let revisions = DomainRevisionState(
+                workingRevision: savedRevision,
+                savedRevision: savedRevision,
+                dirtyRevision: nil
+            )
+            return (.init(
+                document: savedDocument,
+                savedDigest: savedDocument.contentDigest,
+                revisions: revisions,
+                contextRevisions: Dictionary(uniqueKeysWithValues: savedDocument.metadata.contexts.map {
+                    ($0.identity.contextID, revisions)
+                }),
+                contextTombstones: journal?.contextTombstones ?? [:],
+                operations: journal?.operations ?? [],
+                health: .degradedReadOnly(reason: reason),
+                fileMetadata: observedMetadata
+            ), reason)
+        }
+
         switch loadJournal(workspaceID: workspaceID) {
         case let .success(journal?):
-            guard journal.version <= DomainWorkingJournal.schemaVersion else {
-                guard let savedBytes,
-                      let saved = try? DomainWorkspaceDocument.decode(documentBytes: savedBytes, fileURL: fileURL)
-                else { return nil }
-                return (.init(
-                    document: saved,
-                    savedDigest: saved.contentDigest,
-                    revisions: .initial,
-                    contextRevisions: [:],
-                    contextTombstones: [:],
-                    operations: [],
-                    health: .degradedReadOnly(reason: "future_working_journal"),
-                    fileMetadata: observedMetadata
-                ), "future_working_journal")
+            guard journal.workspaceID == workspaceID,
+                  journal.fileURL.standardizedFileURL == fileURL.standardizedFileURL
+            else {
+                return degradedSavedWorkspace(reason: "working_journal_identity_mismatch")
             }
-            if let recovered = resolvedPendingSave(journal) {
+            guard journal.version <= DomainWorkingJournal.schemaVersion else {
+                return degradedSavedWorkspace(reason: "future_working_journal")
+            }
+            if let recovered = resolvedPendingSave(journal, expectedWorkspaceID: workspaceID) {
                 return (.init(
                     document: recovered.document,
                     savedDigest: recovered.journal.savedDigest,
@@ -808,11 +882,31 @@ package struct DomainPersistenceCoordinator: Sendable {
                     fileMetadata: trustedMetadata(matching: recovered.journal.savedDigest)
                 ), nil)
             }
-            guard let bytes = journal.workingDocument ?? savedBytes,
-                  let document = try? DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
-            else { return nil }
+            if let workingBytes = journal.workingDocument {
+                guard let document = decodeWorkspaceDocument(
+                    workingBytes,
+                    fileURL: fileURL,
+                    expectedWorkspaceID: workspaceID
+                ) else {
+                    return degradedSavedWorkspace(
+                        reason: "working_document_decode_failed",
+                        journal: journal
+                    )
+                }
+                return (.init(
+                    document: document,
+                    savedDigest: journal.savedDigest,
+                    revisions: journal.revisions,
+                    contextRevisions: journal.contextRevisions,
+                    contextTombstones: journal.contextTombstones,
+                    operations: journal.operations,
+                    health: .writable,
+                    fileMetadata: trustedMetadata(matching: journal.savedDigest)
+                ), nil)
+            }
+            guard let savedDocument else { return nil }
             return (.init(
-                document: document,
+                document: savedDocument,
                 savedDigest: journal.savedDigest,
                 revisions: journal.revisions,
                 contextRevisions: journal.contextRevisions,
@@ -822,15 +916,13 @@ package struct DomainPersistenceCoordinator: Sendable {
                 fileMetadata: trustedMetadata(matching: journal.savedDigest)
             ), nil)
         case .success(nil):
-            guard let savedBytes,
-                  let document = try? DomainWorkspaceDocument.decode(documentBytes: savedBytes, fileURL: fileURL)
-            else { return nil }
-            let revisions = loadSavedRevision(workspaceID: workspaceID, digest: document.contentDigest)
+            guard let savedDocument else { return nil }
+            let revisions = loadSavedRevision(workspaceID: workspaceID, digest: savedDocument.contentDigest)
             return (.init(
-                document: document,
-                savedDigest: document.contentDigest,
+                document: savedDocument,
+                savedDigest: savedDocument.contentDigest,
                 revisions: revisions,
-                contextRevisions: Dictionary(uniqueKeysWithValues: document.metadata.contexts.map {
+                contextRevisions: Dictionary(uniqueKeysWithValues: savedDocument.metadata.contexts.map {
                     ($0.identity.contextID, revisions)
                 }),
                 contextTombstones: [:],
@@ -839,20 +931,19 @@ package struct DomainPersistenceCoordinator: Sendable {
                 fileMetadata: observedMetadata
             ), nil)
         case .failure:
-            guard let savedBytes,
-                  let document = try? DomainWorkspaceDocument.decode(documentBytes: savedBytes, fileURL: fileURL)
-            else { return nil }
-            return (.init(
-                document: document,
-                savedDigest: document.contentDigest,
-                revisions: .initial,
-                contextRevisions: [:],
-                contextTombstones: [:],
-                operations: [],
-                health: .degradedReadOnly(reason: "working_journal_decode_failed"),
-                fileMetadata: observedMetadata
-            ), "working_journal_decode_failed")
+            return degradedSavedWorkspace(reason: "working_journal_decode_failed")
         }
+    }
+
+    private func decodeWorkspaceDocument(
+        _ bytes: Data,
+        fileURL: URL,
+        expectedWorkspaceID: UUID
+    ) -> DomainWorkspaceDocument? {
+        guard let document = try? DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL),
+              document.workspaceID == expectedWorkspaceID
+        else { return nil }
+        return document
     }
 
     private func persistCreatedBlocking(
@@ -919,7 +1010,7 @@ package struct DomainPersistenceCoordinator: Sendable {
                     updatedAt: now
                 )
                 try DomainPersistenceLock.atomicWrite(
-                    try encoder.encode(pending),
+                    encoder.encode(pending),
                     to: journalURL(document.workspaceID)
                 )
                 try DomainPersistenceLock.atomicWrite(document.documentBytes, to: document.fileURL)
@@ -944,11 +1035,11 @@ package struct DomainPersistenceCoordinator: Sendable {
                     updatedAt: now
                 )
                 try DomainPersistenceLock.atomicWrite(
-                    try encoder.encode(committed),
+                    encoder.encode(committed),
                     to: journalURL(document.workspaceID)
                 )
                 try DomainPersistenceLock.atomicWrite(
-                    try encoder.encode(DomainSavedRevisionRecord(
+                    encoder.encode(DomainSavedRevisionRecord(
                         workspaceID: document.workspaceID,
                         savedRevision: 1,
                         documentDigest: document.contentDigest,
@@ -985,7 +1076,7 @@ package struct DomainPersistenceCoordinator: Sendable {
                     // successfully recreated identity on the next launch.
                     try fileManager.removeItem(at: priorDeletionURL)
                 }
-                try DomainPersistenceLock.atomicWrite(try encoder.encode(nextCatalog), to: catalogURL)
+                try DomainPersistenceLock.atomicWrite(encoder.encode(nextCatalog), to: catalogURL)
             } catch {
                 // Catalog publication is the create authority point. Roll back the earlier
                 // intent/document artifacts when publication fails in-process; a process crash
@@ -1030,7 +1121,7 @@ package struct DomainPersistenceCoordinator: Sendable {
                 pendingSave: durable.pendingSave,
                 updatedAt: now
             )
-            try DomainPersistenceLock.atomicWrite(try encoder.encode(journal), to: journalURL(document.workspaceID))
+            try DomainPersistenceLock.atomicWrite(encoder.encode(journal), to: journalURL(document.workspaceID))
             return DomainPersistenceWorkingCommit(journal: journal, catalogRevision: catalogRevision)
         }
     }
@@ -1067,7 +1158,7 @@ package struct DomainPersistenceCoordinator: Sendable {
                 operations: Self.trimmedOperations(operations, now: now),
                 updatedAt: now
             )
-            try DomainPersistenceLock.atomicWrite(try encoder.encode(journal), to: journalURL(document.workspaceID))
+            try DomainPersistenceLock.atomicWrite(encoder.encode(journal), to: journalURL(document.workspaceID))
             return DomainPersistenceWorkingCommit(journal: journal, catalogRevision: catalogRevision)
         }
     }
@@ -1120,7 +1211,7 @@ package struct DomainPersistenceCoordinator: Sendable {
                 updatedAt: now
             )
             try DomainPersistenceLock.atomicWrite(
-                try encoder.encode(pendingJournal),
+                encoder.encode(pendingJournal),
                 to: journalURL(document.workspaceID)
             )
             try DomainPersistenceLock.atomicWrite(document.documentBytes, to: document.fileURL)
@@ -1155,8 +1246,8 @@ package struct DomainPersistenceCoordinator: Sendable {
             // the pending journal plus document digest, so a post-document sidecar failure must
             // not report a false failed commit to a retrying caller.
             do {
-                try DomainPersistenceLock.atomicWrite(try encoder.encode(journal), to: journalURL(document.workspaceID))
-                try DomainPersistenceLock.atomicWrite(try encoder.encode(revision), to: revisionURL(document.workspaceID))
+                try DomainPersistenceLock.atomicWrite(encoder.encode(journal), to: journalURL(document.workspaceID))
+                try DomainPersistenceLock.atomicWrite(encoder.encode(revision), to: revisionURL(document.workspaceID))
             } catch {
                 // Leave the durable pending journal in place. resolvedPendingSave(_:) presents
                 // and persists the same clean revision on the next load/mutation.
@@ -1216,9 +1307,9 @@ package struct DomainPersistenceCoordinator: Sendable {
                 operations: Self.trimmedOperations(operations, now: now),
                 updatedAt: now
             )
-            try DomainPersistenceLock.atomicWrite(try encoder.encode(journal), to: journalURL(document.workspaceID))
+            try DomainPersistenceLock.atomicWrite(encoder.encode(journal), to: journalURL(document.workspaceID))
             try DomainPersistenceLock.atomicWrite(
-                try encoder.encode(revisionRecord),
+                encoder.encode(revisionRecord),
                 to: revisionURL(document.workspaceID)
             )
             return DomainPersistenceSavedCommit(journal: journal, catalogRevision: catalogRevision)
@@ -1257,7 +1348,7 @@ package struct DomainPersistenceCoordinator: Sendable {
                 operations: Self.trimmedOperations(operations, now: now),
                 updatedAt: now
             )
-            try DomainPersistenceLock.atomicWrite(try encoder.encode(journal), to: journalURL(document.workspaceID))
+            try DomainPersistenceLock.atomicWrite(encoder.encode(journal), to: journalURL(document.workspaceID))
             return DomainPersistenceWorkingCommit(journal: journal, catalogRevision: catalogRevision)
         }
     }
@@ -1310,7 +1401,7 @@ package struct DomainPersistenceCoordinator: Sendable {
                 )
                 // Catalog deletion is the crash-safe authority point. The sidecar and artifact
                 // cleanup follow while both identity and workspace locks remain held.
-                try DomainPersistenceLock.atomicWrite(try encoder.encode(next), to: catalogURL)
+                try DomainPersistenceLock.atomicWrite(encoder.encode(next), to: catalogURL)
                 // The catalog embeds the full tombstone. Its sidecar is a recoverable
                 // convenience and cannot turn an already-authoritative delete into failure.
                 try? DomainPersistenceLock.atomicWrite(
@@ -1320,12 +1411,32 @@ package struct DomainPersistenceCoordinator: Sendable {
                 try? fileManager.removeItem(at: journalURL(document.workspaceID))
                 try? fileManager.removeItem(at: revisionURL(document.workspaceID))
                 try? fileManager.removeItem(at: document.fileURL)
+                finalizeDeletedWorkspaceArtifacts(document)
                 return DomainPersistenceDeleteCommit(
                     catalogRevision: next.revision,
                     tombstone: tombstone
                 )
             }
         }
+    }
+
+    private func finalizeDeletedWorkspaceArtifacts(_ document: DomainWorkspaceDocument) {
+        let fileURL = document.fileURL.standardizedFileURL
+        guard fileURL.lastPathComponent == "workspace.json" else { return }
+        let workspaceDirectory = fileURL.deletingLastPathComponent()
+        if document.metadata.customStoragePath != nil {
+            try? fileManager.removeItem(
+                at: workspaceDirectory.appendingPathComponent("_git_data", isDirectory: true)
+            )
+            return
+        }
+
+        let expectedParent = workspaceRoot.standardizedFileURL
+        let identitySuffix = "-\(document.workspaceID.uuidString)"
+        guard workspaceDirectory.deletingLastPathComponent().standardizedFileURL == expectedParent,
+              workspaceDirectory.lastPathComponent.hasSuffix(identitySuffix)
+        else { return }
+        try? fileManager.removeItem(at: workspaceDirectory)
     }
 
     private func externalDocumentBlocking(
@@ -1348,6 +1459,9 @@ package struct DomainPersistenceCoordinator: Sendable {
                 documentBytes: bytes,
                 fileURL: snapshot.document.fileURL
             )
+            guard document.workspaceID == snapshot.document.workspaceID else {
+                return .invalid(observedMetadata)
+            }
             return .changed(document, observedMetadata)
         } catch {
             return .invalid(observedMetadata)
@@ -1372,14 +1486,17 @@ package struct DomainPersistenceCoordinator: Sendable {
     }
 
     private func resolvedPendingSave(
-        _ journal: DomainWorkingJournal
+        _ journal: DomainWorkingJournal,
+        expectedWorkspaceID: UUID
     ) -> (journal: DomainWorkingJournal, document: DomainWorkspaceDocument)? {
-        guard let pendingSave = journal.pendingSave,
+        guard journal.workspaceID == expectedWorkspaceID,
+              let pendingSave = journal.pendingSave,
               let savedBytes = try? Data(contentsOf: journal.fileURL),
               DomainContentDigest.sha256(savedBytes) == pendingSave.documentDigest,
-              let document = try? DomainWorkspaceDocument.decode(
-                  documentBytes: savedBytes,
-                  fileURL: journal.fileURL
+              let document = decodeWorkspaceDocument(
+                  savedBytes,
+                  fileURL: journal.fileURL,
+                  expectedWorkspaceID: expectedWorkspaceID
               )
         else { return nil }
         let cleanRevisions = DomainRevisionState(
@@ -1438,7 +1555,15 @@ package struct DomainPersistenceCoordinator: Sendable {
             guard journal.version <= DomainWorkingJournal.schemaVersion else {
                 throw DomainPersistenceError.futureJournal(journal.version)
             }
-            return resolvedPendingSave(journal)?.journal ?? journal
+            guard journal.workspaceID == document.workspaceID,
+                  journal.fileURL.standardizedFileURL == document.fileURL.standardizedFileURL
+            else {
+                throw DomainPersistenceError.invalidWorkspaceDocument
+            }
+            return resolvedPendingSave(
+                journal,
+                expectedWorkspaceID: document.workspaceID
+            )?.journal ?? journal
         case .success(nil):
             let savedBytes = (try? Data(contentsOf: document.fileURL)) ?? document.documentBytes
             let savedDigest = DomainContentDigest.sha256(savedBytes)
@@ -1518,7 +1643,7 @@ package struct DomainPersistenceCoordinator: Sendable {
                     updatedAt: now
                 )
                 try DomainPersistenceLock.atomicWrite(
-                    try encoder.encode(repairedCatalog),
+                    encoder.encode(repairedCatalog),
                     to: catalogURL
                 )
                 return try body(repairedCatalog.revision)
@@ -1535,14 +1660,23 @@ package struct DomainPersistenceCoordinator: Sendable {
             guard current.version <= RuntimeWorkspaceCatalog.schemaVersion else {
                 throw DomainPersistenceError.futureJournal(current.version)
             }
+            try validateUniqueCatalogEntries(current.entries)
             return current
         }
+        let entries = try legacyCatalogEntries()
+        try validateUniqueCatalogEntries(entries)
         return RuntimeWorkspaceCatalog(
             version: RuntimeWorkspaceCatalog.schemaVersion,
             revision: 0,
-            entries: try legacyCatalogEntries(),
+            entries: entries,
             updatedAt: now
         )
+    }
+
+    private func validateUniqueCatalogEntries(_ entries: [RuntimeWorkspaceCatalog.Entry]) throws {
+        guard Set(entries.map(\.workspaceID)).count == entries.count else {
+            throw DomainPersistenceError.invalidWorkspaceDocument
+        }
     }
 
     private func ensureLazyMigration(now: Date) throws {
@@ -1561,9 +1695,9 @@ package struct DomainPersistenceCoordinator: Sendable {
                 let url = entry.customStoragePath?.appendingPathComponent("workspace.json")
                     ?? workspaceRoot
                     .appendingPathComponent(
-                    DomainWorkspaceStoragePath.directoryName(name: entry.name, id: entry.id),
-                    isDirectory: true
-                )
+                        DomainWorkspaceStoragePath.directoryName(name: entry.name, id: entry.id),
+                        isDirectory: true
+                    )
                     .appendingPathComponent("workspace.json")
                 guard let bytes = try? Data(contentsOf: url) else { continue }
                 let relative = "workspaces/\(entry.id.uuidString).json"
@@ -1571,13 +1705,13 @@ package struct DomainPersistenceCoordinator: Sendable {
                 artifacts.append(.init(relativePath: relative, digest: DomainContentDigest.sha256(bytes)))
             }
             if !fileManager.fileExists(atPath: catalogURL.path) {
-                let catalog = RuntimeWorkspaceCatalog(
+                let catalog = try RuntimeWorkspaceCatalog(
                     version: RuntimeWorkspaceCatalog.schemaVersion,
                     revision: 0,
-                    entries: try legacyCatalogEntries(),
+                    entries: legacyCatalogEntries(),
                     updatedAt: now
                 )
-                try DomainPersistenceLock.atomicWrite(try encoder.encode(catalog), to: catalogURL)
+                try DomainPersistenceLock.atomicWrite(encoder.encode(catalog), to: catalogURL)
             }
             if !configuration.legacyRuntimeDefaults.isEmpty {
                 let defaultsURL = rollbackDirectory.appendingPathComponent("legacy-runtime-defaults.json")
@@ -1598,7 +1732,7 @@ package struct DomainPersistenceCoordinator: Sendable {
                 legacyDefaultKeys: configuration.legacyRuntimeDefaults.keys.sorted()
             )
             try DomainPersistenceLock.atomicWrite(
-                try encoder.encode(manifest),
+                encoder.encode(manifest),
                 to: rollbackDirectory.appendingPathComponent("manifest.json")
             )
             let policy = RuntimePolicyDocument(
@@ -1608,7 +1742,7 @@ package struct DomainPersistenceCoordinator: Sendable {
                 rollbackDirectoryName: rollbackName,
                 migratedAt: now
             )
-            try DomainPersistenceLock.atomicWrite(try encoder.encode(policy), to: policyURL)
+            try DomainPersistenceLock.atomicWrite(encoder.encode(policy), to: policyURL)
         }
     }
 
@@ -1626,7 +1760,7 @@ package struct DomainPersistenceCoordinator: Sendable {
 
 private enum DomainPersistenceLock {
     private static let waitTimeoutNanoseconds: UInt64 = 2_000_000_000
-    private static let retryDelayMicroseconds: useconds_t = 10_000
+    private static let retryDelayMicroseconds: useconds_t = 10000
 
     static func withLock<T>(
         at url: URL,

@@ -27,14 +27,23 @@ struct DomainWorkspaceAuthorityClient {
         operationID: UUID = UUID()
     ) async throws -> DomainCommandOutcome {
         let document = try document(for: workspace, fileURL: fileURL)
-        let snapshot = await store.snapshot()
-        return await executeStable(.init(
+        let envelope = DomainWorkspaceCommandEnvelope(
             operationID: operationID,
-            expectedCatalogRevision: snapshot.catalogRevision,
+            expectedCatalogRevision: nil,
             expectedWorkspaceRevision: 0,
             origin: .appPresentation(windowID: windowID),
             command: .createWorkspace(document)
-        ))
+        )
+        let first = await executeStable(envelope)
+        guard first.disposition == .conflict,
+              first.errorCode == .stateConflict,
+              first.diagnostic == "durable_create_conflict"
+              || first.diagnostic == "catalog_revision_mismatch",
+              !Task.isCancelled
+        else { return first }
+        // The authority refreshes its durable catalog before returning a catalog-only conflict.
+        // Retry the identical envelope once so the operation ID remains idempotent while work is bounded.
+        return await executeStable(envelope)
     }
 
     func replaceWorking(

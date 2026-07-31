@@ -1712,6 +1712,7 @@ final class MCPServerViewModel: ObservableObject {
     let domainRoutingCoordinator: DomainRoutingCoordinator?
     var domainWindowDescriptor: DomainWindowDescriptor?
     var domainWindowRegistrationTask: Task<DomainWindowDescriptor?, Never>?
+    var domainWindowPresentationRevision: UInt64 = 0
     var domainRoutingWindowIsClosing = false
     /// Serializes routing publications (bind/release) so rapid tab transitions cannot
     /// commit bindings out of order and teardown can drain in-flight publications.
