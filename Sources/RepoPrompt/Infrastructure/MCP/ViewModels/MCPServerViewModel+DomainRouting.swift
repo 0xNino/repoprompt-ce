@@ -66,14 +66,16 @@ extension MCPServerViewModel {
         } else {
             .appPresentationWindow(context.windowID)
         }
-        Task { @MainActor [weak self] in
-            guard let self,
-                  let descriptor = await ensureDomainWindowRegistered(
-                      activeWorkspaceID: context.workspaceID,
-                      activeContextID: context.tabID,
-                      presentationRevision: context.selectionRevision
-                  ),
-                  !self.domainRoutingWindowIsClosing
+        let previousPublish = domainRoutingPublishTask
+        domainRoutingPublishTask = Task { @MainActor [weak self] in
+            await previousPublish?.value
+            guard let self, !self.domainRoutingWindowIsClosing else { return }
+            guard let descriptor = await ensureDomainWindowRegistered(
+                activeWorkspaceID: context.workspaceID,
+                activeContextID: context.tabID,
+                presentationRevision: context.selectionRevision
+            ),
+                !domainRoutingWindowIsClosing
             else { return }
             let updatedDescriptor = DomainWindowDescriptor(
                 windowID: descriptor.windowID,
@@ -84,7 +86,7 @@ extension MCPServerViewModel {
                 presentationRevision: context.selectionRevision
             )
             let updated = await coordinator.registerWindow(updatedDescriptor, operationID: UUID())
-            guard updated.disposition != .staleGeneration else { return }
+            guard !domainRoutingWindowIsClosing, updated.disposition != .staleGeneration else { return }
             domainWindowDescriptor = updated.snapshot.windows.first {
                 $0.windowID == context.windowID
             }
@@ -93,6 +95,8 @@ extension MCPServerViewModel {
                 $0.registration.connectionID == connectionID
             }?.registration
             if registration == nil {
+                // Re-checked above so a straggler cannot resurrect a connection binding
+                // after `unregisterDomainRoutingWindow` tore the window down.
                 let registered = await coordinator.registerConnection(
                     connectionID: connectionID,
                     operationID: UUID()
@@ -101,7 +105,7 @@ extension MCPServerViewModel {
                     $0.registration.connectionID == connectionID
                 }?.registration
             }
-            guard let registration else { return }
+            guard let registration, !domainRoutingWindowIsClosing else { return }
             let bound = await coordinator.bind(
                 connection: registration,
                 binding: binding,
@@ -116,7 +120,9 @@ extension MCPServerViewModel {
     @MainActor
     func publishDomainRoutingRelease(connectionID: UUID) {
         guard let coordinator = domainRoutingCoordinator else { return }
-        Task {
+        let previousPublish = domainRoutingPublishTask
+        domainRoutingPublishTask = Task { @MainActor [weak self] in
+            await previousPublish?.value
             let snapshot = await coordinator.snapshot()
             guard let registration = snapshot.connections.first(where: {
                 $0.registration.connectionID == connectionID
@@ -126,7 +132,7 @@ extension MCPServerViewModel {
                 operationID: UUID()
             )
             if released.disposition != .applied, released.disposition != .unchanged {
-                self.logger.warning(
+                self?.logger.warning(
                     "Domain routing release rejected: \(released.diagnostic ?? String(describing: released.disposition))"
                 )
             }
@@ -137,6 +143,9 @@ extension MCPServerViewModel {
     @MainActor
     func unregisterDomainRoutingWindow() async {
         domainRoutingWindowIsClosing = true
+        let pendingPublish = domainRoutingPublishTask
+        domainRoutingPublishTask = nil
+        await pendingPublish?.value
         domainWindowRegistrationTask?.cancel()
         if domainWindowDescriptor == nil,
            let registrationTask = domainWindowRegistrationTask

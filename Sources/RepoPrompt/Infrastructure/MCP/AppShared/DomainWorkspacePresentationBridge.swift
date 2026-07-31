@@ -40,15 +40,13 @@ struct DomainWorkspaceAuthorityClient {
     func replaceWorking(
         _ workspace: WorkspaceModel,
         fileURL: URL,
+        expectedWorkspaceRevision: UInt64?,
         operationID: UUID = UUID()
     ) async throws -> DomainCommandOutcome {
         let document = try document(for: workspace, fileURL: fileURL)
-        let current = await store.snapshot().workspaces.first {
-            $0.document.workspaceID == workspace.id
-        }
         return await executeStable(.init(
             operationID: operationID,
-            expectedWorkspaceRevision: current?.revisions.workingRevision,
+            expectedWorkspaceRevision: expectedWorkspaceRevision,
             origin: .appPresentation(windowID: windowID),
             command: .replaceWorkingDocument(document)
         ))
@@ -57,19 +55,26 @@ struct DomainWorkspaceAuthorityClient {
     func save(
         _ workspace: WorkspaceModel,
         fileURL: URL,
+        expectedWorkspaceRevision: UInt64?,
+        expectedContentDigest: String?,
         operationIDs: DomainWorkspaceSaveOperationIDs = .init()
     ) async throws -> DomainCommandOutcome {
-        let working = try await replaceWorking(
-            workspace,
-            fileURL: fileURL,
-            operationID: operationIDs.working
-        )
-        guard working.isSuccessfulDomainMutation else { return working }
-        let expectedRevision = working.after?.workingRevision
-            ?? working.workspace?.revisions.workingRevision
+        let document = try document(for: workspace, fileURL: fileURL)
+        var saveRevision = expectedWorkspaceRevision
+        if document.contentDigest != expectedContentDigest {
+            let working = await executeStable(.init(
+                operationID: operationIDs.working,
+                expectedWorkspaceRevision: expectedWorkspaceRevision,
+                origin: .appPresentation(windowID: windowID),
+                command: .replaceWorkingDocument(document)
+            ))
+            guard working.isSuccessfulDomainMutation else { return working }
+            saveRevision = working.after?.workingRevision
+                ?? working.workspace?.revisions.workingRevision
+        }
         return await executeStable(.init(
             operationID: operationIDs.saved,
-            expectedWorkspaceRevision: expectedRevision,
+            expectedWorkspaceRevision: saveRevision,
             origin: .appPresentation(windowID: windowID),
             command: .saveWorkspaceDocument(workspaceID: workspace.id)
         ))
@@ -77,16 +82,14 @@ struct DomainWorkspaceAuthorityClient {
 
     func delete(
         workspaceID: UUID,
+        expectedCatalogRevision: UInt64?,
+        expectedWorkspaceRevision: UInt64?,
         operationID: UUID = UUID()
     ) async -> DomainCommandOutcome {
-        let snapshot = await store.snapshot()
-        let current = snapshot.workspaces.first {
-            $0.document.workspaceID == workspaceID
-        }
-        return await executeStable(.init(
+        await executeStable(.init(
             operationID: operationID,
-            expectedCatalogRevision: snapshot.catalogRevision,
-            expectedWorkspaceRevision: current?.revisions.workingRevision,
+            expectedCatalogRevision: expectedCatalogRevision,
+            expectedWorkspaceRevision: expectedWorkspaceRevision,
             origin: .appPresentation(windowID: windowID),
             command: .deleteWorkspace(workspaceID: workspaceID)
         ))
@@ -95,14 +98,12 @@ struct DomainWorkspaceAuthorityClient {
     func resolveConflict(
         workspaceID: UUID,
         acceptExternal: Bool,
+        expectedWorkspaceRevision: UInt64?,
         operationID: UUID = UUID()
     ) async -> DomainCommandOutcome {
-        let current = await store.snapshot().workspaces.first {
-            $0.document.workspaceID == workspaceID
-        }
-        return await executeStable(.init(
+        await executeStable(.init(
             operationID: operationID,
-            expectedWorkspaceRevision: current?.revisions.workingRevision,
+            expectedWorkspaceRevision: expectedWorkspaceRevision,
             origin: .appPresentation(windowID: windowID),
             command: .resolveExternalConflict(
                 workspaceID: workspaceID,
@@ -171,7 +172,11 @@ final class DomainWorkspacePresentationBridge {
             let deadline = clock.now.advanced(by: timeout)
             repeat {
                 if lastPublicationSequence >= publicationSequence { return true }
-                guard await TaskCancellationDelay.wait(nanoseconds: 10_000_000) else { return false }
+                do {
+                    try await Task.sleep(nanoseconds: 10_000_000)
+                } catch {
+                    return false
+                }
             } while clock.now < deadline
             return lastPublicationSequence >= publicationSequence
         }
@@ -216,11 +221,42 @@ final class DomainWorkspacePresentationBridge {
     private func consume(_ event: DomainWorkspaceEvent) async {
         guard event.sequence > lastPublicationSequence else { return }
         let gap = lastPublicationSequence != 0 && event.sequence != lastPublicationSequence &+ 1
+        if !gap, await suppressSelfEcho(for: event) { return }
         let snapshot = await client.snapshot()
         project(
             snapshot,
             force: gap || event.kind == .externalReloaded || event.kind == .degraded
         )
+    }
+
+    /// The originating window already applied its command outcome (revisions + digest) via
+    /// `applyDomainAuthorityOutcome`, so echoing its own commit back through a full catalog
+    /// snapshot plus a MainActor document decode would only amplify every capture by W windows.
+    /// Bookkeeping is refreshed from a single-workspace snapshot instead.
+    private func suppressSelfEcho(for event: DomainWorkspaceEvent) async -> Bool {
+        let suppressibleKinds: Set<DomainWorkspaceEventKind> = [
+            .workingStateCommitted, .savedDocumentCommitted, .operationDeduplicated
+        ]
+        guard case let .appPresentation(originWindowID) = event.origin,
+              originWindowID == client.windowID,
+              suppressibleKinds.contains(event.kind),
+              let workspaceID = event.workspaceID,
+              projectedModels[workspaceID] != nil
+        else { return false }
+        guard let workspace = await client.store.workspaceSnapshot(workspaceID),
+              workspace.health.acceptsMutations,
+              let model = workspaceManager?.workspace(withID: workspaceID)
+        else { return false }
+        projectedModels[workspaceID] = model
+        projectedDigests[workspaceID] = workspace.document.contentDigest
+        workspaceManager?.applyDomainAuthorityBaseline(
+            workspaceID: workspaceID,
+            revisions: workspace.revisions,
+            digest: workspace.document.contentDigest,
+            catalogRevision: event.catalogRevision
+        )
+        lastPublicationSequence = event.sequence
+        return true
     }
 
     private func project(_ snapshot: DomainWorkspaceCatalogSnapshot, force: Bool) {
@@ -237,6 +273,14 @@ final class DomainWorkspacePresentationBridge {
         })
         let removedIDs = Set(projectedModels.keys).subtracting(nextDigests.keys)
         guard force || !changedIDs.isEmpty || !removedIDs.isEmpty else {
+            for workspace in snapshot.workspaces {
+                workspaceManager?.applyDomainAuthorityBaseline(
+                    workspaceID: workspace.document.workspaceID,
+                    revisions: workspace.revisions,
+                    digest: workspace.document.contentDigest,
+                    catalogRevision: snapshot.catalogRevision
+                )
+            }
             lastPublicationSequence = snapshot.publicationSequence
             return
         }
@@ -272,6 +316,11 @@ final class DomainWorkspacePresentationBridge {
             fileURLsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
                 ($0.document.workspaceID, $0.document.fileURL)
             }),
+            revisionsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                ($0.document.workspaceID, $0.revisions)
+            }),
+            digestsByWorkspaceID: nextDigests,
+            catalogRevision: snapshot.catalogRevision,
             preferredActiveWorkspaceID: workspaceManager?.activeWorkspaceID,
             publicationSequence: snapshot.publicationSequence
         )

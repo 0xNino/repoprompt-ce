@@ -311,11 +311,15 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var domainWorkingCommitTasks: [UUID: Task<Void, Never>] = [:]
     private var domainWorkingCommitGeneration: [UUID: UInt64] = [:]
     private var domainWorkspaceFileURLsByID: [UUID: URL] = [:]
+    private var domainWorkspaceRevisionsByID: [UUID: DomainRevisionState] = [:]
+    private var domainWorkspaceDigestsByID: [UUID: String] = [:]
+    private var domainWorkspaceCatalogRevision: UInt64 = 0
     #if DEBUG
         private var workspaceSavePreparationDidFinishHandlerForTesting:
             (@Sendable (UUID, URL, Int) async -> Void)?
         private var workspaceSaveAttemptCountByWorkspaceIDForTesting: [UUID: Int] = [:]
         private var workspaceSaveCapturePublicationCountByWorkspaceIDForTesting: [UUID: Int] = [:]
+        private var cancelWorkingCommitAfterOutcomeWorkspaceIDsForTesting: Set<UUID> = []
         private var savePathComposeTabReloadCountForTesting = 0
     #endif
 
@@ -425,6 +429,10 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         func debugAwaitWorkingDocumentCommitToDomainAuthority(workspaceID: UUID) async {
             await domainWorkingCommitTasks[workspaceID]?.value
+        }
+
+        func cancelNextWorkingCommitAfterAuthorityOutcomeForTesting(workspaceID: UUID) {
+            cancelWorkingCommitAfterOutcomeWorkspaceIDsForTesting.insert(workspaceID)
         }
 
         func setWorkspaceSavePreparationDidFinishHandlerForTesting(
@@ -1537,10 +1545,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     // Removed - now using free function defaultWorkspaceRoot()
 
     nonisolated func directoryName(for workspace: WorkspaceModel) -> String {
-        let safeName = workspace.name
-            .replacingOccurrences(of: "/", with: "_")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return "Workspace-\(safeName)-\(workspace.id.uuidString)"
+        DomainWorkspaceStoragePath.directoryName(name: workspace.name, id: workspace.id)
     }
 
     func workspaceDirectory(for workspace: WorkspaceModel) -> URL {
@@ -1696,7 +1701,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 if let customURL = entry.customStoragePath {
                     wURL = customURL.appendingPathComponent("workspace.json")
                 } else {
-                    let folder = base.appendingPathComponent("Workspace-\(entry.name)-\(entry.id.uuidString)")
+                    let folder = base.appendingPathComponent(
+                        DomainWorkspaceStoragePath.directoryName(name: entry.name, id: entry.id)
+                    )
                     wURL = folder.appendingPathComponent("workspace.json")
                 }
 
@@ -1942,6 +1949,13 @@ class WorkspaceManagerViewModel: ObservableObject {
                         fileURLsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
                             ($0.document.workspaceID, $0.document.fileURL)
                         }),
+                        revisionsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                            ($0.document.workspaceID, $0.revisions)
+                        }),
+                        digestsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                            ($0.document.workspaceID, $0.document.contentDigest)
+                        }),
+                        catalogRevision: snapshot.catalogRevision,
                         preferredActiveWorkspaceID: activeWorkspaceID,
                         publicationSequence: snapshot.publicationSequence
                     )
@@ -1972,7 +1986,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 if let customURL = entry.customStoragePath {
                     wURL = customURL.appendingPathComponent("workspace.json")
                 } else {
-                    let folder = base.appendingPathComponent("Workspace-\(entry.name)-\(entry.id.uuidString)")
+                    let folder = base.appendingPathComponent(
+                        DomainWorkspaceStoragePath.directoryName(name: entry.name, id: entry.id)
+                    )
                     wURL = folder.appendingPathComponent("workspace.json")
                 }
 
@@ -2066,7 +2082,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 if let customURL = entry.customStoragePath {
                     wURL = customURL.appendingPathComponent("workspace.json")
                 } else {
-                    let folder = base.appendingPathComponent("Workspace-\(entry.name)-\(entry.id.uuidString)")
+                    let folder = base.appendingPathComponent(
+                        DomainWorkspaceStoragePath.directoryName(name: entry.name, id: entry.id)
+                    )
                     wURL = folder.appendingPathComponent("workspace.json")
                 }
 
@@ -2108,7 +2126,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 if let customURL = entry.customStoragePath {
                     wURL = customURL.appendingPathComponent("workspace.json")
                 } else {
-                    let folder = base.appendingPathComponent("Workspace-\(entry.name)-\(entry.id.uuidString)")
+                    let folder = base.appendingPathComponent(
+                        DomainWorkspaceStoragePath.directoryName(name: entry.name, id: entry.id)
+                    )
                     wURL = folder.appendingPathComponent("workspace.json")
                 }
 
@@ -3791,6 +3811,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         domainWorkingCommitTasks[workspaceID]?.cancel()
         let fileURL = workspaceFileURL(for: workspace)
         let operationID = UUID()
+        let expectedWorkspaceRevision = domainWorkspaceRevisionsByID[workspaceID]?.workingRevision
         domainWorkingCommitTasks[workspaceID] = Task { @MainActor [weak self] in
             defer {
                 if self?.domainWorkingCommitGeneration[workspaceID] == generation {
@@ -3805,9 +3826,16 @@ class WorkspaceManagerViewModel: ObservableObject {
                 let outcome = try await domainWorkspaceAuthorityClient.replaceWorking(
                     workspace,
                     fileURL: fileURL,
+                    expectedWorkspaceRevision: expectedWorkspaceRevision,
                     operationID: operationID
                 )
-                guard !Task.isCancelled, outcome.errorCode != .cancelled else { return }
+                #if DEBUG
+                    let abandonAfterOutcome = cancelWorkingCommitAfterOutcomeWorkspaceIDsForTesting.remove(workspaceID) != nil
+                #else
+                    let abandonAfterOutcome = false
+                #endif
+                applyDomainAuthorityOutcome(outcome, workspaceID: workspaceID)
+                guard !abandonAfterOutcome, !Task.isCancelled, outcome.errorCode != .cancelled else { return }
                 if !Self.isSuccessfulDomainOutcome(outcome) {
                     reportDomainAuthorityIssue(outcome, operation: "working_commit")
                 }
@@ -3834,18 +3862,68 @@ class WorkspaceManagerViewModel: ObservableObject {
         return workspace
     }
 
+    private func applyDomainAuthorityOutcome(
+        _ outcome: DomainCommandOutcome,
+        workspaceID: UUID
+    ) {
+        applyDomainAuthorityBaseline(
+            workspaceID: workspaceID,
+            revisions: outcome.workspace?.revisions ?? outcome.after,
+            digest: outcome.workspace?.document.contentDigest ?? outcome.resultingDigest,
+            catalogRevision: outcome.catalogRevision
+        )
+        if domainWorkspaceAuthorityIssue?.workspaceID == workspaceID,
+           outcome.disposition == .applied
+        {
+            domainWorkspaceAuthorityIssue = nil
+        }
+    }
+
+    func applyDomainAuthorityBaseline(
+        workspaceID: UUID,
+        revisions: DomainRevisionState,
+        digest: String,
+        catalogRevision: UInt64
+    ) {
+        domainWorkspaceRevisionsByID[workspaceID] = revisions
+        domainWorkspaceDigestsByID[workspaceID] = digest
+        domainWorkspaceCatalogRevision = max(domainWorkspaceCatalogRevision, catalogRevision)
+    }
+
+    private func applyDomainAuthorityBaseline(
+        workspaceID: UUID,
+        revisions: DomainRevisionState?,
+        digest: String?,
+        catalogRevision: UInt64
+    ) {
+        if let revisions {
+            domainWorkspaceRevisionsByID[workspaceID] = revisions
+        }
+        if let digest {
+            domainWorkspaceDigestsByID[workspaceID] = digest
+        }
+        domainWorkspaceCatalogRevision = max(domainWorkspaceCatalogRevision, catalogRevision)
+    }
+
     func reportDomainAuthorityIssue(_ outcome: DomainCommandOutcome, operation: String) {
         let hasExternalConflict: Bool = if case .externalConflict = outcome.workspace?.health {
             true
         } else {
             outcome.diagnostic?.contains("external") == true
         }
-        domainWorkspaceAuthorityIssue = DomainWorkspaceAuthorityIssue(
+        let nextIssue = DomainWorkspaceAuthorityIssue(
             workspaceID: outcome.workspace?.document.workspaceID,
             operation: operation,
             message: outcome.diagnostic ?? outcome.disposition.rawValue,
             canResolveExternalConflict: hasExternalConflict
         )
+        if domainWorkspaceAuthorityIssue?.workspaceID != nextIssue.workspaceID
+            || domainWorkspaceAuthorityIssue?.operation != nextIssue.operation
+            || domainWorkspaceAuthorityIssue?.message != nextIssue.message
+            || domainWorkspaceAuthorityIssue?.canResolveExternalConflict != nextIssue.canResolveExternalConflict
+        {
+            domainWorkspaceAuthorityIssue = nextIssue
+        }
         if let workspaceID = outcome.workspace?.document.workspaceID,
            let workspace = workspace(withID: workspaceID)
         {
@@ -3892,8 +3970,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard let domainWorkspaceAuthorityClient else { return false }
         let outcome = await domainWorkspaceAuthorityClient.resolveConflict(
             workspaceID: workspaceID,
-            acceptExternal: acceptExternal
+            acceptExternal: acceptExternal,
+            expectedWorkspaceRevision: domainWorkspaceRevisionsByID[
+                workspaceID
+            ]?.workingRevision
         )
+        applyDomainAuthorityOutcome(outcome, workspaceID: workspaceID)
         guard Self.isSuccessfulDomainOutcome(outcome) else {
             reportDomainAuthorityIssue(outcome, operation: "resolve_external_conflict")
             return false
@@ -3926,7 +4008,10 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     func applyDomainWorkspaceProjection(
         _ projectedWorkspaces: [WorkspaceModel],
-        fileURLsByWorkspaceID: [UUID: URL] = [:],
+        fileURLsByWorkspaceID: [UUID: URL],
+        revisionsByWorkspaceID: [UUID: DomainRevisionState],
+        digestsByWorkspaceID: [UUID: String],
+        catalogRevision: UInt64,
         preferredActiveWorkspaceID: UUID?,
         publicationSequence: UInt64
     ) {
@@ -3934,6 +4019,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         lastDomainProjectionSequence = publicationSequence
         if domainWorkspaceAuthorityClient != nil {
             domainWorkspaceFileURLsByID = fileURLsByWorkspaceID
+            domainWorkspaceRevisionsByID = revisionsByWorkspaceID
+            domainWorkspaceDigestsByID = digestsByWorkspaceID
+            domainWorkspaceCatalogRevision = catalogRevision
         }
         workspaces = projectedWorkspaces
         recordRepoPathBaselines(for: projectedWorkspaces)
@@ -6235,7 +6323,14 @@ class WorkspaceManagerViewModel: ObservableObject {
     @discardableResult
     func deleteWorkspaceAsync(_ workspace: WorkspaceModel) async -> Bool {
         if let domainWorkspaceAuthorityClient {
-            let outcome = await domainWorkspaceAuthorityClient.delete(workspaceID: workspace.id)
+            let outcome = await domainWorkspaceAuthorityClient.delete(
+                workspaceID: workspace.id,
+                expectedCatalogRevision: domainWorkspaceCatalogRevision,
+                expectedWorkspaceRevision: domainWorkspaceRevisionsByID[
+                    workspace.id
+                ]?.workingRevision
+            )
+            applyDomainAuthorityOutcome(outcome, workspaceID: workspace.id)
             guard Self.isSuccessfulDomainOutcome(outcome) else {
                 reportDomainAuthorityIssue(outcome, operation: "delete_workspace")
                 return false
@@ -6252,6 +6347,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         saveLegacyIndex: Bool
     ) async {
         workspaces.removeAll { $0.id == workspace.id }
+        domainWorkspaceRevisionsByID.removeValue(forKey: workspace.id)
+        domainWorkspaceDigestsByID.removeValue(forKey: workspace.id)
+        domainWorkspaceFileURLsByID.removeValue(forKey: workspace.id)
         if activeWorkspaceID == workspace.id {
             activeWorkspaceID = nil
         }
@@ -7814,6 +7912,10 @@ class WorkspaceManagerViewModel: ObservableObject {
             try await domainWorkspaceAuthorityClient.save(
                 workspaceToSave,
                 fileURL: targetURL,
+                expectedWorkspaceRevision: domainWorkspaceRevisionsByID[
+                    workspaceToSave.id
+                ]?.workingRevision,
+                expectedContentDigest: domainWorkspaceDigestsByID[workspaceToSave.id],
                 operationIDs: .init()
             )
         } else {
@@ -7823,6 +7925,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 operationID: UUID()
             )
         }
+        applyDomainAuthorityOutcome(outcome, workspaceID: workspaceToSave.id)
         guard Self.isSuccessfulDomainOutcome(outcome) else {
             throw NSError(
                 domain: "RepoPrompt.DomainWorkspaceAuthority",
@@ -8585,6 +8688,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                         fileURL: fileURL,
                         operationID: operationID
                     )
+                    self?.applyDomainAuthorityOutcome(outcome, workspaceID: ws.id)
                     if !Self.isSuccessfulDomainOutcome(outcome) {
                         self?.reportDomainAuthorityIssue(outcome, operation: "create_default")
                     }

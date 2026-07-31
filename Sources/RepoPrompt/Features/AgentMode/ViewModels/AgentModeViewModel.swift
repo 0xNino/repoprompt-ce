@@ -2681,7 +2681,11 @@ final class AgentModeViewModel: ObservableObject {
         initialSystemWorkspaceSessionListRefreshDeferralReason = reason
         initialSystemWorkspaceSessionListRefreshDeferralFallbackTask?.cancel()
         initialSystemWorkspaceSessionListRefreshDeferralFallbackTask = Task { @MainActor [weak self] in
-            guard await TaskCancellationDelay.wait(nanoseconds: 10_000_000_000) else { return }
+            do {
+                try await Task.sleep(nanoseconds: 10_000_000_000)
+            } catch {
+                return
+            }
             self?.finishInitialSystemWorkspaceSessionListRefreshDeferral(refreshIfStillSystem: true)
         }
         #if DEBUG

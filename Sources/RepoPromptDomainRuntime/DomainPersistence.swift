@@ -89,6 +89,30 @@ struct DomainDeletionTombstone: Codable, Sendable {
     }
 }
 
+struct DomainFileMetadata: Equatable, Sendable {
+    let exists: Bool
+    let byteCount: UInt64
+    let modificationNanoseconds: Int64
+    let fileSystemNumber: UInt64
+    let fileNumber: UInt64
+
+    static let missing = DomainFileMetadata(
+        exists: false,
+        byteCount: 0,
+        modificationNanoseconds: 0,
+        fileSystemNumber: 0,
+        fileNumber: 0
+    )
+}
+
+enum DomainExternalDocumentProbe: Sendable {
+    case unchanged(DomainFileMetadata)
+    case changed(DomainWorkspaceDocument, DomainFileMetadata)
+    case missing(DomainFileMetadata)
+    case invalid(DomainFileMetadata)
+    case cancelled
+}
+
 struct DomainPersistenceBootstrap: Sendable {
     struct Workspace: Sendable {
         let document: DomainWorkspaceDocument
@@ -98,11 +122,27 @@ struct DomainPersistenceBootstrap: Sendable {
         let contextTombstones: [UUID: UInt64]
         let operations: [DomainRecordedOperation]
         let health: DomainAuthorityHealth
+        let fileMetadata: DomainFileMetadata
+    }
+
+    struct UnavailableWorkspace: Sendable {
+        let workspaceID: UUID
+        let fileURL: URL
+        let reason: String
+        let fileMetadata: DomainFileMetadata
     }
 
     let workspaces: [Workspace]
+    let unavailableWorkspaces: [UnavailableWorkspace]
     let deletedOperations: [DomainRecordedOperation]
     let deletedWorkspaceIDs: Set<UUID>
+    let health: DomainAuthorityHealth
+    let catalogRevision: UInt64
+}
+
+struct DomainPersistenceWorkspaceRefresh: Sendable {
+    let workspace: DomainPersistenceBootstrap.Workspace?
+    let workspaceIsDeleted: Bool
     let health: DomainAuthorityHealth
     let catalogRevision: UInt64
 }
@@ -329,6 +369,7 @@ package struct DomainPersistenceCoordinator: Sendable {
         } catch {
             return DomainPersistenceBootstrap(
                 workspaces: [],
+                unavailableWorkspaces: [],
                 deletedOperations: [],
                 deletedWorkspaceIDs: [],
                 health: .degradedReadOnly(reason: "bootstrap_cancelled"),
@@ -506,21 +547,107 @@ package struct DomainPersistenceCoordinator: Sendable {
 
     func externalDocument(
         for snapshot: DomainWorkspaceSnapshot,
-        savedDigest: String
-    ) async -> Result<DomainWorkspaceDocument?, DomainPersistenceError> {
+        savedDigest: String,
+        knownMetadata: DomainFileMetadata
+    ) async -> DomainExternalDocumentProbe {
         do {
             return try await DomainBlockingIO.run { cancellation in
                 try cancellation.check()
                 return blockingWorker(cancellation).externalDocumentBlocking(
                     for: snapshot,
-                    savedDigest: savedDigest
+                    savedDigest: savedDigest,
+                    knownMetadata: knownMetadata
                 )
             }
-        } catch let error as DomainPersistenceError {
-            return .failure(error)
+        } catch DomainPersistenceError.cancelled {
+            return .cancelled
+        } catch is CancellationError {
+            return .cancelled
         } catch {
-            return .failure(.writeFailed(String(describing: error)))
+            return .invalid(knownMetadata)
         }
+    }
+
+    func reloadWorkspace(
+        workspaceID: UUID,
+        fileURL: URL
+    ) async -> DomainPersistenceBootstrap.Workspace? {
+        do {
+            return try await DomainBlockingIO.run { cancellation in
+                try cancellation.check()
+                return blockingWorker(cancellation).loadWorkspace(
+                    workspaceID: workspaceID,
+                    fileURL: fileURL
+                )?.workspace
+            }
+        } catch {
+            return nil
+        }
+    }
+
+    func refreshWorkspace(
+        workspaceID: UUID,
+        fallbackFileURL: URL
+    ) async -> DomainPersistenceWorkspaceRefresh? {
+        do {
+            return try await DomainBlockingIO.run { cancellation in
+                try cancellation.check()
+                return blockingWorker(cancellation).refreshWorkspaceBlocking(
+                    workspaceID: workspaceID,
+                    fallbackFileURL: fallbackFileURL
+                )
+            }
+        } catch DomainPersistenceError.cancelled {
+            return nil
+        } catch is CancellationError {
+            return nil
+        } catch {
+            return DomainPersistenceWorkspaceRefresh(
+                workspace: nil,
+                workspaceIsDeleted: false,
+                health: .degradedReadOnly(reason: "workspace_catalog_probe_failed"),
+                catalogRevision: 0
+            )
+        }
+    }
+
+    private func refreshWorkspaceBlocking(
+        workspaceID: UUID,
+        fallbackFileURL: URL
+    ) -> DomainPersistenceWorkspaceRefresh {
+        guard let catalogData = try? Data(contentsOf: catalogURL) else {
+            return DomainPersistenceWorkspaceRefresh(
+                workspace: loadWorkspace(workspaceID: workspaceID, fileURL: fallbackFileURL)?.workspace,
+                workspaceIsDeleted: false,
+                health: .writable,
+                catalogRevision: 0
+            )
+        }
+        guard let catalog = try? decoder.decode(RuntimeWorkspaceCatalog.self, from: catalogData) else {
+            return DomainPersistenceWorkspaceRefresh(
+                workspace: nil,
+                workspaceIsDeleted: false,
+                health: .degradedReadOnly(reason: "workspace_catalog_decode_failed"),
+                catalogRevision: 0
+            )
+        }
+        guard catalog.version <= RuntimeWorkspaceCatalog.schemaVersion else {
+            return DomainPersistenceWorkspaceRefresh(
+                workspace: nil,
+                workspaceIsDeleted: false,
+                health: .degradedReadOnly(reason: "future_workspace_catalog"),
+                catalogRevision: catalog.revision
+            )
+        }
+        let isDeleted = (catalog.deletions ?? []).contains { $0.workspaceID == workspaceID }
+        let fileURL = catalog.entries.first { $0.workspaceID == workspaceID }?.fileURL
+            ?? fallbackFileURL
+        return DomainPersistenceWorkspaceRefresh(
+            workspace: isDeleted ? nil : loadWorkspace(workspaceID: workspaceID, fileURL: fileURL)?.workspace,
+            workspaceIsDeleted: isDeleted,
+            health: .writable,
+            catalogRevision: catalog.revision
+        )
     }
 
     private func bootstrapBlocking() -> DomainPersistenceBootstrap {
@@ -570,6 +697,7 @@ package struct DomainPersistenceCoordinator: Sendable {
             } catch {
                 return DomainPersistenceBootstrap(
                     workspaces: [],
+                    unavailableWorkspaces: [],
                     deletedOperations: deletionTombstones.map(\.operation),
                     deletedWorkspaceIDs: deletedIDs,
                     health: .degradedReadOnly(reason: "workspace_index_decode_failed"),
@@ -579,16 +707,19 @@ package struct DomainPersistenceCoordinator: Sendable {
         }
 
         var loaded: [DomainPersistenceBootstrap.Workspace] = []
+        var unavailable: [DomainPersistenceBootstrap.UnavailableWorkspace] = []
         var loadedIDs = Set<UUID>()
         for entry in entries {
+            loadedIDs.insert(entry.workspaceID)
             if let result = loadWorkspace(workspaceID: entry.workspaceID, fileURL: entry.fileURL) {
                 loaded.append(result.workspace)
-                loadedIDs.insert(entry.workspaceID)
-                if let reason = result.degradedReason {
-                    globalHealth = .degradedReadOnly(reason: reason)
-                }
             } else {
-                globalHealth = .degradedReadOnly(reason: "workspace_document_unavailable")
+                unavailable.append(.init(
+                    workspaceID: entry.workspaceID,
+                    fileURL: entry.fileURL,
+                    reason: "workspace_document_unavailable",
+                    fileMetadata: fileMetadata(at: entry.fileURL)
+                ))
             }
         }
 
@@ -608,13 +739,11 @@ package struct DomainPersistenceCoordinator: Sendable {
             else { continue }
             loaded.append(result.workspace)
             loadedIDs.insert(workspaceID)
-            if let reason = result.degradedReason {
-                globalHealth = .degradedReadOnly(reason: reason)
-            }
         }
 
         return DomainPersistenceBootstrap(
             workspaces: loaded,
+            unavailableWorkspaces: unavailable,
             deletedOperations: deletionTombstones.map(\.operation),
             deletedWorkspaceIDs: deletedIDs,
             health: globalHealth,
@@ -627,7 +756,10 @@ package struct DomainPersistenceCoordinator: Sendable {
         return try decoder.decode([LegacyWorkspaceIndexEntry].self, from: Data(contentsOf: indexURL)).map { entry in
             let fileURL = entry.customStoragePath?.appendingPathComponent("workspace.json")
                 ?? workspaceRoot
-                .appendingPathComponent("Workspace-\(entry.name)-\(entry.id.uuidString)", isDirectory: true)
+                .appendingPathComponent(
+                    DomainWorkspaceStoragePath.directoryName(name: entry.name, id: entry.id),
+                    isDirectory: true
+                )
                 .appendingPathComponent("workspace.json")
             return RuntimeWorkspaceCatalog.Entry(workspaceID: entry.id, fileURL: fileURL)
         }
@@ -637,7 +769,16 @@ package struct DomainPersistenceCoordinator: Sendable {
         workspaceID: UUID,
         fileURL: URL
     ) -> (workspace: DomainPersistenceBootstrap.Workspace, degradedReason: String?)? {
+        let observedMetadata = fileMetadata(at: fileURL)
         let savedBytes = try? Data(contentsOf: fileURL)
+        let savedBytesDigest = savedBytes.map(DomainContentDigest.sha256)
+        // Metadata is only a trusted "no external change" fast-path baseline when the
+        // on-disk bytes still match the journal's saved digest. Otherwise the first
+        // external-document probe must fall back to a full read + digest comparison,
+        // or an edit made while the runtime was down would be masked forever.
+        func trustedMetadata(matching savedDigest: String) -> DomainFileMetadata {
+            savedBytesDigest == savedDigest ? observedMetadata : .missing
+        }
         switch loadJournal(workspaceID: workspaceID) {
         case let .success(journal?):
             guard journal.version <= DomainWorkingJournal.schemaVersion else {
@@ -651,7 +792,8 @@ package struct DomainPersistenceCoordinator: Sendable {
                     contextRevisions: [:],
                     contextTombstones: [:],
                     operations: [],
-                    health: .degradedReadOnly(reason: "future_working_journal")
+                    health: .degradedReadOnly(reason: "future_working_journal"),
+                    fileMetadata: observedMetadata
                 ), "future_working_journal")
             }
             if let recovered = resolvedPendingSave(journal) {
@@ -662,7 +804,8 @@ package struct DomainPersistenceCoordinator: Sendable {
                     contextRevisions: recovered.journal.contextRevisions,
                     contextTombstones: recovered.journal.contextTombstones,
                     operations: recovered.journal.operations,
-                    health: .writable
+                    health: .writable,
+                    fileMetadata: trustedMetadata(matching: recovered.journal.savedDigest)
                 ), nil)
             }
             guard let bytes = journal.workingDocument ?? savedBytes,
@@ -675,7 +818,8 @@ package struct DomainPersistenceCoordinator: Sendable {
                 contextRevisions: journal.contextRevisions,
                 contextTombstones: journal.contextTombstones,
                 operations: journal.operations,
-                health: .writable
+                health: .writable,
+                fileMetadata: trustedMetadata(matching: journal.savedDigest)
             ), nil)
         case .success(nil):
             guard let savedBytes,
@@ -691,7 +835,8 @@ package struct DomainPersistenceCoordinator: Sendable {
                 }),
                 contextTombstones: [:],
                 operations: [],
-                health: .writable
+                health: .writable,
+                fileMetadata: observedMetadata
             ), nil)
         case .failure:
             guard let savedBytes,
@@ -704,7 +849,8 @@ package struct DomainPersistenceCoordinator: Sendable {
                 contextRevisions: [:],
                 contextTombstones: [:],
                 operations: [],
-                health: .degradedReadOnly(reason: "working_journal_decode_failed")
+                health: .degradedReadOnly(reason: "working_journal_decode_failed"),
+                fileMetadata: observedMetadata
             ), "working_journal_decode_failed")
         }
     }
@@ -1176,19 +1322,45 @@ package struct DomainPersistenceCoordinator: Sendable {
 
     private func externalDocumentBlocking(
         for snapshot: DomainWorkspaceSnapshot,
-        savedDigest: String
-    ) -> Result<DomainWorkspaceDocument?, DomainPersistenceError> {
+        savedDigest: String,
+        knownMetadata: DomainFileMetadata
+    ) -> DomainExternalDocumentProbe {
+        let observedMetadata = fileMetadata(at: snapshot.document.fileURL)
+        guard observedMetadata != knownMetadata else {
+            return .unchanged(observedMetadata)
+        }
+        guard observedMetadata.exists else {
+            return .missing(observedMetadata)
+        }
         do {
-            guard fileManager.fileExists(atPath: snapshot.document.fileURL.path) else {
-                return .success(nil)
-            }
             let bytes = try Data(contentsOf: snapshot.document.fileURL)
             let digest = DomainContentDigest.sha256(bytes)
-            guard digest != savedDigest else { return .success(nil) }
-            return .success(try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: snapshot.document.fileURL))
+            guard digest != savedDigest else { return .unchanged(observedMetadata) }
+            let document = try DomainWorkspaceDocument.decode(
+                documentBytes: bytes,
+                fileURL: snapshot.document.fileURL
+            )
+            return .changed(document, observedMetadata)
         } catch {
-            return .failure(.invalidWorkspaceDocument)
+            return .invalid(observedMetadata)
         }
+    }
+
+    private func fileMetadata(at url: URL) -> DomainFileMetadata {
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path) else {
+            return .missing
+        }
+        let modificationDate = attributes[.modificationDate] as? Date ?? .distantPast
+        let modificationNanoseconds = Int64(
+            (modificationDate.timeIntervalSince1970 * 1_000_000_000).rounded()
+        )
+        return DomainFileMetadata(
+            exists: true,
+            byteCount: (attributes[.size] as? NSNumber)?.uint64Value ?? 0,
+            modificationNanoseconds: modificationNanoseconds,
+            fileSystemNumber: (attributes[.systemNumber] as? NSNumber)?.uint64Value ?? 0,
+            fileNumber: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+        )
     }
 
     private func resolvedPendingSave(
@@ -1380,7 +1552,10 @@ package struct DomainPersistenceCoordinator: Sendable {
             for entry in (try? decoder.decode([LegacyWorkspaceIndexEntry].self, from: Data(contentsOf: indexURL))) ?? [] {
                 let url = entry.customStoragePath?.appendingPathComponent("workspace.json")
                     ?? workspaceRoot
-                    .appendingPathComponent("Workspace-\(entry.name)-\(entry.id.uuidString)", isDirectory: true)
+                    .appendingPathComponent(
+                    DomainWorkspaceStoragePath.directoryName(name: entry.name, id: entry.id),
+                    isDirectory: true
+                )
                     .appendingPathComponent("workspace.json")
                 guard let bytes = try? Data(contentsOf: url) else { continue }
                 let relative = "workspaces/\(entry.id.uuidString).json"
@@ -1429,9 +1604,15 @@ package struct DomainPersistenceCoordinator: Sendable {
         }
     }
 
+    private static let maximumRetainedOperationsPerWorkspace = 256
+
     private static func trimmedOperations(_ operations: [DomainRecordedOperation], now: Date) -> [DomainRecordedOperation] {
         let cutoff = now.addingTimeInterval(-7 * 24 * 60 * 60)
-        return Array(operations.filter { $0.recordedAt >= cutoff }.suffix(4096))
+        return Array(
+            operations.lazy
+                .filter { $0.recordedAt >= cutoff }
+                .suffix(maximumRetainedOperationsPerWorkspace)
+        )
     }
 }
 

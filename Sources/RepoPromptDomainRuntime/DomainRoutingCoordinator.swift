@@ -140,7 +140,10 @@ package enum DomainRunLaunchTokenError: Error, Equatable, Sendable {
 }
 
 package actor DomainRoutingCoordinator {
-    private enum TokenState: Sendable {
+    static let maximumRoutingOperations = 4096
+    static let maximumTokenRecords = 1024
+
+    private enum TokenState: Equatable, Sendable {
         case active
         case consumed
         case revoked
@@ -166,7 +169,12 @@ package actor DomainRoutingCoordinator {
     private var nextConnectionGeneration: [UUID: UInt64] = [:]
     private var pendingRunContexts: [UUID: DomainContextIdentity] = [:]
     private var tokenRecords: [String: TokenRecord] = [:]
+    private var tokenDigestsByID: [UUID: String] = [:]
+    private var tokenIssueOrder: [String] = []
+    private var tokenIssueOrderHead = 0
     private var routingOperations: [UUID: DomainRoutingOutcome] = [:]
+    private var routingOperationOrder: [UUID] = []
+    private var routingOperationOrderHead = 0
 
     init(
         identity: DomainRuntimeIdentity,
@@ -312,6 +320,16 @@ package actor DomainRoutingCoordinator {
         operationID: UUID,
         expectedRevision: UInt64? = nil
     ) async -> DomainRoutingOutcome {
+        // Resolve the async context dependency first so validation and commit below run
+        // without suspension: actor reentrancy cannot interleave routing-state changes
+        // between the checks and the committed binding.
+        var contextExists = true
+        switch binding {
+        case let .context(context, _), let .runScoped(_, context):
+            contextExists = await contextStore.snapshot(context) != nil
+        case .appPresentationWindow, .unbound:
+            break
+        }
         if let prior = routingOperations[operationID] { return prior }
         guard expectedRevision == nil || expectedRevision == revision else {
             return finish(operationID, disposition: .conflict, diagnostic: "routing_revision_mismatch")
@@ -325,8 +343,8 @@ package actor DomainRoutingCoordinator {
             return finish(operationID, disposition: .rejected, diagnostic: "run_scoped_binding_is_immutable")
         }
         switch binding {
-        case let .context(context, _), let .runScoped(_, context):
-            guard await contextStore.snapshot(context) != nil else {
+        case .context, .runScoped:
+            guard contextExists else {
                 return finish(operationID, disposition: .rejected, diagnostic: "context_unavailable")
             }
         case let .appPresentationWindow(windowID):
@@ -370,6 +388,7 @@ package actor DomainRoutingCoordinator {
         let digest = DomainContentDigest.sha256(Data(material.utf8))
         let now = clock.now
         let tokenID = UUID()
+        sweepExpiredTokens(now: now)
         tokenRecords[digest] = TokenRecord(
             tokenID: tokenID,
             digest: digest,
@@ -378,6 +397,9 @@ package actor DomainRoutingCoordinator {
             expiresAt: now.advanced(by: request.lifetime),
             state: .active
         )
+        tokenDigestsByID[tokenID] = digest
+        tokenIssueOrder.append(digest)
+        enforceTokenCapacity()
         pendingRunContexts[request.runID] = request.context
         revision &+= 1
         metrics.record(DomainRuntimeMetric(
@@ -450,12 +472,59 @@ package actor DomainRoutingCoordinator {
     }
 
     package func revokeLaunchToken(_ tokenID: UUID) {
-        for (digest, var record) in tokenRecords where record.tokenID == tokenID {
+        if let digest = tokenDigestsByID[tokenID], var record = tokenRecords[digest] {
             record.state = .revoked
             pendingRunContexts.removeValue(forKey: record.request.runID)
             tokenRecords[digest] = record
         }
         revision &+= 1
+    }
+
+    /// Retires expired reservations (releasing their pending run contexts) and drops retired
+    /// records once their lifetime has elapsed, so token bookkeeping cannot grow with uptime.
+    private func sweepExpiredTokens(now: ContinuousClock.Instant) {
+        guard !tokenRecords.isEmpty else { return }
+        for (digest, record) in tokenRecords where now >= record.expiresAt {
+            if record.state == .active {
+                pendingRunContexts.removeValue(forKey: record.request.runID)
+            }
+            removeTokenRecord(digest: digest)
+        }
+    }
+
+    /// Deterministically evicts the oldest-issued records once the bound is exceeded.
+    private func enforceTokenCapacity() {
+        while tokenRecords.count > Self.maximumTokenRecords, tokenIssueOrderHead < tokenIssueOrder.count {
+            let digest = tokenIssueOrder[tokenIssueOrderHead]
+            tokenIssueOrderHead += 1
+            guard let record = tokenRecords[digest] else { continue }
+            if record.state == .active {
+                pendingRunContexts.removeValue(forKey: record.request.runID)
+            }
+            removeTokenRecord(digest: digest)
+        }
+        compactTokenIssueOrderIfNeeded()
+    }
+
+    /// Expiry can remove records without advancing the FIFO head. Rebuild from live digests
+    /// only after a fixed amount of slack is consumed, keeping storage bounded while making
+    /// the O(n) rebuild amortized O(1) across token issuance.
+    private func compactTokenIssueOrderIfNeeded() {
+        let maximumStoredDigests = Self.maximumTokenRecords * 2
+        guard tokenIssueOrder.count > maximumStoredDigests else { return }
+        tokenIssueOrder = tokenIssueOrder[tokenIssueOrderHead...].filter {
+            tokenRecords[$0] != nil
+        }
+        tokenIssueOrderHead = 0
+    }
+
+    func tokenBookkeepingCounts() -> (records: Int, issueOrderStorage: Int) {
+        (tokenRecords.count, tokenIssueOrder.count)
+    }
+
+    private func removeTokenRecord(digest: String) {
+        guard let record = tokenRecords.removeValue(forKey: digest) else { return }
+        tokenDigestsByID.removeValue(forKey: record.tokenID)
     }
 
     package func shutdown() {
@@ -482,11 +551,20 @@ package actor DomainRoutingCoordinator {
             snapshot: snapshot(),
             diagnostic: diagnostic
         )
-        routingOperations[operationID] = outcome
-        if routingOperations.count > 4096,
-           let oldestOperationID = routingOperations.keys.first
+        if routingOperations.updateValue(outcome, forKey: operationID) == nil {
+            routingOperationOrder.append(operationID)
+        }
+        while routingOperations.count > Self.maximumRoutingOperations,
+              routingOperationOrderHead < routingOperationOrder.count
         {
-            routingOperations.removeValue(forKey: oldestOperationID)
+            routingOperations.removeValue(forKey: routingOperationOrder[routingOperationOrderHead])
+            routingOperationOrderHead += 1
+        }
+        if routingOperationOrderHead >= Self.maximumRoutingOperations,
+           routingOperationOrderHead * 2 >= routingOperationOrder.count
+        {
+            routingOperationOrder.removeFirst(routingOperationOrderHead)
+            routingOperationOrderHead = 0
         }
         return outcome
     }

@@ -1713,6 +1713,9 @@ final class MCPServerViewModel: ObservableObject {
     var domainWindowDescriptor: DomainWindowDescriptor?
     var domainWindowRegistrationTask: Task<DomainWindowDescriptor?, Never>?
     var domainRoutingWindowIsClosing = false
+    /// Serializes routing publications (bind/release) so rapid tab transitions cannot
+    /// commit bindings out of order and teardown can drain in-flight publications.
+    var domainRoutingPublishTask: Task<Void, Never>?
     @MainActor
     var tabContextCancellablesByConnectionID: [UUID: Set<AnyCancellable>] = [:]
     @MainActor

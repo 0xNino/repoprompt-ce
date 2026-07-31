@@ -16,6 +16,20 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         XCTAssertEqual(subscription.snapshot.workspaces.first?.document.documentBytes, try Data(contentsOf: fixture.workspaceFile))
     }
 
+    func testLegacyCatalogMigrationUsesCanonicalSanitizedWorkspaceDirectory() async throws {
+        let fixture = try Fixture.make(workspaceName: "  Team / Docs  ")
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+
+        try await runtime.start()
+        let snapshot = await runtime.workspaceStore.snapshot()
+        let migrated = try XCTUnwrap(snapshot.workspaces.first)
+        XCTAssertEqual(snapshot.workspaces.count, 1)
+        XCTAssertEqual(migrated.document.workspaceID, fixture.workspaceID)
+        XCTAssertEqual(migrated.document.fileURL, fixture.workspaceFile)
+        XCTAssertEqual(migrated.document.documentBytes, try Data(contentsOf: fixture.workspaceFile))
+    }
+
     func testExplicitCreatePersistsAndDeletePrunesCatalogDespiteStaleLegacyIndex() async throws {
         let fixture = try Fixture.make(includeWorkspace: false)
         defer { fixture.remove() }
@@ -444,9 +458,312 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         try await restarted.start()
         let runtimeSnapshot = await restarted.snapshot()
         let workspace = await restarted.workspaceStore.snapshot().workspaces.first
-        XCTAssertEqual(runtimeSnapshot.lifecycle, .degraded)
+        // Workspace-scoped damage must not brick the whole runtime: the catalog stays
+        // writable while the damaged workspace alone rejects mutations.
+        XCTAssertEqual(runtimeSnapshot.lifecycle, .ready)
+        XCTAssertEqual(runtimeSnapshot.workspaceHealth, .writable)
         XCTAssertEqual(workspace?.document.documentBytes, try Data(contentsOf: fixture.workspaceFile))
         XCTAssertFalse(workspace?.health.acceptsMutations ?? true)
+        let rejected = await restarted.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: workspace?.revisions.workingRevision,
+            origin: .standalone,
+            command: .replaceWorkingDocument(try fixture.document(prompt: "must not apply"))
+        ))
+        XCTAssertEqual(rejected.disposition, .readOnly)
+        XCTAssertEqual(rejected.errorCode, .runtimeReadOnlyDegraded)
+    }
+
+    func testTwoWindowCaptureRevisionConflictPreventsLostUpdate() async throws {
+        let fixture = try Fixture.make()
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+        try await runtime.start()
+
+        // Both windows capture their CAS expectation at revision 0, before either commits.
+        let windowA = try fixture.document(prompt: "window A capture")
+        let windowB = try fixture.document(prompt: "window B capture")
+        let firstOperationID = UUID()
+        let winner = await runtime.workspaceStore.execute(.init(
+            operationID: firstOperationID,
+            expectedWorkspaceRevision: 0,
+            origin: .appPresentation(windowID: 1),
+            command: .replaceWorkingDocument(windowA)
+        ))
+        XCTAssertEqual(winner.disposition, .applied)
+
+        let loser = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: 0,
+            origin: .appPresentation(windowID: 2),
+            command: .replaceWorkingDocument(windowB)
+        ))
+        XCTAssertEqual(loser.disposition, .conflict)
+        XCTAssertEqual(loser.errorCode, .stateConflict)
+        XCTAssertEqual(loser.diagnostic, "workspace_revision_mismatch")
+        // The losing window receives the authoritative state instead of silently
+        // overwriting it with its up-to-200ms-stale capture.
+        XCTAssertEqual(loser.workspace?.document.documentBytes, windowA.documentBytes)
+
+        let refreshedRevision = try XCTUnwrap(loser.workspace?.revisions.workingRevision)
+        let retry = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: refreshedRevision,
+            origin: .appPresentation(windowID: 2),
+            command: .replaceWorkingDocument(windowB)
+        ))
+        XCTAssertEqual(retry.disposition, .applied)
+        let final = await runtime.workspaceStore.snapshot().workspaces.first
+        XCTAssertEqual(final?.document.documentBytes, windowB.documentBytes)
+
+        // The winner's original operation still deduplicates after the retry landed,
+        // proving journal-adopted operation history survived the interleaving.
+        let replay = await runtime.workspaceStore.execute(.init(
+            operationID: firstOperationID,
+            expectedWorkspaceRevision: 0,
+            origin: .appPresentation(windowID: 1),
+            command: .replaceWorkingDocument(windowA)
+        ))
+        XCTAssertEqual(replay.disposition, .deduplicated)
+    }
+
+    func testBoundedOperationIndexEvictsOldestDeterministicallyAtScales() throws {
+        func operation(_ ordinal: Int) -> DomainRecordedOperation {
+            DomainRecordedOperation(
+                fingerprint: "fingerprint-\(ordinal)",
+                recordedAt: Date(timeIntervalSince1970: TimeInterval(ordinal)),
+                outcome: DomainCommandOutcome(
+                    operationID: UUID(),
+                    disposition: .applied,
+                    before: nil,
+                    after: nil,
+                    catalogRevision: 0,
+                    resultingDigest: nil
+                )
+            )
+        }
+
+        for scale in [1, 10, 100] {
+            let capacity = 10
+            var index = BoundedDomainOperationIndex(capacity: capacity)
+            var inserted: [DomainRecordedOperation] = []
+            for ordinal in 0 ..< scale {
+                let recorded = operation(ordinal)
+                inserted.append(recorded)
+                index.insert(recorded)
+            }
+            XCTAssertEqual(index.count, min(scale, capacity), "scale \(scale)")
+            for retained in inserted.suffix(capacity) {
+                XCTAssertEqual(
+                    index[retained.operationID]?.fingerprint,
+                    retained.fingerprint,
+                    "scale \(scale) retains the newest \(capacity) operations"
+                )
+            }
+            for evicted in inserted.dropLast(capacity) {
+                XCTAssertNil(index[evicted.operationID], "scale \(scale) evicts oldest first")
+            }
+        }
+
+        // replace(with:) trims to the newest entries by recorded time, matching the
+        // durable journal trim, so bootstrap and reload adoption stay bounded too.
+        var replaced = BoundedDomainOperationIndex(capacity: 10)
+        replaced.replace(with: (0 ..< 100).map(operation))
+        XCTAssertEqual(replaced.count, 10)
+    }
+
+    func testUnavailableWorkspaceDegradesOnlyItselfAndRecoversWhenDocumentReturns() async throws {
+        let fixture = try Fixture.make()
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+        try await runtime.start()
+        let secondID = UUID()
+        let secondURL = fixture.storageRoot
+            .appendingPathComponent("Workspaces/Workspace-Second-\(secondID.uuidString)/workspace.json")
+        let secondDocument = try fixture.document(
+            workspaceID: secondID,
+            contextID: UUID(),
+            fileURL: secondURL,
+            prompt: "second workspace"
+        )
+        let created = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedCatalogRevision: 0,
+            expectedWorkspaceRevision: 0,
+            origin: .standalone,
+            command: .createWorkspace(secondDocument)
+        ))
+        XCTAssertEqual(created.disposition, .applied)
+        _ = await runtime.shutdown()
+
+        // Simulate an unplugged volume: the document and its journal are unreachable.
+        try FileManager.default.removeItem(at: secondURL)
+        for journal in try allFiles(below: fixture.storageRoot.appendingPathComponent("DomainRuntime"))
+            where journal.lastPathComponent == "\(secondID.uuidString).json"
+        {
+            try FileManager.default.removeItem(at: journal)
+        }
+
+        let restarted = fixture.runtime(generation: 2)
+        try await restarted.start()
+        let snapshot = await restarted.workspaceStore.snapshot()
+        XCTAssertEqual(snapshot.health, .writable)
+        XCTAssertEqual(snapshot.workspaces.map(\.document.workspaceID), [fixture.workspaceID])
+        let runtimeSnapshot = await restarted.snapshot()
+        XCTAssertEqual(runtimeSnapshot.lifecycle, .ready)
+
+        // Mutating the unavailable workspace fails closed and scoped...
+        let rejected = await restarted.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: nil,
+            origin: .standalone,
+            command: .saveWorkspaceDocument(workspaceID: secondID)
+        ))
+        XCTAssertEqual(rejected.disposition, .readOnly)
+        XCTAssertEqual(rejected.errorCode, .runtimeReadOnlyDegraded)
+        XCTAssertEqual(rejected.diagnostic, "workspace_document_unavailable")
+
+        // ...while the healthy workspace keeps full mutation authority.
+        let healthy = await restarted.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: 0,
+            origin: .standalone,
+            command: .replaceWorkingDocument(try fixture.document(prompt: "healthy edit"))
+        ))
+        XCTAssertEqual(healthy.disposition, .applied)
+
+        // The document returning is picked up by the reload probe and restores authority.
+        try FileManager.default.createDirectory(
+            at: secondURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try secondDocument.documentBytes.write(to: secondURL, options: .atomic)
+        let activity = await restarted.workspaceStore.reloadExternalChanges()
+        XCTAssertEqual(activity, .changed)
+        let recovered = await restarted.workspaceStore.workspaceSnapshot(secondID)
+        XCTAssertEqual(recovered?.health, .writable)
+        let applied = await restarted.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: recovered?.revisions.workingRevision,
+            origin: .standalone,
+            command: .replaceWorkingDocument(try fixture.document(
+                workspaceID: secondID,
+                contextID: UUID(),
+                fileURL: secondURL,
+                prompt: "second workspace edited"
+            ))
+        ))
+        XCTAssertEqual(applied.disposition, .applied)
+    }
+
+    func testExternalReloadActivityReportsFastPathChangeAndRecovery() async throws {
+        let fixture = try Fixture.make()
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+        try await runtime.start()
+
+        // No-change poll takes the metadata fast path and reports unchanged.
+        var activity = await runtime.workspaceStore.reloadExternalChanges()
+        XCTAssertEqual(activity, .unchanged)
+
+        // Prove the fast path performs no document read: with unchanged metadata but an
+        // unreadable file, a read-based probe would degrade instead of staying unchanged.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000],
+            ofItemAtPath: fixture.workspaceFile.path
+        )
+        activity = await runtime.workspaceStore.reloadExternalChanges()
+        XCTAssertEqual(activity, .unchanged)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: fixture.workspaceFile.path
+        )
+
+        // A real external change is detected through the metadata delta.
+        let changed = try fixture.document(prompt: "external change")
+        try changed.documentBytes.write(to: fixture.workspaceFile, options: .atomic)
+        activity = await runtime.workspaceStore.reloadExternalChanges()
+        XCTAssertEqual(activity, .changed)
+        var workspace = await runtime.workspaceStore.workspaceSnapshot(fixture.workspaceID)
+        XCTAssertEqual(workspace?.document.documentBytes, changed.documentBytes)
+
+        // Invalid external bytes degrade only this workspace and keep recovery pending.
+        try Data("not json".utf8).write(to: fixture.workspaceFile, options: .atomic)
+        activity = await runtime.workspaceStore.reloadExternalChanges()
+        XCTAssertEqual(activity, .recoveryPending)
+        workspace = await runtime.workspaceStore.workspaceSnapshot(fixture.workspaceID)
+        XCTAssertEqual(workspace?.health, .degradedReadOnly(reason: "external_workspace_decode_failed"))
+        activity = await runtime.workspaceStore.reloadExternalChanges()
+        XCTAssertEqual(activity, .recoveryPending)
+
+        // Restoring a valid document recovers the workspace to writable.
+        let restored = try fixture.document(prompt: "external restored")
+        try restored.documentBytes.write(to: fixture.workspaceFile, options: .atomic)
+        activity = await runtime.workspaceStore.reloadExternalChanges()
+        XCTAssertEqual(activity, .changed)
+        workspace = await runtime.workspaceStore.workspaceSnapshot(fixture.workspaceID)
+        XCTAssertEqual(workspace?.health, .writable)
+        XCTAssertEqual(workspace?.document.documentBytes, restored.documentBytes)
+        let mutation = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: workspace?.revisions.workingRevision,
+            origin: .standalone,
+            command: .replaceWorkingDocument(try fixture.document(prompt: "post recovery edit"))
+        ))
+        XCTAssertEqual(mutation.disposition, .applied)
+
+        // Cancellation is a transient poll outcome, not evidence that saved bytes are invalid.
+        let cancelledActivity = await Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await runtime.workspaceStore.reloadExternalChanges()
+        }.value
+        XCTAssertEqual(cancelledActivity, .recoveryPending)
+        workspace = await runtime.workspaceStore.workspaceSnapshot(fixture.workspaceID)
+        XCTAssertEqual(workspace?.health, .writable)
+
+        let persistence = DomainPersistenceCoordinator(
+            configuration: runtime.configuration,
+            identity: runtime.identity
+        )
+        let cancelledConflictRefresh = await Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return await persistence.refreshWorkspace(
+                workspaceID: fixture.workspaceID,
+                fallbackFileURL: fixture.workspaceFile
+            )
+        }.value
+        XCTAssertNil(cancelledConflictRefresh)
+    }
+
+    func testExpiredLaunchTokenIssueOrderCompactsWithinFixedStorageBound() async throws {
+        let fixture = try Fixture.make()
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+        try await runtime.start()
+        let context = DomainContextIdentity(
+            workspaceID: fixture.workspaceID,
+            contextID: fixture.contextID
+        )
+
+        for _ in 0 ..< DomainRoutingCoordinator.maximumTokenRecords * 3 {
+            _ = try await runtime.routingCoordinator.issueLaunchToken(.init(
+                runID: UUID(),
+                context: context,
+                expectedContextRevision: 0,
+                windowID: nil,
+                clientPrincipal: "test",
+                providerIdentifier: "fixture",
+                runPurpose: "bounded-order-regression",
+                lifetime: .zero
+            ))
+        }
+
+        let counts = await runtime.routingCoordinator.tokenBookkeepingCounts()
+        XCTAssertLessThanOrEqual(counts.records, 1)
+        XCTAssertLessThanOrEqual(
+            counts.issueOrderStorage,
+            DomainRoutingCoordinator.maximumTokenRecords * 2
+        )
     }
 
     func testRoutingGenerationsAndRunLaunchTokensAreAuthoritativeAndSingleUse() async throws {
@@ -597,16 +914,23 @@ private struct Fixture {
     let storageRoot: URL
     let workspaceID: UUID
     let contextID: UUID
+    let workspaceName: String
     let workspaceFile: URL
 
-    static func make(includeWorkspace: Bool = true) throws -> Fixture {
+    static func make(
+        includeWorkspace: Bool = true,
+        workspaceName: String = "Fixture"
+    ) throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("domain-context-authority-\(UUID().uuidString)", isDirectory: true)
         let storageRoot = root.appendingPathComponent("state", isDirectory: true)
         let workspaceRoot = storageRoot.appendingPathComponent("Workspaces", isDirectory: true)
         let workspaceID = UUID()
         let contextID = UUID()
-        let directory = workspaceRoot.appendingPathComponent("Workspace-Fixture-\(workspaceID.uuidString)", isDirectory: true)
+        let directory = workspaceRoot.appendingPathComponent(
+            DomainWorkspaceStoragePath.directoryName(name: workspaceName, id: workspaceID),
+            isDirectory: true
+        )
         let workspaceFile = directory.appendingPathComponent("workspace.json")
         try FileManager.default.createDirectory(at: workspaceRoot, withIntermediateDirectories: true)
         let fixture = Fixture(
@@ -614,6 +938,7 @@ private struct Fixture {
             storageRoot: storageRoot,
             workspaceID: workspaceID,
             contextID: contextID,
+            workspaceName: workspaceName,
             workspaceFile: workspaceFile
         )
         if includeWorkspace {
@@ -629,7 +954,7 @@ private struct Fixture {
     func writeLegacyIndex() throws {
         let index: [[String: Any]] = [[
             "id": workspaceID.uuidString,
-            "name": "Fixture",
+            "name": workspaceName,
             "customStoragePath": NSNull(),
             "isSystemWorkspace": false,
             "isHiddenInMenus": false,

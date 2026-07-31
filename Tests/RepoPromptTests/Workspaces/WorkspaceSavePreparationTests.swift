@@ -496,6 +496,90 @@ import XCTest
             XCTAssertEqual(manager.workspace(withID: workspaceID)?.name, "Runtime Renamed")
         }
 
+        func testCancelledWorkingCommitAdoptsAuthorityBaselineForNextSave() async throws {
+            let root = try temporaryDirectory(named: "CancelledDomainWorkingCommit")
+            let defaults = UserDefaults.standard
+            let priorStoragePath = defaults.string(forKey: "GlobalCustomStorageURL")
+            defaults.set(
+                root.appendingPathComponent("Workspaces", isDirectory: true).path,
+                forKey: "GlobalCustomStorageURL"
+            )
+            defer {
+                if let priorStoragePath {
+                    defaults.set(priorStoragePath, forKey: "GlobalCustomStorageURL")
+                } else {
+                    defaults.removeObject(forKey: "GlobalCustomStorageURL")
+                }
+            }
+
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "cancelled-working-commit-\(UUID().uuidString)",
+                storageDirectory: root,
+                eventDirectory: root.appendingPathComponent("events"),
+                temporaryDirectory: root.appendingPathComponent("tmp"),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            defer { Task { _ = await runtime.shutdown() } }
+            let composition = WindowStateCompositionFactory.make(
+                windowID: -992,
+                deferredInitialAgentSystemWorkspaceRefresh: false,
+                sharedMCPService: MCPService(),
+                domainRuntime: runtime,
+                workspaceFileContextStore: WorkspaceFileContextStore()
+            )
+            let manager = composition.workspaceManager
+            await manager.awaitInitialized()
+            let initial = try await waitForDomainWorkspace(runtime)
+            let workspaceID = initial.document.workspaceID
+            let bridge = try XCTUnwrap(composition.domainWorkspacePresentationBridge)
+            let initialCatalog = await runtime.workspaceStore.snapshot()
+            let initialProjectionCompleted = await bridge.waitUntilProjected(
+                through: initialCatalog.publicationSequence
+            )
+            XCTAssertTrue(initialProjectionCompleted)
+
+            var firstCapture = try XCTUnwrap(manager.workspace(withID: workspaceID))
+            firstCapture.currentPromptText = "durable despite cancelled presentation task"
+            guard let managerIndex = manager.workspaces.firstIndex(where: { $0.id == workspaceID }) else {
+                return XCTFail("Runtime workspace disappeared before the cancelled presentation task")
+            }
+            manager.workspaces[managerIndex] = firstCapture
+            manager.cancelNextWorkingCommitAfterAuthorityOutcomeForTesting(workspaceID: workspaceID)
+            await manager.debugPublishWorkingDocumentToDomainAuthority(firstCapture)
+            let cancelledTaskCommit = try await waitForDomainWorkspace(
+                runtime,
+                workspaceID: workspaceID,
+                description: "durable working commit after presentation cancellation"
+            ) { snapshot in
+                guard snapshot.revisions.dirtyRevision != nil else { return false }
+                let projected = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                    documentBytes: snapshot.document.documentBytes,
+                    fileURL: snapshot.document.fileURL
+                )
+                return projected.currentPromptText == "durable despite cancelled presentation task"
+            }
+
+            manager.markWorkspaceDirty()
+            await manager.pollAndSaveStateAsync()
+
+            let afterSave = await runtime.workspaceStore.snapshot()
+            let saved = try XCTUnwrap(afterSave.workspaces.first { $0.document.workspaceID == workspaceID })
+            let savedProjection = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                documentBytes: saved.document.documentBytes,
+                fileURL: saved.document.fileURL
+            )
+            XCTAssertNil(saved.revisions.dirtyRevision)
+            XCTAssertEqual(savedProjection.id, workspaceID)
+            XCTAssertGreaterThan(
+                saved.revisions.workingRevision,
+                cancelledTaskCommit.revisions.workingRevision
+            )
+            XCTAssertEqual(saved.revisions.savedRevision, saved.revisions.workingRevision)
+            XCTAssertNil(manager.domainWorkspaceAuthorityIssue)
+        }
+
         func testCompositionUsesExplicitDomainRuntimeOwnershipOnlyWhenInjected() async throws {
             let legacy = makeComposition(windowID: -989)
             XCTAssertNil(legacy.domainWorkspacePresentationBridge)

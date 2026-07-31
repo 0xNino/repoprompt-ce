@@ -1,6 +1,15 @@
 import CryptoKit
 import Foundation
 
+package enum DomainWorkspaceStoragePath {
+    package static func directoryName(name: String, id: UUID) -> String {
+        let safeName = name
+            .replacingOccurrences(of: "/", with: "_")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return "Workspace-\(safeName)-\(id.uuidString)"
+    }
+}
+
 package struct DomainContextIdentity: Codable, Hashable, Sendable {
     package let workspaceID: UUID
     package let contextID: UUID
@@ -183,10 +192,12 @@ package enum DomainWorkspaceEventKind: String, Codable, Sendable {
 package struct DomainWorkspaceEvent: Codable, Equatable, Sendable {
     package let runtimeID: UUID
     package let sequence: UInt64
+    package let catalogRevision: UInt64
     package let kind: DomainWorkspaceEventKind
     package let workspaceID: UUID?
     package let contextID: UUID?
     package let operationID: UUID?
+    package let origin: DomainCommandOrigin?
     package let revisions: DomainRevisionState?
     package let timestamp: Date
     package let diagnostic: String?
