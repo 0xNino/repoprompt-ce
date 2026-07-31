@@ -1871,6 +1871,7 @@ import XCTest
                             $0.id == fixture.contextB.workspaceID
                         }
                     )
+                    _ = try await fixture.contextB.window.workspaceManager.saveWorkspaceToFileAsync(sourceWorkspaceB)
                     fixture.contextB.window.workspaceManager.workspaces.removeAll {
                         $0.id == fixture.contextB.workspaceID
                     }
