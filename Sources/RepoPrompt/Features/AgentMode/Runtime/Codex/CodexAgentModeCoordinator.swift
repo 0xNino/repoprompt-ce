@@ -3300,7 +3300,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return MCPBootstrapLease(
             spec: leaseSpec,
             mcpServerEnabler: { [weak viewModel] in
-                await viewModel?.ensureMCPServerEnabledForThreadStart()
+                await viewModel?.ensureMCPServerEnabledForThreadStart() ?? false
             },
             policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller)
         )
