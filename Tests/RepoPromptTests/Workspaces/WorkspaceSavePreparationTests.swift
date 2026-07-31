@@ -623,7 +623,8 @@ import XCTest
                 domainRuntime: runtime,
                 workspaceFileContextStore: WorkspaceFileContextStore()
             )
-            XCTAssertNotNil(owned.domainWorkspacePresentationBridge)
+            let presentationBridge = try XCTUnwrap(owned.domainWorkspacePresentationBridge)
+            XCTAssertTrue(presentationBridge.hasActiveSubscriptionForTesting)
             XCTAssertNotNil(owned.mcpServer.domainRoutingCoordinator)
             await owned.workspaceManager.awaitInitialized()
             _ = try await waitForDomainWorkspace(runtime)
@@ -632,6 +633,8 @@ import XCTest
             XCTAssertFalse(owned.workspaceManager.workspaces.isEmpty)
             let registeredRouting = await runtime.routingCoordinator.snapshot()
             XCTAssertTrue(registeredRouting.windows.contains { $0.windowID == -990 })
+            presentationBridge.stop()
+            XCTAssertFalse(presentationBridge.hasActiveSubscriptionForTesting)
             await owned.mcpServer.unregisterDomainRoutingWindow()
             let unregisteredRouting = await runtime.routingCoordinator.snapshot()
             XCTAssertFalse(unregisteredRouting.windows.contains { $0.windowID == -990 })

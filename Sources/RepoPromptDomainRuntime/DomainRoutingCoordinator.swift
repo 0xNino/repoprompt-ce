@@ -436,6 +436,7 @@ package actor DomainRoutingCoordinator {
         }
         guard clock.now < record.expiresAt else {
             record.state = .revoked
+            pendingRunContexts.removeValue(forKey: record.request.runID)
             tokenRecords[digest] = record
             return .expired
         }
@@ -518,8 +519,8 @@ package actor DomainRoutingCoordinator {
         tokenIssueOrderHead = 0
     }
 
-    func tokenBookkeepingCounts() -> (records: Int, issueOrderStorage: Int) {
-        (tokenRecords.count, tokenIssueOrder.count)
+    func tokenBookkeepingCounts() -> (records: Int, issueOrderStorage: Int, pendingRunContexts: Int) {
+        (tokenRecords.count, tokenIssueOrder.count, pendingRunContexts.count)
     }
 
     private func removeTokenRecord(digest: String) {

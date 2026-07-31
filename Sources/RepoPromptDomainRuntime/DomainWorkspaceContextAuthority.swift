@@ -510,11 +510,32 @@ actor DomainWorkspaceContextAuthority {
             case .cancelled:
                 return .recoveryPending
             case let .unchanged(metadata):
-                if record.fileMetadata != metadata {
+                let recoveredExternalDegradation: Bool
+                if case let .degradedReadOnly(reason) = record.health,
+                   reason.hasPrefix("external_"),
+                   record.fileMetadata != metadata
+                {
+                    record.health = .writable
+                    record.externalDocument = nil
+                    recoveredExternalDegradation = true
+                    changed = true
+                } else {
+                    recoveredExternalDegradation = false
+                }
+                if record.fileMetadata != metadata || recoveredExternalDegradation {
                     record.fileMetadata = metadata
                     records[workspaceID] = record
                 }
-                if !record.health.acceptsMutations {
+                if recoveredExternalDegradation {
+                    publish(
+                        kind: .externalReloaded,
+                        workspaceID: workspaceID,
+                        contextID: nil,
+                        operationID: nil,
+                        revisions: record.revisions,
+                        diagnostic: "external_workspace_recovered"
+                    )
+                } else if !record.health.acceptsMutations {
                     recoveryPending = true
                 }
             case let .missing(metadata):
@@ -1083,9 +1104,65 @@ actor DomainWorkspaceContextAuthority {
             globalOperations.insert(recorded)
         } catch let error as DomainPersistenceError {
             if case .externalDocumentConflict = error {
-                record.health = .externalConflict(reason: "saved_document_changed_before_commit")
-                records[workspaceID] = record
-                return conflictOutcome(envelope, record: record, diagnostic: "external_document_conflict")
+                let observedRevisions = record.revisions
+                let observedSavedDigest = record.savedDigest
+                let observedMetadata = record.fileMetadata
+                let external = await persistence.externalDocument(
+                    for: makeSnapshot(record),
+                    savedDigest: observedSavedDigest,
+                    knownMetadata: observedMetadata
+                )
+                guard var current = records[workspaceID],
+                      current.revisions == observedRevisions,
+                      current.savedDigest == observedSavedDigest,
+                      current.fileMetadata == observedMetadata
+                else {
+                    return conflictOutcome(
+                        envelope,
+                        record: records[workspaceID] ?? record,
+                        diagnostic: "external_document_conflict"
+                    )
+                }
+
+                var eventKind: DomainWorkspaceEventKind?
+                var eventDiagnostic: String?
+                switch external {
+                case let .changed(document, metadata):
+                    current.health = .externalConflict(reason: "saved_document_changed_before_commit")
+                    current.externalDocument = document
+                    current.fileMetadata = metadata
+                    eventKind = .externalConflict
+                    eventDiagnostic = "external_document_conflict"
+                case let .invalid(metadata):
+                    current.health = .degradedReadOnly(reason: "external_workspace_decode_failed")
+                    current.externalDocument = nil
+                    current.fileMetadata = metadata
+                    eventKind = .degraded
+                    eventDiagnostic = "external_workspace_decode_failed"
+                case let .unchanged(metadata), let .missing(metadata):
+                    // The file changed again while the save conflict was being classified. Keep
+                    // authority writable so the caller can retry against the now-current bytes.
+                    current.fileMetadata = metadata
+                case .cancelled:
+                    break
+                }
+                records[workspaceID] = current
+                if let eventKind {
+                    publish(
+                        kind: eventKind,
+                        workspaceID: workspaceID,
+                        contextID: nil,
+                        operationID: envelope.operationID,
+                        origin: envelope.origin,
+                        revisions: current.revisions,
+                        diagnostic: eventDiagnostic
+                    )
+                }
+                return conflictOutcome(
+                    envelope,
+                    record: current,
+                    diagnostic: "external_document_conflict"
+                )
             }
             return persistenceFailureOutcome(envelope, record: record, error: error)
         } catch {

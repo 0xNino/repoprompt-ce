@@ -73,6 +73,48 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         XCTAssertEqual(finalSnapshot.health, .writable)
     }
 
+    func testRecreateSameWorkspaceIDClearsDeletionSidecarAcrossRestart() async throws {
+        let fixture = try Fixture.make(includeWorkspace: false)
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+        try await runtime.start()
+        let original = try fixture.document(prompt: "created before delete")
+        let created = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedCatalogRevision: 0,
+            expectedWorkspaceRevision: 0,
+            origin: .standalone,
+            command: .createWorkspace(original)
+        ))
+        XCTAssertEqual(created.disposition, .applied)
+        let deleted = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedCatalogRevision: created.catalogRevision,
+            expectedWorkspaceRevision: created.after?.workingRevision,
+            origin: .standalone,
+            command: .deleteWorkspace(workspaceID: fixture.workspaceID)
+        ))
+        XCTAssertEqual(deleted.disposition, .applied)
+
+        let recreatedDocument = try fixture.document(prompt: "recreated identity survives restart")
+        let recreated = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedCatalogRevision: deleted.catalogRevision,
+            expectedWorkspaceRevision: 0,
+            origin: .standalone,
+            command: .createWorkspace(recreatedDocument)
+        ))
+        XCTAssertEqual(recreated.disposition, .applied)
+        _ = await runtime.shutdown()
+
+        let restarted = fixture.runtime(generation: 2)
+        try await restarted.start()
+        let restored = await restarted.workspaceStore.snapshot()
+        XCTAssertEqual(restored.workspaces.map(\.document.workspaceID), [fixture.workspaceID])
+        XCTAssertEqual(restored.workspaces.first?.document.documentBytes, recreatedDocument.documentBytes)
+        XCTAssertEqual(restored.health, .writable)
+    }
+
     func testPendingSaveJournalRecoversCommittedDocumentWithoutManufacturedConflict() async throws {
         let fixture = try Fixture.make()
         defer { fixture.remove() }
@@ -433,6 +475,58 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: fixture.workspaceFile), working.documentBytes)
     }
 
+    func testSaveTimeExternalConflictCapturesResolvableDocument() async throws {
+        let fixture = try Fixture.make()
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+        try await runtime.start()
+        let initialCatalog = await runtime.workspaceStore.snapshot()
+        let initial = try XCTUnwrap(initialCatalog.workspaces.first)
+        let local = try fixture.document(prompt: "local dirty state retained across save conflict")
+        let working = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: initial.revisions.workingRevision,
+            origin: .standalone,
+            command: .replaceWorkingDocument(local)
+        ))
+        XCTAssertEqual(working.disposition, .applied)
+
+        let external = try fixture.document(prompt: "external bytes changed immediately before explicit save")
+        try external.documentBytes.write(to: fixture.workspaceFile, options: .atomic)
+        let conflicted = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: working.after?.workingRevision,
+            origin: .standalone,
+            command: .saveWorkspaceDocument(workspaceID: fixture.workspaceID)
+        ))
+        XCTAssertEqual(conflicted.disposition, .conflict)
+        let observedConflict = await runtime.workspaceStore.workspaceSnapshot(fixture.workspaceID)
+        let conflictSnapshot = try XCTUnwrap(observedConflict)
+        if case .externalConflict = conflictSnapshot.health {
+            // Expected: the external document is captured for immediate resolution.
+        } else {
+            XCTFail("Save-time conflict did not retain resolvable external state")
+        }
+
+        let resolved = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: conflictSnapshot.revisions.workingRevision,
+            origin: .standalone,
+            command: .resolveExternalConflict(workspaceID: fixture.workspaceID, acceptExternal: false)
+        ))
+        XCTAssertEqual(resolved.disposition, .applied)
+        XCTAssertEqual(resolved.workspace?.health, .writable)
+        XCTAssertNotNil(resolved.after?.dirtyRevision)
+        let saved = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedWorkspaceRevision: resolved.after?.workingRevision,
+            origin: .standalone,
+            command: .saveWorkspaceDocument(workspaceID: fixture.workspaceID)
+        ))
+        XCTAssertEqual(saved.disposition, .applied)
+        XCTAssertEqual(try Data(contentsOf: fixture.workspaceFile), local.documentBytes)
+    }
+
     func testFutureJournalDegradesToReadOnlyWithoutDiscardingSavedDocument() async throws {
         let fixture = try Fixture.make()
         defer { fixture.remove() }
@@ -696,14 +790,14 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         activity = await runtime.workspaceStore.reloadExternalChanges()
         XCTAssertEqual(activity, .recoveryPending)
 
-        // Restoring a valid document recovers the workspace to writable.
-        let restored = try fixture.document(prompt: "external restored")
-        try restored.documentBytes.write(to: fixture.workspaceFile, options: .atomic)
+        // Restoring the exact previously valid bytes recovers health even though the digest
+        // matches saved authority and the document probe reports an unchanged payload.
+        try changed.documentBytes.write(to: fixture.workspaceFile, options: .atomic)
         activity = await runtime.workspaceStore.reloadExternalChanges()
         XCTAssertEqual(activity, .changed)
         workspace = await runtime.workspaceStore.workspaceSnapshot(fixture.workspaceID)
         XCTAssertEqual(workspace?.health, .writable)
-        XCTAssertEqual(workspace?.document.documentBytes, restored.documentBytes)
+        XCTAssertEqual(workspace?.document.documentBytes, changed.documentBytes)
         let mutation = await runtime.workspaceStore.execute(.init(
             operationID: UUID(),
             expectedWorkspaceRevision: workspace?.revisions.workingRevision,
@@ -745,8 +839,9 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
             contextID: fixture.contextID
         )
 
+        var lastToken: DomainRunLaunchToken?
         for _ in 0 ..< DomainRoutingCoordinator.maximumTokenRecords * 3 {
-            _ = try await runtime.routingCoordinator.issueLaunchToken(.init(
+            lastToken = try await runtime.routingCoordinator.issueLaunchToken(.init(
                 runID: UUID(),
                 context: context,
                 expectedContextRevision: 0,
@@ -757,6 +852,16 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
                 lifetime: .zero
             ))
         }
+        let expired = await runtime.routingCoordinator.redeemLaunchToken(
+            material: try XCTUnwrap(lastToken).material,
+            runtimeID: runtime.identity.runtimeID,
+            runtimeGeneration: runtime.identity.lifecycleGeneration,
+            connectionID: UUID(),
+            processID: nil,
+            clientPrincipal: "test",
+            providerIdentifier: "fixture"
+        )
+        XCTAssertEqual(expired, .expired)
 
         let counts = await runtime.routingCoordinator.tokenBookkeepingCounts()
         XCTAssertLessThanOrEqual(counts.records, 1)
@@ -764,6 +869,7 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
             counts.issueOrderStorage,
             DomainRoutingCoordinator.maximumTokenRecords * 2
         )
+        XCTAssertEqual(counts.pendingRunContexts, 0)
     }
 
     func testRoutingGenerationsAndRunLaunchTokensAreAuthoritativeAndSingleUse() async throws {

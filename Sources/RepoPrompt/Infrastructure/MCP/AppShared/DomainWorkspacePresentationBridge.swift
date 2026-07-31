@@ -163,7 +163,18 @@ final class DomainWorkspacePresentationBridge {
         subscriptionTask?.cancel()
     }
 
+    func stop() {
+        subscriptionTask?.cancel()
+        subscriptionTask = nil
+        projectedDigests.removeAll(keepingCapacity: false)
+        projectedModels.removeAll(keepingCapacity: false)
+    }
+
     #if DEBUG
+        var hasActiveSubscriptionForTesting: Bool {
+            subscriptionTask != nil
+        }
+
         func waitUntilProjected(
             through publicationSequence: UInt64,
             timeout: Duration = .seconds(5)
@@ -185,37 +196,41 @@ final class DomainWorkspacePresentationBridge {
     func start() {
         guard subscriptionTask == nil else { return }
         subscriptionTask = Task { [weak self, client] in
-            guard let self else { return }
             let subscription = await client.store.subscribe()
             guard subscription.snapshot.isBootstrapped else { return }
-
-            var initial = subscription.snapshot
-            if initial.workspaces.isEmpty,
-               let candidate = workspaceManager?.runtimeOwnedDefaultWorkspaceCandidate()
-            {
-                let fileURL = workspaceManager?.workspaceFileURL(for: candidate)
-                if let fileURL {
-                    do {
-                        let outcome = try await client.create(candidate, fileURL: fileURL)
-                        if !outcome.isSuccessfulDomainMutation {
-                            workspaceManager?.reportDomainAuthorityIssue(outcome, operation: "create_default")
-                        }
-                    } catch {
-                        workspaceManager?.reportDomainAuthorityFailure(
-                            error,
-                            workspaceID: candidate.id,
-                            operation: "create_default"
-                        )
-                    }
-                    initial = await client.snapshot()
-                }
+            if let self {
+                await projectInitial(subscription.snapshot)
             }
-            project(initial, force: true)
             for await event in subscription.events {
-                guard !Task.isCancelled else { return }
-                await consume(event)
+                guard !Task.isCancelled, let self else { return }
+                await self.consume(event)
             }
         }
+    }
+
+    private func projectInitial(_ snapshot: DomainWorkspaceCatalogSnapshot) async {
+        var initial = snapshot
+        if initial.workspaces.isEmpty,
+           let candidate = workspaceManager?.runtimeOwnedDefaultWorkspaceCandidate()
+        {
+            let fileURL = workspaceManager?.workspaceFileURL(for: candidate)
+            if let fileURL {
+                do {
+                    let outcome = try await client.create(candidate, fileURL: fileURL)
+                    if !outcome.isSuccessfulDomainMutation {
+                        workspaceManager?.reportDomainAuthorityIssue(outcome, operation: "create_default")
+                    }
+                } catch {
+                    workspaceManager?.reportDomainAuthorityFailure(
+                        error,
+                        workspaceID: candidate.id,
+                        operation: "create_default"
+                    )
+                }
+                initial = await client.snapshot()
+            }
+        }
+        project(initial, force: true)
     }
 
     private func consume(_ event: DomainWorkspaceEvent) async {

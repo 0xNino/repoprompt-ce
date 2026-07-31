@@ -180,6 +180,7 @@ class WindowState: ObservableObject {
     // MARK: - Possibly shared references
 
     let workspaceManager: WorkspaceManagerViewModel
+    private let domainWorkspacePresentationBridge: DomainWorkspacePresentationBridge?
     weak var windowStatesManager: WindowStatesManager?
 
     /// Reference to the NSWindow this state is associated with
@@ -431,6 +432,7 @@ class WindowState: ObservableObject {
         aiQueriesService = composition.aiQueriesService
         chatDataService = composition.chatDataService
         workspaceManager = composition.workspaceManager
+        domainWorkspacePresentationBridge = composition.domainWorkspacePresentationBridge
 
         // Set up additional actions
         setupSendPromptAction()
@@ -1651,8 +1653,10 @@ class WindowState: ObservableObject {
             }
         }
 
-        // Remove the presentation incarnation before any connection/server teardown. Runtime
-        // shutdown also clears routing state, but explicit unregister keeps ordinary close exact.
+        // Stop domain projection before removing the presentation incarnation. The bridge owns
+        // a long-lived subscription, so explicit cancellation is required to bound closed-window
+        // memory and prevent stale windows from multiplying catalog snapshot work.
+        domainWorkspacePresentationBridge?.stop()
         await mcpServer.unregisterDomainRoutingWindow()
 
         // App-level termination already coordinates agent/session and MCP shutdown.

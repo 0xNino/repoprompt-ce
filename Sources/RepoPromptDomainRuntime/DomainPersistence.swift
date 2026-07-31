@@ -977,6 +977,14 @@ package struct DomainPersistenceCoordinator: Sendable {
                 updatedAt: now
             )
             do {
+                let priorDeletionURL = deletionURL(document.workspaceID)
+                if fileManager.fileExists(atPath: priorDeletionURL.path) {
+                    // Remove the crash-recovery sidecar before publishing recreated identity. If
+                    // catalog publication then fails, the still-authoritative catalog tombstone
+                    // continues to suppress the workspace; a stale sidecar can never suppress a
+                    // successfully recreated identity on the next launch.
+                    try fileManager.removeItem(at: priorDeletionURL)
+                }
                 try DomainPersistenceLock.atomicWrite(try encoder.encode(nextCatalog), to: catalogURL)
             } catch {
                 // Catalog publication is the create authority point. Roll back the earlier
