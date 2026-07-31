@@ -65,7 +65,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ allowsAgentExternalControlTools: Bool,
         _ requiresExpectedAgentPID: Bool
     ) async -> Void
-    typealias MCPServerEnabler = () async -> Void
+    typealias MCPServerEnabler = () async -> Bool
     typealias MCPRunRoutingCleaner = (_ runID: UUID, _ windowID: Int, _ reason: String) async -> Void
     typealias MCPRunToolCanceller = (_ runID: UUID, _ reason: String?) -> Int
     typealias ProviderConversationCleaner = ProviderConversationCleanupRegistry.Cleaner
@@ -1486,8 +1486,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
         mcpServerEnabler = { [weak mcpServer] in
-            guard let mcpServer else { return }
-            await mcpServer.ensureServerReadyForAgentBootstrap()
+            guard let mcpServer else { return false }
+            return await mcpServer.ensureServerReadyForAgentBootstrap()
         }
         mcpRunRoutingCleaner = { runID, windowID, reason in
             await Self.defaultMCPRunRoutingCleaner(
@@ -1636,7 +1636,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             },
             mcpRunToolCanceller: MCPRunToolCanceller? = nil,
             providerConversationCleanupRegistry: ProviderConversationCleanupRegistry = ProviderConversationCleanupRegistry(),
-            mcpServerEnabler: @escaping MCPServerEnabler = {},
+            mcpServerEnabler: @escaping MCPServerEnabler = { true },
             testMCPServer: MCPServerViewModel? = nil,
             testWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
             testCodexActiveToolQuery: CodexActiveToolQuery? = nil,
@@ -11440,7 +11440,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     // MARK: - User Interaction
 
-    func ensureMCPServerEnabledForThreadStart() async {
+    func ensureMCPServerEnabledForThreadStart() async -> Bool {
         await mcpServerEnabler()
     }
 
