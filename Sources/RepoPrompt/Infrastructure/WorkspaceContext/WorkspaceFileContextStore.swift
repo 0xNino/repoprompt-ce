@@ -2816,6 +2816,7 @@ actor WorkspaceFileContextStore {
         private var appliedIndexRootSnapshotRequestCountForTesting = 0
         private var codemapPathInvalidationStageHandlerForTesting:
             (@Sendable (WorkspaceCodemapRootEpoch, UUID, CodemapPathInvalidationStage) async -> Void)?
+        private var discardedCodemapPathFenceReleaseCounterForTesting = 0
     #endif
     private var codemapCleanupFlightsByRootID: [UUID: CodemapCleanupFlight] = [:]
     private var codemapPathInvalidationFlightsByRootEpoch: [
@@ -14084,6 +14085,21 @@ actor WorkspaceFileContextStore {
             codemapPathQuiescenceWaitersByRootEpoch[rootEpoch]?.count ?? 0
         }
 
+        func codemapPathFenceCountForTesting(rootID: UUID, relativePath: String) -> Int {
+            let path = StandardizedPath.relative(relativePath)
+            return codemapPathFenceTokensByID.values.count { token in
+                token.rootEpoch.rootID == rootID && token.standardizedRelativePaths.contains(path)
+            }
+        }
+
+        func discardedCodemapPathFenceReleaseCountForTesting() -> Int {
+            discardedCodemapPathFenceReleaseCounterForTesting
+        }
+
+        func pendingCodemapGraphIndexRescheduleCountForTesting() -> Int {
+            codemapGraphIndexBuildReschedulePendingRootEpochs.count
+        }
+
         func revokeReadyCodemapArtifactContributionForTesting(
             _ ticket: WorkspaceCodemapArtifactDemandTicket
         ) async -> Bool {
@@ -15698,8 +15714,9 @@ actor WorkspaceFileContextStore {
         return true
     }
 
-    private func removeCodemapPathFenceToken(id: UUID) {
-        codemapPathFenceTokensByID.removeValue(forKey: id)
+    @discardableResult
+    private func removeCodemapPathFenceToken(id: UUID) -> Bool {
+        codemapPathFenceTokensByID.removeValue(forKey: id) != nil
     }
 
     private func finishCodemapPathInvalidationWithoutAuthority(
@@ -15734,7 +15751,12 @@ actor WorkspaceFileContextStore {
         didCommitMutation: Bool = true
     ) {
         guard let token else { return }
-        removeCodemapPathFenceToken(id: token.id)
+        guard removeCodemapPathFenceToken(id: token.id) else {
+            #if DEBUG
+                discardedCodemapPathFenceReleaseCounterForTesting += 1
+            #endif
+            return
+        }
         // The fence itself advanced projection/path authority and cancelled old work. A failed
         // disk mutation still needs one restoration preload, while committed work needs the same
         // reschedule against the new public catalog.
@@ -15744,6 +15766,17 @@ actor WorkspaceFileContextStore {
         _ = didCommitMutation
         schedulePendingCodemapGraphIndexBuildIfFullyUnfenced(rootEpoch: token.rootEpoch)
         resumeCodemapPathQuiescenceWaitersIfNeeded(rootEpoch: token.rootEpoch)
+    }
+
+    private func retainCodemapPathFenceUntilMutationDrain(
+        _ token: CodemapPathFenceToken?,
+        service: FileSystemService,
+        relativePaths: Set<String>
+    ) {
+        Task { [weak self] in
+            await service.awaitMutationDrain(conflictingWith: relativePaths)
+            await self?.releaseCodemapPathFence(token, didCommitMutation: true)
+        }
     }
 
     private func cancelCodemapGraphIndexBuildLaunchForInvalidation(
@@ -16243,13 +16276,26 @@ actor WorkspaceFileContextStore {
             commands: [.modified([standardizedRelativePath])]
         )
         var didCommitCatalogMutation = false
+        var retainedFenceUntilMutationDrain = false
         defer {
-            releaseCodemapPathFence(
-                codemapFence,
-                didCommitMutation: didCommitCatalogMutation
-            )
+            if !retainedFenceUntilMutationDrain {
+                releaseCodemapPathFence(
+                    codemapFence,
+                    didCommitMutation: didCommitCatalogMutation
+                )
+            }
         }
-        try await state.service.createFile(atRelativePath: standardizedRelativePath, content: content)
+        do {
+            try await state.service.createFile(atRelativePath: standardizedRelativePath, content: content)
+        } catch is CancellationError {
+            retainedFenceUntilMutationDrain = true
+            retainCodemapPathFenceUntilMutationDrain(
+                codemapFence,
+                service: state.service,
+                relativePaths: [standardizedRelativePath]
+            )
+            throw CancellationError()
+        }
         let result = try await materializeCatalogFileAfterDiskWrite(
             rootID: rootID,
             relativePath: standardizedRelativePath,
@@ -16271,11 +16317,14 @@ actor WorkspaceFileContextStore {
             commands: [.modified([standardizedRelativePath])]
         )
         var didCommitCodemapMutation = false
+        var retainedFenceUntilMutationDrain = false
         defer {
-            releaseCodemapPathFence(
-                codemapFence,
-                didCommitMutation: didCommitCodemapMutation
-            )
+            if !retainedFenceUntilMutationDrain {
+                releaseCodemapPathFence(
+                    codemapFence,
+                    didCommitMutation: didCommitCodemapMutation
+                )
+            }
         }
         let deferredPublicationToken: FileSystemDeferredEditPublicationToken
         do {
@@ -16290,6 +16339,14 @@ actor WorkspaceFileContextStore {
             }
             deferredPublicationToken = token
             didCommitCodemapMutation = true
+        } catch is CancellationError {
+            retainedFenceUntilMutationDrain = true
+            retainCodemapPathFenceUntilMutationDrain(
+                codemapFence,
+                service: state.service,
+                relativePaths: [standardizedRelativePath]
+            )
+            throw CancellationError()
         } catch FileSystemError.fileNotFound {
             didCommitCodemapMutation = withCodemapPathLocalCatalogMutation(rootID: rootID) {
                 pruneCatalogFileMissingOnDisk(
@@ -16368,18 +16425,31 @@ actor WorkspaceFileContextStore {
             commands: [.renamed(from: oldPath, to: newPath)]
         )
         var didCommitCodemapMutation = false
+        var retainedFenceUntilMutationDrain = false
         defer {
-            releaseCodemapPathFence(
-                codemapFence,
-                didCommitMutation: didCommitCodemapMutation
-            )
+            if !retainedFenceUntilMutationDrain {
+                releaseCodemapPathFence(
+                    codemapFence,
+                    didCommitMutation: didCommitCodemapMutation
+                )
+            }
         }
         let oldFile = file(rootID: rootID, relativePath: oldPath)
         let oldFileWasDiscoverable = oldFile.map { isDiscoverableFileID($0.id) } ?? false
-        try await state.service.moveFile(
-            atRelativePath: oldPath,
-            toRelativePath: newPath
-        )
+        do {
+            try await state.service.moveFile(
+                atRelativePath: oldPath,
+                toRelativePath: newPath
+            )
+        } catch is CancellationError {
+            retainedFenceUntilMutationDrain = true
+            retainCodemapPathFenceUntilMutationDrain(
+                codemapFence,
+                service: state.service,
+                relativePaths: [oldPath, newPath]
+            )
+            throw CancellationError()
+        }
         didCommitCodemapMutation = true
         let destinationEligibility = await state.service.registerExplicitlyManagedRegularFile(relativePath: newPath)
         let destinationManagedOnly: Bool
@@ -16411,16 +16481,27 @@ actor WorkspaceFileContextStore {
             commands: [.deleted([standardizedRelativePath])]
         )
         var didCommitCodemapMutation = false
+        var retainedFenceUntilMutationDrain = false
         defer {
-            releaseCodemapPathFence(
-                codemapFence,
-                didCommitMutation: didCommitCodemapMutation
-            )
+            if !retainedFenceUntilMutationDrain {
+                releaseCodemapPathFence(
+                    codemapFence,
+                    didCommitMutation: didCommitCodemapMutation
+                )
+            }
         }
         let oldFile = file(rootID: rootID, relativePath: standardizedRelativePath)
         let oldFileWasDiscoverable = oldFile.map { isDiscoverableFileID($0.id) } ?? false
         do {
             try await state.service.deleteFile(atRelativePath: standardizedRelativePath)
+        } catch is CancellationError {
+            retainedFenceUntilMutationDrain = true
+            retainCodemapPathFenceUntilMutationDrain(
+                codemapFence,
+                service: state.service,
+                relativePaths: [standardizedRelativePath]
+            )
+            throw CancellationError()
         } catch FileSystemError.fileNotFound {
             if oldFile != nil {
                 didCommitCodemapMutation = withCodemapPathLocalCatalogMutation(rootID: rootID) {
@@ -16461,14 +16542,25 @@ actor WorkspaceFileContextStore {
             commands: [.deleted(affectedPaths)]
         )
         var didCommitCodemapMutation = false
+        var retainedFenceUntilMutationDrain = false
         defer {
-            releaseCodemapPathFence(
-                codemapFence,
-                didCommitMutation: didCommitCodemapMutation
-            )
+            if !retainedFenceUntilMutationDrain {
+                releaseCodemapPathFence(
+                    codemapFence,
+                    didCommitMutation: didCommitCodemapMutation
+                )
+            }
         }
         do {
             try await state.service.moveItemToTrash(atRelativePath: standardizedRelativePath)
+        } catch is CancellationError {
+            retainedFenceUntilMutationDrain = true
+            retainCodemapPathFenceUntilMutationDrain(
+                codemapFence,
+                service: state.service,
+                relativePaths: [standardizedRelativePath]
+            )
+            throw CancellationError()
         } catch FileSystemError.fileNotFound {
             if oldFile != nil || oldFolder != nil {
                 didCommitCodemapMutation = withCodemapPathLocalCatalogMutation(rootID: rootID) {
