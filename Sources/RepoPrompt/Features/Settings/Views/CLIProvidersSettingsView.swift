@@ -1635,7 +1635,7 @@ struct CLIProvidersSettingsView: View {
                                 }
                                 .buttonStyle(CustomButtonStyle())
                             }
-                            Text("The verification page was opened. RepoPrompt CE will keep checking this separate Codex sign-in until the code completes or expires.")
+                            Text("Open the verification page in a browser, enter the code, and leave this panel open. RepoPrompt CE will keep checking this separate Codex sign-in until it completes or expires.")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)

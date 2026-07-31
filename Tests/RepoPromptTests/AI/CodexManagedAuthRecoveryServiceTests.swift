@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 @testable import RepoPromptApp
 import XCTest
@@ -44,6 +45,9 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
 
         XCTAssertTrue(guidance.contains("localhost:1455"))
         XCTAssertTrue(guidance.contains("lsof -iTCP:1455"))
+        XCTAssertTrue(guidance.contains("listener belongs to the active Codex app-server"))
+        XCTAssertTrue(guidance.contains("still running and healthy"))
+        XCTAssertFalse(guidance.contains("Another app may be occupying"))
         XCTAssertTrue(guidance.contains(CodexManagedAuthRecoveryClassifier.deviceCodeActionTitle))
         XCTAssertTrue(guidance.contains(CodexManagedAuthRecoveryClassifier.separateSignInExplanation))
         XCTAssertTrue(CodexManagedAuthRecoveryClassifier.preservesAsUserFacingGuidance(guidance))
@@ -71,6 +75,206 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
         XCTAssertEqual(client.stopCallCount(), 1)
     }
 
+    func testStalePreLoginAccountCannotAuthenticateWithoutValidatingRefresh() async {
+        let staleAccount: [String: Any] = [
+            "account": ["type": "chatgpt", "email": "stale@example.com"],
+            "requiresOpenaiAuth": true
+        ]
+        let client = MockCodexManagedAuthClient(
+            loginStartResponse: Self.browserStartResponse,
+            accountReadResponses: [Self.signedOutAccount],
+            unrefreshedAccountReadResponse: staleAccount
+        )
+        let clock = TestClock()
+        let service = makeService(client: client, clock: clock, validationTimeout: 1)
+
+        let result = await service.startManagedChatgptLogin { _ in }
+
+        guard case let .failed(message) = result else {
+            return XCTFail("Expected unchanged stale account to time out, got \(result)")
+        }
+        XCTAssertTrue(message.contains("still signed out"))
+        XCTAssertEqual(client.accountReadRefreshFlags(), [true, true])
+        XCTAssertEqual(client.requestCount(method: "account/login/cancel"), 0)
+        XCTAssertEqual(client.stopCallCount(), 1)
+    }
+
+    func testCorrelatedSuccessValidatesRefreshBeforeAcceptingUnchangedAccount() async {
+        let unchangedAccount: [String: Any] = [
+            "account": ["type": "chatgpt", "email": "same@example.com"],
+            "requiresOpenaiAuth": true
+        ]
+        let client = MockCodexManagedAuthClient(
+            loginStartResponse: Self.browserStartResponse,
+            accountReadResponses: [unchangedAccount],
+            notificationOnLoginStart: CodexAppServerClient.Notification(
+                method: "account/login/completed",
+                params: [
+                    "loginId": .string("browser-login"),
+                    "success": .bool(true),
+                    "error": .null
+                ]
+            )
+        )
+        let service = CodexManagedAuthRecoveryService(
+            clientFactory: { client },
+            refreshRequestTimeout: 1,
+            browserLoginValidationTimeout: 300,
+            deviceCodeLoginValidationTimeout: 900,
+            loginPollInterval: 1,
+            sleep: { _ in try await Task.sleep(nanoseconds: .max) }
+        )
+
+        let result = await service.startManagedChatgptLogin { _ in }
+
+        XCTAssertEqual(result, .authenticated)
+        let refreshFlags = client.accountReadRefreshFlags()
+        XCTAssertFalse(refreshFlags.isEmpty)
+        XCTAssertTrue(refreshFlags.allSatisfy(\.self))
+        XCTAssertEqual(client.stopCallCount(), 1)
+    }
+
+    func testAbsentAndNullCompletionLoginIDsAreIgnoredAndSafeFallbackRemainsAvailable() async {
+        let notificationParams: [[String: CodexJSONValue]] = [
+            [
+                "success": .bool(false),
+                "error": .string("Uncorrelated failure without an ID.")
+            ],
+            [
+                "loginId": .null,
+                "success": .bool(false),
+                "error": .string("Uncorrelated failure with a null ID.")
+            ]
+        ]
+
+        for params in notificationParams {
+            let client = MockCodexManagedAuthClient(
+                loginStartResponse: Self.deviceStartResponse,
+                accountReadResponses: [Self.signedOutAccount, Self.signedInAccount],
+                notificationOnLoginStart: CodexAppServerClient.Notification(
+                    method: "account/login/completed",
+                    params: params
+                )
+            )
+            let clock = TestClock()
+            let service = makeService(client: client, clock: clock, validationTimeout: 1)
+
+            let result = await service.startManagedChatgptDeviceCodeLogin { _, _ in }
+
+            XCTAssertEqual(result, .authenticated)
+            XCTAssertEqual(client.accountReadRefreshFlags(), [true, true])
+            XCTAssertEqual(client.stopCallCount(), 1)
+        }
+    }
+
+    func testDocumentedOverloadRetryBudgetIsBounded() async {
+        let overload = CodexAppServerClient.ClientError.requestFailed(.init(
+            method: "account/read",
+            code: -32001,
+            message: "Server overloaded; retry later.",
+            data: nil
+        ))
+        let client = MockCodexManagedAuthClient(
+            loginStartResponse: Self.browserStartResponse,
+            accountReadOutcomes: [.failure(overload)]
+        )
+        let clock = TestClock()
+        let service = makeService(client: client, clock: clock, validationTimeout: 300)
+
+        let result = await service.startManagedChatgptLogin { _ in }
+
+        guard case let .failed(message) = result else {
+            return XCTFail("Expected bounded overload failure, got \(result)")
+        }
+        XCTAssertTrue(message.contains("Server overloaded; retry later."))
+        XCTAssertEqual(client.requestCount(method: "account/read"), 3)
+        XCTAssertEqual(clock.now.timeIntervalSince1970, 3, accuracy: 0.001)
+        XCTAssertEqual(client.requestCount(method: "account/login/cancel"), 1)
+        XCTAssertEqual(client.stopCallCount(), 1)
+    }
+
+    func testProcessExitDuringValidationFailsPromptlyCancelsAndAwaitsStop() async throws {
+        let events = EventRecorder()
+        let processExit = CodexAppServerClient.ClientError.processExited(.init(
+            executablePath: "/tmp/codex",
+            launchDirectory: "/tmp",
+            pid: 4242,
+            status: .exited(code: 23),
+            stderrTail: Data("fixture process exit".utf8),
+            stderrWasTruncated: false,
+            stderrWasSettled: true
+        ))
+        let client = MockCodexManagedAuthClient(
+            label: "browser",
+            loginStartResponse: Self.browserStartResponse,
+            accountReadOutcomes: [
+                .response(Self.signedOutAccount),
+                .failure(processExit)
+            ],
+            eventRecorder: { events.record($0) }
+        )
+        let clock = TestClock()
+        let service = makeService(client: client, clock: clock, validationTimeout: 300)
+
+        let result = await service.startManagedChatgptLogin { _ in }
+
+        guard case let .failed(message) = result else {
+            return XCTFail("Expected prompt process-exit failure, got \(result)")
+        }
+        XCTAssertTrue(message.contains("exited with status 23"))
+        XCTAssertTrue(message.contains("fixture process exit"))
+        XCTAssertTrue(message.contains("listener belongs to the active Codex app-server"))
+        XCTAssertTrue(message.contains(CodexManagedAuthRecoveryClassifier.deviceCodeActionTitle))
+        XCTAssertEqual(clock.now.timeIntervalSince1970, 1, accuracy: 0.001)
+        XCTAssertEqual(client.requestCount(method: "account/login/cancel"), 1)
+        XCTAssertEqual(client.stopCallCount(), 1)
+
+        let recordedEvents = events.snapshot()
+        let validationRead = try XCTUnwrap(recordedEvents.lastIndex(of: "browser.account/read"))
+        let cancel = try XCTUnwrap(recordedEvents.firstIndex(of: "browser.account/login/cancel"))
+        let stop = try XCTUnwrap(recordedEvents.firstIndex(of: "browser.stop"))
+        XCTAssertLessThan(validationRead, cancel)
+        XCTAssertLessThan(cancel, stop)
+    }
+
+    func testTransportFailureDuringValidationFailsPromptlyCancelsAndAwaitsStop() async throws {
+        let events = EventRecorder()
+        let transportFailure = CodexAppServerClient.ClientError.transportReadSetupFailed(
+            message: "Codex app-server process pipe reader failed to start: Bad file descriptor",
+            errno: EBADF
+        )
+        let client = MockCodexManagedAuthClient(
+            label: "device",
+            loginStartResponse: Self.deviceStartResponse,
+            accountReadOutcomes: [
+                .response(Self.signedOutAccount),
+                .failure(transportFailure)
+            ],
+            eventRecorder: { events.record($0) }
+        )
+        let clock = TestClock()
+        let service = makeService(client: client, clock: clock, validationTimeout: 900)
+
+        let result = await service.startManagedChatgptDeviceCodeLogin { _, _ in }
+
+        guard case let .failed(message) = result else {
+            return XCTFail("Expected prompt transport failure, got \(result)")
+        }
+        XCTAssertTrue(message.contains("process pipe reader failed to start"))
+        XCTAssertTrue(message.contains("Request a new device code and try again"))
+        XCTAssertTrue(message.contains(CodexManagedAuthRecoveryClassifier.separateSignInExplanation))
+        XCTAssertEqual(clock.now.timeIntervalSince1970, 1, accuracy: 0.001)
+        XCTAssertEqual(client.requestCount(method: "account/login/cancel"), 1)
+        XCTAssertEqual(client.stopCallCount(), 1)
+
+        let recordedEvents = events.snapshot()
+        let validationRead = try XCTUnwrap(recordedEvents.lastIndex(of: "device.account/read"))
+        let cancel = try XCTUnwrap(recordedEvents.firstIndex(of: "device.account/login/cancel"))
+        let stop = try XCTUnwrap(recordedEvents.firstIndex(of: "device.stop"))
+        XCTAssertLessThan(validationRead, cancel)
+        XCTAssertLessThan(cancel, stop)
+    }
+
     func testCompletionFailureNotificationStopsLoginWithoutRetry() async {
         let client = MockCodexManagedAuthClient(
             loginStartResponse: Self.deviceStartResponse,
@@ -84,8 +288,14 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
                 ]
             )
         )
-        let clock = TestClock()
-        let service = makeService(client: client, clock: clock, validationTimeout: 10)
+        let service = CodexManagedAuthRecoveryService(
+            clientFactory: { client },
+            refreshRequestTimeout: 1,
+            browserLoginValidationTimeout: 10,
+            deviceCodeLoginValidationTimeout: 10,
+            loginPollInterval: 1,
+            sleep: { _ in try await Task.sleep(nanoseconds: .max) }
+        )
 
         let result = await service.startManagedChatgptDeviceCodeLogin { _, _ in }
 
@@ -141,7 +351,8 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
         )
         let deviceClient = MockCodexManagedAuthClient(
             loginStartResponse: Self.deviceStartResponse,
-            accountReadResponses: [Self.signedInAccount]
+            accountReadResponses: [Self.signedOutAccount, Self.signedInAccount],
+            notificationOnLoginStart: Self.deviceSuccessNotification
         )
         let clients = ClientFactoryBox([browserClient, deviceClient])
         let service = CodexManagedAuthRecoveryService(
@@ -159,7 +370,7 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
             await service.startManagedChatgptLogin { _ in }
         }
         try await waitUntil {
-            browserClient.requestCount(method: "account/read") == 1
+            browserClient.requestCount(method: "account/login/start") == 1
         }
 
         let deviceResult = await service.startManagedChatgptDeviceCodeLogin { _, _ in }
@@ -179,7 +390,8 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
     func testConcurrentSameFlowDeviceCodeLoginsCoalesceAndOnlyInitiatingPresenterOpensURL() async {
         let client = MockCodexManagedAuthClient(
             loginStartResponse: Self.deviceStartResponse,
-            accountReadResponses: [Self.signedInAccount]
+            accountReadResponses: [Self.signedOutAccount, Self.signedInAccount],
+            notificationOnLoginStart: Self.deviceSuccessNotification
         )
         let clients = ClientFactoryBox([client])
         let service = CodexManagedAuthRecoveryService(
@@ -226,6 +438,7 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
             label: "device",
             loginStartResponse: Self.deviceStartResponse,
             accountReadResponses: [Self.signedInAccount],
+            notificationOnLoginStart: Self.deviceSuccessNotification,
             eventRecorder: { events.record($0) }
         )
         let clients = ClientFactoryBox([browserClient, deviceClient])
@@ -244,7 +457,7 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
             await service.startManagedChatgptLogin { _ in }
         }
         try await waitUntil {
-            browserClient.requestCount(method: "account/read") == 1
+            browserClient.requestCount(method: "account/login/start") == 1
         }
 
         async let deviceResult1 = service.startManagedChatgptDeviceCodeLogin { _, _ in }
@@ -368,6 +581,15 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
         "verificationUrl": "https://auth.openai.com/codex/device"
     ]
 
+    private static let deviceSuccessNotification = CodexAppServerClient.Notification(
+        method: "account/login/completed",
+        params: [
+            "loginId": .string("device-login"),
+            "success": .bool(true),
+            "error": .null
+        ]
+    )
+
     private static let signedOutAccount: [String: Any] = [
         "account": NSNull(),
         "requiresOpenaiAuth": true
@@ -444,17 +666,24 @@ private final class ClientFactoryBox: @unchecked Sendable {
     }
 }
 
+private enum MockAccountReadOutcome {
+    case response([String: Any])
+    case failure(Error)
+}
+
 private final class MockCodexManagedAuthClient: CodexManagedAuthRPCClient, @unchecked Sendable {
     private struct RequestRecord {
         let method: String
         let loginType: String?
         let loginID: String?
+        let refreshToken: Bool?
     }
 
     private let lock = NSLock()
     private let label: String
     private let loginStartResponse: [String: Any]
-    private var accountReadResponses: [[String: Any]]
+    private let unrefreshedAccountReadOutcome: MockAccountReadOutcome?
+    private var accountReadOutcomes: [MockAccountReadOutcome]
     private let notificationOnLoginStart: CodexAppServerClient.Notification?
     private let notificationStream: AsyncStream<CodexAppServerClient.Notification>
     private let notificationContinuation: AsyncStream<CodexAppServerClient.Notification>.Continuation
@@ -466,12 +695,32 @@ private final class MockCodexManagedAuthClient: CodexManagedAuthRPCClient, @unch
         label: String = "client",
         loginStartResponse: [String: Any],
         accountReadResponses: [[String: Any]],
+        unrefreshedAccountReadResponse: [String: Any]? = nil,
         notificationOnLoginStart: CodexAppServerClient.Notification? = nil,
         eventRecorder: (@Sendable (String) -> Void)? = nil
     ) {
         self.label = label
         self.loginStartResponse = loginStartResponse
-        self.accountReadResponses = accountReadResponses
+        unrefreshedAccountReadOutcome = unrefreshedAccountReadResponse.map(MockAccountReadOutcome.response)
+        accountReadOutcomes = accountReadResponses.map(MockAccountReadOutcome.response)
+        self.notificationOnLoginStart = notificationOnLoginStart
+        self.eventRecorder = eventRecorder
+        var continuation: AsyncStream<CodexAppServerClient.Notification>.Continuation!
+        notificationStream = AsyncStream { continuation = $0 }
+        notificationContinuation = continuation
+    }
+
+    init(
+        label: String = "client",
+        loginStartResponse: [String: Any],
+        accountReadOutcomes: [MockAccountReadOutcome],
+        notificationOnLoginStart: CodexAppServerClient.Notification? = nil,
+        eventRecorder: (@Sendable (String) -> Void)? = nil
+    ) {
+        self.label = label
+        self.loginStartResponse = loginStartResponse
+        unrefreshedAccountReadOutcome = nil
+        self.accountReadOutcomes = accountReadOutcomes
         self.notificationOnLoginStart = notificationOnLoginStart
         self.eventRecorder = eventRecorder
         var continuation: AsyncStream<CodexAppServerClient.Notification>.Continuation!
@@ -498,8 +747,14 @@ private final class MockCodexManagedAuthClient: CodexManagedAuthRPCClient, @unch
     ) async throws -> [String: Any] {
         let loginType = params?["type"] as? String
         let loginID = params?["loginId"] as? String
+        let refreshToken = params?["refreshToken"] as? Bool
         lock.withLock {
-            requests.append(RequestRecord(method: method, loginType: loginType, loginID: loginID))
+            requests.append(RequestRecord(
+                method: method,
+                loginType: loginType,
+                loginID: loginID,
+                refreshToken: refreshToken
+            ))
         }
         eventRecorder?("\(label).\(method)")
 
@@ -510,11 +765,23 @@ private final class MockCodexManagedAuthClient: CodexManagedAuthRPCClient, @unch
             }
             return loginStartResponse
         case "account/read":
-            return lock.withLock {
-                guard accountReadResponses.count > 1 else {
-                    return accountReadResponses.first ?? ["account": NSNull(), "requiresOpenaiAuth": true]
+            let outcome = lock.withLock {
+                if refreshToken == false, let unrefreshedAccountReadOutcome {
+                    return unrefreshedAccountReadOutcome
                 }
-                return accountReadResponses.removeFirst()
+                guard accountReadOutcomes.count > 1 else {
+                    return accountReadOutcomes.first ?? .response([
+                        "account": NSNull(),
+                        "requiresOpenaiAuth": true
+                    ])
+                }
+                return accountReadOutcomes.removeFirst()
+            }
+            switch outcome {
+            case let .response(response):
+                return response
+            case let .failure(error):
+                throw error
             }
         case "account/login/cancel":
             return ["status": "canceled"]
@@ -549,6 +816,14 @@ private final class MockCodexManagedAuthClient: CodexManagedAuthRPCClient, @unch
     func lastLoginID(for method: String) -> String? {
         lock.withLock {
             requests.last(where: { $0.method == method })?.loginID
+        }
+    }
+
+    func accountReadRefreshFlags() -> [Bool] {
+        lock.withLock {
+            requests.compactMap { record in
+                record.method == "account/read" ? record.refreshToken : nil
+            }
         }
     }
 }

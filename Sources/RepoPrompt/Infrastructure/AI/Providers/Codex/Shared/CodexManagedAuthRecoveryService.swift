@@ -310,6 +310,7 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         deviceCodeStarted: (@Sendable (CodexManagedChatgptDeviceCode) async -> Void)?
     ) async -> CodexManagedChatgptLoginResult {
         let cancellation = LoginCancellationState()
+        var failureAuthURL: URL?
         let result = await withTaskCancellationHandler {
             do {
                 await client.updateDefaultRequestTimeout(requestTimeout)
@@ -331,6 +332,7 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                     }
                     loginID = browser.loginID
                     browserAuthURL = browser.authURL
+                    failureAuthURL = browser.authURL
                     await cancellation.register(loginID: loginID, client: client, timeout: requestTimeout)
                     try Task.checkCancellation()
                     await browserOpened?(browser.authURL)
@@ -358,21 +360,44 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                 }
                 defer { notificationTask.cancel() }
 
-                // Race an event-driven wait for a failure notification against the
-                // success-polling loop so a failure notification is surfaced as soon as
-                // it arrives, rather than only being noticed on the next poll tick.
                 let deadline = now().addingTimeInterval(validationTimeout)
                 return try await withThrowingTaskGroup(of: CodexManagedChatgptLoginResult?.self) { group in
+                    // A matching managed-login completion is the primary success signal.
+                    // Even then, account/read(refreshToken: true) remains authoritative.
                     group.addTask {
-                        guard let failure = await state.waitForFailure() else {
+                        guard let completion = await state.waitForCompletion() else {
                             return nil
                         }
-                        return .failed(message: failureGuidance(flow: flow, message: failure, authURL: browserAuthURL))
+                        switch completion {
+                        case .success:
+                            let isAuthenticated = try await readAuthenticatedAccount(
+                                client: client,
+                                timeout: requestTimeout,
+                                retryDelay: pollInterval,
+                                sleep: sleep
+                            )
+                            return isAuthenticated ? .authenticated : nil
+                        case let .failure(message):
+                            return .failed(message: failureGuidance(
+                                flow: flow,
+                                message: message,
+                                authURL: browserAuthURL
+                            ))
+                        }
                     }
                     group.addTask {
+                        // Notifications can be lost with a dying transport. Keep a bounded
+                        // fallback, but force token refresh so an unvalidated stale account
+                        // snapshot cannot report success. A successful refresh remains
+                        // authoritative even when the user signs back into the same account.
                         while now() < deadline {
                             try Task.checkCancellation()
-                            if try await accountIsAuthenticated(client: client, timeout: requestTimeout) {
+                            if try await readAuthenticatedAccount(
+                                client: client,
+                                timeout: requestTimeout,
+                                retryDelay: pollInterval,
+                                sleep: sleep
+                            ) {
                                 return .authenticated
                             }
                             let remaining = deadline.timeIntervalSince(now())
@@ -381,7 +406,12 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                             }
                         }
                         try Task.checkCancellation()
-                        if try await accountIsAuthenticated(client: client, timeout: requestTimeout) {
+                        if try await readAuthenticatedAccount(
+                            client: client,
+                            timeout: requestTimeout,
+                            retryDelay: pollInterval,
+                            sleep: sleep
+                        ) {
                             return .authenticated
                         }
                         return .failed(message: timeoutGuidance(flow: flow, authURL: browserAuthURL))
@@ -398,10 +428,15 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                 await cancellation.cancel(client: client, timeout: requestTimeout)
                 return .failed(message: "Codex ChatGPT login was canceled before completion. Start the login again when ready.")
             } catch {
+                await cancellation.cancel(client: client, timeout: requestTimeout)
                 if let message = executableUnavailableMessage(from: error) {
                     return .executableUnavailable(message: message)
                 }
-                return .failed(message: failureGuidance(flow: flow, message: error.localizedDescription, authURL: nil))
+                return .failed(message: failureGuidance(
+                    flow: flow,
+                    message: error.localizedDescription,
+                    authURL: failureAuthURL
+                ))
             }
         } onCancel: {
             Task {
@@ -412,22 +447,42 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         return result
     }
 
-    private static func accountIsAuthenticated(
+    private static func readAuthenticatedAccount(
         client: any CodexManagedAuthRPCClient,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        retryDelay: TimeInterval,
+        sleep: @escaping @Sendable (TimeInterval) async throws -> Void
     ) async throws -> Bool {
-        do {
-            let result = try await client.request(
-                method: "account/read",
-                params: ["refreshToken": false],
-                timeout: timeout
-            )
-            return isAuthenticatedAccountReadResult(result)
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
+        var transientFailureCount = 0
+        while true {
+            do {
+                let result = try await client.request(
+                    method: "account/read",
+                    params: ["refreshToken": true],
+                    timeout: timeout
+                )
+                return isAuthenticatedAccountReadResult(result)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                guard isClearlyTransientAccountReadFailure(error), transientFailureCount < 2 else {
+                    throw error
+                }
+                transientFailureCount += 1
+                let backoff = min(max(retryDelay, 0.1) * pow(2, Double(transientFailureCount - 1)), 2)
+                try await sleep(backoff)
+            }
+        }
+    }
+
+    private static func isClearlyTransientAccountReadFailure(_ error: Error) -> Bool {
+        guard let clientError = error as? CodexAppServerClient.ClientError,
+              case let .requestFailed(failure) = clientError
+        else {
             return false
         }
+        // Codex documents -32001 as its overloaded/retry-later response.
+        return failure.code == -32001
     }
 
     private static func executableUnavailableMessage(from error: Error) -> String? {
@@ -536,10 +591,10 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         var parts = [trimmedMessage(message, fallback: "Codex ChatGPT login failed.")]
         if let authURL, let port = browserCallbackPort(from: authURL) {
             parts.append(
-                "Codex was waiting for the browser callback on localhost:\(port). Another app may be occupying that port; check `lsof -iTCP:\(port) -sTCP:LISTEN`."
+                "Codex was waiting for the browser callback on localhost:\(port). Use `lsof -iTCP:\(port) -sTCP:LISTEN` to verify that the listener belongs to the active Codex app-server, then confirm that process is still running and healthy."
             )
         } else {
-            parts.append("The browser callback to Codex may not have reached the local app-server.")
+            parts.append("Verify that the Codex app-server process is still running and able to receive the browser callback.")
         }
         parts.append("Try 'Use device code instead' to sign in without a localhost callback.")
         parts.append(CodexManagedAuthRecoveryClassifier.separateSignInExplanation)
@@ -658,27 +713,40 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
     }
 
     private actor LoginNotificationState {
-        private(set) var failureMessage: String?
-        private var pendingFailureWaiters: [CheckedContinuation<String?, Never>] = []
+        enum Completion {
+            case success
+            case failure(String)
+        }
+
+        private var completion: Completion?
+        private var pendingCompletionWaiters: [CheckedContinuation<Completion?, Never>] = []
 
         func consume(notification: CodexAppServerClient.Notification, expectedLoginID: String) {
-            guard notification.method == "account/login/completed" else { return }
+            guard notification.method == "account/login/completed", completion == nil else { return }
             let params = Self.decodeParams(notification.params)
+            // The broad Codex notification union permits a null loginId for non-managed
+            // variants. Browser and device-code starts return an ID, so only an exact
+            // match can complete this attempt. Absent, null, and foreign IDs are ignored;
+            // account/read provides the bounded notification-loss fallback.
             guard Self.stringValue(in: params, keys: ["loginId", "login_id"]) == expectedLoginID else {
                 return
             }
-            guard Self.boolValue(in: params, keys: ["success"]) != true else { return }
-            let message = Self.stringValue(in: params, keys: ["error"]) ?? "Codex ChatGPT login failed."
-            failureMessage = message
-            resolvePendingWaiters(with: message)
+            let observedCompletion: Completion = if Self.boolValue(in: params, keys: ["success"]) == true {
+                .success
+            } else {
+                .failure(
+                    Self.stringValue(in: params, keys: ["error"]) ?? "Codex ChatGPT login failed."
+                )
+            }
+            completion = observedCompletion
+            resolvePendingWaiters(with: observedCompletion)
         }
 
-        /// Suspends until a failure notification is observed, resolving immediately
-        /// when one arrives instead of relying on the caller to poll. Returns `nil`
-        /// if cancelled before any failure notification is observed.
-        func waitForFailure() async -> String? {
-            if let failureMessage {
-                return failureMessage
+        /// Suspends until the correlated terminal notification arrives. Returns `nil`
+        /// when the waiter is cancelled so task-group cancellation cannot strand it.
+        func waitForCompletion() async -> Completion? {
+            if let completion {
+                return completion
             }
             return await withTaskCancellationHandler {
                 await withCheckedContinuation { continuation in
@@ -689,25 +757,25 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
             }
         }
 
-        private func registerWaiterIfStillPending(_ continuation: CheckedContinuation<String?, Never>) {
-            if let failureMessage {
-                continuation.resume(returning: failureMessage)
+        private func registerWaiterIfStillPending(_ continuation: CheckedContinuation<Completion?, Never>) {
+            if let completion {
+                continuation.resume(returning: completion)
                 return
             }
-            pendingFailureWaiters.append(continuation)
+            pendingCompletionWaiters.append(continuation)
         }
 
-        private func resolvePendingWaiters(with message: String) {
-            let waiters = pendingFailureWaiters
-            pendingFailureWaiters.removeAll()
+        private func resolvePendingWaiters(with completion: Completion) {
+            let waiters = pendingCompletionWaiters
+            pendingCompletionWaiters.removeAll()
             for waiter in waiters {
-                waiter.resume(returning: message)
+                waiter.resume(returning: completion)
             }
         }
 
         private func cancelPendingWaiters() {
-            let waiters = pendingFailureWaiters
-            pendingFailureWaiters.removeAll()
+            let waiters = pendingCompletionWaiters
+            pendingCompletionWaiters.removeAll()
             for waiter in waiters {
                 waiter.resume(returning: nil)
             }
