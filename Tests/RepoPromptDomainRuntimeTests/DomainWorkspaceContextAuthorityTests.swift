@@ -613,7 +613,7 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
             XCTAssertEqual(error as? DomainWorkspaceDocumentError, .invalidContext(fixture.contextID))
         }
 
-        let validDocument = fixture.document(prompt: "saved")
+        let validDocument = try fixture.document(prompt: "saved")
         let duplicateMetadata = DomainWorkspaceMetadata(
             workspaceID: validDocument.metadata.workspaceID,
             schemaVersion: validDocument.metadata.schemaVersion,
