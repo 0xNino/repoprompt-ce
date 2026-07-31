@@ -417,7 +417,7 @@ final class MCPServerViewModel: ObservableObject {
     // ---------------------------------------------------------------------
     let windowID: Int
     private(set) var service: MCPService
-    private let logger = Logger(label: "com.repoprompt.mcp")
+    let logger = Logger(label: "com.repoprompt.mcp")
 
     #if DEBUG
         private var oracleChatSendOverrideForTesting: MCPOracleToolService.SendChat?
@@ -1682,6 +1682,7 @@ final class MCPServerViewModel: ObservableObject {
         await workspaceManager?.applyStoredSelectionMirrorForReadFileAutoSelection(tabID: key.tabID)
     }
 
+    /// Presentation cache for M3 read-provider compatibility. M2 routing truth lives in domainRoutingCoordinator.
     @MainActor
     var tabContextByConnectionID: [UUID: TabScopedContext] = [:]
     @MainActor
@@ -1708,6 +1709,14 @@ final class MCPServerViewModel: ObservableObject {
     var pendingPolicyRunIDMappingTokenIDByRunID: [UUID: UUID] = [:]
     @MainActor
     var windowIDByConnection: [UUID: Int] = [:]
+    let domainRoutingCoordinator: DomainRoutingCoordinator?
+    var domainWindowDescriptor: DomainWindowDescriptor?
+    var domainWindowRegistrationTask: Task<DomainWindowDescriptor?, Never>?
+    var domainWindowPresentationRevision: UInt64 = 0
+    var domainRoutingWindowIsClosing = false
+    /// Serializes routing publications (bind/release) so rapid tab transitions cannot
+    /// commit bindings out of order and teardown can drain in-flight publications.
+    var domainRoutingPublishTask: Task<Void, Never>?
     @MainActor
     var tabContextCancellablesByConnectionID: [UUID: Set<AnyCancellable>] = [:]
     @MainActor
@@ -2478,6 +2487,7 @@ final class MCPServerViewModel: ObservableObject {
             WorkspaceModel,
             WorkspaceManagerViewModel
         ) async throws -> WorkspaceRootRef,
+        domainRoutingCoordinator: DomainRoutingCoordinator? = nil,
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared
     ) {
         self.service = service
@@ -2488,7 +2498,14 @@ final class MCPServerViewModel: ObservableObject {
         self.selectionCoordinator = selectionCoordinator
         self.workspaceSearch = workspaceSearch
         self.ensureGitDataRootLoaded = ensureGitDataRootLoaded
+        self.domainRoutingCoordinator = domainRoutingCoordinator
         self.applyEditsApprovalStore = applyEditsApprovalStore
+
+        scheduleDomainWindowRegistration(
+            activeWorkspaceID: workspaceManager.activeWorkspaceID,
+            activeContextID: workspaceManager.activeWorkspace?.activeComposeTabID,
+            presentationRevision: 0
+        )
 
         // Observe service state updates
         observeService()

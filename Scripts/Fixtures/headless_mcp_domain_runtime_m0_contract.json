@@ -312,7 +312,7 @@
     "existing_test": "RepoPromptTests.WorkspaceApprovalCancellationTests/testCancellingAwaitedApprovalResolvesDeniedAndClearsOverlay"
   },
   "main_actor": {
-    "mcp_local_declaration_count": 41,
+    "mcp_local_declaration_count": 42,
     "mcp_local_declaration_sites": [
       {
         "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentExploreMCPToolService.swift",
@@ -353,6 +353,15 @@
         "path": "Sources/RepoPrompt/Infrastructure/MCP/Agent/MCPAgentRoleDefaultsService.swift",
         "kind": "protocol",
         "symbol": "MCPAgentRoleDefaultsStoring"
+      },
+      {
+        "path": "Sources/RepoPrompt/Infrastructure/MCP/AppShared/DomainWorkspacePresentationBridge.swift",
+        "kind": "class",
+        "symbol": "DomainWorkspacePresentationBridge",
+        "actor_boundary_classification": "presentation_only",
+        "presentation_role": "snapshot_projection_and_default_bootstrap_command_client",
+        "mutable_domain_authority": false,
+        "executable_tool_hop": false
       },
       {
         "path": "Sources/RepoPrompt/Infrastructure/MCP/MCPExternalEventsMonitor.swift",
@@ -741,7 +750,31 @@
       "failure_behavior": "fail_closed_and_revoke_endpoint_and_token"
     },
     "domain_run_launch_token_contract": {
-      "status": "frozen_contract_only_not_implemented",
+      "status": "host_authority_implemented_private_endpoint_and_carriers_deferred",
+      "host_authority": {
+        "milestone": "M2",
+        "operations": ["issue", "redeem", "revoke"],
+        "production_declaration_sites": [
+          {
+            "path": "Sources/RepoPromptDomainRuntime/DomainRoutingCoordinator.swift",
+            "kind": "struct",
+            "symbol": "DomainRunLaunchToken"
+          },
+          {
+            "path": "Sources/RepoPromptDomainRuntime/DomainWorkspaceContextAuthority.swift",
+            "kind": "struct",
+            "symbol": "DomainWorkspaceStore"
+          },
+          {
+            "path": "Sources/RepoPromptDomainRuntime/DomainWorkspaceContextAuthority.swift",
+            "kind": "struct",
+            "symbol": "DomainContextStore"
+          }
+        ],
+        "routing_test": "RepoPromptDomainRuntimeTests.DomainWorkspaceContextAuthorityTests/testRoutingGenerationsAndRunLaunchTokensAreAuthoritativeAndSingleUse"
+      },
+      "private_endpoint_status": "deferred",
+      "provider_carrier_wiring_status": "deferred",
       "child_material": ["opaque_random_capability"],
       "host_record_bindings": ["token_id", "secret_digest", "runtime_id", "runtime_generation", "run_id", "expected_child_pid_or_descendant", "workspace_context_identity", "client_principal", "provider", "run_purpose", "restricted_tools", "additional_tools", "issued_at", "expires_at", "nonce"],
       "rules": ["single_use", "short_lived", "memory_only", "never_logged", "never_persisted", "bound_to_private_endpoint_generation", "revoked_on_terminal_cleanup"],

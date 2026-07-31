@@ -313,7 +313,12 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertEqual(try string(endpoint, key: "admission"), "single_use_expected_child_or_descendant")
         XCTAssertEqual(try string(endpoint, key: "cleanup"), "identity_fenced_idempotent_settlement")
         let token = try dictionary(child, key: "domain_run_launch_token_contract")
-        XCTAssertEqual(try string(token, key: "status"), "frozen_contract_only_not_implemented")
+        XCTAssertEqual(
+            try string(token, key: "status"),
+            "host_authority_implemented_private_endpoint_and_carriers_deferred"
+        )
+        XCTAssertEqual(try string(token, key: "private_endpoint_status"), "deferred")
+        XCTAssertEqual(try string(token, key: "provider_carrier_wiring_status"), "deferred")
         XCTAssertEqual(try strings(token, key: "child_material"), ["opaque_random_capability"])
         XCTAssertEqual(try string(token, key: "policy_selection_authority"), "host_only")
         XCTAssertTrue(try strings(token, key: "host_record_bindings").contains("restricted_tools"))
@@ -322,10 +327,22 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         let packageManifest = try source("Package.swift")
         XCTAssertTrue(packageManifest.contains("name: \"RepoPromptDomainRuntime\""))
         XCTAssertTrue(packageManifest.contains("name: \"RepoPromptDomainRuntimeTests\""))
-        let productionSwift = try allSwiftSource()
-        XCTAssertFalse(productionSwift.contains("DomainRunLaunchToken"))
-        XCTAssertFalse(productionSwift.contains("DomainWorkspaceStore"))
-        XCTAssertFalse(productionSwift.contains("DomainContextStore"))
+        let hostAuthority = try dictionary(token, key: "host_authority")
+        XCTAssertEqual(try string(hostAuthority, key: "milestone"), "M2")
+        XCTAssertEqual(try strings(hostAuthority, key: "operations"), ["issue", "redeem", "revoke"])
+        XCTAssertEqual(
+            try string(hostAuthority, key: "routing_test"),
+            "RepoPromptDomainRuntimeTests.DomainWorkspaceContextAuthorityTests/testRoutingGenerationsAndRunLaunchTokensAreAuthoritativeAndSingleUse"
+        )
+        for declaration in try dictionaries(hostAuthority, key: "production_declaration_sites") {
+            let path = try string(declaration, key: "path")
+            let kind = try string(declaration, key: "kind")
+            let symbol = try string(declaration, key: "symbol")
+            XCTAssertTrue(
+                try containsSwiftTypeDeclaration(kind: kind, named: symbol, in: source(path)),
+                "\(kind) \(symbol) at \(path)"
+            )
+        }
     }
 
     func testPersistenceApprovalMainActorAndPerformanceInventoriesRemainComplete() throws {
@@ -374,13 +391,30 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         XCTAssertEqual(Set(scannerFixtureSites.compactMap { $0["symbol"] as? String }), ["InlineActor", "IndentedActor", "AttributedActor", "ExtendedActor"])
 
         let expectedLocalSiteRows = try dictionaries(actorInventory, key: "mcp_local_declaration_sites")
+        let presentationOnlySites = expectedLocalSiteRows.filter {
+            $0["actor_boundary_classification"] != nil
+        }
+        XCTAssertEqual(
+            presentationOnlySites.map(mainActorSiteKey),
+            [
+                "Sources/RepoPrompt/Infrastructure/MCP/AppShared/DomainWorkspacePresentationBridge.swift|class|DomainWorkspacePresentationBridge"
+            ]
+        )
+        let presentationBridge = try XCTUnwrap(presentationOnlySites.first)
+        XCTAssertEqual(presentationBridge["actor_boundary_classification"] as? String, "presentation_only")
+        XCTAssertEqual(
+            presentationBridge["presentation_role"] as? String,
+            "snapshot_projection_and_default_bootstrap_command_client"
+        )
+        XCTAssertEqual(presentationBridge["mutable_domain_authority"] as? Bool, false)
+        XCTAssertEqual(presentationBridge["executable_tool_hop"] as? Bool, false)
         let expectedLocalSites = expectedLocalSiteRows.map(mainActorSiteKey).sorted()
         let actualLocalSites = try mainActorDeclarationSites(
             under: "Sources/RepoPrompt/Infrastructure/MCP"
         ).map(mainActorSiteKey).sorted()
         XCTAssertEqual(actualLocalSites, expectedLocalSites)
         XCTAssertEqual(actualLocalSites.count, try integer(actorInventory, key: "mcp_local_declaration_count"))
-        XCTAssertEqual(actualLocalSites.count, 41)
+        XCTAssertEqual(actualLocalSites.count, 42)
 
         let externalSites = try dictionaries(actorInventory, key: "external_collaborators")
         for site in externalSites {
@@ -394,6 +428,17 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         let allTools = try strings(dictionary(manifest, key: "catalog"), key: "global_tools")
             + strings(dictionary(manifest, key: "catalog"), key: "window_tools")
         XCTAssertEqual(Set(perToolHops.keys), Set(allTools))
+        let executableHopSymbols = Set(perToolHops.values.flatMap(\.self))
+        let presentationOnlySymbols = Set(presentationOnlySites.compactMap { $0["symbol"] as? String })
+        XCTAssertTrue(executableHopSymbols.isDisjoint(with: presentationOnlySymbols))
+        let bridgePath = "Sources/RepoPrompt/Infrastructure/MCP/AppShared/DomainWorkspacePresentationBridge.swift"
+        let mcpBoundarySources = try swiftSources(under: "Sources/RepoPrompt/Infrastructure/MCP")
+        XCTAssertTrue(mcpBoundarySources.contains { $0.path == bridgePath })
+        let bridgeReferenceBoundary = mcpBoundarySources.filter { $0.path != bridgePath }
+        XCTAssertFalse(bridgeReferenceBoundary.isEmpty)
+        for file in bridgeReferenceBoundary {
+            XCTAssertFalse(file.contents.contains("DomainWorkspacePresentationBridge"), file.path)
+        }
         let inventoriedSymbols = Set(expectedLocalSites.map { $0.split(separator: "|").last.map(String.init) ?? "" })
             .union(externalSites.compactMap { $0["symbol"] as? String })
         for tool in allTools {
@@ -442,6 +487,19 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
 
     private func source(_ relativePath: String) throws -> String {
         try String(contentsOf: RepoRoot.url().appendingPathComponent(relativePath), encoding: .utf8)
+    }
+
+    private func swiftSources(under relativeDirectory: String) throws -> [(path: String, contents: String)] {
+        let root = try RepoRoot.url()
+        let directory = root.appendingPathComponent(relativeDirectory, isDirectory: true)
+        let enumerator = try XCTUnwrap(FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil))
+        return try enumerator.compactMap { item -> (path: String, contents: String)? in
+            guard let url = item as? URL, url.pathExtension == "swift" else { return nil }
+            return try (
+                path: String(url.path.dropFirst(root.path.count + 1)),
+                contents: String(contentsOf: url, encoding: .utf8)
+            )
+        }.sorted { $0.path < $1.path }
     }
 
     private func sdkCheckoutSource(_ relativePath: String) throws -> String {
@@ -745,13 +803,9 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
     }
 
     private func mainActorDeclarationSites(under relativeDirectory: String) throws -> [[String: Any]] {
-        let root = try RepoRoot.url()
-        let directory = root.appendingPathComponent(relativeDirectory, isDirectory: true)
-        let enumerator = try XCTUnwrap(FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil))
         var sites: [[String: Any]] = []
-        for case let url as URL in enumerator where url.pathExtension == "swift" {
-            let relativePath = String(url.path.dropFirst(root.path.count + 1))
-            try sites.append(contentsOf: mainActorDeclarationSites(in: String(contentsOf: url, encoding: .utf8), path: relativePath))
+        for file in try swiftSources(under: relativeDirectory) {
+            try sites.append(contentsOf: mainActorDeclarationSites(in: file.contents, path: file.path))
         }
         return sites
     }
@@ -772,14 +826,17 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         }
     }
 
-    private func allSwiftSource() throws -> String {
-        let sources = try RepoRoot.url().appendingPathComponent("Sources", isDirectory: true)
-        let enumerator = try XCTUnwrap(FileManager.default.enumerator(at: sources, includingPropertiesForKeys: nil))
-        var content = ""
-        for case let url as URL in enumerator where url.pathExtension == "swift" {
-            content += try String(contentsOf: url, encoding: .utf8)
-        }
-        return content
+    private func containsSwiftTypeDeclaration(
+        kind: String,
+        named typeName: String,
+        in source: String
+    ) throws -> Bool {
+        let escapedKind = NSRegularExpression.escapedPattern(for: kind)
+        let escapedName = NSRegularExpression.escapedPattern(for: typeName)
+        let expression = try NSRegularExpression(
+            pattern: "(?m)^[ \\t]*(?:(?:public|package|internal|private|fileprivate|open|final|indirect|nonisolated)\\s+)*\(escapedKind)\\s+\(escapedName)\\b"
+        )
+        return expression.firstMatch(in: source, range: NSRange(source.startIndex..., in: source)) != nil
     }
 
     private func makeWindowWithoutAutoStart() -> WindowState {

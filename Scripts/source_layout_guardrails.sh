@@ -382,9 +382,9 @@ if [[ -d "$workspace_core_source_dir" ]]; then
   fi
 fi
 
-# RepoPromptDomainRuntime owns only Sendable MCP catalog/runtime values. It must
-# stay free of app/UI/provider/workspace authority; later milestones add those
-# boundaries deliberately instead of smuggling them into the M1 foundation.
+# RepoPromptDomainRuntime owns Sendable MCP catalog/runtime values plus the M2
+# workspace/context persistence and routing authorities. It remains free of
+# app/UI/provider implementations; later milestones migrate providers deliberately.
 domain_runtime_source_dir="Sources/RepoPromptDomainRuntime"
 if [[ -d "$domain_runtime_source_dir" ]]; then
   unexpected_domain_runtime_files="$(find "$domain_runtime_source_dir" -type f ! -name '*.swift' -print)"
@@ -398,9 +398,37 @@ if [[ -d "$domain_runtime_source_dir" ]]; then
   print_matches \
     "RepoPromptDomainRuntime declares MainActor ownership" \
     grep -R -n -E '@MainActor' "$domain_runtime_source_dir"
+  domain_runtime_m2_required_files=(
+    "DomainPersistence.swift"
+    "DomainWorkspaceModels.swift"
+    "DomainWorkspaceCommand.swift"
+    "DomainWorkspaceContextAuthority.swift"
+    "DomainRoutingCoordinator.swift"
+    "DomainRuntimeMetrics.swift"
+  )
+  for file in "${domain_runtime_m2_required_files[@]}"; do
+    if [[ ! -f "$domain_runtime_source_dir/$file" ]]; then
+      fail "RepoPromptDomainRuntime M2 authority file missing: $file"
+    fi
+  done
   print_matches \
-    "RepoPromptDomainRuntime contains M2+ workspace/context/run/provider authority" \
-    grep -R -n -E 'DomainWorkspaceStore|DomainContextStore|DomainRunLaunchToken|WindowState|ViewModel|AgentProvider|Claude[^[:space:]]*Provider|Codex[^[:space:]]*Provider|OpenCode[^[:space:]]*Provider|Cursor[^[:space:]]*Provider' "$domain_runtime_source_dir"
+    "RepoPromptDomainRuntime contains app/UI/provider implementation" \
+    grep -R -n -E 'WindowState|ViewModel|AgentProvider|Claude[^[:space:]]*Provider|Codex[^[:space:]]*Provider|OpenCode[^[:space:]]*Provider|Cursor[^[:space:]]*Provider' "$domain_runtime_source_dir"
+  print_matches \
+    "RepoPromptDomainRuntime reintroduced random window incarnations" \
+    grep -R -n -E 'windowGeneration.*random|UInt64\.random' "$domain_runtime_source_dir"
+fi
+
+m2_presentation_bridge="Sources/RepoPrompt/Infrastructure/MCP/AppShared/DomainWorkspacePresentationBridge.swift"
+if [[ ! -f "$m2_presentation_bridge" ]]; then
+  fail "M2 MainActor workspace presentation bridge missing"
+else
+  if ! grep -q 'final class DomainWorkspacePresentationBridge' "$m2_presentation_bridge"; then
+    fail "M2 workspace presentation bridge declaration missing"
+  fi
+  if ! grep -q 'guard subscription.snapshot.isBootstrapped' "$m2_presentation_bridge"; then
+    fail "M2 workspace presentation bridge lost first-projection readiness gate"
+  fi
 fi
 
 service_registry_source="Sources/RepoPrompt/Infrastructure/MCP/ServiceRegistry.swift"
@@ -554,6 +582,7 @@ allowed_tracked_docs=(
   "docs/testing.md"
   "docs/spec/headless-mcp-domain-runtime-m0-contracts.md"
   "docs/spec/headless-mcp-domain-runtime-m0-editflowperf-baseline.json"
+  "docs/spec/headless-mcp-domain-runtime-m2-context-authority.md"
   "docs/spec/history-query-tools.md"
   "docs/worktrees.md"
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"

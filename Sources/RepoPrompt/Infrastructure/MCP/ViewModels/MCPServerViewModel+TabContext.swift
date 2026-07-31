@@ -699,6 +699,7 @@ extension MCPServerViewModel {
         fileToolLookupContextCacheByConnectionID.removeValue(forKey: connectionID)
         pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)?.task.cancel()
         guard let context = tabContextByConnectionID.removeValue(forKey: connectionID) else { return }
+        publishDomainRoutingRelease(connectionID: connectionID)
         invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
         endMirroringForConnection(connectionID)
         windowIDByConnection.removeValue(forKey: connectionID)
@@ -1205,6 +1206,7 @@ extension MCPServerViewModel {
 
         activateReadFileAutoSelection(&context)
         tabContextByConnectionID[connectionID] = context
+        publishDomainRoutingBinding(connectionID: connectionID, context: context)
         windowIDByConnection[connectionID] = windowID
         if let runID {
             let mappingSucceeded = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: windowID)
@@ -1359,6 +1361,7 @@ extension MCPServerViewModel {
             }
             activateReadFileAutoSelection(&context)
             tabContextByConnectionID[uuid] = context
+            publishDomainRoutingBinding(connectionID: uuid, context: context)
             windowIDByConnection[uuid] = context.windowID
             var pendingPolicyToken: PendingPolicyRunIDMappingToken?
             if let runID = context.runID {
@@ -1473,6 +1476,7 @@ extension MCPServerViewModel {
         readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
         activateReadFileAutoSelection(&context)
         tabContextByConnectionID[connectionID] = context
+        publishDomainRoutingBinding(connectionID: connectionID, context: context)
         windowIDByConnection[connectionID] = context.windowID
         if let runID = context.runID {
             let mappingSucceeded = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: context.windowID)

@@ -1731,19 +1731,109 @@ final class TabContextRoutingTests: XCTestCase {
     }
 
     @MainActor
-    func testManageSelectionSetPersistsAcrossConnectionRebindAndWorkspaceSerialization() async throws {
+    func testDomainRoutingUsesWindowWideRevisionAcrossLowerSelectionRevision() async throws {
+        let authorityRoot = try makeTemporaryDirectory(named: "window-routing-revision")
+        let storageOverride = ScopedGlobalWorkspaceStorageOverride(authorityRoot: authorityRoot)
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app,
+            profileIdentifier: "window-routing-revision-\(UUID().uuidString)",
+            storageDirectory: authorityRoot,
+            eventDirectory: authorityRoot.appendingPathComponent("events"),
+            temporaryDirectory: authorityRoot.appendingPathComponent("tmp"),
+            externalReloadInterval: nil
+        ))
+        try await runtime.start()
+
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let window = WindowState()
+        let window = WindowState(domainRuntime: runtime)
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        addTeardownBlock { @MainActor in
+            WindowStatesManager.shared.unregisterWindowState(window)
+            await window.tearDown()
+            _ = await runtime.shutdown()
+            storageOverride.restore()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        }
+        await window.workspaceManager.awaitInitialized()
+
+        let connectionID = UUID()
+        var first = MCPServerViewModel.TabContextSnapshot(
+            tabID: UUID(),
+            windowID: window.windowID,
+            workspaceID: nil,
+            promptText: "",
+            selection: StoredSelection(),
+            selectedMetaPromptIDs: [],
+            tabName: "First",
+            runID: nil,
+            explicitlyBound: false
+        )
+        first.selectionRevision = 50
+        window.mcpServer.publishDomainRoutingBinding(connectionID: connectionID, context: first)
+        await window.mcpServer.domainRoutingPublishTask?.value
+
+        var second = MCPServerViewModel.TabContextSnapshot(
+            tabID: UUID(),
+            windowID: window.windowID,
+            workspaceID: nil,
+            promptText: "",
+            selection: StoredSelection(),
+            selectedMetaPromptIDs: [],
+            tabName: "Second",
+            runID: nil,
+            explicitlyBound: false
+        )
+        second.selectionRevision = 0
+        window.mcpServer.publishDomainRoutingBinding(connectionID: connectionID, context: second)
+        await window.mcpServer.domainRoutingPublishTask?.value
+
+        let routing = await runtime.routingCoordinator.snapshot()
+        let descriptor = try XCTUnwrap(routing.windows.first { $0.windowID == window.windowID })
+        XCTAssertEqual(descriptor.activeContextID, second.tabID)
+        XCTAssertEqual(descriptor.presentationRevision, 2)
+        let connection = try XCTUnwrap(routing.connections.first {
+            $0.registration.connectionID == connectionID
+        })
+        guard case let .appPresentationWindow(boundWindowID) = connection.binding else {
+            return XCTFail("Expected the connection to retain its presentation-window binding")
+        }
+        XCTAssertEqual(boundWindowID, window.windowID)
+    }
+
+    @MainActor
+    func testManageSelectionSetPersistsAcrossConnectionRebindAndWorkspaceSerialization() async throws {
+        let authorityRoot = try makeTemporaryDirectory(named: "isolated-domain-authority")
+        // Scope ownership is established before runtime startup can throw. A successful startup
+        // extends it through the teardown block; an early throw releases it via deinit.
+        let storageOverride = ScopedGlobalWorkspaceStorageOverride(authorityRoot: authorityRoot)
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app,
+            profileIdentifier: "tab-context-routing-\(UUID().uuidString)",
+            storageDirectory: authorityRoot,
+            eventDirectory: authorityRoot.appendingPathComponent("events"),
+            temporaryDirectory: authorityRoot.appendingPathComponent("tmp"),
+            externalReloadInterval: nil
+        ))
+        try await runtime.start()
+
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState(domainRuntime: runtime)
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        addTeardownBlock { @MainActor in
+            WindowStatesManager.shared.unregisterWindowState(window)
+            await window.tearDown()
+            _ = await runtime.shutdown()
+            storageOverride.restore()
+        }
+        await window.workspaceManager.awaitInitialized()
 
         let root = try makeTemporaryDirectory(named: "tool-persistence-root")
-        let storageRoot = try makeTemporaryDirectory(named: "serialized-workspace")
         defer {
             try? FileManager.default.removeItem(at: root.deletingLastPathComponent())
-            try? FileManager.default.removeItem(at: storageRoot.deletingLastPathComponent())
         }
         let sources = root.appendingPathComponent("Sources", isDirectory: true)
         try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
@@ -1815,9 +1905,12 @@ final class TabContextRoutingTests: XCTestCase {
         let canonicalTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
         XCTAssertEqual(canonicalTab.selection.selectedPaths, [selectedFile.path])
 
-        var workspaceToSave = try XCTUnwrap(window.workspaceManager.workspace(withID: workspace.id))
-        workspaceToSave.customStoragePath = storageRoot
-        let savedURL = try window.workspaceManager.saveWorkspaceToFile(workspaceToSave, source: .directUnknown)
+        let workspaceToSave = try XCTUnwrap(window.workspaceManager.workspace(withID: workspace.id))
+        let savedURL = try await window.workspaceManager.saveWorkspaceToFileAsync(
+            workspaceToSave,
+            source: .directUnknown
+        )
+        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: savedURL)
         let serializedWorkspace = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: savedURL))
         let serializedTab = try XCTUnwrap(serializedWorkspace.composeTabs.first { $0.id == tabID })
         XCTAssertEqual(serializedTab.selection.selectedPaths, [selectedFile.path])
@@ -3047,6 +3140,7 @@ final class TabContextRoutingTests: XCTestCase {
             let window = WindowState()
             WindowStatesManager.shared.registerWindowState(window)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            await window.workspaceManager.awaitInitialized()
 
             do {
                 let sources = root.appendingPathComponent("Sources", isDirectory: true)
@@ -3061,11 +3155,18 @@ final class TabContextRoutingTests: XCTestCase {
                     repoPaths: [root.path],
                     ephemeral: true
                 )
-                await window.workspaceManager.switchWorkspace(
+                let switchResult = await window.workspaceManager.switchWorkspace(
                     to: workspace,
                     saveState: false,
                     reason: "callerBindingRegressionFixture"
                 )
+                guard switchResult.didSwitch, window.workspaceManager.activeWorkspaceID == workspace.id else {
+                    throw NSError(
+                        domain: "TabContextRoutingTests",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: switchResult.message ?? "Caller-binding workspace did not become active"]
+                    )
+                }
                 let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
                 window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
                 _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
@@ -3315,6 +3416,7 @@ final class TabContextRoutingTests: XCTestCase {
         selection: StoredSelection,
         name: String
     ) async {
+        await window.workspaceManager.awaitInitialized()
         let workspace = WorkspaceModel(
             id: workspaceID,
             name: name,
@@ -3326,11 +3428,15 @@ final class TabContextRoutingTests: XCTestCase {
             activeComposeTabID: tabID
         )
         window.workspaceManager.workspaces = [workspace]
-        await window.workspaceManager.switchWorkspace(
+        let switchResult = await window.workspaceManager.switchWorkspace(
             to: workspace,
             saveState: false,
             reason: "selectionPropagationLifecycleTest"
         )
+        guard switchResult.didSwitch, window.workspaceManager.activeWorkspaceID == workspaceID else {
+            XCTFail(switchResult.message ?? "Selection workspace did not become active")
+            return
+        }
         let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
         guard var installedTab = window.workspaceManager.composeTab(for: identity) else {
             XCTFail("Expected installed selection tab")
@@ -3464,6 +3570,38 @@ final class TabContextRoutingTests: XCTestCase {
         }
     }
 #endif
+
+private final class ScopedGlobalWorkspaceStorageOverride {
+    private let defaults: UserDefaults
+    private let priorStoragePath: String?
+    private let cleanupRoot: URL
+    private var isRestored = false
+
+    init(authorityRoot: URL, defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        priorStoragePath = defaults.string(forKey: "GlobalCustomStorageURL")
+        cleanupRoot = authorityRoot.deletingLastPathComponent()
+        defaults.set(
+            authorityRoot.appendingPathComponent("Workspaces", isDirectory: true).path,
+            forKey: "GlobalCustomStorageURL"
+        )
+    }
+
+    func restore() {
+        guard !isRestored else { return }
+        isRestored = true
+        if let priorStoragePath {
+            defaults.set(priorStoragePath, forKey: "GlobalCustomStorageURL")
+        } else {
+            defaults.removeObject(forKey: "GlobalCustomStorageURL")
+        }
+        try? FileManager.default.removeItem(at: cleanupRoot)
+    }
+
+    deinit {
+        restore()
+    }
+}
 
 private actor TabContextHydrationGate {
     private var isReleased = false

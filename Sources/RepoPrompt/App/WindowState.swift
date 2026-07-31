@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptDomainRuntime
 import SwiftUI
 
 enum WindowKind: String, Codable {
@@ -179,6 +180,7 @@ class WindowState: ObservableObject {
     // MARK: - Possibly shared references
 
     let workspaceManager: WorkspaceManagerViewModel
+    private let domainWorkspacePresentationBridge: DomainWorkspacePresentationBridge?
     weak var windowStatesManager: WindowStatesManager?
 
     /// Reference to the NSWindow this state is associated with
@@ -332,7 +334,17 @@ class WindowState: ObservableObject {
         self.init(
             contextBuilderProviderFactory: nil,
             loadStoredAPISettingsDataOnInit: true,
-            codexModelPollingService: .shared
+            codexModelPollingService: .shared,
+            domainRuntimeOverride: nil
+        )
+    }
+
+    convenience init(domainRuntime: MCPDomainRuntime) {
+        self.init(
+            contextBuilderProviderFactory: nil,
+            loadStoredAPISettingsDataOnInit: true,
+            codexModelPollingService: .shared,
+            domainRuntimeOverride: domainRuntime
         )
     }
 
@@ -341,7 +353,8 @@ class WindowState: ObservableObject {
             self.init(
                 contextBuilderProviderFactory: Optional(contextBuilderProviderFactory),
                 loadStoredAPISettingsDataOnInit: true,
-                codexModelPollingService: .shared
+                codexModelPollingService: .shared,
+                domainRuntimeOverride: nil
             )
         }
 
@@ -352,7 +365,8 @@ class WindowState: ObservableObject {
             self.init(
                 contextBuilderProviderFactory: nil,
                 loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
-                codexModelPollingService: codexModelPollingService
+                codexModelPollingService: codexModelPollingService,
+                domainRuntimeOverride: nil
             )
         }
 
@@ -361,7 +375,8 @@ class WindowState: ObservableObject {
                 contextBuilderProviderFactory: nil,
                 loadStoredAPISettingsDataOnInit: true,
                 codexModelPollingService: .shared,
-                workspaceFileContextStore: workspaceFileContextStore
+                workspaceFileContextStore: workspaceFileContextStore,
+                domainRuntimeOverride: nil
             )
         }
 
@@ -371,7 +386,8 @@ class WindowState: ObservableObject {
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory?,
         loadStoredAPISettingsDataOnInit: Bool,
         codexModelPollingService: CodexModelPollingService,
-        workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil
+        workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
+        domainRuntimeOverride: MCPDomainRuntime?
     ) {
         // Assign a unique window ID
         windowID = WindowState.allocateWindowID()
@@ -389,6 +405,7 @@ class WindowState: ObservableObject {
             windowID: windowID,
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,
             sharedMCPService: Self.sharedMCPService,
+            domainRuntime: domainRuntimeOverride,
             contextBuilderProviderFactory: contextBuilderProviderFactory,
             workspaceFileContextStore: injectedWorkspaceFileContextStore,
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
@@ -414,6 +431,7 @@ class WindowState: ObservableObject {
         aiQueriesService = composition.aiQueriesService
         chatDataService = composition.chatDataService
         workspaceManager = composition.workspaceManager
+        domainWorkspacePresentationBridge = composition.domainWorkspacePresentationBridge
 
         // Set up additional actions
         setupSendPromptAction()
@@ -1633,6 +1651,12 @@ class WindowState: ObservableObject {
                 settingsManager.commitAllVisitedWorkspaces()
             }
         }
+
+        // Stop domain projection before removing the presentation incarnation. The bridge owns
+        // a long-lived subscription, so explicit cancellation is required to bound closed-window
+        // memory and prevent stale windows from multiplying catalog snapshot work.
+        domainWorkspacePresentationBridge?.stop()
+        await mcpServer.unregisterDomainRoutingWindow()
 
         // App-level termination already coordinates agent/session and MCP shutdown.
         // Skip duplicate per-window teardown work on quit so close latency stays bounded.

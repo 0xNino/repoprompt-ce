@@ -49,7 +49,7 @@ Sources/
   RepoPromptCodeMapCore/        # internal deterministic synchronous parsing/query/extraction and canonical artifact core
   RepoPromptRegexCore/          # internal reusable PCRE2 wrapper/JIT runtime
   RepoPromptWorkspaceCore/      # internal Foundation-only workspace path values and deterministic policies
-  RepoPromptDomainRuntime/      # internal AppKit-free MCP runtime identity, catalog, policy, registry, and fingerprints
+  RepoPromptDomainRuntime/      # internal AppKit-free MCP runtime, workspace/context persistence, routing, and launch-token authority
   RepoPromptShared/
     MCP/                         # shared app/CLI MCP control protocol definitions
   RepoPromptMCP/                 # MCP CLI implementation
@@ -60,7 +60,7 @@ Tests/
   RepoPromptCodeMapCoreTests/    # sole owner of pure CodeMap fixtures, goldens, and deterministic core tests
   RepoPromptRegexCoreTests/      # direct reusable regex runtime tests
   RepoPromptWorkspaceCoreTests/  # direct deterministic tests owned by RepoPromptWorkspaceCore
-  RepoPromptDomainRuntimeTests/  # direct owner tests for the headless MCP domain-runtime foundation
+  RepoPromptDomainRuntimeTests/  # direct owner tests for the headless MCP runtime and workspace/context authority
   RepoPromptTests/               # app integration, persistence, workspace, presentation, UI, and MCP tests
 ```
 
@@ -90,7 +90,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 
 - `Sources/RepoPromptExecutable` is restricted to the shipped executable entry. Do not add lifecycle, feature, infrastructure, startup, or composition logic there.
 - Deterministic workspace path values and policies with no app, UI, persistence, filesystem, process, or mutable authority may go under `Sources/RepoPromptWorkspaceCore`; direct tests go under `Tests/RepoPromptWorkspaceCoreTests`. The target is not a general non-UI bucket.
-- AppKit-free MCP runtime identity/lifecycle configuration, canonical tool names, capability/admission/client classification, normalized schema fingerprints, Sendable tool definitions/bindings, and the actor registry belong under `Sources/RepoPromptDomainRuntime`; owner tests belong under `Tests/RepoPromptDomainRuntimeTests`. Application-scoped app-settings and window-routing registration is process-lifetime composition owned: service construction is inert, AppDelegate startup explicitly registers them, fixtures may join but must not unregister its handles, and catalog readiness only observes the canonical registry with a bounded fail-closed wait. The composition also restores missing availability publication without creating a second catalog authority. M1 does not move workspace/context authority, provider implementations, secure credentials, or child-launch tokens into this target.
+- AppKit-free MCP runtime identity/lifecycle configuration, canonical tool names, capability/admission/client classification, normalized schema fingerprints, Sendable tool definitions/bindings, the actor registry, workspace/context document and journal persistence, revision/CAS/event publication, connection/window routing, and run-launch-token authority belong under `Sources/RepoPromptDomainRuntime`; owner tests belong under `Tests/RepoPromptDomainRuntimeTests`. Application-scoped app-settings and global window-routing registration is process-lifetime composition owned: service construction is inert, AppDelegate startup explicitly registers them, fixtures may join but must not unregister its handles, and catalog readiness only observes the canonical registry with a bounded fail-closed wait. The composition also restores missing availability publication without creating a second catalog authority. M2 app composition owns the runtime instance and a MainActor workspace/context projection bridge; AppKit/SwiftUI state, provider execution, protected mutations, child listeners, and read-provider adapters remain outside the M2 boundary.
 - Deterministic synchronous CodeMap grammar descriptors, CodeMap-only queries, invocation-local parsing/extraction, provenance-free decoded source values, pipeline/key canonical encoding, artifact outcomes, and path-free canonical rendering belong under `Sources/RepoPromptCodeMapCore`; pure fixtures/goldens and owner tests belong only under `Tests/RepoPromptCodeMapCoreTests`.
 - Keep CodeMap decoding and raw-digest construction, validation/Git/worktree provenance, permits/cancellation, environment/performance aggregation, CAS/persistence, workspace authority, token/path/import presentation, syntax-query validation, UI/MCP, and selection-graph policy in `RepoPromptApp`. App syntax parsing retains direct `SwiftTreeSitter` linkage; it may consume immutable core grammar descriptors but must not share parser/cursor state.
 - Reusable PCRE2 wrapper/JIT construction belongs under `Sources/RepoPromptRegexCore`; app search policy, limits, repair, and presentation remain app-owned.
