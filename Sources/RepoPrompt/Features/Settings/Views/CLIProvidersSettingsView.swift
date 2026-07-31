@@ -4,6 +4,7 @@ import SwiftUI
 struct CLIProvidersSettingsView: View {
     @ObservedObject var viewModel: APISettingsViewModel
     @ObservedObject var promptViewModel: PromptViewModel
+    @ObservedObject private var codexSessionFence = CodexManagedSessionFence.shared
     let windowID: Int
     var onAPIKeyUpdated: (() -> Void)?
     var closeAction: (() -> Void)?
@@ -37,10 +38,12 @@ struct CLIProvidersSettingsView: View {
     @State private var alertMessage = ""
     @State private var isLoadingClaudeCode = false
     @State private var isLoadingCodex = false
+    @State private var isSigningOutCodex = false
     @State private var activeCodexManagedLoginFlow: CodexManagedLoginFlow?
     @State private var codexManagedLoginOperationID: UUID?
     @State private var codexManagedDeviceCode: CodexManagedChatgptDeviceCode?
     @State private var didCopyCodexManagedDeviceCode = false
+    @State private var showCodexSignOutConfirmation = false
     @State private var isLoadingOpenCode = false
     @State private var isLoadingCursor = false
     @State private var isLoadingZAI = false
@@ -148,7 +151,17 @@ struct CLIProvidersSettingsView: View {
             }
         }
         .alert(isPresented: $showAlert) {
-            if showClaudeCodeTraceDump, viewModel.hasClaudeCodeTrace() {
+            if showCodexSignOutConfirmation {
+                Alert(
+                    title: Text(CodexManagedSignOutConfirmation.title),
+                    message: Text(CodexManagedSignOutConfirmation.message),
+                    primaryButton: .destructive(
+                        Text(CodexManagedSignOutConfirmation.confirmTitle),
+                        action: stopCodexSessionsAndSignOut
+                    ),
+                    secondaryButton: .cancel(Text(CodexManagedSignOutConfirmation.cancelTitle))
+                )
+            } else if showClaudeCodeTraceDump, viewModel.hasClaudeCodeTrace() {
                 Alert(
                     title: Text("CLI Provider Management"),
                     message: Text(alertMessage),
@@ -190,6 +203,7 @@ struct CLIProvidersSettingsView: View {
                 showCodexTraceDump = false
                 showOpenCodeTraceDump = false
                 showCursorTraceDump = false
+                showCodexSignOutConfirmation = false
             }
         }
     }
@@ -1507,6 +1521,36 @@ struct CLIProvidersSettingsView: View {
 
     // MARK: - Codex Card
 
+    private func codexAccountSummary(_ account: CodexManagedAccount) -> some View {
+        let projection = account.settingsProjection
+        return Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 5) {
+            GridRow {
+                Text("Account")
+                    .foregroundColor(.secondary)
+                Text(projection.account)
+                    .foregroundColor(.primary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GridRow {
+                Text("Plan")
+                    .foregroundColor(.secondary)
+                Text(projection.plan)
+                    .foregroundColor(.primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            GridRow {
+                Text("Authentication")
+                    .foregroundColor(.secondary)
+                Text(projection.authentication)
+                    .foregroundColor(.primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .font(.caption)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
     private var codexCard: some View {
         providerCard(
             title: "Codex CLI",
@@ -1532,6 +1576,15 @@ struct CLIProvidersSettingsView: View {
                 if viewModel.isCodexConnected {
                     Divider()
 
+                    if let account = viewModel.managedCodexAccount {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("Signed in to Codex")
+                                .font(.subheadline)
+                                .fontWeight(.semibold)
+                            codexAccountSummary(account)
+                        }
+                    }
+
                     HStack(spacing: 8) {
                         Button(action: { testCodexConnection() }) {
                             if isLoadingCodex {
@@ -1542,16 +1595,25 @@ struct CLIProvidersSettingsView: View {
                                 Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
                             }
                         }
-                        .disabled(isLoadingCodex)
+                        .disabled(isLoadingCodex || isSigningOutCodex || codexSessionFence.isLogoutInProgress)
                         .buttonStyle(CustomButtonStyle())
 
                         Spacer()
 
-                        Button(action: { signOutFromCodex() }) {
-                            Text("Sign Out")
-                                .foregroundColor(.secondary)
+                        if viewModel.managedCodexAccount?.isConfirmedManagedAuthentication == true {
+                            Button(action: requestCodexSignOutConfirmation) {
+                                if isSigningOutCodex {
+                                    ProgressView()
+                                        .scaleEffect(0.6)
+                                        .frame(height: 16)
+                                } else {
+                                    Text("Sign Out")
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            .disabled(isLoadingCodex || isSigningOutCodex || codexSessionFence.isLogoutInProgress)
+                            .buttonStyle(CustomButtonStyle())
                         }
-                        .buttonStyle(CustomButtonStyle())
                     }
 
                     if case let .connected(resolvedExecutable) = viewModel.codexConnectionPhase,
@@ -1581,7 +1643,11 @@ struct CLIProvidersSettingsView: View {
                                 Label("Connect", systemImage: "link")
                             }
                         }
-                        .disabled(isLoadingCodex || activeCodexManagedLoginFlow != nil)
+                        .disabled(
+                            isLoadingCodex
+                                || activeCodexManagedLoginFlow != nil
+                                || codexSessionFence.isLogoutInProgress
+                        )
                         .buttonStyle(CustomButtonStyle())
 
                         Button(action: { startCodexManagedChatgptLogin() }) {
@@ -2168,13 +2234,30 @@ struct CLIProvidersSettingsView: View {
         didCopyCodexManagedDeviceCode = true
     }
 
-    private func signOutFromCodex() {
-        Task {
-            await viewModel.resetCodexConnectionForSignOut(windowID: windowID)
-            await MainActor.run {
-                alertMessage = "Signed out from Codex CLI"
+    private func requestCodexSignOutConfirmation() {
+        guard viewModel.managedCodexAccount?.isConfirmedManagedAuthentication == true,
+              !codexSessionFence.isLogoutInProgress
+        else { return }
+        showCodexSignOutConfirmation = true
+        showAlert = true
+    }
+
+    private func stopCodexSessionsAndSignOut() {
+        guard CodexManagedSignOutConfirmation.shouldProceed(with: .stopSessionsAndSignOut) else { return }
+        isSigningOutCodex = true
+        Task { @MainActor in
+            do {
+                try await viewModel.stopCodexSessionsAndSignOut(windowID: windowID)
+                isSigningOutCodex = false
+                alertMessage = "Signed out from Codex."
+                showCodexTraceDump = false
                 showAlert = true
                 onAPIKeyUpdated?()
+            } catch {
+                isSigningOutCodex = false
+                alertMessage = viewModel.codexError ?? error.asFriendlyString()
+                showCodexTraceDump = false
+                showAlert = true
             }
         }
     }

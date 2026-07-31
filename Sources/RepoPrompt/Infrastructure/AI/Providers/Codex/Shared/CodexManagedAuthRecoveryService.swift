@@ -14,12 +14,14 @@ protocol CodexManagedAuthRPCClient: Sendable {
 
 protocol CodexManagedAuthRecovering: Sendable {
     func refreshManagedAccount() async -> CodexManagedAuthRefreshResult
+    func managedAccountSnapshot() async -> CodexManagedAccount?
     func startManagedChatgptLogin(
         openURL: @MainActor @escaping @Sendable (URL) -> Void
     ) async -> CodexManagedChatgptLoginResult
     func startManagedChatgptDeviceCodeLogin(
         presentDeviceCode: @MainActor @escaping @Sendable (CodexManagedChatgptDeviceCode, Bool) -> Void
     ) async -> CodexManagedChatgptLoginResult
+    func logoutManagedAccount() async -> CodexManagedAuthLogoutResult
 }
 
 enum CodexManagedLoginFlow: Equatable {
@@ -27,16 +29,140 @@ enum CodexManagedLoginFlow: Equatable {
     case deviceCode
 }
 
+struct CodexManagedAccount: Equatable, CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+    let email: String?
+    let planType: String?
+    let accountType: String?
+    let accountID: String?
+    let authenticationMode: String?
+    let managedLoginValidated: Bool
+
+    init(
+        email: String? = nil,
+        planType: String? = nil,
+        accountType: String? = nil,
+        accountID: String? = nil,
+        authenticationMode: String? = nil,
+        managedLoginValidated: Bool = false
+    ) {
+        self.email = email
+        self.planType = planType
+        self.accountType = accountType
+        self.accountID = accountID
+        self.authenticationMode = authenticationMode
+        self.managedLoginValidated = managedLoginValidated
+    }
+
+    var description: String {
+        "CodexManagedAccount(present)"
+    }
+
+    var debugDescription: String {
+        description
+    }
+
+    var customMirror: Mirror {
+        Mirror(
+            self,
+            children: [
+                "hasEmail": email != nil,
+                "hasPlanType": planType != nil,
+                "hasAccountType": accountType != nil,
+                "hasAccountID": accountID != nil,
+                "hasAuthenticationMode": authenticationMode != nil,
+                "managedLoginValidated": managedLoginValidated
+            ],
+            displayStyle: .struct
+        )
+    }
+
+    var identityLabel: String {
+        email ?? "Managed Codex account"
+    }
+
+    var planDisplayLabel: String {
+        Self.normalizedLabel(planType) ?? "Plan not provided"
+    }
+
+    var authenticationModeDisplayLabel: String {
+        Self.normalizedLabel(authenticationMode) ?? "Managed Codex sign-in"
+    }
+
+    var settingsProjection: CodexManagedAccountSettingsProjection {
+        CodexManagedAccountSettingsProjection(
+            account: identityLabel,
+            plan: planDisplayLabel,
+            authentication: authenticationModeDisplayLabel
+        )
+    }
+
+    var isConfirmedManagedAuthentication: Bool {
+        if let accountType,
+           accountType.trimmingCharacters(in: .whitespacesAndNewlines)
+           .caseInsensitiveCompare("chatgpt") == .orderedSame
+        {
+            return true
+        }
+        return managedLoginValidated
+    }
+
+    private static func normalizedLabel(_ rawValue: String?) -> String? {
+        guard let rawValue else { return nil }
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.caseInsensitiveCompare("chatgpt") == .orderedSame {
+            return "ChatGPT"
+        }
+        return trimmed
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .split(whereSeparator: \.isWhitespace)
+            .map { word in
+                let lowered = word.lowercased()
+                switch lowered {
+                case "api": return "API"
+                case "chatgpt": return "ChatGPT"
+                case "oauth": return "OAuth"
+                case "sso": return "SSO"
+                default: return lowered.prefix(1).uppercased() + lowered.dropFirst()
+                }
+            }
+            .joined(separator: " ")
+    }
+}
+
+struct CodexManagedAccountSettingsProjection: Equatable {
+    let account: String
+    let plan: String
+    let authentication: String
+}
+
 enum CodexManagedAuthRefreshResult: Equatable {
-    case recovered
+    case recovered(account: CodexManagedAccount?)
     case requiresUserLogin(message: String)
     case executableUnavailable(message: String)
 }
 
 enum CodexManagedChatgptLoginResult: Equatable {
-    case authenticated
+    case authenticated(account: CodexManagedAccount)
+    case authenticatedWithoutManagedAccount
     case failed(message: String)
     case executableUnavailable(message: String)
+}
+
+enum CodexManagedAuthLogoutResult: Equatable {
+    case signedOut
+    case failed(message: String)
+    case executableUnavailable(message: String)
+
+    var failureMessage: String? {
+        switch self {
+        case .signedOut:
+            nil
+        case let .failed(message), let .executableUnavailable(message):
+            message
+        }
+    }
 }
 
 struct CodexManagedChatgptDeviceCode: Equatable {
@@ -97,10 +223,20 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         CodexProviderHelpers.makeOwnedNonAgentAppServerClient()
     }
 
+    private struct InFlightRefresh {
+        let id: UUID
+        let task: Task<CodexManagedAuthRefreshResult, Never>
+    }
+
     private struct InFlightLogin {
         let id: UUID
         let flow: CodexManagedLoginFlow
         let task: Task<CodexManagedChatgptLoginResult, Never>
+    }
+
+    private struct InFlightLogout {
+        let id: UUID
+        let task: Task<CodexManagedAuthLogoutResult, Never>
     }
 
     private let clientFactory: @Sendable () -> any CodexManagedAuthRPCClient
@@ -108,10 +244,15 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
     private let browserLoginValidationTimeout: TimeInterval
     private let deviceCodeLoginValidationTimeout: TimeInterval
     private let loginPollInterval: TimeInterval
+    private let cancelledWorkRetirementTimeout: TimeInterval
     private let now: @Sendable () -> Date
     private let sleep: @Sendable (TimeInterval) async throws -> Void
-    private var inFlightRefreshTask: Task<CodexManagedAuthRefreshResult, Never>?
+    private let retirementSleep: @Sendable (TimeInterval) async throws -> Void
+    private var inFlightRefresh: InFlightRefresh?
     private var inFlightLogin: InFlightLogin?
+    private var inFlightLogout: InFlightLogout?
+    private var latestManagedAccount: CodexManagedAccount?
+    private var authMutationGeneration: UInt64 = 0
     private var deviceCodePresenters: [UUID: @MainActor @Sendable (CodexManagedChatgptDeviceCode, Bool) -> Void] = [:]
     private var currentDeviceCode: CodexManagedChatgptDeviceCode?
 
@@ -121,8 +262,12 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         browserLoginValidationTimeout: TimeInterval = 300,
         deviceCodeLoginValidationTimeout: TimeInterval = 15 * 60,
         loginPollInterval: TimeInterval = 0.5,
+        cancelledWorkRetirementTimeout: TimeInterval = 5,
         now: @escaping @Sendable () -> Date = { Date() },
         sleep: @escaping @Sendable (TimeInterval) async throws -> Void = { interval in
+            try await Task.sleep(nanoseconds: UInt64(max(0, interval) * 1_000_000_000))
+        },
+        retirementSleep: @escaping @Sendable (TimeInterval) async throws -> Void = { interval in
             try await Task.sleep(nanoseconds: UInt64(max(0, interval) * 1_000_000_000))
         }
     ) {
@@ -131,53 +276,101 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         self.browserLoginValidationTimeout = browserLoginValidationTimeout
         self.deviceCodeLoginValidationTimeout = deviceCodeLoginValidationTimeout
         self.loginPollInterval = loginPollInterval
+        self.cancelledWorkRetirementTimeout = cancelledWorkRetirementTimeout
         self.now = now
         self.sleep = sleep
+        self.retirementSleep = retirementSleep
     }
 
     func refreshManagedAccount() async -> CodexManagedAuthRefreshResult {
+        if let inFlightLogout {
+            switch await inFlightLogout.task.value {
+            case .signedOut:
+                latestManagedAccount = nil
+                return .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
+            case .failed, .executableUnavailable:
+                break
+            }
+        }
+        let operationGeneration = authMutationGeneration
         if let inFlightLogin {
-            switch await inFlightLogin.task.value {
-            case .authenticated:
-                return .recovered
+            let result = await inFlightLogin.task.value
+            guard operationGeneration == authMutationGeneration else {
+                return .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
+            }
+            switch result {
+            case let .authenticated(account):
+                latestManagedAccount = account
+                return .recovered(account: account)
+            case .authenticatedWithoutManagedAccount:
+                latestManagedAccount = nil
+                return .recovered(account: nil)
             case let .executableUnavailable(message):
+                latestManagedAccount = nil
                 return .executableUnavailable(message: message)
             case .failed:
                 return .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
             }
         }
-        if let inFlightRefreshTask {
-            return await inFlightRefreshTask.value
+        if let inFlightRefresh {
+            let result = await inFlightRefresh.task.value
+            guard operationGeneration == authMutationGeneration else {
+                return .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
+            }
+            applyRefreshResult(result)
+            return result
         }
 
         let task = Task<CodexManagedAuthRefreshResult, Never> { [clientFactory, refreshRequestTimeout] in
             let client = clientFactory()
-            defer {
-                Task { await client.stop() }
-            }
+            let result: CodexManagedAuthRefreshResult
             do {
                 await client.updateDefaultRequestTimeout(refreshRequestTimeout)
                 try await client.startIfNeeded()
-                let result = try await client.request(
+                let response = try await client.request(
                     method: "account/read",
                     params: ["refreshToken": true],
                     timeout: refreshRequestTimeout
                 )
-                if Self.isValidAccountReadResult(result) {
-                    return .recovered
+                if Self.isValidAccountReadResult(response) {
+                    result = .recovered(account: Self.parseManagedAccount(from: response))
+                } else {
+                    result = .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
                 }
             } catch {
                 if let message = Self.executableUnavailableMessage(from: error) {
-                    return .executableUnavailable(message: message)
+                    result = .executableUnavailable(message: message)
+                } else {
+                    result = .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
                 }
-                return .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
             }
+            await client.stop()
+            return result
+        }
+        let refreshID = UUID()
+        inFlightRefresh = InFlightRefresh(id: refreshID, task: task)
+        let result = await task.value
+        if inFlightRefresh?.id == refreshID {
+            inFlightRefresh = nil
+        }
+        guard operationGeneration == authMutationGeneration else {
             return .requiresUserLogin(message: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
         }
-        inFlightRefreshTask = task
-        let result = await task.value
-        inFlightRefreshTask = nil
+        applyRefreshResult(result)
         return result
+    }
+
+    func managedAccountSnapshot() -> CodexManagedAccount? {
+        latestManagedAccount
+    }
+
+    private func applyRefreshResult(_ result: CodexManagedAuthRefreshResult) {
+        switch result {
+        case let .recovered(account):
+            latestManagedAccount = account
+        case .requiresUserLogin, .executableUnavailable:
+            latestManagedAccount = nil
+        }
     }
 
     func startManagedChatgptLogin(
@@ -247,11 +440,22 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         flow: CodexManagedLoginFlow,
         operation: @escaping @Sendable () async -> CodexManagedChatgptLoginResult
     ) async -> CodexManagedChatgptLoginResult {
+        if let inFlightLogout {
+            _ = await inFlightLogout.task.value
+        }
+        let operationGeneration = authMutationGeneration
         var waitedForRefresh = false
         while true {
+            guard operationGeneration == authMutationGeneration else {
+                return .failed(message: "Codex sign-in was canceled because sign out started.")
+            }
             if let slot = inFlightLogin {
                 if slot.flow == flow {
-                    return await slot.task.value
+                    let result = await slot.task.value
+                    guard operationGeneration == authMutationGeneration else {
+                        return .failed(message: "Codex sign-in was canceled because sign out started.")
+                    }
+                    return result
                 }
                 slot.task.cancel()
                 _ = await slot.task.value
@@ -262,15 +466,24 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                 continue
             }
 
-            if !waitedForRefresh, let refreshTask = inFlightRefreshTask {
+            if !waitedForRefresh, let refresh = inFlightRefresh {
                 waitedForRefresh = true
-                switch await refreshTask.value {
-                case .recovered:
-                    return .authenticated
-                case let .executableUnavailable(message):
-                    return .executableUnavailable(message: message)
+                let refreshResult = await refresh.task.value
+                guard operationGeneration == authMutationGeneration else {
+                    return .failed(message: "Codex sign-in was canceled because sign out started.")
+                }
+                switch refreshResult {
+                case let .recovered(account?):
+                    latestManagedAccount = account
+                    return .authenticated(account: account)
+                case .recovered(account: nil):
+                    latestManagedAccount = nil
+                    return .authenticatedWithoutManagedAccount
                 case .requiresUserLogin:
                     continue
+                case let .executableUnavailable(message):
+                    latestManagedAccount = nil
+                    return .executableUnavailable(message: message)
                 }
             }
 
@@ -284,8 +497,123 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                 inFlightLogin = nil
                 currentDeviceCode = nil
             }
+            guard operationGeneration == authMutationGeneration else {
+                return .failed(message: "Codex sign-in was canceled because sign out started.")
+            }
+            switch result {
+            case let .authenticated(account):
+                latestManagedAccount = account
+            case .authenticatedWithoutManagedAccount, .executableUnavailable:
+                latestManagedAccount = nil
+            case .failed:
+                break
+            }
             return result
         }
+    }
+
+    func logoutManagedAccount() async -> CodexManagedAuthLogoutResult {
+        if let inFlightLogout {
+            return await inFlightLogout.task.value
+        }
+
+        authMutationGeneration &+= 1
+        let loginTask = inFlightLogin?.task
+        loginTask?.cancel()
+        if inFlightLogin != nil {
+            inFlightLogin = nil
+        }
+        let refreshTask = inFlightRefresh?.task
+        refreshTask?.cancel()
+        inFlightRefresh = nil
+        currentDeviceCode = nil
+
+        var retirementTasks: [Task<Void, Never>] = []
+        if let loginTask {
+            retirementTasks.append(Task { _ = await loginTask.value })
+        }
+        if let refreshTask {
+            retirementTasks.append(Task { _ = await refreshTask.value })
+        }
+
+        let id = UUID()
+        let task = Task<CodexManagedAuthLogoutResult, Never> { [
+            clientFactory,
+            refreshRequestTimeout,
+            cancelledWorkRetirementTimeout,
+            retirementSleep
+        ] in
+            _ = await Self.awaitCancelledWorkRetirement(
+                retirementTasks,
+                timeout: cancelledWorkRetirementTimeout,
+                sleep: retirementSleep
+            )
+
+            let client = clientFactory()
+            let result: CodexManagedAuthLogoutResult
+            do {
+                await client.updateDefaultRequestTimeout(refreshRequestTimeout)
+                try await client.startIfNeeded()
+                _ = try await client.request(
+                    method: "account/logout",
+                    params: nil,
+                    timeout: refreshRequestTimeout
+                )
+                result = .signedOut
+            } catch {
+                if let message = Self.executableUnavailableMessage(from: error) {
+                    result = .executableUnavailable(message: message)
+                } else {
+                    result = .failed(message: Self.trimmedMessage(
+                        error.localizedDescription,
+                        fallback: "Codex could not complete sign out."
+                    ))
+                }
+            }
+            await client.stop()
+            await self.finishLogoutOperation(id: id, result: result)
+            return result
+        }
+        inFlightLogout = InFlightLogout(id: id, task: task)
+        return await task.value
+    }
+
+    private func finishLogoutOperation(id: UUID, result: CodexManagedAuthLogoutResult) {
+        guard inFlightLogout?.id == id else { return }
+        inFlightLogout = nil
+        switch result {
+        case .signedOut, .executableUnavailable:
+            latestManagedAccount = nil
+        case .failed:
+            break
+        }
+    }
+
+    private static func awaitCancelledWorkRetirement(
+        _ tasks: [Task<Void, Never>],
+        timeout: TimeInterval,
+        sleep: @escaping @Sendable (TimeInterval) async throws -> Void
+    ) async -> Bool {
+        guard !tasks.isEmpty else { return true }
+        let signal = RetirementSignal()
+        let retirementTask = Task {
+            for task in tasks {
+                await task.value
+            }
+            await signal.resolve(true)
+        }
+        let timeoutTask = Task {
+            do {
+                try await sleep(max(0, timeout))
+            } catch {
+                return
+            }
+            await signal.resolve(false)
+        }
+        let retired = await signal.wait()
+        retirementTask.cancel()
+        timeoutTask.cancel()
+        return retired
     }
 
     private func publishDeviceCode(
@@ -370,13 +698,15 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                         }
                         switch completion {
                         case .success:
-                            let isAuthenticated = try await readAuthenticatedAccount(
+                            guard let account = try await readAuthenticatedAccount(
                                 client: client,
                                 timeout: requestTimeout,
                                 retryDelay: pollInterval,
                                 sleep: sleep
-                            )
-                            return isAuthenticated ? .authenticated : nil
+                            ) else {
+                                return nil
+                            }
+                            return .authenticated(account: account)
                         case let .failure(message):
                             return .failed(message: failureGuidance(
                                 flow: flow,
@@ -392,13 +722,13 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                         // authoritative even when the user signs back into the same account.
                         while now() < deadline {
                             try Task.checkCancellation()
-                            if try await readAuthenticatedAccount(
+                            if let account = try await readAuthenticatedAccount(
                                 client: client,
                                 timeout: requestTimeout,
                                 retryDelay: pollInterval,
                                 sleep: sleep
                             ) {
-                                return .authenticated
+                                return .authenticated(account: account)
                             }
                             let remaining = deadline.timeIntervalSince(now())
                             if remaining > 0 {
@@ -406,13 +736,13 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                             }
                         }
                         try Task.checkCancellation()
-                        if try await readAuthenticatedAccount(
+                        if let account = try await readAuthenticatedAccount(
                             client: client,
                             timeout: requestTimeout,
                             retryDelay: pollInterval,
                             sleep: sleep
                         ) {
-                            return .authenticated
+                            return .authenticated(account: account)
                         }
                         return .failed(message: timeoutGuidance(flow: flow, authURL: browserAuthURL))
                     }
@@ -452,7 +782,7 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         timeout: TimeInterval,
         retryDelay: TimeInterval,
         sleep: @escaping @Sendable (TimeInterval) async throws -> Void
-    ) async throws -> Bool {
+    ) async throws -> CodexManagedAccount? {
         var transientFailureCount = 0
         while true {
             do {
@@ -461,7 +791,15 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
                     params: ["refreshToken": true],
                     timeout: timeout
                 )
-                return isAuthenticatedAccountReadResult(result)
+                guard let account = parseManagedAccount(from: result) else { return nil }
+                return CodexManagedAccount(
+                    email: account.email,
+                    planType: account.planType,
+                    accountType: account.accountType,
+                    accountID: account.accountID,
+                    authenticationMode: account.authenticationMode ?? "managed_chatgpt",
+                    managedLoginValidated: true
+                )
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -642,6 +980,31 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
         return true
     }
 
+    static func parseManagedAccount(from result: [String: Any]) -> CodexManagedAccount? {
+        guard boolValue(in: result, keys: ["requiresOpenaiAuth", "requires_openai_auth"]) != false else {
+            return nil
+        }
+        guard isAuthenticatedAccountReadResult(result) else { return nil }
+        guard let account = result["account"] as? [String: Any] else {
+            return CodexManagedAccount()
+        }
+        let accountType = stringValue(in: account, keys: ["type", "kind", "accountType", "account_type"])
+        let explicitAuthenticationMode = stringValue(
+            in: account,
+            keys: ["authenticationMode", "authentication_mode", "authMode", "auth_mode"]
+        ) ?? stringValue(
+            in: result,
+            keys: ["authenticationMode", "authentication_mode", "authMode", "auth_mode"]
+        )
+        return CodexManagedAccount(
+            email: stringValue(in: account, keys: ["email"]),
+            planType: stringValue(in: account, keys: ["planType", "plan_type", "plan"]),
+            accountType: accountType,
+            accountID: stringValue(in: account, keys: ["accountId", "account_id", "id"]),
+            authenticationMode: explicitAuthenticationMode
+        )
+    }
+
     private static func stringValue(in payload: [String: Any], keys: [String]) -> String? {
         for key in keys {
             if let value = payload[key] as? String, !value.isEmpty {
@@ -668,6 +1031,32 @@ actor CodexManagedAuthRecoveryService: CodexManagedAuthRecovering {
     private enum ManagedChatgptLoginStartResponse {
         case browser(ManagedChatgptBrowserLoginStartResponse)
         case deviceCode(CodexManagedChatgptDeviceCode)
+    }
+
+    private actor RetirementSignal {
+        private var result: Bool?
+        private var waiters: [CheckedContinuation<Bool, Never>] = []
+
+        func wait() async -> Bool {
+            if let result { return result }
+            return await withCheckedContinuation { continuation in
+                if let result {
+                    continuation.resume(returning: result)
+                } else {
+                    waiters.append(continuation)
+                }
+            }
+        }
+
+        func resolve(_ result: Bool) {
+            guard self.result == nil else { return }
+            self.result = result
+            let pending = waiters
+            waiters.removeAll()
+            for waiter in pending {
+                waiter.resume(returning: result)
+            }
+        }
     }
 
     private actor LoginCancellationState {

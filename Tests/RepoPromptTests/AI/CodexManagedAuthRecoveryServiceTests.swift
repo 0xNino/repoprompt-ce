@@ -66,7 +66,7 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
             presented.set((code: code, shouldOpen: shouldOpen))
         }
 
-        XCTAssertEqual(result, .authenticated)
+        assertAuthenticated(result)
         XCTAssertEqual(presented.value?.code.userCode, "ABCD-EFGH")
         XCTAssertEqual(presented.value?.shouldOpen, true)
         XCTAssertEqual(client.requestCount(method: "account/login/start"), 1)
@@ -127,7 +127,7 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
 
         let result = await service.startManagedChatgptLogin { _ in }
 
-        XCTAssertEqual(result, .authenticated)
+        assertAuthenticated(result)
         let refreshFlags = client.accountReadRefreshFlags()
         XCTAssertFalse(refreshFlags.isEmpty)
         XCTAssertTrue(refreshFlags.allSatisfy(\.self))
@@ -161,7 +161,7 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
 
             let result = await service.startManagedChatgptDeviceCodeLogin { _, _ in }
 
-            XCTAssertEqual(result, .authenticated)
+            assertAuthenticated(result)
             XCTAssertEqual(client.accountReadRefreshFlags(), [true, true])
             XCTAssertEqual(client.stopCallCount(), 1)
         }
@@ -318,7 +318,7 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
 
         let result = await service.startManagedChatgptLogin { _ in }
 
-        XCTAssertEqual(result, .authenticated)
+        assertAuthenticated(result)
         XCTAssertEqual(client.requestCount(method: "account/read"), 2)
         XCTAssertEqual(client.requestCount(method: "account/login/start"), 1)
     }
@@ -376,7 +376,7 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
         let deviceResult = await service.startManagedChatgptDeviceCodeLogin { _, _ in }
         let browserResult = await browserTask.value
 
-        XCTAssertEqual(deviceResult, .authenticated)
+        assertAuthenticated(deviceResult)
         guard case .failed = browserResult else {
             return XCTFail("Expected the browser flow to be canceled, got \(browserResult)")
         }
@@ -415,8 +415,8 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
         }
         let (a, b) = await (resultA, resultB)
 
-        XCTAssertEqual(a, .authenticated)
-        XCTAssertEqual(b, .authenticated)
+        assertAuthenticated(a)
+        assertAuthenticated(b)
         XCTAssertEqual(client.requestCount(method: "account/login/start"), 1)
         XCTAssertEqual(clients.remaining, 0)
 
@@ -465,8 +465,8 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
         let (result1, result2) = await (deviceResult1, deviceResult2)
         let browserResult = await browserTask.value
 
-        XCTAssertEqual(result1, .authenticated)
-        XCTAssertEqual(result2, .authenticated)
+        assertAuthenticated(result1)
+        assertAuthenticated(result2)
         guard case .failed = browserResult else {
             return XCTFail("Expected the browser flow to be canceled, got \(browserResult)")
         }
@@ -531,6 +531,448 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
         XCTAssertEqual(clock.now.timeIntervalSince1970, 900, accuracy: 0.001)
     }
 
+    func testManagedAccountParsingSupportsRepresentativeAndPartialPayloads() throws {
+        let full = try XCTUnwrap(CodexManagedAuthRecoveryService.parseManagedAccount(from: [
+            "account": [
+                "type": "chatgpt",
+                "email": "person@example.com",
+                "planType": "self_serve_business_prolite",
+                "accountId": "account-123"
+            ],
+            "requiresOpenaiAuth": true
+        ]))
+        XCTAssertEqual(
+            full,
+            CodexManagedAccount(
+                email: "person@example.com",
+                planType: "self_serve_business_prolite",
+                accountType: "chatgpt",
+                accountID: "account-123"
+            )
+        )
+        XCTAssertEqual(full.identityLabel, "person@example.com")
+        XCTAssertEqual(full.planDisplayLabel, "Self Serve Business Prolite")
+        XCTAssertEqual(full.authenticationModeDisplayLabel, "Managed Codex sign-in")
+        XCTAssertTrue(full.isConfirmedManagedAuthentication)
+
+        let partial = try XCTUnwrap(CodexManagedAuthRecoveryService.parseManagedAccount(from: [
+            "account": ["plan_type": "plus"]
+        ]))
+        XCTAssertEqual(
+            partial,
+            CodexManagedAccount(planType: "plus")
+        )
+        XCTAssertEqual(partial.identityLabel, "Managed Codex account")
+        XCTAssertEqual(partial.planDisplayLabel, "Plus")
+        XCTAssertEqual(partial.authenticationModeDisplayLabel, "Managed Codex sign-in")
+        XCTAssertFalse(partial.isConfirmedManagedAuthentication)
+
+        let explicitMode = try XCTUnwrap(CodexManagedAuthRecoveryService.parseManagedAccount(from: [
+            "account": ["authentication_mode": "enterprise_sso"]
+        ]))
+        XCTAssertEqual(explicitMode.authenticationMode, "enterprise_sso")
+        XCTAssertEqual(explicitMode.authenticationModeDisplayLabel, "Enterprise SSO")
+        XCTAssertFalse(explicitMode.isConfirmedManagedAuthentication)
+
+        let apiKeyAccount = try XCTUnwrap(CodexManagedAuthRecoveryService.parseManagedAccount(from: [
+            "account": ["type": "apiKey", "authentication_mode": "api_key"]
+        ]))
+        XCTAssertEqual(apiKeyAccount.authenticationModeDisplayLabel, "API Key")
+        XCTAssertFalse(apiKeyAccount.isConfirmedManagedAuthentication)
+
+        XCTAssertEqual(
+            CodexManagedAuthRecoveryService.parseManagedAccount(from: ["account": "present"]),
+            CodexManagedAccount()
+        )
+        XCTAssertNil(CodexManagedAuthRecoveryService.parseManagedAccount(from: [:]))
+        XCTAssertNil(CodexManagedAuthRecoveryService.parseManagedAccount(from: ["account": NSNull()]))
+    }
+
+    func testManagedAccountDisplayProjectionKeepsAccountPlanAndAuthenticationDistinct() {
+        let account = CodexManagedAccount(
+            email: "person@example.com",
+            planType: "business_plus",
+            accountType: "chatgpt",
+            accountID: "not-for-display",
+            authenticationMode: "enterprise_sso"
+        )
+
+        XCTAssertEqual(
+            account.settingsProjection,
+            CodexManagedAccountSettingsProjection(
+                account: "person@example.com",
+                plan: "Business Plus",
+                authentication: "Enterprise SSO"
+            )
+        )
+        XCTAssertNotEqual(account.settingsProjection.plan, account.settingsProjection.authentication)
+
+        let fallback = CodexManagedAccount()
+        XCTAssertEqual(
+            fallback.settingsProjection,
+            CodexManagedAccountSettingsProjection(
+                account: "Managed Codex account",
+                plan: "Plan not provided",
+                authentication: "Managed Codex sign-in"
+            )
+        )
+    }
+
+    func testRefreshPublishesSnapshotAndDefinitiveSignedOutClearsIt() async {
+        let accountPayload: [String: Any] = [
+            "account": ["type": "chatgpt", "email": "refresh@example.com", "planType": "pro"],
+            "requiresOpenaiAuth": true
+        ]
+        let client = MockCodexManagedAuthClient(
+            loginStartResponse: Self.browserStartResponse,
+            accountReadResponses: [accountPayload, Self.signedOutAccount]
+        )
+        let service = makeService(client: client, clock: TestClock(), validationTimeout: 1)
+
+        let first = await service.refreshManagedAccount()
+        XCTAssertEqual(
+            first,
+            .recovered(account: CodexManagedAccount(
+                email: "refresh@example.com",
+                planType: "pro",
+                accountType: "chatgpt"
+            ))
+        )
+        let firstSnapshot = await service.managedAccountSnapshot()
+        XCTAssertNotNil(firstSnapshot)
+
+        guard case .requiresUserLogin = await service.refreshManagedAccount() else {
+            return XCTFail("Expected the signed-out account response to require login")
+        }
+        let clearedSnapshot = await service.managedAccountSnapshot()
+        XCTAssertNil(clearedSnapshot)
+    }
+
+    func testLoginReturnsFreshManagedAccountSnapshot() async {
+        let accountPayload: [String: Any] = [
+            "account": ["type": "chatgpt", "email": "fresh@example.com", "planType": "plus"],
+            "requiresOpenaiAuth": true
+        ]
+        let client = MockCodexManagedAuthClient(
+            loginStartResponse: Self.deviceStartResponse,
+            accountReadResponses: [Self.signedOutAccount, accountPayload]
+        )
+        let service = makeService(client: client, clock: TestClock(), validationTimeout: 2)
+
+        let result = await service.startManagedChatgptDeviceCodeLogin { _, _ in }
+        guard case let .authenticated(account) = result else {
+            return XCTFail("Expected authenticated result, got \(result)")
+        }
+        XCTAssertEqual(account.email, "fresh@example.com")
+        XCTAssertEqual(account.planType, "plus")
+        XCTAssertTrue(account.isConfirmedManagedAuthentication)
+        let snapshot = await service.managedAccountSnapshot()
+        XCTAssertEqual(snapshot, account)
+    }
+
+    func testRecoveredConnectionWithoutManagedAccountDoesNotStartChatGPTLogin() async throws {
+        let refreshStopGate = TestAsyncGate()
+        let client = MockCodexManagedAuthClient(
+            loginStartResponse: Self.browserStartResponse,
+            accountReadResponses: [[
+                "account": [
+                    "type": "chatgpt",
+                    "email": "incidental@example.com",
+                    "authentication_mode": "enterprise_sso"
+                ],
+                "requiresOpenaiAuth": false
+            ]],
+            stopGate: refreshStopGate
+        )
+        let service = makeService(client: client, clock: TestClock(), validationTimeout: 1)
+
+        let refreshTask = Task { await service.refreshManagedAccount() }
+        try await waitUntil { client.requestCount(method: "account/read") == 1 }
+        let loginTask = Task { await service.startManagedChatgptLogin { _ in } }
+        await Task.yield()
+
+        XCTAssertEqual(client.requestCount(method: "account/login/start"), 0)
+        await refreshStopGate.open()
+        let refreshResult = await refreshTask.value
+        let loginResult = await loginTask.value
+        XCTAssertEqual(refreshResult, .recovered(account: nil))
+        XCTAssertEqual(loginResult, .authenticatedWithoutManagedAccount)
+        XCTAssertEqual(client.requestCount(method: "account/login/start"), 0)
+        let snapshot = await service.managedAccountSnapshot()
+        XCTAssertNil(snapshot)
+    }
+
+    func testLogoutBoundsCanceledLoginRetirementAndDoesNotClobberLaterLogin() async throws {
+        let abandonedLoginStopGate = TestAsyncGate()
+        let abandonedLoginClient = MockCodexManagedAuthClient(
+            label: "abandoned-login",
+            loginStartResponse: Self.deviceStartResponse,
+            accountReadResponses: [Self.signedInAccount],
+            stopGate: abandonedLoginStopGate
+        )
+        let logoutClient = MockCodexManagedAuthClient(
+            label: "logout",
+            loginStartResponse: Self.browserStartResponse,
+            accountReadResponses: []
+        )
+        let laterLoginPayload: [String: Any] = [
+            "account": ["type": "chatgpt", "email": "later@example.com"],
+            "requiresOpenaiAuth": true
+        ]
+        let laterLoginClient = MockCodexManagedAuthClient(
+            label: "later-login",
+            loginStartResponse: Self.browserStartResponse,
+            accountReadResponses: [laterLoginPayload]
+        )
+        let clients = ClientFactoryBox([abandonedLoginClient, logoutClient, laterLoginClient])
+        let service = CodexManagedAuthRecoveryService(
+            clientFactory: { clients.next() },
+            refreshRequestTimeout: 1,
+            browserLoginValidationTimeout: 1,
+            deviceCodeLoginValidationTimeout: 1,
+            loginPollInterval: 0.01,
+            cancelledWorkRetirementTimeout: 1,
+            retirementSleep: { _ in }
+        )
+
+        let abandonedLogin = Task {
+            await service.startManagedChatgptDeviceCodeLogin { _, _ in }
+        }
+        try await waitUntil { abandonedLoginClient.requestCount(method: "account/read") == 1 }
+
+        let logoutResult = await service.logoutManagedAccount()
+        XCTAssertEqual(logoutResult, .signedOut)
+        XCTAssertEqual(logoutClient.requestCount(method: "account/logout"), 1)
+        XCTAssertEqual(abandonedLoginClient.stopCallCount(), 0)
+
+        let laterLogin = await service.startManagedChatgptLogin { _ in }
+        guard case let .authenticated(account) = laterLogin else {
+            await abandonedLoginStopGate.open()
+            _ = await abandonedLogin.value
+            return XCTFail("Expected later login to succeed, got \(laterLogin)")
+        }
+        XCTAssertEqual(account.email, "later@example.com")
+
+        await abandonedLoginStopGate.open()
+        _ = await abandonedLogin.value
+        let snapshot = await service.managedAccountSnapshot()
+        XCTAssertEqual(snapshot?.email, "later@example.com")
+    }
+
+    func testAbandonedRefreshCannotClearLaterRefreshSlotOrRaceManagedLogin() async throws {
+        let abandonedRefreshStopGate = TestAsyncGate()
+        let laterRefreshStopGate = TestAsyncGate()
+        let abandonedRefreshClient = MockCodexManagedAuthClient(
+            label: "abandoned-refresh",
+            loginStartResponse: Self.browserStartResponse,
+            accountReadResponses: [Self.signedInAccount],
+            stopGate: abandonedRefreshStopGate
+        )
+        let logoutClient = MockCodexManagedAuthClient(
+            label: "logout",
+            loginStartResponse: Self.browserStartResponse,
+            accountReadResponses: []
+        )
+        let laterPayload: [String: Any] = [
+            "account": ["type": "chatgpt", "email": "later-refresh@example.com"],
+            "requiresOpenaiAuth": true
+        ]
+        let laterRefreshClient = MockCodexManagedAuthClient(
+            label: "later-refresh",
+            loginStartResponse: Self.browserStartResponse,
+            accountReadResponses: [laterPayload],
+            stopGate: laterRefreshStopGate
+        )
+        let unexpectedLoginClient = MockCodexManagedAuthClient(
+            label: "unexpected-login",
+            loginStartResponse: Self.browserStartResponse,
+            accountReadResponses: [laterPayload]
+        )
+        let clients = ClientFactoryBox([
+            abandonedRefreshClient,
+            logoutClient,
+            laterRefreshClient,
+            unexpectedLoginClient
+        ])
+        let service = CodexManagedAuthRecoveryService(
+            clientFactory: { clients.next() },
+            cancelledWorkRetirementTimeout: 1,
+            retirementSleep: { _ in }
+        )
+
+        let abandonedRefresh = Task { await service.refreshManagedAccount() }
+        try await waitUntil { abandonedRefreshClient.requestCount(method: "account/read") == 1 }
+        let logoutResult = await service.logoutManagedAccount()
+        XCTAssertEqual(logoutResult, .signedOut)
+
+        let laterRefresh = Task { await service.refreshManagedAccount() }
+        try await waitUntil { laterRefreshClient.requestCount(method: "account/read") == 1 }
+        await abandonedRefreshStopGate.open()
+        _ = await abandonedRefresh.value
+
+        let login = Task { await service.startManagedChatgptLogin { _ in } }
+        await Task.yield()
+        XCTAssertEqual(unexpectedLoginClient.requestCount(method: "account/login/start"), 0)
+
+        await laterRefreshStopGate.open()
+        guard case let .recovered(account?) = await laterRefresh.value else {
+            return XCTFail("Expected later refresh to recover its account")
+        }
+        XCTAssertEqual(account.email, "later-refresh@example.com")
+        guard case let .authenticated(loginAccount) = await login.value else {
+            return XCTFail("Expected login to await and reuse the later refresh")
+        }
+        XCTAssertEqual(loginAccount.email, "later-refresh@example.com")
+        XCTAssertEqual(unexpectedLoginClient.requestCount(method: "account/login/start"), 0)
+    }
+
+    func testLogoutSupersedesInFlightLoginWithoutPublishingStaleSnapshot() async throws {
+        let loginStopGate = TestAsyncGate()
+        let loginClient = MockCodexManagedAuthClient(
+            label: "login",
+            loginStartResponse: Self.deviceStartResponse,
+            accountReadResponses: [Self.signedInAccount],
+            stopGate: loginStopGate
+        )
+        let logoutClient = MockCodexManagedAuthClient(
+            label: "logout",
+            loginStartResponse: Self.browserStartResponse,
+            accountReadResponses: []
+        )
+        let clients = ClientFactoryBox([loginClient, logoutClient])
+        let service = CodexManagedAuthRecoveryService(
+            clientFactory: { clients.next() },
+            deviceCodeLoginValidationTimeout: 2,
+            loginPollInterval: 0.01
+        )
+
+        let loginTask = Task {
+            await service.startManagedChatgptDeviceCodeLogin { _, _ in }
+        }
+        try await waitUntil { loginClient.requestCount(method: "account/read") == 1 }
+        let logoutTask = Task { await service.logoutManagedAccount() }
+        await Task.yield()
+        await Task.yield()
+        await loginStopGate.open()
+
+        let loginResult = await loginTask.value
+        let logoutResult = await logoutTask.value
+        guard case .failed = loginResult else {
+            return XCTFail("Expected sign out to supersede the in-flight login, got \(loginResult)")
+        }
+        XCTAssertEqual(logoutResult, .signedOut)
+        XCTAssertEqual(logoutClient.requestCount(method: "account/logout"), 1)
+        let snapshot = await service.managedAccountSnapshot()
+        XCTAssertNil(snapshot)
+    }
+
+    func testRealLogoutClearsSnapshotAndAwaitsClientStop() async throws {
+        let stopGate = TestAsyncGate()
+        let refreshClient = MockCodexManagedAuthClient(
+            label: "refresh",
+            loginStartResponse: Self.browserStartResponse,
+            accountReadResponses: [Self.signedInAccount]
+        )
+        let logoutClient = MockCodexManagedAuthClient(
+            label: "logout",
+            loginStartResponse: Self.browserStartResponse,
+            accountReadResponses: [],
+            stopGate: stopGate
+        )
+        let clients = ClientFactoryBox([refreshClient, logoutClient])
+        let service = CodexManagedAuthRecoveryService(
+            clientFactory: { clients.next() },
+            refreshRequestTimeout: 1
+        )
+        _ = await service.refreshManagedAccount()
+        let signedInSnapshot = await service.managedAccountSnapshot()
+        XCTAssertNotNil(signedInSnapshot)
+        let completed = LockedBox<Bool>()
+
+        let task = Task {
+            let result = await service.logoutManagedAccount()
+            completed.set(true)
+            return result
+        }
+        try await waitUntil { logoutClient.requestCount(method: "account/logout") == 1 }
+        XCTAssertNotEqual(completed.value, true)
+
+        await stopGate.open()
+        let logoutResult = await task.value
+        XCTAssertEqual(logoutResult, .signedOut)
+        XCTAssertEqual(completed.value, true)
+        XCTAssertEqual(logoutClient.stopCallCount(), 1)
+        let clearedSnapshot = await service.managedAccountSnapshot()
+        XCTAssertNil(clearedSnapshot)
+    }
+
+    func testLogoutFailureRetainsLastConfirmedSnapshotAndReportsFailure() async {
+        let accountPayload: [String: Any] = [
+            "account": ["type": "chatgpt", "email": "still-signed-in@example.com"],
+            "requiresOpenaiAuth": true
+        ]
+        let client = MockCodexManagedAuthClient(
+            loginStartResponse: Self.browserStartResponse,
+            accountReadResponses: [accountPayload],
+            logoutError: AIProviderError.invalidResponse(detail: "logout RPC rejected")
+        )
+        let service = makeService(client: client, clock: TestClock(), validationTimeout: 1)
+        _ = await service.refreshManagedAccount()
+
+        let result = await service.logoutManagedAccount()
+
+        guard case let .failed(message) = result else {
+            return XCTFail("Expected logout failure, got \(result)")
+        }
+        XCTAssertTrue(message.contains("logout RPC rejected"))
+        let retainedSnapshot = await service.managedAccountSnapshot()
+        XCTAssertEqual(retainedSnapshot?.email, "still-signed-in@example.com")
+        XCTAssertEqual(client.requestCount(method: "account/logout"), 1)
+        XCTAssertEqual(client.stopCallCount(), 2)
+    }
+
+    func testLogoutExecutableUnavailableClearsSnapshotWithoutClaimingSuccess() async {
+        let refreshClient = MockCodexManagedAuthClient(
+            label: "refresh",
+            loginStartResponse: Self.browserStartResponse,
+            accountReadResponses: [Self.signedInAccount]
+        )
+        let logoutClient = MockCodexManagedAuthClient(
+            label: "logout",
+            loginStartResponse: Self.browserStartResponse,
+            accountReadResponses: [],
+            logoutError: CodexAppServerClient.ClientError.executableUnavailable("Codex executable unavailable")
+        )
+        let clients = ClientFactoryBox([refreshClient, logoutClient])
+        let service = CodexManagedAuthRecoveryService(clientFactory: { clients.next() })
+        _ = await service.refreshManagedAccount()
+
+        let result = await service.logoutManagedAccount()
+
+        XCTAssertEqual(result, .executableUnavailable(message: "Codex executable unavailable"))
+        XCTAssertNotEqual(result, .signedOut)
+        let snapshot = await service.managedAccountSnapshot()
+        XCTAssertNil(snapshot)
+        XCTAssertEqual(logoutClient.stopCallCount(), 1)
+    }
+
+    func testManagedAccountStringAndMirrorDoNotExposeSensitiveFields() {
+        let account = CodexManagedAccount(
+            email: "private@example.com",
+            planType: "enterprise",
+            accountType: "chatgpt",
+            accountID: "secret-account-id",
+            authenticationMode: "enterprise_sso"
+        )
+        let rendered = String(describing: account) + String(reflecting: account)
+        let mirrorValues = account.customMirror.children.map { String(describing: $0.value) }.joined()
+
+        XCTAssertFalse(rendered.contains("private@example.com"))
+        XCTAssertFalse(rendered.contains("secret-account-id"))
+        XCTAssertFalse(mirrorValues.contains("private@example.com"))
+        XCTAssertFalse(mirrorValues.contains("secret-account-id"))
+    }
+
     func testManagedGuidanceAdvertisesBothUISurfacesAndSeparateCredentialNamespace() {
         let guidance = CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage
 
@@ -590,6 +1032,16 @@ final class CodexManagedAuthRecoveryServiceTests: XCTestCase {
         ]
     )
 
+    private func assertAuthenticated(
+        _ result: CodexManagedChatgptLoginResult,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case .authenticated = result else {
+            return XCTFail("Expected authenticated result, got \(result)", file: file, line: line)
+        }
+    }
+
     private static let signedOutAccount: [String: Any] = [
         "account": NSNull(),
         "requiresOpenaiAuth": true
@@ -612,6 +1064,27 @@ private final class TestClock: @unchecked Sendable {
     func advance(by interval: TimeInterval) {
         lock.withLock {
             date = date.addingTimeInterval(interval)
+        }
+    }
+}
+
+private actor TestAsyncGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending {
+            waiter.resume()
         }
     }
 }
@@ -688,6 +1161,8 @@ private final class MockCodexManagedAuthClient: CodexManagedAuthRPCClient, @unch
     private let notificationStream: AsyncStream<CodexAppServerClient.Notification>
     private let notificationContinuation: AsyncStream<CodexAppServerClient.Notification>.Continuation
     private let eventRecorder: (@Sendable (String) -> Void)?
+    private let logoutError: Error?
+    private let stopGate: TestAsyncGate?
     private var requests: [RequestRecord] = []
     private var stopCount = 0
 
@@ -697,7 +1172,9 @@ private final class MockCodexManagedAuthClient: CodexManagedAuthRPCClient, @unch
         accountReadResponses: [[String: Any]],
         unrefreshedAccountReadResponse: [String: Any]? = nil,
         notificationOnLoginStart: CodexAppServerClient.Notification? = nil,
-        eventRecorder: (@Sendable (String) -> Void)? = nil
+        eventRecorder: (@Sendable (String) -> Void)? = nil,
+        logoutError: Error? = nil,
+        stopGate: TestAsyncGate? = nil
     ) {
         self.label = label
         self.loginStartResponse = loginStartResponse
@@ -705,6 +1182,8 @@ private final class MockCodexManagedAuthClient: CodexManagedAuthRPCClient, @unch
         accountReadOutcomes = accountReadResponses.map(MockAccountReadOutcome.response)
         self.notificationOnLoginStart = notificationOnLoginStart
         self.eventRecorder = eventRecorder
+        self.logoutError = logoutError
+        self.stopGate = stopGate
         var continuation: AsyncStream<CodexAppServerClient.Notification>.Continuation!
         notificationStream = AsyncStream { continuation = $0 }
         notificationContinuation = continuation
@@ -715,7 +1194,9 @@ private final class MockCodexManagedAuthClient: CodexManagedAuthRPCClient, @unch
         loginStartResponse: [String: Any],
         accountReadOutcomes: [MockAccountReadOutcome],
         notificationOnLoginStart: CodexAppServerClient.Notification? = nil,
-        eventRecorder: (@Sendable (String) -> Void)? = nil
+        eventRecorder: (@Sendable (String) -> Void)? = nil,
+        logoutError: Error? = nil,
+        stopGate: TestAsyncGate? = nil
     ) {
         self.label = label
         self.loginStartResponse = loginStartResponse
@@ -723,6 +1204,8 @@ private final class MockCodexManagedAuthClient: CodexManagedAuthRPCClient, @unch
         self.accountReadOutcomes = accountReadOutcomes
         self.notificationOnLoginStart = notificationOnLoginStart
         self.eventRecorder = eventRecorder
+        self.logoutError = logoutError
+        self.stopGate = stopGate
         var continuation: AsyncStream<CodexAppServerClient.Notification>.Continuation!
         notificationStream = AsyncStream { continuation = $0 }
         notificationContinuation = continuation
@@ -733,6 +1216,7 @@ private final class MockCodexManagedAuthClient: CodexManagedAuthRPCClient, @unch
     func startIfNeeded() async throws {}
 
     func stop() async {
+        await stopGate?.wait()
         lock.withLock {
             stopCount += 1
         }
@@ -786,6 +1270,9 @@ private final class MockCodexManagedAuthClient: CodexManagedAuthRPCClient, @unch
         case "account/login/cancel":
             return ["status": "canceled"]
         case "account/logout":
+            if let logoutError {
+                throw logoutError
+            }
             return [:]
         default:
             XCTFail("Unexpected mock request: \(method)")

@@ -14,7 +14,7 @@ struct AgentContextUsage: Codable, Equatable {
 
 /// View model for Agent mode - manages per-tab agent chat sessions with long-running agent interactions
 @MainActor
-final class AgentModeViewModel: ObservableObject {
+final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownParticipant {
     @TaskLocal private static var mcpRunEpochTransitionToken: UUID?
 
     nonisolated static func steeringDebugLog(_ message: @autoclosure () -> String) {
@@ -1178,6 +1178,7 @@ final class AgentModeViewModel: ObservableObject {
 
     var canSendWithCurrentProvider: Bool {
         isSelectedAgentAvailable
+            && !(selectedAgent == .codexExec && CodexManagedSessionFence.shared.isFenced)
     }
 
     var unavailableSelectedAgentMessage: String? {
@@ -2816,6 +2817,53 @@ final class AgentModeViewModel: ObservableObject {
             windowID: windowID,
             reason: "Cancelled because window is closing"
         )
+    }
+
+    func stopCodexSessionsForManagedLogout() async {
+        codexCoordinator.stopRuntimeTasksForManagedLogout()
+        let codexSessions = sessions.values.filter(Self.sessionOwnsCodexRuntimeState)
+        await withTaskGroup(of: Void.self) { group in
+            for session in codexSessions {
+                group.addTask { @MainActor [weak self, weak session] in
+                    guard let self, let session else { return }
+                    if session.selectedAgent == .codexExec {
+                        session.cancelEphemeralRuntimeState()
+                        cancelPendingQuestion(for: session)
+                        cancelPendingApproval(for: session)
+                        await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
+                        cancelPendingInstruction(for: session)
+                        await teardownMCPControl(for: session, cleanupSessionStore: true)
+                        if session.runState.isActive {
+                            await cancelAgentRun(
+                                tabID: session.tabID,
+                                completion: .terminalTeardownCompleted
+                            )
+                        }
+                        await session.disposeProviderIfPresent()
+                        await codexCoordinator.shutdownCodexSession(session)
+                        let sessionID = boundSessionID(for: session.tabID)
+                        await cleanupMCPRunRoutingIfPresent(
+                            boundSessionID: sessionID,
+                            liveSession: session,
+                            reason: "managed_codex_logout"
+                        )
+                    } else {
+                        await codexCoordinator.shutdownCodexSession(
+                            session,
+                            preserveNonCodexRunState: true
+                        )
+                    }
+                    scheduleSave(for: session.tabID)
+                }
+            }
+        }
+    }
+
+    private static func sessionOwnsCodexRuntimeState(_ session: TabSession) -> Bool {
+        session.selectedAgent == .codexExec
+            || session.codexController != nil
+            || session.codexConversationID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            || session.codexRolloutPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
 
     private func prepareSessionForWindowClose(_ session: TabSession) async {
@@ -12043,6 +12091,9 @@ final class AgentModeViewModel: ObservableObject {
         guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
             return .blocked(message: unavailableAgentMessage(for: session.selectedAgent))
         }
+        if session.selectedAgent == .codexExec, CodexManagedSessionFence.shared.isFenced {
+            return .blocked(message: CodexManagedSessionFence.blockedMessage)
+        }
 
         scheduleSkillCatalogRefresh()
 
@@ -12176,6 +12227,19 @@ final class AgentModeViewModel: ObservableObject {
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil
     ) async {
         guard let session = sessions[tabID] else { return }
+        if session.selectedAgent == .codexExec, CodexManagedSessionFence.shared.isFenced {
+            restoreRejectedManualSubmissionComposerState(
+                tabID: tabID,
+                session: session,
+                draftText: rawDraftText ?? trimmedText,
+                images: attachmentsToSend,
+                taggedFiles: taggedFilesToSend,
+                selectedWorkflow: restorationSelectedWorkflow,
+                selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
+                message: CodexManagedSessionFence.blockedMessage
+            )
+            return
+        }
         await prepareSessionForRunStart(tabID: tabID, session: session)
         guard let hydratedSession = sessions[tabID] else { return }
         _ = submitPreparedUserTurn(
