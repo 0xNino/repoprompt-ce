@@ -3068,6 +3068,7 @@ final class TabContextRoutingTests: XCTestCase {
             let window = WindowState()
             WindowStatesManager.shared.registerWindowState(window)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            await window.workspaceManager.awaitInitialized()
 
             do {
                 let sources = root.appendingPathComponent("Sources", isDirectory: true)
@@ -3082,11 +3083,18 @@ final class TabContextRoutingTests: XCTestCase {
                     repoPaths: [root.path],
                     ephemeral: true
                 )
-                await window.workspaceManager.switchWorkspace(
+                let switchResult = await window.workspaceManager.switchWorkspace(
                     to: workspace,
                     saveState: false,
                     reason: "callerBindingRegressionFixture"
                 )
+                guard switchResult.didSwitch, window.workspaceManager.activeWorkspaceID == workspace.id else {
+                    throw NSError(
+                        domain: "TabContextRoutingTests",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: switchResult.message ?? "Caller-binding workspace did not become active"]
+                    )
+                }
                 let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
                 window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
                 _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
@@ -3336,6 +3344,7 @@ final class TabContextRoutingTests: XCTestCase {
         selection: StoredSelection,
         name: String
     ) async {
+        await window.workspaceManager.awaitInitialized()
         let workspace = WorkspaceModel(
             id: workspaceID,
             name: name,
@@ -3347,11 +3356,15 @@ final class TabContextRoutingTests: XCTestCase {
             activeComposeTabID: tabID
         )
         window.workspaceManager.workspaces = [workspace]
-        await window.workspaceManager.switchWorkspace(
+        let switchResult = await window.workspaceManager.switchWorkspace(
             to: workspace,
             saveState: false,
             reason: "selectionPropagationLifecycleTest"
         )
+        guard switchResult.didSwitch, window.workspaceManager.activeWorkspaceID == workspaceID else {
+            XCTFail(switchResult.message ?? "Selection workspace did not become active")
+            return
+        }
         let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
         guard var installedTab = window.workspaceManager.composeTab(for: identity) else {
             XCTFail("Expected installed selection tab")

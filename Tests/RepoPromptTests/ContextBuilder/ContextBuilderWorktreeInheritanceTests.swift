@@ -2226,14 +2226,18 @@ import XCTest
         }
 
         private func activateWorkspace(_ context: PersistentMCPTestContext) async throws {
+            await context.window.workspaceManager.awaitInitialized()
             let workspace = try XCTUnwrap(
                 context.window.workspaceManager.workspaces.first { $0.id == context.workspaceID }
             )
-            await context.window.workspaceManager.switchWorkspace(
+            let switchResult = await context.window.workspaceManager.switchWorkspace(
                 to: workspace,
                 saveState: false,
                 reason: "ContextBuilderWorktreeInheritanceTests"
             )
+            guard switchResult.didSwitch, context.window.workspaceManager.activeWorkspaceID == workspace.id else {
+                throw failure(switchResult.message ?? "Project workspace did not become active")
+            }
             let activeWorkspace = try XCTUnwrap(context.window.workspaceManager.activeWorkspace)
             context.window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
 
