@@ -2236,7 +2236,13 @@ import XCTest
                 reason: "ContextBuilderWorktreeInheritanceTests"
             )
             guard switchResult.didSwitch, context.window.workspaceManager.activeWorkspaceID == workspace.id else {
-                throw failure(switchResult.message ?? "Project workspace did not become active")
+                throw NSError(
+                    domain: "ContextBuilderWorktreeInheritanceTests",
+                    code: 3,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: switchResult.message ?? "Project workspace did not become active"
+                    ]
+                )
             }
             let activeWorkspace = try XCTUnwrap(context.window.workspaceManager.activeWorkspace)
             context.window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
