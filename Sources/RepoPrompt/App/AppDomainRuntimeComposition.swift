@@ -27,6 +27,49 @@ final class AppDomainRuntimeComposition: Sendable {
     }
 }
 
+/// Coalesces one shared registration task while preventing a late waiter from
+/// clearing a newer attempt. Waiters observe the shared task's `Result`
+/// directly, so cancelling a waiter does not misclassify the shared work.
+@MainActor
+final class SharedRegistrationAttempt<Value: Sendable> {
+    struct Attempt {
+        let id: UInt64
+        let task: Task<Value, Error>
+    }
+
+    struct Completion {
+        let result: Result<Value, Error>
+        let wasCurrent: Bool
+    }
+
+    private var nextID: UInt64 = 0
+    private(set) var current: Attempt?
+
+    func start(
+        operation: @escaping @MainActor @Sendable () async throws -> Value
+    ) -> Attempt {
+        precondition(current == nil, "Registration attempt already active")
+        nextID &+= 1
+        let attempt = Attempt(
+            id: nextID,
+            task: Task { @MainActor in
+                try await operation()
+            }
+        )
+        current = attempt
+        return attempt
+    }
+
+    func complete(_ attempt: Attempt) async -> Completion {
+        let result = await attempt.task.result
+        let wasCurrent = current?.id == attempt.id
+        if wasCurrent {
+            current = nil
+        }
+        return Completion(result: result, wasCurrent: wasCurrent)
+    }
+}
+
 /// Process-lifetime owner for application-scoped MCP services. Registration is
 /// coalesced so app startup, readiness, and test fixtures all join the same work
 /// and no caller receives a handle it could use to remove another caller's tools.
@@ -68,7 +111,7 @@ final class AppGlobalMCPServiceComposition {
     private let appSettingsService: AppSettingsMCPService
     private let windowRoutingService: WindowRoutingService
     private var registrationHandles: RegistrationHandles?
-    private var registrationTask: Task<RegistrationHandles, Error>?
+    private let registrationAttempt = SharedRegistrationAttempt<RegistrationHandles>()
     private var status: RegistrationStatus = .idle
 
     private init(
@@ -99,15 +142,14 @@ final class AppGlobalMCPServiceComposition {
             return
         }
 
-        if let registrationTask {
-            registrationHandles = try await registrationTask.value
-            await restoreAvailabilityPublicationIfNeeded()
-            status = .registered
+        if let attempt = registrationAttempt.current {
+            try await finishRegistration(attempt)
             return
         }
 
         status = .registering
-        let task = Task { @MainActor [runtime, networkManager, appSettingsService, windowRoutingService] in
+        let attempt = registrationAttempt.start {
+            @MainActor [runtime, networkManager, appSettingsService, windowRoutingService] in
             try await runtime.start()
             await windowRoutingService.prepareDomainTools()
             let appSettingsTools = await appSettingsService.tools
@@ -134,16 +176,24 @@ final class AppGlobalMCPServiceComposition {
                 windowRouting: results[1].handle
             )
         }
-        registrationTask = task
+        try await finishRegistration(attempt)
+    }
 
-        do {
-            registrationHandles = try await task.value
-            registrationTask = nil
+    private func finishRegistration(
+        _ attempt: SharedRegistrationAttempt<RegistrationHandles>.Attempt
+    ) async throws {
+        let completion = await registrationAttempt.complete(attempt)
+        switch completion.result {
+        case let .success(handles):
+            if completion.wasCurrent {
+                registrationHandles = handles
+                status = .registered
+            }
             await restoreAvailabilityPublicationIfNeeded()
-            status = .registered
-        } catch {
-            registrationTask = nil
-            status = .failed(String(reflecting: error))
+        case let .failure(error):
+            if completion.wasCurrent {
+                status = .failed(String(reflecting: error))
+            }
             throw error
         }
     }
