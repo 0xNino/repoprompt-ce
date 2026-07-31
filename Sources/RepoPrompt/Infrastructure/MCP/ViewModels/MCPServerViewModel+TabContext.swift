@@ -3227,9 +3227,25 @@ extension MCPServerViewModel {
     func commitPrimaryGitArtifactsToCurrentTab(
         toolName: String,
         candidates: [GitDiffPublishedArtifact],
-        sourceSelection: StoredSelection? = nil
+        sourceSelection: StoredSelection? = nil,
+        capturedContext: DomainReadAppExecutionContext? = nil
     ) async throws -> PrimaryGitArtifactCommitResult {
-        let (connectionID, context) = try await contextForCurrentRequest(toolName: toolName)
+        // Domain reads commit against the tab context captured at resolve time; re-resolving the
+        // current request here could publish primary artifacts into a different tab than the read
+        // that produced them. Only the legacy non-domain path may resolve the current request.
+        let connectionID: UUID
+        let context: TabScopedContext
+        if let capturedContext {
+            guard let capturedConnectionID = capturedContext.metadata.connectionID else {
+                throw MCPError.internalError(
+                    "Connection identity is unavailable for Git artifact publication"
+                )
+            }
+            connectionID = capturedConnectionID
+            context = capturedContext.resolvedTabContext.snapshot
+        } else {
+            (connectionID, context) = try await contextForCurrentRequest(toolName: toolName)
+        }
         guard let workspaceID = context.workspaceID,
               let selectionCoordinator
         else {
@@ -3290,17 +3306,23 @@ extension MCPServerViewModel {
             throw MCPError.internalError("Canonical Git artifact selection verification failed")
         }
 
-        guard var latest = tabContextByConnectionID[connectionID],
-              latest.tabID == context.tabID,
-              latest.windowID == context.windowID,
-              latest.workspaceID == context.workspaceID,
-              latest.runID == context.runID
-        else {
+        // The legacy path always mirrors the connection (contextForCurrentRequest registers it),
+        // so a missing entry means the tab moved. A captured domain read never registered a
+        // mirror, so absence is expected there; a present-but-moved mirror stays a hard failure.
+        if var latest = tabContextByConnectionID[connectionID] {
+            guard latest.tabID == context.tabID,
+                  latest.windowID == context.windowID,
+                  latest.workspaceID == context.workspaceID,
+                  latest.runID == context.runID
+            else {
+                throw MCPError.internalError("Git artifact publication tab context is no longer current")
+            }
+            latest.selection = canonicalSelection
+            latest.selectionRevision = committedRevision
+            tabContextByConnectionID[connectionID] = latest
+        } else if capturedContext == nil {
             throw MCPError.internalError("Git artifact publication tab context is no longer current")
         }
-        latest.selection = canonicalSelection
-        latest.selectionRevision = committedRevision
-        tabContextByConnectionID[connectionID] = latest
 
         return PrimaryGitArtifactCommitResult(
             selection: canonicalSelection,
@@ -3313,9 +3335,25 @@ extension MCPServerViewModel {
     @MainActor
     func replaceAdvertisedGitArtifactsForCurrentTab(
         toolName: String,
-        artifacts: [GitDiffPublishedArtifact]
+        artifacts: [GitDiffPublishedArtifact],
+        capturedContext: DomainReadAppExecutionContext? = nil
     ) async throws -> MCPGitArtifactAdvertisementSnapshot {
-        let (connectionID, context) = try await contextForCurrentRequest(toolName: toolName)
+        // Domain reads advertise against the tab context captured at resolve time; re-resolving
+        // the current request here could target a different tab than the read that produced the
+        // artifacts. Only the legacy non-domain path may resolve the current request.
+        let connectionID: UUID
+        let context: TabContextSnapshot
+        if let capturedContext {
+            guard let capturedConnectionID = capturedContext.metadata.connectionID else {
+                throw MCPError.internalError(
+                    "Connection identity is unavailable for Git artifact advertisement"
+                )
+            }
+            connectionID = capturedConnectionID
+            context = capturedContext.resolvedTabContext.snapshot
+        } else {
+            (connectionID, context) = try await contextForCurrentRequest(toolName: toolName)
+        }
         guard let workspaceID = context.workspaceID else {
             throw MCPError.internalError("Workspace identity is unavailable for Git artifact advertisement")
         }
@@ -3443,10 +3481,16 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    func invalidateAdvertisedGitArtifactsForCurrentTab(toolName: String) async {
-        guard let (_, context) = try? await contextForCurrentRequest(toolName: toolName),
-              let workspaceID = context.workspaceID
-        else { return }
+    func invalidateAdvertisedGitArtifactsForCurrentTab(
+        toolName: String,
+        capturedContext: DomainReadAppExecutionContext? = nil
+    ) async {
+        let context: TabContextSnapshot? = if let capturedContext {
+            capturedContext.resolvedTabContext.snapshot
+        } else {
+            await (try? contextForCurrentRequest(toolName: toolName))?.1
+        }
+        guard let context, let workspaceID = context.workspaceID else { return }
         gitArtifactAdvertisementRegistry.invalidate(
             identity: WorkspaceSelectionIdentity(
                 workspaceID: workspaceID,
