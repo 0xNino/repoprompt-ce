@@ -606,6 +606,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         #if DEBUG
             try await MCPSharedServerTestLease.shared.withLease { _ in
                 try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+                await Self.purgeStaleWindowScopeRegistrations()
 
                 let supersededWindow = Self.makeWindowWithoutAutoStart()
                 supersededWindow.mcpServer.setServiceForTesting(MCPService(
@@ -744,6 +745,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
     func testServiceRegistryReregistrationPreservesLiveHandleAndSurfacesFailures() async throws {
         #if DEBUG
             try await MCPSharedServerTestLease.shared.withLease { _ in
+                await Self.purgeStaleWindowScopeRegistrations()
                 let window = Self.makeWindowWithoutAutoStart()
                 try await Self.withIsolatedBootstrapSocketNamespace(window: window) { _ in
                     let before = await ServiceRegistry.catalogSnapshot()
@@ -1061,6 +1063,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             ))
 
             try await MCPSharedServerTestLease.shared.withLease { _ in
+                await Self.purgeStaleWindowScopeRegistrations()
                 let window = Self.makeWindowWithoutAutoStart()
                 let catalogService = window.mcpServer.windowMCPToolCatalogService
 
@@ -1203,6 +1206,32 @@ final class ToolCatalogSnapshotTests: XCTestCase {
                     )
                 ]
             }
+        }
+    }
+
+    private static func purgeStaleWindowScopeRegistrations() async {
+        let liveWindowIDs = Set(WindowStatesManager.shared.allWindows.map(\.windowID))
+        let snapshot = await ServiceRegistry.catalogSnapshot()
+        var staleScopes = Set<MCPDomainToolRegistrationScope>()
+        for scopes in snapshot.activeScopesByToolName.values {
+            for scope in scopes {
+                guard case let .window(id) = scope,
+                      !liveWindowIDs.contains(id)
+                else { continue }
+                staleScopes.insert(scope)
+            }
+        }
+
+        var staleHandles = Set<MCPDomainToolRegistrationHandle>()
+        for scope in staleScopes {
+            for toolName in MCPDomainToolCatalog.windowToolNames {
+                if let resolved = await ServiceRegistry.resolve(toolName: toolName, scope: scope) {
+                    staleHandles.insert(resolved.handle)
+                }
+            }
+        }
+        for handle in staleHandles {
+            await ServiceRegistry.unregister(handle)
         }
     }
 
