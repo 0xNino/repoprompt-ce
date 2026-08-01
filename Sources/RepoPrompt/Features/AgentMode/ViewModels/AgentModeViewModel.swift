@@ -1466,6 +1466,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 suppressThirdPartyMCPServers: permissionProfile.codexSuppressesThirdPartyMCPServers,
                 goalSupportEnabledProvider: { CodexGoalSupport.isEnabled },
                 reasoningSummariesEnabledProvider: { CodexReasoningSummaries.isEnabled },
+                memoriesEnabledProvider: { CodexMemories.isEnabled },
                 computerUseEnabledProvider: { computerUseEnabled }
             )
             return CodexNativeSessionController(
