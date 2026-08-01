@@ -180,7 +180,13 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
 
     private func executeShow(args: [String: Value]) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
         let context = try await resolveRepositoryContext(args: args)
-        let worktree = try await resolveWorktree(args: args, repo: context.repo, allRepos: context.allRepos, requireExplicit: false)
+        let worktree = try await resolveWorktree(
+            args: args,
+            repo: context.repo,
+            allRepos: context.allRepos,
+            visibleRoots: context.visibleRoots,
+            requireExplicit: false
+        )
         if parseBool(args["persist_visuals"]) == true {
             try await MCPDomainMutationCommitContext.willCommit()
         }
@@ -282,7 +288,13 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
 
     private func executeBind(op: Operation, args: [String: Value]) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
         let context = try await resolveRepositoryContext(args: args)
-        let worktree = try await resolveWorktree(args: args, repo: context.repo, allRepos: context.allRepos, requireExplicit: true)
+        let worktree = try await resolveWorktree(
+            args: args,
+            repo: context.repo,
+            allRepos: context.allRepos,
+            visibleRoots: context.visibleRoots,
+            requireExplicit: true
+        )
         let sessionID = try await resolveBindingSessionID(args: args)
         try validateLiveSession(sessionID, in: dependencies.requireTargetWindow())
         try await MCPDomainMutationCommitContext.willCommit()
@@ -320,7 +332,13 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             removed = existing
         } else if hasWorktreeSelector(args) {
             let context = try await resolveRepositoryContext(args: args)
-            let worktree = try await resolveWorktree(args: args, repo: context.repo, allRepos: context.allRepos, requireExplicit: true)
+            let worktree = try await resolveWorktree(
+                args: args,
+                repo: context.repo,
+                allRepos: context.allRepos,
+                visibleRoots: context.visibleRoots,
+                requireExplicit: true
+            )
             removed = existing.filter { $0.worktreeID == worktree.worktreeID }
             remaining = existing.filter { $0.worktreeID != worktree.worktreeID }
         } else {
@@ -480,6 +498,7 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
         args: [String: Value],
         repo: GitRepoDescriptor,
         allRepos: [GitRepoDescriptor],
+        visibleRoots: [WorkspaceRootRef],
         requireExplicit: Bool
     ) async throws -> GitWorktreeDescriptor {
         let selector = worktreeSelector(from: args)
@@ -487,7 +506,12 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             throw MCPError.invalidParams("worktree or worktree_id is required for this operation.")
         }
         do {
-            return try await resolver.resolveWorktree(selector: selector, repo: repo, allRepos: allRepos)
+            return try await resolver.resolveWorktree(
+                selector: selector,
+                repo: repo,
+                allRepos: allRepos,
+                authorizedRoots: visibleRoots
+            )
         } catch let error as GitRepoTargetResolverError {
             throw MCPError.invalidParams(error.message)
         }

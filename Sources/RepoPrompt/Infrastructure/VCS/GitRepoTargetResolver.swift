@@ -102,13 +102,23 @@ struct GitRepoTargetResolver {
     func resolveWorktree(
         selector rawSelector: String?,
         repo: GitRepoDescriptor,
-        allRepos: [GitRepoDescriptor]
+        allRepos: [GitRepoDescriptor],
+        authorizedRoots: [WorkspaceRootRef]? = nil
     ) async throws -> GitWorktreeDescriptor {
         let worktree = try await resolveWorktreeDescriptor(
             selector: rawSelector,
             repo: repo,
             allRepos: allRepos
         )
+        if let authorizedRoots {
+            let rootPaths = authorizedRoots.map(\.standardizedFullPath)
+            guard GitRepoRootAuthorization.isPathWithinAuthorizedRoots(worktree.path, roots: rootPaths) else {
+                let rootsList = rootPaths.joined(separator: ", ")
+                throw GitRepoTargetResolverError.invalidParams(
+                    "worktree path must be inside a loaded root. Received: \(worktree.path). Loaded roots: \(rootsList)"
+                )
+            }
+        }
         // Fail closed on stale/prunable worktrees. Git reports a worktree as prunable when its
         // gitdir points to a non-existent location (the checkout was removed or left incomplete).
         // Binding a session to such a worktree, or operating on it, would crawl and search an
@@ -213,14 +223,6 @@ struct GitRepoTargetResolver {
                     return resolved
                 }
                 throw GitRepoTargetResolverError.invalidParams("No VCS repository found at path: \(trimmed)")
-            }
-
-            if let worktree = try await resolveWorktreeSelector(
-                trimmed,
-                in: candidateRepos(allRepos: allRepos, defaultRepo: defaultRepo),
-                selectorKind: .path
-            ) {
-                return GitRepoDescriptor(rootURL: URL(fileURLWithPath: worktree.path))
             }
 
             let rootsList = visibleRootPaths.joined(separator: ", ")

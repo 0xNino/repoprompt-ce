@@ -218,8 +218,12 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
         let id: UUID
         let sourceRoot: URL
         let sourceHead: String
+        let sourceRepositoryIdentity: String
+        let sourceWorktreeIdentity: String
         let targetRoot: URL
         let targetHead: String
+        let targetRepositoryIdentity: String
+        let targetWorktreeIdentity: String
     }
 
     private let runtime: MCPDomainRuntime
@@ -286,7 +290,7 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
             return try .object(["op": .string(op), "path": .string(url.path), "output": .string(output)])
         case "bind", "select":
             let sessionID = try sessionID(args: args, request: request)
-            let worktree = try await resolveWorktree(args: args, repository: repo)
+            let worktree = try await resolveWorktree(args: args, repository: repo, roots: snapshot.roots)
             let repositoryID = DomainContentDigest.sha256(Data(repo.path.utf8))
             let branch = try? await gitLine(at: worktree, arguments: ["branch", "--show-current"])
             let head = try? await gitLine(at: worktree, arguments: ["rev-parse", "HEAD"])
@@ -327,16 +331,24 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
                 "bindings": .array((runtime.agentWorktreeBindingStore.bindings(sessionID: sessionID)).map(bindingValue))
             ])
         case "preview":
-            let target = try await resolveMergeTarget(args: args, repository: repo)
+            let target = try await resolveMergeTarget(args: args, repository: repo, roots: snapshot.roots)
             let sourceHead = try await gitLine(at: repo, arguments: ["rev-parse", "HEAD"])
             let targetHead = try await gitLine(at: target, arguments: ["rev-parse", "HEAD"])
+            let sourceRepositoryIdentity = try await gitCommonDirectory(at: repo)
+            let sourceWorktreeIdentity = try await gitDirectory(at: repo)
+            let targetRepositoryIdentity = try await gitCommonDirectory(at: target)
+            let targetWorktreeIdentity = try await gitDirectory(at: target)
             let id = UUID()
             mergeOperations[id] = MergeOperation(
                 id: id,
                 sourceRoot: repo,
                 sourceHead: sourceHead,
+                sourceRepositoryIdentity: sourceRepositoryIdentity,
+                sourceWorktreeIdentity: sourceWorktreeIdentity,
                 targetRoot: target,
-                targetHead: targetHead
+                targetHead: targetHead,
+                targetRepositoryIdentity: targetRepositoryIdentity,
+                targetWorktreeIdentity: targetWorktreeIdentity
             )
             let patch = try await DirectProcess.run(
                 "/usr/bin/git",
@@ -351,17 +363,26 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
             ])
         case "apply":
             let operation = try mergeOperation(args)
-            guard try await gitLine(at: operation.sourceRoot, arguments: ["rev-parse", "HEAD"]) == operation.sourceHead,
-                  try await gitLine(at: operation.targetRoot, arguments: ["rev-parse", "HEAD"]) == operation.targetHead
-            else {
-                throw MCPError.invalidRequest("merge preview is stale; create a new preview")
-            }
-            try await admitMergeMutation(operation, canonicalRepository: repo)
+            let initialTargets = try await revalidatedMergeMutationTargets(
+                operation,
+                repository: repo,
+                request: request
+            )
+            try await admitMergeMutation(initialTargets)
             try await MCPDomainMutationCommitContext.willCommit()
+            let targets = try await revalidatedMergeMutationTargets(
+                operation,
+                repository: repo,
+                request: request
+            )
             let message = args["commit_message"]?.stringValue ?? "Merge headless worktree \(operation.sourceHead.prefix(12))"
             let output = try await DirectProcess.run(
                 "/usr/bin/git",
-                arguments: ["-C", operation.targetRoot.path, "merge", "--no-ff", "-m", message, operation.sourceHead]
+                arguments: Self.mergeMutationArguments(
+                    targetRoot: targets.targetRoot,
+                    gitDirectory: targets.targetGitDirectory,
+                    command: ["merge", "--no-ff", "-m", message, operation.sourceHead]
+                )
             )
             mergeOperations.removeValue(forKey: operation.id)
             return try .object(["op": .string(op), "operation_id": .string(operation.id.uuidString), "output": .string(output)])
@@ -378,10 +399,27 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
             return try .object(["op": .string(op), "bindings": .array(bindings)])
         case "continue", "abort":
             let operation = try mergeOperation(args)
-            try await admitMergeMutation(operation, canonicalRepository: repo)
+            let initialTargets = try await revalidatedMergeMutationTargets(
+                operation,
+                repository: repo,
+                request: request
+            )
+            try await admitMergeMutation(initialTargets)
             try await MCPDomainMutationCommitContext.willCommit()
+            let targets = try await revalidatedMergeMutationTargets(
+                operation,
+                repository: repo,
+                request: request
+            )
             let command = op == "continue" ? ["merge", "--continue"] : ["merge", "--abort"]
-            let output = try await DirectProcess.run("/usr/bin/git", arguments: ["-C", operation.targetRoot.path] + command)
+            let output = try await DirectProcess.run(
+                "/usr/bin/git",
+                arguments: Self.mergeMutationArguments(
+                    targetRoot: targets.targetRoot,
+                    gitDirectory: targets.targetGitDirectory,
+                    command: command
+                )
+            )
             mergeOperations.removeValue(forKey: operation.id)
             return try .object(["op": .string(op), "operation_id": .string(operation.id.uuidString), "output": .string(output)])
         default:
@@ -398,22 +436,106 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
         }
     }
 
-    private func admitMergeMutation(
+    private struct MergeMutationTargets {
+        let sourceRoot: URL
+        let targetRoot: URL
+        let targetGitDirectory: String
+        let roots: [URL]
+    }
+
+    nonisolated static func revalidateMergeEndpointPaths(
+        sourceRoot: URL,
+        targetRoot: URL,
+        roots: [URL],
+        listedWorktrees: [URL]
+    ) throws -> (source: URL, target: URL) {
+        let source = try authorizeWorktreePath(sourceRoot, roots: roots)
+        let target = try authorizeWorktreePath(targetRoot, roots: roots)
+        let livePaths = Set(listedWorktrees.map { Self.canonicalWorktreePath($0) })
+        guard livePaths.contains(source.path) else {
+            throw MCPError.invalidRequest("merge preview source endpoint is no longer a listed worktree")
+        }
+        guard livePaths.contains(target.path) else {
+            throw MCPError.invalidRequest("merge preview target endpoint is no longer a listed worktree")
+        }
+        return (source, target)
+    }
+
+    private func revalidatedMergeMutationTargets(
         _ operation: MergeOperation,
-        canonicalRepository: URL
-    ) async throws {
+        repository: URL,
+        request: DomainPhysicalToolRequest
+    ) async throws -> MergeMutationTargets {
+        let snapshot = try await context.snapshot(for: request)
+        let listed = try await listedWorktrees(repository: repository)
+        let endpoints = try Self.revalidateMergeEndpointPaths(
+            sourceRoot: operation.sourceRoot,
+            targetRoot: operation.targetRoot,
+            roots: snapshot.roots,
+            listedWorktrees: listed
+        )
+        let sourceHead = try await gitLine(at: endpoints.source, arguments: ["rev-parse", "HEAD"])
+        let targetHead = try await gitLine(at: endpoints.target, arguments: ["rev-parse", "HEAD"])
+        let sourceRepositoryIdentity = try await gitCommonDirectory(at: endpoints.source)
+        let sourceWorktreeIdentity = try await gitDirectory(at: endpoints.source)
+        let targetRepositoryIdentity = try await gitCommonDirectory(at: endpoints.target)
+        let targetWorktreeIdentity = try await gitDirectory(at: endpoints.target)
+        try Self.validateMergeEndpointIdentity(
+            expectedHead: operation.sourceHead,
+            currentHead: sourceHead,
+            expectedRepositoryIdentity: operation.sourceRepositoryIdentity,
+            currentRepositoryIdentity: sourceRepositoryIdentity,
+            expectedWorktreeIdentity: operation.sourceWorktreeIdentity,
+            currentWorktreeIdentity: sourceWorktreeIdentity
+        )
+        try Self.validateMergeEndpointIdentity(
+            expectedHead: operation.targetHead,
+            currentHead: targetHead,
+            expectedRepositoryIdentity: operation.targetRepositoryIdentity,
+            currentRepositoryIdentity: targetRepositoryIdentity,
+            expectedWorktreeIdentity: operation.targetWorktreeIdentity,
+            currentWorktreeIdentity: targetWorktreeIdentity
+        )
+        return MergeMutationTargets(
+            sourceRoot: endpoints.source,
+            targetRoot: endpoints.target,
+            targetGitDirectory: targetWorktreeIdentity,
+            roots: snapshot.roots
+        )
+    }
+
+    nonisolated static func mergeMutationArguments(
+        targetRoot: URL,
+        gitDirectory: String,
+        command: [String]
+    ) -> [String] {
+        ["--git-dir", gitDirectory, "--work-tree", canonicalWorktreePath(targetRoot)] + command
+    }
+
+    nonisolated static func validateMergeEndpointIdentity(
+        expectedHead: String,
+        currentHead: String,
+        expectedRepositoryIdentity: String,
+        currentRepositoryIdentity: String,
+        expectedWorktreeIdentity: String,
+        currentWorktreeIdentity: String
+    ) throws {
+        guard expectedHead == currentHead,
+              expectedRepositoryIdentity == currentRepositoryIdentity,
+              expectedWorktreeIdentity == currentWorktreeIdentity
+        else {
+            throw MCPError.invalidRequest("merge preview endpoint identity changed; create a new preview")
+        }
+    }
+
+    private nonisolated static func canonicalWorktreePath(_ url: URL) -> String {
+        url.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    private func admitMergeMutation(_ targets: MergeMutationTargets) async throws {
         try await MCPDomainMutationCommitContext.admitPhysicalTargets(
-            [operation.sourceRoot.path, operation.targetRoot.path],
-            rootMappings: [
-                DomainMutationPhysicalRootMapping(
-                    canonicalRoot: canonicalRepository.path,
-                    physicalRoot: operation.sourceRoot.path
-                ),
-                DomainMutationPhysicalRootMapping(
-                    canonicalRoot: canonicalRepository.path,
-                    physicalRoot: operation.targetRoot.path
-                )
-            ]
+            [targets.sourceRoot.path, targets.targetRoot.path],
+            rootMappings: Self.mutationRootMappings(workspaceRoots: targets.roots)
         )
     }
 
@@ -442,20 +564,32 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
         ])
     }
 
-    private func resolveWorktree(args: [String: Value], repository: URL) async throws -> URL {
+    nonisolated static func authorizeWorktreePath(_ path: URL, roots: [URL]) throws -> URL {
+        try DirectHeadlessDomainContext.resolvePath(path.path, roots: roots)
+    }
+
+    private func resolveWorktree(
+        args: [String: Value],
+        repository: URL,
+        roots: [URL]
+    ) async throws -> URL {
         let selector = args["worktree"]?.stringValue
             ?? args["worktree_id"]?.stringValue
             ?? "@current"
         if selector.hasPrefix("/") {
-            let url = URL(fileURLWithPath: selector).standardizedFileURL.resolvingSymlinksInPath()
+            let url = try Self.authorizeWorktreePath(URL(fileURLWithPath: selector), roots: roots)
             guard FileManager.default.fileExists(atPath: url.path) else {
                 throw MCPError.invalidParams("worktree does not exist: \(selector)")
             }
             return url
         }
         let worktrees = try await listedWorktrees(repository: repository)
-        if selector == "@current" { return repository }
-        if selector == "@main" { return worktrees.first ?? repository }
+        if selector == "@current" {
+            return try Self.authorizeWorktreePath(repository, roots: roots)
+        }
+        if selector == "@main" {
+            return try Self.authorizeWorktreePath(worktrees.first ?? repository, roots: roots)
+        }
         let normalizedBranch = selector.hasPrefix("@branch:") ? String(selector.dropFirst("@branch:".count)) : selector
         let normalizedID = normalizedBranch.replacingOccurrences(of: "@id:", with: "")
         for worktree in worktrees {
@@ -464,16 +598,20 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
                 || DomainContentDigest.sha256(Data(worktree.path.utf8)) == normalizedID
                 || branch == normalizedBranch
             {
-                return worktree
+                return try Self.authorizeWorktreePath(worktree, roots: roots)
             }
         }
         throw MCPError.invalidParams("unknown worktree selector: \(selector)")
     }
 
-    private func resolveMergeTarget(args: [String: Value], repository: URL) async throws -> URL {
+    private func resolveMergeTarget(
+        args: [String: Value],
+        repository: URL,
+        roots: [URL]
+    ) async throws -> URL {
         var targetArgs = args
         targetArgs["worktree"] = args["target"] ?? .string("@main")
-        return try await resolveWorktree(args: targetArgs, repository: repository)
+        return try await resolveWorktree(args: targetArgs, repository: repository, roots: roots)
     }
 
     private func listedWorktrees(repository: URL) async throws -> [URL] {
@@ -490,6 +628,22 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
     private func gitLine(at root: URL, arguments: [String]) async throws -> String {
         try await DirectProcess.run("/usr/bin/git", arguments: ["-C", root.path] + arguments)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func gitCommonDirectory(at root: URL) async throws -> String {
+        let raw = try await gitLine(at: root, arguments: ["rev-parse", "--git-common-dir"])
+        let url = raw.hasPrefix("/")
+            ? URL(fileURLWithPath: raw)
+            : URL(fileURLWithPath: root.path).appendingPathComponent(raw)
+        return Self.canonicalWorktreePath(url)
+    }
+
+    private func gitDirectory(at root: URL) async throws -> String {
+        let raw = try await gitLine(at: root, arguments: ["rev-parse", "--git-dir"])
+        let url = raw.hasPrefix("/")
+            ? URL(fileURLWithPath: raw)
+            : URL(fileURLWithPath: root.path).appendingPathComponent(raw)
+        return Self.canonicalWorktreePath(url)
     }
 
     private func mergeOperation(_ args: [String: Value]) throws -> MergeOperation {
@@ -835,6 +989,60 @@ actor DirectHeadlessHistoryBackend: DomainHistoryCapabilityBackend {
 }
 
 enum DirectProcess {
+    /// Child providers need basic process/configuration context and the explicit private
+    /// launch carrier, but must not inherit arbitrary parent credentials or loader controls.
+    private static let inheritedEnvironmentKeys: Set<String> = [
+        "CODEX_HOME",
+        "COLORTERM",
+        "HOME",
+        "LANG",
+        "LOGNAME",
+        "NO_COLOR",
+        "PATH",
+        "SHELL",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TERM",
+        "TMPDIR",
+        "USER",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME"
+    ]
+
+    private static let childLaunchEnvironmentKeys: Set<String> = [
+        DomainChildLaunchCarrier.endpointEnvironmentKey,
+        DomainChildLaunchCarrier.launchTokenEnvironmentKey,
+        DomainChildLaunchCarrier.credentialEnvelopeEnvironmentKey,
+        DomainChildLaunchCarrier.clientPrincipalEnvironmentKey,
+        DomainChildLaunchCarrier.providerIdentifierEnvironmentKey,
+        DomainChildLaunchCarrier.runIDEnvironmentKey
+    ]
+
+    /// Removes private launch-carrier values from a stored parent environment before
+    /// the current request carrier is merged in.
+    static func withoutPrivateCarrier(from environment: [String: String]) -> [String: String] {
+        environment.filter { !childLaunchEnvironmentKeys.contains($0.key) }
+    }
+
+    static func childEnvironment(
+        inherited: [String: String] = ProcessInfo.processInfo.environment,
+        overrides: [String: String] = [:]
+    ) -> [String: String] {
+        var environment = inherited.filter { key, _ in
+            inheritedEnvironmentKeys.contains(key) || key.hasPrefix("LC_")
+        }
+        for (key, value) in overrides where inheritedEnvironmentKeys.contains(key)
+            || childLaunchEnvironmentKeys.contains(key)
+            || key.hasPrefix("LC_")
+        {
+            environment[key] = value
+        }
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        environment["LC_ALL"] = "C"
+        return environment
+    }
+
     static func run(
         _ executable: String,
         arguments: [String],
@@ -875,11 +1083,7 @@ private final class DirectProcessInvocation: @unchecked Sendable {
         inputPipe = input == nil ? nil : Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
-        var environment = ProcessInfo.processInfo.environment
-        environment["GIT_TERMINAL_PROMPT"] = "0"
-        environment["LC_ALL"] = "C"
-        environment.merge(overrides) { _, supplied in supplied }
-        process.environment = environment
+        process.environment = DirectProcess.childEnvironment(overrides: overrides)
         process.currentDirectoryURL = currentDirectory
         process.standardOutput = pipe
         process.standardError = pipe

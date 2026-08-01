@@ -138,7 +138,7 @@ actor DirectHeadlessDomainContext {
         return try await snapshot(identity: current.identity)
     }
 
-    nonisolated func resolvePath(_ rawPath: String, roots: [URL], allowMissingLeaf: Bool = false) throws -> URL {
+    nonisolated static func resolvePath(_ rawPath: String, roots: [URL], allowMissingLeaf: Bool = false) throws -> URL {
         guard !rawPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw MCPError.invalidParams("path must not be empty")
         }
@@ -166,6 +166,10 @@ actor DirectHeadlessDomainContext {
             throw Error.pathOutsideWorkspace(rawPath)
         }
         return checked
+    }
+
+    nonisolated func resolvePath(_ rawPath: String, roots: [URL], allowMissingLeaf: Bool = false) throws -> URL {
+        try Self.resolvePath(rawPath, roots: roots, allowMissingLeaf: allowMissingLeaf)
     }
 
     private static func contextObject(

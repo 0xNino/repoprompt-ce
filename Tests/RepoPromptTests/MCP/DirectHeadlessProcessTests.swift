@@ -1,7 +1,73 @@
 import Foundation
+@testable import RepoPromptMCP
 import XCTest
 
 final class DirectHeadlessProcessTests: XCTestCase {
+    func testDirectProcessChildEnvironmentUsesAllowlistAndPrivateCarrier() {
+        let inherited = [
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/tmp/home",
+            "TMPDIR": "/tmp/",
+            "LANG": "en_US.UTF-8",
+            "LC_CTYPE": "en_US.UTF-8",
+            "OPENAI_API_KEY": "secret-openai",
+            "AWS_SECRET_ACCESS_KEY": "secret-aws",
+            "SSH_AUTH_SOCK": "/tmp/ssh-agent",
+            "DYLD_INSERT_LIBRARIES": "/tmp/injected.dylib",
+            "REPOPROMPT_CODEX_COMMAND": "/tmp/codex"
+        ]
+        let carrier = [
+            "REPOPROMPT_MCP_PRIVATE_ENDPOINT": "unix:///tmp/private.sock",
+            "REPOPROMPT_MCP_LAUNCH_TOKEN": "single-use-token",
+            "REPOPROMPT_MCP_CREDENTIAL_ENVELOPE": "envelope-id",
+            "REPOPROMPT_MCP_CLIENT_PRINCIPAL": "headless-client",
+            "REPOPROMPT_MCP_PROVIDER_IDENTIFIER": "codex",
+            "REPOPROMPT_MCP_RUN_ID": UUID().uuidString
+        ]
+        let overrides = inherited.merging(carrier) { _, supplied in supplied }
+        let child = DirectProcess.childEnvironment(inherited: inherited, overrides: overrides)
+
+        XCTAssertEqual(child["PATH"], inherited["PATH"])
+        XCTAssertEqual(child["HOME"], inherited["HOME"])
+        XCTAssertEqual(child["LC_CTYPE"], inherited["LC_CTYPE"])
+        XCTAssertEqual(child["GIT_TERMINAL_PROMPT"], "0")
+        XCTAssertEqual(child["LC_ALL"], "C")
+        for (key, value) in carrier {
+            XCTAssertEqual(child[key], value, "carrier key=\(key)")
+        }
+        for key in ["OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK", "DYLD_INSERT_LIBRARIES", "REPOPROMPT_CODEX_COMMAND"] {
+            XCTAssertNil(child[key], "unexpected inherited key=\(key)")
+        }
+    }
+
+    func testDirectProcessStripsStalePrivateCarrierBeforeCurrentCarrierMerge() {
+        let staleCarrier = [
+            "REPOPROMPT_MCP_PRIVATE_ENDPOINT": "unix:///tmp/stale.sock",
+            "REPOPROMPT_MCP_LAUNCH_TOKEN": "stale-token",
+            "REPOPROMPT_MCP_CREDENTIAL_ENVELOPE": "stale-envelope",
+            "REPOPROMPT_MCP_CLIENT_PRINCIPAL": "stale-client",
+            "REPOPROMPT_MCP_PROVIDER_IDENTIFIER": "stale-provider",
+            "REPOPROMPT_MCP_RUN_ID": "stale-run"
+        ]
+        let currentCarrier = [
+            "REPOPROMPT_MCP_PRIVATE_ENDPOINT": "unix:///tmp/current.sock",
+            "REPOPROMPT_MCP_LAUNCH_TOKEN": "current-token"
+        ]
+        let inherited = ["PATH": "/usr/bin:/bin"].merging(staleCarrier) { _, supplied in supplied }
+        let sanitized = DirectProcess.withoutPrivateCarrier(from: inherited)
+        let child = DirectProcess.childEnvironment(
+            inherited: inherited,
+            overrides: sanitized.merging(currentCarrier) { _, supplied in supplied }
+        )
+
+        for (key, value) in currentCarrier {
+            XCTAssertEqual(child[key], value, "carrier key=\(key)")
+        }
+        for (key, value) in staleCarrier where currentCarrier[key] == nil {
+            XCTAssertNil(child[key], "stale carrier key=\(key) value=\(value)")
+        }
+    }
+
     func testNoAppHeadlessProcessListsCanonicalPolicySurfaceAndDrainsOnEOF() throws {
         let executable = try Self.executableURL()
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)

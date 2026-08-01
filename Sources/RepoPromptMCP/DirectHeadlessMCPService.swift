@@ -455,10 +455,22 @@ actor DirectHeadlessMCPService {
         _ = await prepared.runtime.shutdown()
     }
 
+    nonisolated static func configuredWorkingDirectoryValues(
+        environment: [String: String],
+        fallback: URL
+    ) -> [String] {
+        guard let configured = environment["REPOPROMPT_MCP_WORKING_DIRS"] else {
+            return [fallback.path]
+        }
+        let values = configured.split(separator: ":").map(String.init)
+        return values.isEmpty ? [fallback.path] : values
+    }
+
     private func resolvedWorkingDirectories() throws -> [URL] {
-        let raw = environment["REPOPROMPT_MCP_WORKING_DIRS"]
-            .map { $0.split(separator: ":").map(String.init) }
-            ?? [currentDirectory.path]
+        let raw = Self.configuredWorkingDirectoryValues(
+            environment: environment,
+            fallback: currentDirectory
+        )
         var seen: Set<String> = []
         return try raw.map { value in
             let url = URL(fileURLWithPath: value).standardizedFileURL.resolvingSymlinksInPath()

@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import MCP
+import RepoPromptC
 import RepoPromptCodeMapCore
 import RepoPromptDomainRuntime
 
@@ -654,12 +655,30 @@ actor DirectHeadlessWorkspaceBackend: DomainWorkspaceCapabilityBackend {
         let regexEnabled = args["regex"]?.boolValue ?? Self.looksLikeRegex(pattern)
         let regex = regexEnabled ? try NSRegularExpression(pattern: pattern) : nil
         let mode = args["mode"]?.stringValue ?? "auto"
+        let filter = args["filter"]?.objectValue
+        let includeExtensions = filter?["extensions"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        let excludePatterns = filter?["exclude"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        var scopeInputs = filter?["paths"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        if scopeInputs.isEmpty, let singlePath = args["path"]?.stringValue {
+            scopeInputs = [singlePath]
+        }
+        let candidates = try searchFiles(
+            in: snapshot.roots,
+            scopeInputs: scopeInputs
+        )
+        let files = try Self.filterSearchFiles(
+            candidates,
+            roots: snapshot.roots,
+            includeExtensions: includeExtensions,
+            excludePatterns: excludePatterns
+        )
+        let pathOnly = mode == "path" || (mode == "auto" && pattern.contains("*"))
         var results: [Value] = []
-        for file in Self.files(under: snapshot.roots) {
+        for file in files {
             if results.count >= maxResults { break }
             let relative = Self.relativePath(file, roots: snapshot.roots)
             let pathMatch = Self.matches(pattern, value: relative, regex: regex)
-            if mode == "path" || (mode == "auto" && pattern.contains("*")) {
+            if pathOnly {
                 if pathMatch { results.append(.object(["path": .string(relative)])) }
                 continue
             }
@@ -679,6 +698,39 @@ actor DirectHeadlessWorkspaceBackend: DomainWorkspaceCapabilityBackend {
             return try .object(["count": .int(results.count)])
         }
         return try .object(["matches": .array(results), "count": .int(results.count)])
+    }
+
+    private func searchFiles(in roots: [URL], scopeInputs: [String]) throws -> [URL] {
+        guard !scopeInputs.isEmpty else { return Self.files(under: roots) }
+
+        var seen = Set<String>()
+        return try scopeInputs.flatMap { rawPath -> [URL] in
+            let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return [] }
+            let scope = try resolveSearchScope(trimmed, roots: roots)
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: scope.path, isDirectory: &isDirectory) else {
+                throw MCPError.invalidParams("search path does not exist: \(trimmed)")
+            }
+            let files = isDirectory.boolValue ? Self.files(under: [scope]) : [scope]
+            return files.filter { seen.insert($0.path).inserted }
+        }
+    }
+
+    private func resolveSearchScope(_ rawPath: String, roots: [URL]) throws -> URL {
+        if let root = roots.first(where: { $0.lastPathComponent == rawPath }) {
+            return root
+        }
+        if let separator = rawPath.firstIndex(of: "/") {
+            let rootName = String(rawPath[..<separator])
+            if let root = roots.first(where: { $0.lastPathComponent == rootName }) {
+                let relative = String(rawPath[rawPath.index(after: separator)...])
+                return relative.isEmpty
+                    ? root
+                    : try context.resolvePath(relative, roots: [root])
+            }
+        }
+        return try context.resolvePath(rawPath, roots: roots)
     }
 
     func renderWorkspaceContext(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
@@ -846,6 +898,55 @@ actor DirectHeadlessWorkspaceBackend: DomainWorkspaceCapabilityBackend {
             lines.append(String(repeating: "  ", count: depth) + url.lastPathComponent + (isDirectory ? "/" : ""))
         }
         return lines
+    }
+
+    private struct SearchExcludeMatcher {
+        private static let wildstarFlag: Int32 = 0x40
+        private static let casefoldFlag: Int32 = 0x10
+
+        let pattern: String
+        let wildmatchFlags: Int32?
+
+        init?(rawPattern: String) {
+            let pattern = rawPattern.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !pattern.isEmpty else { return nil }
+            self.pattern = pattern
+            if pattern.contains("*") || pattern.contains("?") {
+                wildmatchFlags = (pattern.contains("**") ? Self.wildstarFlag : 0) | Self.casefoldFlag
+            } else {
+                wildmatchFlags = nil
+            }
+        }
+
+        func matches(_ value: String) -> Bool {
+            guard let wildmatchFlags else {
+                return value.localizedCaseInsensitiveContains(pattern)
+            }
+            return pattern.withCString { patternC in
+                value.withCString { valueC in
+                    wildmatch(patternC, valueC, wildmatchFlags) == 0
+                }
+            }
+        }
+    }
+
+    private nonisolated static func filterSearchFiles(
+        _ files: [URL],
+        roots: [URL],
+        includeExtensions: [String],
+        excludePatterns: [String]
+    ) throws -> [URL] {
+        let normalizedExtensions = Set(includeExtensions.map { $0.lowercased() })
+        let excludeMatchers = excludePatterns.compactMap(SearchExcludeMatcher.init(rawPattern:))
+
+        return files.filter { file in
+            if !normalizedExtensions.isEmpty {
+                let fileExtension = file.pathExtension.isEmpty ? "" : ".\(file.pathExtension)"
+                guard normalizedExtensions.contains(fileExtension.lowercased()) else { return false }
+            }
+            let relative = relativePath(file, roots: roots)
+            return !excludeMatchers.contains { $0.matches(relative) }
+        }
     }
 
     private nonisolated static func relativePath(_ url: URL, roots: [URL]) -> String {
