@@ -24,11 +24,7 @@ concurrency:
   # delays the commit users actually asked the channel to publish. A failed CI
   # notification receives a unique group so it cannot evict a healthy pending or
   # in-flight Tip build before setup's success guard skips the replacement run.
-  cancel-in-progress: >-
-    ${{
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
-    }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
 
 permissions:
   contents: read

@@ -2560,7 +2560,7 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
             normalized_concurrency,
         )
         self.assertIn(
-            "cancel-in-progress: >- ${{ github.event_name == 'workflow_dispatch' || "
+            "cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' || "
             "github.event.workflow_run.conclusion == 'success' }}",
             normalized_concurrency,
         )
