@@ -2551,8 +2551,20 @@ shutil.copyfile(os.environ["FAKE_SWIFTFORMAT_ARCHIVE"], output)
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
 
         self.assertIn("name: Publish Tip", tip_workflow)
-        self.assertIn("group: main-tip-channel", tip_workflow)
-        self.assertIn("cancel-in-progress: true", tip_workflow)
+        concurrency_block = tip_workflow.split("concurrency:", 1)[1].split("\npermissions:", 1)[0]
+        normalized_concurrency = " ".join(concurrency_block.split())
+        self.assertIn(
+            "group: >- ${{ (github.event_name == 'workflow_dispatch' || "
+            "github.event.workflow_run.conclusion == 'success') && "
+            "'main-tip-channel' || format('main-tip-skipped-{0}', github.run_id) }}",
+            normalized_concurrency,
+        )
+        self.assertIn(
+            "cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' || "
+            "github.event.workflow_run.conclusion == 'success' }}",
+            normalized_concurrency,
+        )
+        self.assertNotIn("cancel-in-progress: true", concurrency_block)
         self.assertIn("should-publish", tip_workflow)
         self.assertIn("stable-appcast.xml", tip_workflow)
         self.assertIn('build_number="$stable_build_number.$((build_sequence / 100)).$((build_sequence % 100))"', tip_workflow)

@@ -13,10 +13,18 @@ on:
         type: string
 
 concurrency:
-  group: main-tip-channel
+  group: >-
+    ${{
+      (github.event_name == 'workflow_dispatch' ||
+        github.event.workflow_run.conclusion == 'success') &&
+      'main-tip-channel' ||
+      format('main-tip-skipped-{0}', github.run_id)
+    }}
   # Tip is a rolling channel: once main advances, completing an older artifact only
-  # delays the commit users actually asked the channel to publish.
-  cancel-in-progress: true
+  # delays the commit users actually asked the channel to publish. A failed CI
+  # notification receives a unique group so it cannot evict a healthy pending or
+  # in-flight Tip build before setup's success guard skips the replacement run.
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
 
 permissions:
   contents: read
