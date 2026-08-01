@@ -195,6 +195,92 @@ package actor DomainRoutingCoordinator {
         )
     }
 
+    package func resolveReadContext(
+        connection registration: DomainConnectionRegistration
+    ) async throws -> DomainReadContextHandle {
+        guard registration.runtimeID == identity.runtimeID else {
+            throw DomainReadContextResolutionError.runtimeGenerationMismatch
+        }
+        guard let current = connections[registration.connectionID] else {
+            throw DomainReadContextResolutionError.connectionUnavailable
+        }
+        guard current.registration == registration else {
+            throw DomainReadContextResolutionError.staleConnectionGeneration
+        }
+
+        let contextIdentity: DomainContextIdentity
+        let bindingKind: DomainReadBindingKind
+        switch current.binding {
+        case .unbound:
+            throw DomainReadContextResolutionError.unboundConnection
+        case let .context(context, explicit):
+            contextIdentity = context
+            bindingKind = explicit ? .explicit : .appPresentation
+        case let .runScoped(runID, context):
+            contextIdentity = context
+            bindingKind = .runScoped(runID: runID)
+        case let .appPresentationWindow(windowID):
+            guard let window = windows[windowID], !window.isClosing else {
+                throw DomainReadContextResolutionError.presentationWindowUnavailable
+            }
+            guard let workspaceID = window.activeWorkspaceID,
+                  let contextID = window.activeContextID
+            else {
+                throw DomainReadContextResolutionError.presentationContextUnavailable
+            }
+            contextIdentity = DomainContextIdentity(workspaceID: workspaceID, contextID: contextID)
+            bindingKind = .appPresentation
+        }
+
+        guard let workspace = await contextStore.workspaceSnapshot(contextIdentity.workspaceID) else {
+            throw DomainReadContextResolutionError.contextUnavailable
+        }
+        guard let context = workspace.contexts.first(where: {
+            $0.metadata.identity == contextIdentity
+        }) else {
+            throw DomainReadContextResolutionError.contextUnavailable
+        }
+        if case .removed = context.health {
+            throw DomainReadContextResolutionError.contextRemoved
+        }
+        return DomainReadContextHandle(
+            runtimeID: identity.runtimeID,
+            runtimeGeneration: identity.lifecycleGeneration,
+            connectionID: registration.connectionID,
+            connectionGeneration: registration.generation,
+            context: contextIdentity,
+            workspaceRevision: workspace.revisions.workingRevision,
+            contextRevision: context.revisions.workingRevision,
+            routingRevision: revision,
+            bindingKind: bindingKind
+        )
+    }
+
+    /// Revalidates only the authority actually consumed by a read: runtime generation,
+    /// connection incarnation, bound context identity, and that context's current revisions.
+    /// Global routing revision and unrelated presentation/window changes are intentionally ignored.
+    package func refreshReadContext(
+        _ handle: DomainReadContextHandle
+    ) async throws -> DomainReadContextHandle {
+        guard handle.runtimeID == identity.runtimeID,
+              handle.runtimeGeneration == identity.lifecycleGeneration
+        else {
+            throw DomainReadContextResolutionError.runtimeGenerationMismatch
+        }
+        let registration = DomainConnectionRegistration(
+            connectionID: handle.connectionID,
+            generation: handle.connectionGeneration,
+            runtimeID: handle.runtimeID
+        )
+        let refreshed = try await resolveReadContext(connection: registration)
+        guard refreshed.context == handle.context,
+              refreshed.bindingKind == handle.bindingKind
+        else {
+            throw DomainReadContextResolutionError.staleConnectionGeneration
+        }
+        return refreshed
+    }
+
     /// Opens a presentation window with a runtime-issued monotonic incarnation.
     /// Reusing an app window ID after teardown therefore cannot revive stale bindings.
     package func openWindow(

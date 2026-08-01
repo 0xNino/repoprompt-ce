@@ -42,6 +42,66 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertEqual(signatures, Self.expectedSignatures)
     }
 
+    func testSharedReadCutoverPreservesUnmigratedFileActionsCatalogProjection() async throws {
+        let window = Self.makeWindowWithoutAutoStart()
+        let tools = await window.mcpServer.windowMCPTools
+        let fileActions = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.fileActions })
+        let projected = try fileActions.domainBinding().definition
+        let schema = try XCTUnwrap(projected.inputSchema.objectValue)
+        let properties = try XCTUnwrap(schema["properties"]?.objectValue)
+        let operationID = try XCTUnwrap(properties["operation_id"]?.objectValue)
+        let required = try XCTUnwrap(schema["required"]?.arrayValue?.compactMap(\.stringValue))
+
+        XCTAssertFalse(
+            MCPDomainReadToolDefinitions.definitions.contains { $0.name == MCPWindowToolName.fileActions },
+            "file_actions must remain an app-owned legacy provider until its mutation milestone."
+        )
+        XCTAssertTrue(projected.description.contains("Create, delete, or move files."))
+        XCTAssertEqual(
+            operationID["description"]?.stringValue,
+            "Optional caller-stable correlation ID echoed in the mutation acknowledgement; not a deduplication or status lookup key"
+        )
+        XCTAssertEqual(Set(required), ["action", "path"])
+        XCTAssertEqual(projected.annotations.readOnlyHint, false)
+        XCTAssertEqual(projected.annotations.destructiveHint, true)
+        XCTAssertEqual(projected.isEnabledByDefault, true)
+    }
+
+    func testSharedReadBindingRetainsAppRuntimeExecutionEnvelope() async throws {
+        let definition = try XCTUnwrap(
+            MCPDomainReadToolDefinitions.definitions.first { $0.name == MCPWindowToolName.readFile }
+        )
+        let binding = MCPDomainToolBinding(definition: definition) { arguments in
+            .object(["path": arguments["path"] ?? .null])
+        }
+        let recorder = SharedBindingRuntimeRecorder()
+        let runtime = MCPWindowToolRuntime(windowID: 73) { name, freshnessPolicy, arguments, implementation in
+            let providerManaged = if case .providerManaged = freshnessPolicy { true } else { false }
+            await recorder.record(name: name, providerManaged: providerManaged, arguments: arguments)
+            return try await implementation(
+                MCPWindowToolContext(toolName: name, windowID: 73),
+                arguments
+            )
+        }
+        let catalog = MCPWindowToolCatalogService(
+            windowID: 73,
+            providers: [],
+            sharedBindings: [binding],
+            sharedBindingRuntime: runtime
+        )
+
+        let tools = await catalog.tools
+        let tool = try XCTUnwrap(tools.first)
+        let value = try await tool(["path": .string("README.md")])
+        let invocation = await recorder.snapshot()
+
+        XCTAssertEqual(tool.name, MCPWindowToolName.readFile)
+        XCTAssertEqual(value.objectValue?["path"]?.stringValue, "README.md")
+        XCTAssertEqual(invocation?.name, MCPWindowToolName.readFile)
+        XCTAssertEqual(invocation?.providerManaged, true)
+        XCTAssertEqual(invocation?.arguments["path"]?.stringValue, "README.md")
+    }
+
     func testReadinessCoalescesLightweightScopeQueriesForOneTenAndOneHundredWaiters() async throws {
         #if DEBUG
             for waiterCount in [1, 10, 100] {
@@ -1688,5 +1748,27 @@ private actor ServerControllerRegistrationOrderingProbe {
 
     func counts() -> (registration: Int, preActivation: Int) {
         (registrationCount, preActivationCount)
+    }
+}
+
+private actor SharedBindingRuntimeRecorder {
+    struct Invocation {
+        let name: String
+        let providerManaged: Bool
+        let arguments: [String: Value]
+    }
+
+    private var invocation: Invocation?
+
+    func record(name: String, providerManaged: Bool, arguments: [String: Value]) {
+        invocation = Invocation(
+            name: name,
+            providerManaged: providerManaged,
+            arguments: arguments
+        )
+    }
+
+    func snapshot() -> Invocation? {
+        invocation
     }
 }

@@ -13,6 +13,100 @@ final class TabContextRoutingTests: XCTestCase {
         super.tearDown()
     }
 
+    func testScopedReadRebindsStaleRebindableBindingsButNeverRunScoped() {
+        let t1 = DomainContextIdentity(workspaceID: UUID(), contextID: UUID())
+        let t2 = DomainContextIdentity(workspaceID: UUID(), contextID: UUID())
+        let target = DomainBinding.context(t2, explicit: false)
+
+        // Fresh or never-bound connections always bind toward routing truth.
+        XCTAssertTrue(MCPServerViewModel.shouldRebindDomainReadConnection(existing: nil, target: target))
+        XCTAssertTrue(MCPServerViewModel.shouldRebindDomainReadConnection(existing: .unbound, target: target))
+
+        // A binding publication racing a tab switch leaves the connection on the previous target;
+        // rebindable bindings must follow the freshly resolved target instead of failing the read.
+        XCTAssertTrue(MCPServerViewModel.shouldRebindDomainReadConnection(
+            existing: .context(t1, explicit: false),
+            target: target
+        ))
+        XCTAssertTrue(MCPServerViewModel.shouldRebindDomainReadConnection(
+            existing: .context(t2, explicit: false),
+            target: .context(t2, explicit: true)
+        ))
+        XCTAssertTrue(MCPServerViewModel.shouldRebindDomainReadConnection(
+            existing: .appPresentationWindow(7),
+            target: target
+        ))
+        XCTAssertTrue(MCPServerViewModel.shouldRebindDomainReadConnection(
+            existing: .appPresentationWindow(7),
+            target: .appPresentationWindow(8)
+        ))
+
+        // Already-current bindings stay untouched: no redundant coordinator mutation per read.
+        XCTAssertFalse(MCPServerViewModel.shouldRebindDomainReadConnection(
+            existing: .context(t2, explicit: false),
+            target: target
+        ))
+        XCTAssertFalse(MCPServerViewModel.shouldRebindDomainReadConnection(
+            existing: .appPresentationWindow(7),
+            target: .appPresentationWindow(7)
+        ))
+
+        // Run-scoped bindings are immutable for the lifetime of their run: the read resolver must
+        // fail closed rather than mutate them, even when the routed target has moved on.
+        XCTAssertFalse(MCPServerViewModel.shouldRebindDomainReadConnection(
+            existing: .runScoped(runID: UUID(), context: t1),
+            target: target
+        ))
+        XCTAssertFalse(MCPServerViewModel.shouldRebindDomainReadConnection(
+            existing: .runScoped(runID: UUID(), context: t2),
+            target: .runScoped(runID: UUID(), context: t2)
+        ))
+    }
+
+    func testScopedReadFinalValidationRejectsMismatchedRunIdentity() {
+        let runA = UUID()
+        let runB = UUID()
+
+        // The only acceptable run-scoped resolution is the exact requested run.
+        XCTAssertTrue(MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(
+            requestedRunID: runA,
+            resolvedBindingKind: .runScoped(runID: runA)
+        ))
+        XCTAssertFalse(
+            MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(
+                requestedRunID: runA,
+                resolvedBindingKind: .runScoped(runID: runB)
+            ),
+            "A different run over the same workspace/context must fail closed, never serve the read."
+        )
+
+        // A run-scoped request must not execute over a plain binding.
+        XCTAssertFalse(MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(
+            requestedRunID: runA,
+            resolvedBindingKind: .explicit
+        ))
+        XCTAssertFalse(MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(
+            requestedRunID: runA,
+            resolvedBindingKind: .appPresentation
+        ))
+
+        // A non-run request must not execute under someone else's run-scoped binding.
+        XCTAssertFalse(MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(
+            requestedRunID: nil,
+            resolvedBindingKind: .runScoped(runID: runA)
+        ))
+
+        // Plain bindings satisfy non-run requests.
+        XCTAssertTrue(MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(
+            requestedRunID: nil,
+            resolvedBindingKind: .explicit
+        ))
+        XCTAssertTrue(MCPServerViewModel.domainReadBindingSatisfiesRequestedRun(
+            requestedRunID: nil,
+            resolvedBindingKind: .appPresentation
+        ))
+    }
+
     func testBindingResolverResolvesExplicitContextIDAndLegacyTabIDAlias() async throws {
         let contextID = UUID()
         let workspaceID = UUID()

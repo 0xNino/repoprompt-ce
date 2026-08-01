@@ -30,6 +30,15 @@ package struct DomainWorkspaceStore {
         await authority.reloadExternalChanges()
     }
 
+    /// Registers the app's current in-memory document as an awaited read authority.
+    ///
+    /// This compatibility seam is intentionally transient: it makes newly created and ephemeral
+    /// workspaces immediately routable without waiting for debounced durable publication, while
+    /// leaving the normal command/persistence path authoritative for mutations.
+    package func registerReadDocument(_ document: DomainWorkspaceDocument) async -> DomainWorkspaceSnapshot {
+        await authority.registerReadDocument(document)
+    }
+
     package func workspaceSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceSnapshot? {
         await authority.workspaceSnapshot(workspaceID)
     }
@@ -119,6 +128,9 @@ actor DomainWorkspaceContextAuthority {
     private let persistence: DomainPersistenceCoordinator
     private let metrics: DomainRuntimeMetricsSink
     private var records: [UUID: WorkspaceRecord] = [:]
+    /// Awaited in-memory registrations used only by read routing. They are not catalog entries and
+    /// never persist ephemeral/test workspaces. A later command invalidates the overlay.
+    private var readRegistrations: [UUID: DomainWorkspaceSnapshot] = [:]
     private var unavailableWorkspaces: [UUID: DomainPersistenceBootstrap.UnavailableWorkspace] = [:]
     private var globalOperations = BoundedDomainOperationIndex(capacity: maximumGlobalOperations)
     private var health: DomainAuthorityHealth = .writable
@@ -207,20 +219,64 @@ actor DomainWorkspaceContextAuthority {
     }
 
     func workspaceSnapshot(_ workspaceID: UUID) -> DomainWorkspaceSnapshot? {
+        readRegistrations[workspaceID] ?? records[workspaceID].map(makeSnapshot)
+    }
+
+    /// Command outcomes must report canonical record state; the read overlay is routing-only and
+    /// must never leak into dedup replay or transient-outcome revision lines.
+    private func canonicalWorkspaceSnapshot(_ workspaceID: UUID) -> DomainWorkspaceSnapshot? {
         records[workspaceID].map(makeSnapshot)
     }
 
     func contextSnapshot(_ identity: DomainContextIdentity) -> DomainContextSnapshot? {
-        guard let record = records[identity.workspaceID],
-              let metadata = record.document.metadata.contexts.first(where: {
-                  $0.identity.contextID == identity.contextID
-              })
-        else { return nil }
-        return DomainContextSnapshot(
-            metadata: metadata,
-            revisions: record.contextRevisions[identity.contextID] ?? record.revisions,
-            health: record.health
+        workspaceSnapshot(identity.workspaceID)?.contexts.first {
+            $0.metadata.identity.contextID == identity.contextID
+        }
+    }
+
+    func registerReadDocument(_ document: DomainWorkspaceDocument) async -> DomainWorkspaceSnapshot {
+        await bootstrap()
+        let previous = readRegistrations[document.workspaceID]
+            ?? records[document.workspaceID].map(makeSnapshot)
+        if let previous, previous.document.contentDigest == document.contentDigest {
+            return previous
+        }
+
+        let before = previous?.revisions ?? .initial
+        let nextWorking = before.workingRevision &+ 1
+        let revisions = DomainRevisionState(
+            workingRevision: nextWorking,
+            savedRevision: before.savedRevision,
+            dirtyRevision: nextWorking
         )
+        let contextRevisions: [UUID: DomainRevisionState] = if let previous {
+            Self.updatedContextRevisions(
+                previousDocument: previous.document,
+                nextDocument: document,
+                previousRevisions: Dictionary(uniqueKeysWithValues: previous.contexts.map {
+                    ($0.metadata.identity.contextID, $0.revisions)
+                }),
+                workspaceRevision: revisions
+            ).revisions
+        } else {
+            Dictionary(uniqueKeysWithValues: document.metadata.contexts.map {
+                ($0.identity.contextID, revisions)
+            })
+        }
+        let registration = DomainWorkspaceSnapshot(
+            document: document,
+            revisions: revisions,
+            health: .writable,
+            contexts: document.metadata.contexts.map { metadata in
+                DomainContextSnapshot(
+                    metadata: metadata,
+                    revisions: contextRevisions[metadata.identity.contextID] ?? revisions,
+                    health: .writable
+                )
+            }
+        )
+        readRegistrations[document.workspaceID] = registration
+        return registration
     }
 
     func readySnapshot() async -> DomainWorkspaceCatalogSnapshot {
@@ -289,22 +345,51 @@ actor DomainWorkspaceContextAuthority {
             )
         }
 
-        switch envelope.command {
+        let outcome: DomainCommandOutcome = switch envelope.command {
         case let .createWorkspace(document):
-            return await createWorkspace(document, envelope: envelope, fingerprint: fingerprint)
+            await createWorkspace(document, envelope: envelope, fingerprint: fingerprint)
         case let .replaceWorkingDocument(document):
-            return await replaceWorkingDocument(document, envelope: envelope, fingerprint: fingerprint)
+            await replaceWorkingDocument(document, envelope: envelope, fingerprint: fingerprint)
         case let .saveWorkspaceDocument(workspaceID):
-            return await saveWorkspace(workspaceID, envelope: envelope, fingerprint: fingerprint)
+            await saveWorkspace(workspaceID, envelope: envelope, fingerprint: fingerprint)
         case let .resolveExternalConflict(workspaceID, acceptExternal):
-            return await resolveExternalConflict(
+            await resolveExternalConflict(
                 workspaceID,
                 acceptExternal: acceptExternal,
                 envelope: envelope,
                 fingerprint: fingerprint
             )
         case let .deleteWorkspace(workspaceID):
-            return await deleteWorkspace(workspaceID, envelope: envelope, fingerprint: fingerprint)
+            await deleteWorkspace(workspaceID, envelope: envelope, fingerprint: fingerprint)
+        }
+        invalidateReadRegistrationIfSuperseded(
+            workspaceID: workspaceID,
+            disposition: outcome.disposition,
+            resultingDigest: outcome.resultingDigest
+        )
+        return outcome
+    }
+
+    /// Keep the read overlay while persistence is suspended/re-entrant. Any completed canonical
+    /// transition supersedes it, including a different newer document and a deduplicated replay
+    /// of a completed command. A failed command must not reopen the publication race, so replayed
+    /// transients key on the original recorded disposition, never on the replay's `.deduplicated`.
+    private func invalidateReadRegistrationIfSuperseded(
+        workspaceID: UUID?,
+        disposition: DomainCommandDisposition,
+        resultingDigest: String?
+    ) {
+        guard let workspaceID,
+              let registration = readRegistrations[workspaceID]
+        else { return }
+        switch disposition {
+        case .applied, .deduplicated:
+            readRegistrations.removeValue(forKey: workspaceID)
+        case .unchanged where resultingDigest == nil
+            || resultingDigest == registration.document.contentDigest:
+            readRegistrations.removeValue(forKey: workspaceID)
+        default:
+            break
         }
     }
 
@@ -363,6 +448,11 @@ actor DomainWorkspaceContextAuthority {
                 revisions: record.revisions,
                 diagnostic: nil
             )
+            invalidateReadRegistrationIfSuperseded(
+                workspaceID: workspaceID,
+                disposition: prior.disposition,
+                resultingDigest: prior.resultingDigest
+            )
             return prior.outcome(workspace: makeSnapshot(record))
         }
         if let prior = globalOperations[envelope.operationID] {
@@ -383,7 +473,12 @@ actor DomainWorkspaceContextAuthority {
                     )
                 }
             }
-            return prior.outcome(workspace: workspaceID.flatMap(workspaceSnapshot))
+            invalidateReadRegistrationIfSuperseded(
+                workspaceID: workspaceID,
+                disposition: prior.disposition,
+                resultingDigest: prior.resultingDigest
+            )
+            return prior.outcome(workspace: workspaceID.flatMap(canonicalWorkspaceSnapshot))
         }
         return nil
     }
@@ -437,6 +532,7 @@ actor DomainWorkspaceContextAuthority {
             }) {
                 unavailableWorkspaces.removeValue(forKey: workspaceID)
                 if records.removeValue(forKey: workspaceID) != nil {
+                    readRegistrations.removeValue(forKey: workspaceID)
                     changed = true
                     publish(
                         kind: .workspaceDeleted,
@@ -458,6 +554,7 @@ actor DomainWorkspaceContextAuthority {
             {
                 let workspaceID = workspace.document.workspaceID
                 records[workspaceID] = makeRecord(from: workspace)
+                readRegistrations.removeValue(forKey: workspaceID)
                 unavailableWorkspaces.removeValue(forKey: workspaceID)
                 changed = true
                 publish(
@@ -501,6 +598,7 @@ actor DomainWorkspaceContextAuthority {
                 continue
             }
             records[workspaceID] = makeRecord(from: recovered)
+            readRegistrations.removeValue(forKey: workspaceID)
             unavailableWorkspaces.removeValue(forKey: workspaceID)
             changed = true
             publish(
@@ -529,6 +627,7 @@ actor DomainWorkspaceContextAuthority {
                 if let recovered, recovered.health.acceptsMutations {
                     current = makeRecord(from: recovered)
                     records[workspaceID] = current
+                    readRegistrations.removeValue(forKey: workspaceID)
                     changed = true
                     publish(
                         kind: .externalReloaded,
@@ -684,6 +783,9 @@ actor DomainWorkspaceContextAuthority {
                     record.externalDocument = nil
                     record.fileMetadata = metadata
                     records[workspaceID] = record
+                    // A successfully reloaded external document is a completed canonical
+                    // transition: read routing must stop serving the pre-reload overlay.
+                    readRegistrations.removeValue(forKey: workspaceID)
                     changed = true
                     publish(
                         kind: .externalReloaded,
@@ -1612,7 +1714,7 @@ actor DomainWorkspaceContextAuthority {
         errorCode: DomainCommandErrorCode,
         diagnostic: String
     ) -> DomainCommandOutcome {
-        let workspace = envelope.workspaceID.flatMap(workspaceSnapshot)
+        let workspace = envelope.workspaceID.flatMap(canonicalWorkspaceSnapshot)
         let outcome = DomainCommandOutcome(
             operationID: envelope.operationID,
             disposition: disposition,

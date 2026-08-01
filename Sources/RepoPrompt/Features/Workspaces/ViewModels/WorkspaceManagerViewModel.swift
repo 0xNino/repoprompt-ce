@@ -367,6 +367,120 @@ class WorkspaceManagerViewModel: ObservableObject {
         stateVersionByWorkspaceID[id, default: 0] &+= 1 // wraparound-safe
     }
 
+    // MARK: - Domain read-registration cache (M3 scoped reads)
+
+    /// Identity of one awaited read-registration attempt for a workspace. Scoped MCP reads
+    /// re-register only when the dirty-tracking state version or the target file URL moved, so
+    /// consecutive reads skip the O(document-size) encode/decode/digest on the MainActor.
+    struct DomainReadRegistrationToken: Equatable {
+        let workspaceID: UUID
+        let stateVersion: Int
+        let attemptID: UInt64
+        let fileURL: URL
+    }
+
+    private var confirmedDomainReadRegistrationsByWorkspaceID: [UUID: DomainReadRegistrationToken] = [:]
+    /// Pending attempts exist only while an awaited `registerForRead` is outstanding for a
+    /// workspace. Projection invalidation removes the pending entry, so a token issued before the
+    /// projection can never be confirmed after it — without any per-workspace tombstone state:
+    /// an invalidated or removed workspace leaves no residue in either dictionary.
+    private var pendingDomainReadRegistrationsByWorkspaceID: [UUID: DomainReadRegistrationToken] = [:]
+    /// Wrapping scalar minting attempt identities; uniqueness only matters within the bounded
+    /// pending window, so wraparound is harmless.
+    private var nextDomainReadRegistrationAttemptID: UInt64 = 0
+
+    /// Returns the registration token a scoped read must register with, or `nil` when the last
+    /// confirmed registration already covers the workspace's current dirty-tracking state version
+    /// and file URL (the common case for consecutive reads). An outstanding attempt for the same
+    /// state is reused so retries after a failed registration stay idempotent.
+    func domainReadRegistrationToken(
+        for workspace: WorkspaceModel,
+        fileURL: URL
+    ) -> DomainReadRegistrationToken? {
+        let stateVersion = stateVersionByWorkspaceID[workspace.id, default: 0]
+        if let confirmed = confirmedDomainReadRegistrationsByWorkspaceID[workspace.id],
+           confirmed.stateVersion == stateVersion,
+           confirmed.fileURL == fileURL
+        {
+            return nil
+        }
+        if let pending = pendingDomainReadRegistrationsByWorkspaceID[workspace.id],
+           pending.stateVersion == stateVersion,
+           pending.fileURL == fileURL
+        {
+            return pending
+        }
+        nextDomainReadRegistrationAttemptID &+= 1
+        let token = DomainReadRegistrationToken(
+            workspaceID: workspace.id,
+            stateVersion: stateVersion,
+            attemptID: nextDomainReadRegistrationAttemptID,
+            fileURL: fileURL
+        )
+        pendingDomainReadRegistrationsByWorkspaceID[workspace.id] = token
+        return token
+    }
+
+    /// Confirms a successful awaited `registerForRead` for `token`. Confirmation requires the
+    /// workspace's current dirty-tracking state version, current file URL, and exact pending
+    /// attempt to still match: a state-version bump or a projection-driven invalidation that raced
+    /// the awaited registration keeps the cache unconfirmed so the next scoped read re-registers.
+    func confirmDomainReadRegistration(_ token: DomainReadRegistrationToken) {
+        guard stateVersionByWorkspaceID[token.workspaceID, default: 0] == token.stateVersion,
+              let workspace = workspace(withID: token.workspaceID),
+              workspaceFileURL(for: workspace) == token.fileURL,
+              pendingDomainReadRegistrationsByWorkspaceID[token.workspaceID] == token
+        else { return }
+        pendingDomainReadRegistrationsByWorkspaceID.removeValue(forKey: token.workspaceID)
+        confirmedDomainReadRegistrationsByWorkspaceID[token.workspaceID] = token
+    }
+
+    /// Drops confirmed and pending read registrations whose workspace was removed from the
+    /// projected catalog or whose projected canonical digest moved. A registration only remains
+    /// valid while the canonical state it was registered against is unchanged.
+    func invalidateConfirmedDomainReadRegistrations(
+        previousDigestsByWorkspaceID: [UUID: String],
+        projectedDigestsByWorkspaceID: [UUID: String]
+    ) {
+        for workspaceID in previousDigestsByWorkspaceID.keys
+            where projectedDigestsByWorkspaceID[workspaceID] == nil
+        {
+            invalidateDomainReadRegistration(for: workspaceID)
+        }
+        for (workspaceID, projected) in projectedDigestsByWorkspaceID
+            where previousDigestsByWorkspaceID[workspaceID] != projected
+        {
+            invalidateDomainReadRegistration(for: workspaceID)
+        }
+        // Defensive: tracked workspaces absent from the projected digest map cannot be validated.
+        for workspaceID in Array(confirmedDomainReadRegistrationsByWorkspaceID.keys)
+            where projectedDigestsByWorkspaceID[workspaceID] == nil
+        {
+            invalidateDomainReadRegistration(for: workspaceID)
+        }
+        for workspaceID in Array(pendingDomainReadRegistrationsByWorkspaceID.keys)
+            where projectedDigestsByWorkspaceID[workspaceID] == nil
+        {
+            invalidateDomainReadRegistration(for: workspaceID)
+        }
+    }
+
+    /// Removes one workspace's confirmed registration and outstanding pending attempt so an
+    /// in-flight registration token issued before this point cannot be confirmed afterward.
+    /// Both removals are complete: an invalidated or removed workspace retains no registration
+    /// state at all.
+    func invalidateDomainReadRegistration(for workspaceID: UUID) {
+        confirmedDomainReadRegistrationsByWorkspaceID.removeValue(forKey: workspaceID)
+        pendingDomainReadRegistrationsByWorkspaceID.removeValue(forKey: workspaceID)
+    }
+
+    #if DEBUG
+        func debugDomainReadRegistrationStateExistsForWorkspace(_ workspaceID: UUID) -> Bool {
+            confirmedDomainReadRegistrationsByWorkspaceID[workspaceID] != nil
+                || pendingDomainReadRegistrationsByWorkspaceID[workspaceID] != nil
+        }
+    #endif
+
     private func captureDeferredWorkspaceObservation<Value>(_ value: Value) -> DeferredWorkspaceObservation<Value> {
         DeferredWorkspaceObservation(
             value: value,
@@ -4057,10 +4171,24 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard publicationSequence >= lastDomainProjectionSequence else { return }
         lastDomainProjectionSequence = publicationSequence
         if domainWorkspaceAuthorityClient != nil {
+            // A projected canonical transition (external reload, cross-window commit, deletion)
+            // can replace workspace content without touching this manager's dirty-tracking
+            // versions, so confirmed read registrations keyed on those versions must be
+            // re-validated against the projected digests.
+            invalidateConfirmedDomainReadRegistrations(
+                previousDigestsByWorkspaceID: domainWorkspaceDigestsByID,
+                projectedDigestsByWorkspaceID: digestsByWorkspaceID
+            )
             domainWorkspaceFileURLsByID = fileURLsByWorkspaceID
             domainWorkspaceRevisionsByID = revisionsByWorkspaceID
             domainWorkspaceDigestsByID = digestsByWorkspaceID
             domainWorkspaceCatalogRevision = catalogRevision
+        } else {
+            let trackedWorkspaceIDs = Set(confirmedDomainReadRegistrationsByWorkspaceID.keys)
+                .union(pendingDomainReadRegistrationsByWorkspaceID.keys)
+            for workspaceID in trackedWorkspaceIDs {
+                invalidateDomainReadRegistration(for: workspaceID)
+            }
         }
         workspaces = projectedWorkspaces
         recordRepoPathBaselines(for: projectedWorkspaces)
@@ -6386,6 +6514,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         saveLegacyIndex: Bool
     ) async {
         workspaces.removeAll { $0.id == workspace.id }
+        invalidateDomainReadRegistration(for: workspace.id)
         domainWorkspaceRevisionsByID.removeValue(forKey: workspace.id)
         domainWorkspaceDigestsByID.removeValue(forKey: workspace.id)
         domainWorkspaceFileURLsByID.removeValue(forKey: workspace.id)

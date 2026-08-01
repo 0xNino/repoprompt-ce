@@ -70,6 +70,40 @@ public struct Tool: Sendable {
 }
 
 extension Tool {
+    init(domainBinding: MCPDomainToolBinding) throws {
+        let schemaData = try JSONEncoder().encode(domainBinding.definition.inputSchema)
+        let schema = try JSONDecoder().decode(JSONSchema.self, from: schemaData)
+        self.init(
+            name: domainBinding.definition.name,
+            description: domainBinding.definition.description,
+            inputSchema: schema,
+            annotations: domainBinding.definition.annotations.mcpAnnotations,
+            isEnabledByDefault: domainBinding.definition.isEnabledByDefault,
+            returnsValue: { arguments in
+                try await domainBinding(arguments)
+            }
+        )
+    }
+
+    @MainActor
+    init(
+        domainBinding: MCPDomainToolBinding,
+        runtime: MCPWindowToolRuntime
+    ) throws {
+        let schemaData = try JSONEncoder().encode(domainBinding.definition.inputSchema)
+        let schema = try JSONDecoder().decode(JSONSchema.self, from: schemaData)
+        self = runtime.tool(
+            name: domainBinding.definition.name,
+            freshnessPolicy: .providerManaged,
+            description: domainBinding.definition.description,
+            annotations: domainBinding.definition.annotations.mcpAnnotations,
+            inputSchema: schema,
+            isEnabledByDefault: domainBinding.definition.isEnabledByDefault
+        ) { _, arguments in
+            try await domainBinding(arguments)
+        }
+    }
+
     func domainBinding() throws -> MCPDomainToolBinding {
         let definition = try MCPDomainToolDefinition(
             name: name,

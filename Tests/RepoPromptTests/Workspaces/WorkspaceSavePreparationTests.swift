@@ -83,6 +83,181 @@ import XCTest
             XCTAssertFalse(FileManager.default.fileExists(atPath: manager.workspaceFileURL(for: workspaceB).path))
         }
 
+        func testDomainReadRegistrationCacheSkipsUnchangedStateAndInvalidatesOnDirtyOrRelocation() async throws {
+            let storageRoot = try temporaryDirectory(named: "ReadRegistrationCache")
+            let composition = makeComposition(windowID: -991)
+            let manager = composition.workspaceManager
+            await manager.awaitInitialized()
+            let workspace = makeWorkspace(
+                name: "ReadCache",
+                storage: storageRoot.appendingPathComponent("ReadCache")
+            )
+            manager.workspaces.append(workspace)
+            let switchResult = await manager.switchWorkspace(to: workspace, saveState: false)
+            XCTAssertTrue(switchResult.didSwitch)
+            await manager.waitUntilPostSwitchGitDataLoadComplete()
+            let fileURL = manager.workspaceFileURL(for: workspace)
+
+            // First scoped read must register and, once confirmed, unchanged state is an O(1) skip.
+            let first = try XCTUnwrap(manager.domainReadRegistrationToken(for: workspace, fileURL: fileURL))
+            XCTAssertEqual(first.workspaceID, workspace.id)
+            manager.confirmDomainReadRegistration(first)
+            XCTAssertNil(
+                manager.domainReadRegistrationToken(for: workspace, fileURL: fileURL),
+                "Consecutive reads over unchanged working state must skip re-registration."
+            )
+
+            // A relocated workspace file is a different registration even at the same state version.
+            let relocatedURL = storageRoot.appendingPathComponent("Relocated/workspace.json")
+            XCTAssertNotNil(
+                manager.domainReadRegistrationToken(for: workspace, fileURL: relocatedURL),
+                "A changed target file URL must invalidate the cached registration."
+            )
+
+            // Any dirty-tracking bump requires a fresh registration.
+            manager.markWorkspaceDirty()
+            let afterDirty = try XCTUnwrap(
+                manager.domainReadRegistrationToken(for: workspace, fileURL: fileURL),
+                "A working-state mutation must invalidate the cached registration."
+            )
+            XCTAssertNotEqual(afterDirty.stateVersion, first.stateVersion)
+
+            // A mutation racing the awaited registration must not confirm the stale token.
+            manager.markWorkspaceDirty()
+            manager.confirmDomainReadRegistration(afterDirty)
+            XCTAssertNotNil(
+                manager.domainReadRegistrationToken(for: workspace, fileURL: fileURL),
+                "A token issued before a racing mutation must not satisfy the next read."
+            )
+        }
+
+        func testDomainProjectionInvalidatesConfirmedReadRegistrationCache() async throws {
+            let storageRoot = try temporaryDirectory(named: "ProjectionReadCache")
+            let composition = makeComposition(windowID: -992)
+            let manager = composition.workspaceManager
+            await manager.awaitInitialized()
+            let workspace = makeWorkspace(
+                name: "Projected",
+                storage: storageRoot.appendingPathComponent("Projected")
+            )
+            manager.workspaces.append(workspace)
+            let fileURL = manager.workspaceFileURL(for: workspace)
+
+            func confirmRegistration() throws {
+                let token = try XCTUnwrap(
+                    manager.domainReadRegistrationToken(for: workspace, fileURL: fileURL)
+                )
+                manager.confirmDomainReadRegistration(token)
+                XCTAssertNil(manager.domainReadRegistrationToken(for: workspace, fileURL: fileURL))
+            }
+
+            // An unchanged projected digest keeps the confirmed registration cached.
+            try confirmRegistration()
+            manager.invalidateConfirmedDomainReadRegistrations(
+                previousDigestsByWorkspaceID: [workspace.id: "digest-a"],
+                projectedDigestsByWorkspaceID: [workspace.id: "digest-a"]
+            )
+            XCTAssertNil(
+                manager.domainReadRegistrationToken(for: workspace, fileURL: fileURL),
+                "An unchanged projected digest must not invalidate the confirmed registration."
+            )
+
+            // A moved projected digest (external reload, cross-window commit) forces the next
+            // scoped read to re-register.
+            manager.invalidateConfirmedDomainReadRegistrations(
+                previousDigestsByWorkspaceID: [workspace.id: "digest-a"],
+                projectedDigestsByWorkspaceID: [workspace.id: "digest-b"]
+            )
+            XCTAssertNotNil(
+                manager.domainReadRegistrationToken(for: workspace, fileURL: fileURL),
+                "A changed projected digest must invalidate the confirmed registration."
+            )
+
+            // A workspace removed from the projected catalog also drops its registration.
+            try confirmRegistration()
+            manager.invalidateConfirmedDomainReadRegistrations(
+                previousDigestsByWorkspaceID: [workspace.id: "digest-b"],
+                projectedDigestsByWorkspaceID: [:]
+            )
+            XCTAssertNotNil(
+                manager.domainReadRegistrationToken(for: workspace, fileURL: fileURL),
+                "A removed projected workspace must invalidate the confirmed registration."
+            )
+
+            // End-to-end: a domain projection publication re-validates the cache through the same
+            // seam. Without an authority client this composition conservatively clears it.
+            try confirmRegistration()
+            manager.applyDomainWorkspaceProjection(
+                [workspace],
+                fileURLsByWorkspaceID: [workspace.id: fileURL],
+                revisionsByWorkspaceID: [:],
+                digestsByWorkspaceID: [workspace.id: "digest-c"],
+                catalogRevision: 1,
+                preferredActiveWorkspaceID: workspace.id,
+                publicationSequence: 1
+            )
+            XCTAssertNotNil(
+                manager.domainReadRegistrationToken(for: workspace, fileURL: fileURL),
+                "A projected catalog publication must invalidate confirmed read registrations."
+            )
+        }
+
+        func testProjectionInvalidationFencesInFlightReadRegistrationToken() async throws {
+            let storageRoot = try temporaryDirectory(named: "ReadRegistrationFence")
+            let composition = makeComposition(windowID: -993)
+            let manager = composition.workspaceManager
+            await manager.awaitInitialized()
+            let workspace = makeWorkspace(
+                name: "Fenced",
+                storage: storageRoot.appendingPathComponent("Fenced")
+            )
+            manager.workspaces.append(workspace)
+            let fileURL = manager.workspaceFileURL(for: workspace)
+
+            // Deterministic race: the token is issued (the awaited registerForRead begins), then a
+            // projected digest change invalidates the workspace before the registration confirms.
+            // Projections do not move dirty-tracking state versions, so only the pending-attempt
+            // fence can reject this token.
+            let inFlight = try XCTUnwrap(
+                manager.domainReadRegistrationToken(for: workspace, fileURL: fileURL)
+            )
+            manager.invalidateConfirmedDomainReadRegistrations(
+                previousDigestsByWorkspaceID: [workspace.id: "digest-a"],
+                projectedDigestsByWorkspaceID: [workspace.id: "digest-b"]
+            )
+            manager.confirmDomainReadRegistration(inFlight)
+            XCTAssertNotNil(
+                manager.domainReadRegistrationToken(for: workspace, fileURL: fileURL),
+                "A token issued before a projection invalidation must not be confirmable after it."
+            )
+
+            // The same fence applies when the workspace disappears from the projected catalog.
+            let secondInFlight = try XCTUnwrap(
+                manager.domainReadRegistrationToken(for: workspace, fileURL: fileURL)
+            )
+            manager.invalidateConfirmedDomainReadRegistrations(
+                previousDigestsByWorkspaceID: [workspace.id: "digest-b"],
+                projectedDigestsByWorkspaceID: [:]
+            )
+            manager.confirmDomainReadRegistration(secondInFlight)
+            XCTAssertFalse(
+                manager.debugDomainReadRegistrationStateExistsForWorkspace(workspace.id),
+                "An invalidated/removed workspace must retain no registration state — no tombstones."
+            )
+            XCTAssertNotNil(
+                manager.domainReadRegistrationToken(for: workspace, fileURL: fileURL),
+                "A token issued before a projected removal must not be confirmable after it."
+            )
+
+            // A fresh post-projection token confirms normally and restores the O(1) skip.
+            let fresh = try XCTUnwrap(
+                manager.domainReadRegistrationToken(for: workspace, fileURL: fileURL)
+            )
+            XCTAssertNotEqual(fresh.attemptID, inFlight.attemptID)
+            manager.confirmDomainReadRegistration(fresh)
+            XCTAssertNil(manager.domainReadRegistrationToken(for: workspace, fileURL: fileURL))
+        }
+
         func testSaveBailsWithoutEnqueueOrAcknowledgementWhenWorkspaceRemovedAfterPreparation() async throws {
             let storageRoot = try temporaryDirectory(named: "Removal")
             let composition = makeComposition(windowID: -982)

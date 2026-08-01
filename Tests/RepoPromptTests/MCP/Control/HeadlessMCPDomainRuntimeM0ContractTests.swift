@@ -439,22 +439,125 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         for file in bridgeReferenceBoundary {
             XCTAssertFalse(file.contents.contains("DomainWorkspacePresentationBridge"), file.path)
         }
+        let m3NonMainActorHops = try strings(actorInventory, key: "m3_non_main_actor_hops")
+        let m3SharedReadTools = try Set(strings(actorInventory, key: "m3_shared_read_tools"))
+        let m3ContextRequirements = try stringArrays(actorInventory, key: "m3_context_requirements")
+        XCTAssertEqual(try Set(XCTUnwrap(m3ContextRequirements["workspace_independent"])), ["history", "oracle_chat_log"])
+        XCTAssertEqual(try Set(XCTUnwrap(m3ContextRequirements["workspace_optional"])), ["get_file_tree", "git"])
+        XCTAssertEqual(
+            try Set(XCTUnwrap(m3ContextRequirements["workspace_required"])),
+            ["get_code_structure", "read_file", "file_search", "workspace_context", "prompt"]
+        )
+        let m3CaptureContract = try dictionary(actorInventory, key: "m3_main_actor_capture_contract")
+        XCTAssertEqual(try integer(m3CaptureContract, key: "scoped_authority_captures_per_invocation"), 1)
+        XCTAssertEqual(try integer(m3CaptureContract, key: "workspace_independent_authority_captures_per_invocation"), 0)
+        XCTAssertEqual(m3CaptureContract["refresh_runs_on_main_actor"] as? Bool, false)
+        XCTAssertEqual(m3CaptureContract["read_mutates_presentation_descriptor"] as? Bool, false)
+        XCTAssertEqual(m3CaptureContract["app_execution_snapshot_registered_and_released"] as? Bool, true)
+        XCTAssertEqual(m3CaptureContract["required_context_allows_nil_handle"] as? Bool, false)
+        XCTAssertEqual(m3CaptureContract["direct_test_fallback_uses_domain_handle"] as? Bool, true)
+        XCTAssertEqual(
+            m3CaptureContract["post_drain_refresh"] as? String,
+            "bound_workspace_tab_selection_and_revision_only"
+        )
+        let domainReadRouting = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+DomainRouting.swift"
+        )
+        let resolverStart = try XCTUnwrap(domainReadRouting.range(of: "func resolveDomainReadContext"))
+        let resolverEnd = try XCTUnwrap(
+            domainReadRouting.range(of: "/// Runs before the server is stopped", range: resolverStart.upperBound ..< domainReadRouting.endIndex)
+        )
+        let resolver = domainReadRouting[resolverStart.lowerBound ..< resolverEnd.lowerBound]
+        XCTAssertTrue(resolver.contains("requirement != .workspaceIndependent"))
+        XCTAssertTrue(resolver.contains("registerForRead"))
+        XCTAssertFalse(resolver.contains("registerWindow"))
+        XCTAssertFalse(resolver.contains("publishDomainRoutingBinding"))
+        XCTAssertFalse(domainReadRouting.contains("validateDomainReadContext"))
+        XCTAssertTrue(domainReadRouting.contains("domainReadAppExecutionContexts[invocation.invocationID]"))
+        XCTAssertTrue(domainReadRouting.contains("releaseDomainReadAppExecutionContext"))
+        XCTAssertTrue(domainReadRouting.contains("WindowStatesManager.shared.window(withID: context.windowID)"))
+        XCTAssertTrue(domainReadRouting.contains("targetWorkspaceAuthorityClient.registerForRead"))
+        XCTAssertTrue(domainReadRouting.contains("lookupContext: targetServer.lookupContext(for: context)"))
+        let serverViewModel = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift"
+        )
+        XCTAssertTrue(serverViewModel.contains("window(withID: appContext.targetWindowID)?.mcpServer"))
+        XCTAssertTrue(serverViewModel.contains("executionServer.fileToolProvider.executeDomainRead"))
+        XCTAssertTrue(serverViewModel.contains("executionServer.promptContextToolProvider.executeDomainRead"))
+        XCTAssertTrue(serverViewModel.contains("executionServer.gitToolProvider.executeDomainRead"))
+        XCTAssertTrue(serverViewModel.contains("ServerNetworkManager.currentToolDispatchAuthorization"))
+        XCTAssertTrue(serverViewModel.contains("oracleExecutionServer.oracleToolProvider.executeDomainOracleChatLog"))
+        let fileReadBackend = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift"
+        )
+        XCTAssertTrue(fileReadBackend.contains("readAuthority(appContext)"))
+        let promptReadBackend = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPPromptContextToolProvider.swift"
+        )
+        XCTAssertTrue(promptReadBackend.contains("appContext.resolvedTabContext"))
+        XCTAssertTrue(promptReadBackend.contains("simplePromptReply(tabContext.promptText"))
+        let gitReadBackend = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPGitToolProvider.swift"
+        )
+        // Git domain reads execute against resolve-time captured authority: metadata, lookup
+        // context, routed workspace, and tab context all come from the invocation snapshot, and
+        // the artifact side effects advertise against the same captured context instead of
+        // re-resolving the current request.
+        XCTAssertTrue(gitReadBackend.contains("appContext.metadata"))
+        XCTAssertTrue(gitReadBackend.contains("appContext.lookupContext"))
+        XCTAssertTrue(gitReadBackend.contains("appContext?.resolvedTabContext"))
+        XCTAssertTrue(gitReadBackend.contains("capturedWorkspaceID"))
+        let tabContextExtension = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+TabContext.swift"
+        )
+        XCTAssertTrue(tabContextExtension.contains("capturedContext: DomainReadAppExecutionContext? = nil"))
+        XCTAssertTrue(tabContextExtension.contains("capturedContext.resolvedTabContext.snapshot"))
+        // The primary artifact commit is the third advertisement-adjacent seam: it must accept
+        // the captured context and fail closed when the captured connection identity is missing.
+        XCTAssertTrue(tabContextExtension.contains("Connection identity is unavailable for Git artifact publication"))
+        let windowToolDependencies = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolDependencies.swift"
+        )
+        XCTAssertEqual(
+            windowToolDependencies.components(
+                separatedBy: "_ capturedContext: MCPServerViewModel.DomainReadAppExecutionContext?"
+            ).count - 1,
+            3,
+            "Commit, replace, and invalidate git artifact seams must all carry the captured domain read context."
+        )
         let inventoriedSymbols = Set(expectedLocalSites.map { $0.split(separator: "|").last.map(String.init) ?? "" })
             .union(externalSites.compactMap { $0["symbol"] as? String })
+            .union(m3NonMainActorHops)
         for tool in allTools {
             let hops = try XCTUnwrap(perToolHops[tool], tool)
             XCTAssertFalse(hops.isEmpty, tool)
             XCTAssertTrue(Set(hops).isSubset(of: inventoriedSymbols), tool)
             if MCPWindowToolGroup.orderedToolNames.contains(tool) {
                 XCTAssertTrue(hops.contains("MCPServerViewModel"), tool)
-                XCTAssertTrue(hops.contains("MCPWindowToolRuntime"), tool)
-                let provider = try XCTUnwrap(hops.first { $0.hasSuffix("ToolProvider") }, tool)
-                let providerPaths = expectedLocalSiteRows.compactMap { site -> String? in
-                    guard (site["symbol"] as? String) == provider else { return nil }
-                    return site["path"] as? String
-                }
                 let marker = "name: MCPWindowToolName.\(swiftToolIdentifier(tool))"
-                XCTAssertTrue(try providerPaths.contains { try source($0).contains(marker) }, "\(tool) owner \(provider)")
+                if m3SharedReadTools.contains(tool) {
+                    XCTAssertTrue(hops.contains("MCPDomainReadToolProvider"), tool)
+                    XCTAssertTrue(hops.contains("MCPWindowToolRuntime"), tool)
+                    let definitions = try source("Sources/RepoPromptDomainRuntime/MCPDomainReadToolDefinitions.swift")
+                    XCTAssertTrue(definitions.contains("name: \"\(tool)\""), "\(tool) shared schema")
+                    let appProviders = hops.filter { $0.hasSuffix("ToolProvider") && $0 != "MCPDomainReadToolProvider" }
+                    XCTAssertFalse(appProviders.isEmpty, "\(tool) app backend")
+                    for provider in appProviders {
+                        let providerPaths = expectedLocalSiteRows.compactMap { site -> String? in
+                            guard (site["symbol"] as? String) == provider else { return nil }
+                            return site["path"] as? String
+                        }
+                        XCTAssertFalse(try providerPaths.contains { try source($0).contains(marker) }, "\(tool) duplicate schema in \(provider)")
+                    }
+                } else {
+                    XCTAssertTrue(hops.contains("MCPWindowToolRuntime"), tool)
+                    let provider = try XCTUnwrap(hops.first { $0.hasSuffix("ToolProvider") }, tool)
+                    let providerPaths = expectedLocalSiteRows.compactMap { site -> String? in
+                        guard (site["symbol"] as? String) == provider else { return nil }
+                        return site["path"] as? String
+                    }
+                    XCTAssertTrue(try providerPaths.contains { try source($0).contains(marker) }, "\(tool) owner \(provider)")
+                }
             }
         }
         XCTAssertTrue(try XCTUnwrap(perToolHops["manage_worktree"]).contains("MCPWorktreeToolProvider"))

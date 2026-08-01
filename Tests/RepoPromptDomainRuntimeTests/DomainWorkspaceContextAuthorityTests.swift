@@ -4,6 +4,141 @@ import Foundation
 import XCTest
 
 final class DomainWorkspaceContextAuthorityTests: XCTestCase {
+    func testAwaitedReadRegistrationRoutesMissingWorkspaceWithoutPersistence() async throws {
+        let fixture = try Fixture.make(includeWorkspace: false)
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+        try await runtime.start()
+        let document = try fixture.document(prompt: "ephemeral")
+
+        let registered = await runtime.workspaceStore.registerReadDocument(document)
+        XCTAssertEqual(registered.document.contentDigest, document.contentDigest)
+        XCTAssertEqual(registered.contexts.first?.metadata.identity.contextID, fixture.contextID)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.workspaceFile.path))
+        let catalog = await runtime.workspaceStore.snapshot()
+        XCTAssertTrue(catalog.workspaces.isEmpty)
+
+        let connectionID = UUID()
+        let registrationOutcome = await runtime.routingCoordinator.registerConnection(
+            connectionID: connectionID,
+            operationID: UUID()
+        )
+        let registration = try XCTUnwrap(registrationOutcome.snapshot.connections.first?.registration)
+        let bound = await runtime.routingCoordinator.bind(
+            connection: registration,
+            binding: .context(
+                DomainContextIdentity(workspaceID: fixture.workspaceID, contextID: fixture.contextID),
+                explicit: true
+            ),
+            operationID: UUID()
+        )
+        XCTAssertEqual(bound.disposition, .applied)
+        let handle = try await runtime.routingCoordinator.resolveReadContext(connection: registration)
+        XCTAssertEqual(handle.workspaceRevision, registered.revisions.workingRevision)
+        XCTAssertEqual(handle.contextRevision, registered.contexts.first?.revisions.workingRevision)
+
+        let rejectedReplace = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            origin: .standalone,
+            command: .replaceWorkingDocument(document)
+        ))
+        XCTAssertEqual(rejectedReplace.disposition, .invalid)
+        let stillRegistered = await runtime.contextStore.workspaceSnapshot(fixture.workspaceID)
+        XCTAssertNotNil(stillRegistered)
+
+        // A different newer canonical document supersedes the transient overlay.
+        let canonicalDocument = try fixture.document(prompt: "canonical")
+        let created = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedCatalogRevision: 0,
+            expectedWorkspaceRevision: 0,
+            origin: .standalone,
+            command: .createWorkspace(canonicalDocument)
+        ))
+        XCTAssertEqual(created.disposition, .applied)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.workspaceFile.path))
+        let registeredCanonicalSnapshot = await runtime.contextStore.workspaceSnapshot(fixture.workspaceID)
+        let canonicalSnapshot = try XCTUnwrap(registeredCanonicalSnapshot)
+        XCTAssertEqual(canonicalSnapshot.document.contentDigest, canonicalDocument.contentDigest)
+        XCTAssertNotEqual(canonicalSnapshot.document.contentDigest, document.contentDigest)
+    }
+
+    func testCommandOutcomesReportCanonicalStateWhileReadOverlayIsActive() async throws {
+        let fixture = try Fixture.make(includeWorkspace: false)
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+        try await runtime.start()
+
+        let canonicalDocument = try fixture.document(prompt: "canonical")
+        let created = await runtime.workspaceStore.execute(.init(
+            operationID: UUID(),
+            expectedCatalogRevision: 0,
+            expectedWorkspaceRevision: 0,
+            origin: .standalone,
+            command: .createWorkspace(canonicalDocument)
+        ))
+        XCTAssertEqual(created.disposition, .applied)
+
+        let overlayDocument = try fixture.document(prompt: "overlay")
+        let overlay = await runtime.workspaceStore.registerReadDocument(overlayDocument)
+        XCTAssertNotEqual(
+            overlay.document.contentDigest,
+            canonicalDocument.contentDigest,
+            "Fixture must produce a divergent overlay digest for the assertion to be meaningful."
+        )
+
+        // Transient outcome path: a catalog-revision conflict is recorded while the overlay shadows
+        // read routing. The outcome must still report canonical record state.
+        let transientEnvelope = DomainWorkspaceCommandEnvelope(
+            operationID: UUID(),
+            expectedCatalogRevision: 999_999,
+            origin: .standalone,
+            command: .saveWorkspaceDocument(workspaceID: fixture.workspaceID)
+        )
+        let transient = await runtime.workspaceStore.execute(transientEnvelope)
+        XCTAssertEqual(transient.disposition, .conflict)
+        XCTAssertEqual(
+            transient.workspace?.document.contentDigest,
+            canonicalDocument.contentDigest,
+            "Transient command outcomes must report canonical state, not the read overlay."
+        )
+        XCTAssertEqual(transient.resultingDigest, canonicalDocument.contentDigest)
+
+        // A deduplicated replay of a transient failure is not a completed canonical transition:
+        // the read overlay must survive it.
+        let replayedTransient = await runtime.workspaceStore.execute(transientEnvelope)
+        XCTAssertEqual(replayedTransient.disposition, .deduplicated)
+        let overlayAfterTransientReplay = await runtime.contextStore.workspaceSnapshot(fixture.workspaceID)
+        XCTAssertEqual(
+            overlayAfterTransientReplay?.document.contentDigest,
+            overlayDocument.contentDigest,
+            "A replayed transient failure must not supersede the read overlay."
+        )
+
+        // Global dedup replay path: delete drops the canonical record but keeps the recorded
+        // operation. A replay while a fresh overlay is registered must not resurrect overlay state.
+        let deleteEnvelope = DomainWorkspaceCommandEnvelope(
+            operationID: UUID(),
+            origin: .standalone,
+            command: .deleteWorkspace(workspaceID: fixture.workspaceID)
+        )
+        let deleted = await runtime.workspaceStore.execute(deleteEnvelope)
+        XCTAssertEqual(deleted.disposition, .applied)
+
+        _ = await runtime.workspaceStore.registerReadDocument(overlayDocument)
+        let replayed = await runtime.workspaceStore.execute(deleteEnvelope)
+        XCTAssertEqual(replayed.disposition, .deduplicated)
+        XCTAssertNil(
+            replayed.workspace,
+            "Global dedup replay must report canonical (absent) state, not the read overlay."
+        )
+        let overlayAfterCompletedReplay = await runtime.contextStore.workspaceSnapshot(fixture.workspaceID)
+        XCTAssertNil(
+            overlayAfterCompletedReplay,
+            "A deduplicated replay of a completed command must supersede the read overlay exactly like its original execution."
+        )
+    }
+
     func testSubscriptionBootstrapsBeforePublishingFirstProjection() async throws {
         let fixture = try Fixture.make()
         defer { fixture.remove() }
@@ -426,6 +561,38 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         ))
         XCTAssertEqual(rejected.disposition, .conflict)
         XCTAssertEqual(rejected.diagnostic, "context_revision_scope_mismatch")
+    }
+
+    func testSuccessfulExternalReloadSupersedesReadOverlay() async throws {
+        let fixture = try Fixture.make()
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+        try await runtime.start()
+
+        // Shadow the clean canonical record with a divergent read overlay.
+        let overlayDocument = try fixture.document(prompt: "overlay")
+        let overlay = await runtime.workspaceStore.registerReadDocument(overlayDocument)
+        let shadowed = await runtime.contextStore.workspaceSnapshot(fixture.workspaceID)
+        XCTAssertEqual(shadowed?.document.contentDigest, overlay.document.contentDigest)
+
+        // A successful external reload of a changed saved document is a completed canonical
+        // transition: read routing must serve the reloaded document, not the stale overlay.
+        let external = try fixture.document(prompt: "external clean")
+        try external.documentBytes.write(to: fixture.workspaceFile, options: .atomic)
+        await runtime.workspaceStore.reloadExternalChanges()
+
+        let routed = await runtime.contextStore.workspaceSnapshot(fixture.workspaceID)
+        XCTAssertEqual(
+            routed?.document.contentDigest,
+            external.contentDigest,
+            "External reload must clear the read overlay so reads serve the reloaded canonical document."
+        )
+        XCTAssertNotEqual(routed?.document.contentDigest, overlayDocument.contentDigest)
+
+        // An unchanged follow-up reload must not resurrect anything.
+        await runtime.workspaceStore.reloadExternalChanges()
+        let stable = await runtime.contextStore.workspaceSnapshot(fixture.workspaceID)
+        XCTAssertEqual(stable?.document.contentDigest, external.contentDigest)
     }
 
     func testExternalReloadIsAppliedWhenCleanAndConflictsWhenDirty() async throws {
@@ -1043,6 +1210,100 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         XCTAssertEqual(counts.pendingRunContexts, 0)
     }
 
+    func testBindRevisionCASRejectsStaleObservationAndAdmitsExactlyOneConcurrentWinner() async throws {
+        let fixture = try Fixture.make()
+        defer { fixture.remove() }
+        let runtime = fixture.runtime()
+        try await runtime.start()
+        let coordinator = runtime.routingCoordinator
+        let context = DomainContextIdentity(workspaceID: fixture.workspaceID, contextID: fixture.contextID)
+
+        // Phase 1: a publication that advances routing after the reader observed its revision
+        // makes the reader's CAS bind fail closed without mutating the reader's binding, and a
+        // retry against the conflict outcome's re-observed revision succeeds.
+        let readerID = UUID()
+        let registeredReader = await coordinator.registerConnection(connectionID: readerID, operationID: UUID())
+        let readerRegistration = try XCTUnwrap(registeredReader.snapshot.connections.first {
+            $0.registration.connectionID == readerID
+        }?.registration)
+        let observedRevision = registeredReader.snapshot.revision
+
+        let concurrentID = UUID()
+        let registeredConcurrent = await coordinator.registerConnection(
+            connectionID: concurrentID,
+            operationID: UUID()
+        )
+        let concurrentRegistration = try XCTUnwrap(registeredConcurrent.snapshot.connections.first {
+            $0.registration.connectionID == concurrentID
+        }?.registration)
+        let concurrentBound = await coordinator.bind(
+            connection: concurrentRegistration,
+            binding: .context(context, explicit: false),
+            operationID: UUID()
+        )
+        XCTAssertEqual(concurrentBound.disposition, .applied)
+
+        let stale = await coordinator.bind(
+            connection: readerRegistration,
+            binding: .context(context, explicit: true),
+            operationID: UUID(),
+            expectedRevision: observedRevision
+        )
+        XCTAssertEqual(stale.disposition, .conflict)
+        XCTAssertEqual(stale.diagnostic, "routing_revision_mismatch")
+        XCTAssertEqual(
+            stale.snapshot.connections.first { $0.registration.connectionID == readerID }?.binding,
+            .unbound,
+            "A stale CAS bind must not mutate the connection binding."
+        )
+
+        let retried = await coordinator.bind(
+            connection: readerRegistration,
+            binding: .context(context, explicit: true),
+            operationID: UUID(),
+            expectedRevision: stale.snapshot.revision
+        )
+        XCTAssertEqual(retried.disposition, .applied)
+        let handle = try await coordinator.resolveReadContext(connection: readerRegistration)
+        XCTAssertEqual(handle.context, context)
+        XCTAssertEqual(handle.bindingKind, .explicit)
+
+        // Phase 2: concurrent CAS binds sharing one observed revision admit exactly one winner;
+        // every loser reports the revision conflict and no binding is silently clobbered.
+        var racers: [DomainConnectionRegistration] = []
+        for _ in 0 ..< 8 {
+            let racerID = UUID()
+            let registered = await coordinator.registerConnection(connectionID: racerID, operationID: UUID())
+            try racers.append(XCTUnwrap(registered.snapshot.connections.first {
+                $0.registration.connectionID == racerID
+            }?.registration))
+        }
+        let sharedRevision = await coordinator.snapshot().revision
+        let outcomes = await withTaskGroup(of: DomainRoutingOutcome.self) { group in
+            for racer in racers {
+                group.addTask {
+                    await coordinator.bind(
+                        connection: racer,
+                        binding: .context(context, explicit: false),
+                        operationID: UUID(),
+                        expectedRevision: sharedRevision
+                    )
+                }
+            }
+            var collected: [DomainRoutingOutcome] = []
+            for await outcome in group {
+                collected.append(outcome)
+            }
+            return collected
+        }
+        XCTAssertEqual(outcomes.count(where: { $0.disposition == .applied }), 1)
+        XCTAssertEqual(outcomes.count(where: { $0.disposition == .conflict }), racers.count - 1)
+        XCTAssertTrue(
+            outcomes.filter { $0.disposition == .conflict }
+                .allSatisfy { $0.diagnostic == "routing_revision_mismatch" }
+        )
+    }
+
     func testRoutingGenerationsAndRunLaunchTokensAreAuthoritativeAndSingleUse() async throws {
         let fixture = try Fixture.make()
         defer { fixture.remove() }
@@ -1061,6 +1322,26 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
             operationID: UUID()
         )
         XCTAssertEqual(bound.disposition, .applied)
+        let readHandle = try await runtime.routingCoordinator.resolveReadContext(connection: registration)
+        XCTAssertEqual(readHandle.context, context)
+        XCTAssertEqual(readHandle.runtimeID, runtime.identity.runtimeID)
+        XCTAssertEqual(readHandle.runtimeGeneration, runtime.identity.lifecycleGeneration)
+        XCTAssertEqual(readHandle.connectionID, connectionID)
+        XCTAssertEqual(readHandle.bindingKind, .explicit)
+
+        _ = await runtime.routingCoordinator.openWindow(
+            windowID: 99,
+            activeWorkspaceID: nil,
+            activeContextID: nil,
+            presentationRevision: 1,
+            operationID: UUID()
+        )
+        let refreshed = try await runtime.routingCoordinator.refreshReadContext(readHandle)
+        XCTAssertEqual(refreshed.context, readHandle.context)
+        XCTAssertEqual(refreshed.workspaceRevision, readHandle.workspaceRevision)
+        XCTAssertEqual(refreshed.contextRevision, readHandle.contextRevision)
+        XCTAssertNotEqual(refreshed.routingRevision, readHandle.routingRevision)
+
         _ = await runtime.routingCoordinator.registerConnection(connectionID: connectionID, operationID: UUID())
         let stale = await runtime.routingCoordinator.bind(
             connection: registration,
@@ -1164,7 +1445,7 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
             operationID: UUID()
         )
         XCTAssertEqual(latePublication.disposition, .staleGeneration)
-        XCTAssertTrue(latePublication.snapshot.windows.isEmpty)
+        XCTAssertFalse(latePublication.snapshot.windows.contains { $0.windowID == 7 })
 
         let replay = await runtime.routingCoordinator.redeemLaunchToken(
             material: token.material,
