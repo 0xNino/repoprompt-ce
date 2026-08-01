@@ -3336,6 +3336,7 @@ extension MCPServerViewModel {
     func replaceAdvertisedGitArtifactsForCurrentTab(
         toolName: String,
         artifacts: [GitDiffPublishedArtifact],
+        expectedSelectionRevision: UInt64? = nil,
         capturedContext: DomainReadAppExecutionContext? = nil
     ) async throws -> MCPGitArtifactAdvertisementSnapshot {
         // Domain reads advertise against the tab context captured at resolve time; re-resolving
@@ -3432,7 +3433,8 @@ extension MCPServerViewModel {
         guard visibleRootsAreCurrent,
               gitArtifactAdvertisementContextIsCurrent(
                   connectionID: connectionID,
-                  expected: context
+                  expected: context,
+                  expectedSelectionRevision: expectedSelectionRevision
               )
         else {
             gitArtifactAdvertisementRegistry.invalidate(identity: identity)
@@ -3451,7 +3453,8 @@ extension MCPServerViewModel {
     @MainActor
     private func gitArtifactAdvertisementContextIsCurrent(
         connectionID: UUID,
-        expected: TabContextSnapshot
+        expected: TabContextSnapshot,
+        expectedSelectionRevision: UInt64?
     ) -> Bool {
         guard let workspaceID = expected.workspaceID,
               windowIDByConnection[connectionID] == expected.windowID,
@@ -3460,6 +3463,12 @@ extension MCPServerViewModel {
               let tab = manager.composeTab(with: expected.tabID)
         else { return false }
 
+        let currentSelectionRevision = expectedSelectionRevision ?? expected.selectionRevision
+        guard manager.selectionRevisionForMCP(
+            workspaceID: workspaceID,
+            tabID: expected.tabID
+        ) == currentSelectionRevision else { return false }
+
         if let latest = tabContextByConnectionID[connectionID] {
             return latest.tabID == expected.tabID
                 && latest.windowID == expected.windowID
@@ -3467,17 +3476,13 @@ extension MCPServerViewModel {
                 && latest.runID == expected.runID
                 && latest.activeAgentSessionID == expected.activeAgentSessionID
                 && latest.worktreeBindingState == expected.worktreeBindingState
-                && latest.selectionRevision == expected.selectionRevision
+                && latest.selectionRevision == currentSelectionRevision
         }
 
         let activeTabID = manager.activeWorkspace?.activeComposeTabID
             ?? manager.activeWorkspace?.composeTabs.first?.id
         return activeTabID == expected.tabID
             && tab.activeAgentSessionID == expected.activeAgentSessionID
-            && manager.selectionRevisionForMCP(
-                workspaceID: workspaceID,
-                tabID: expected.tabID
-            ) == expected.selectionRevision
     }
 
     @MainActor

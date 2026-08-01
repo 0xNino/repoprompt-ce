@@ -151,6 +151,7 @@ struct MCPWindowToolDependencies {
     typealias ReplaceAdvertisedGitArtifactsForCurrentTab = @MainActor @Sendable (
         _ toolName: String,
         _ artifacts: [GitDiffPublishedArtifact],
+        _ expectedSelectionRevision: UInt64?,
         _ capturedContext: MCPServerViewModel.DomainReadAppExecutionContext?
     ) async throws -> MCPGitArtifactAdvertisementSnapshot
     typealias InvalidateAdvertisedGitArtifactsForCurrentTab = @MainActor @Sendable (

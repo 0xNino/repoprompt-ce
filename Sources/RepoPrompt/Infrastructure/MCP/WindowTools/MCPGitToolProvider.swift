@@ -160,15 +160,23 @@ private final class MCPGitRequestContext {
     }
 }
 
-private actor GitArtifactCommitResultBox {
-    private var aliases: [String] = []
+private struct GitArtifactCommitProjection {
+    let aliases: [String]
+    let selectionRevision: UInt64
+}
 
-    func store(_ aliases: [String]) {
-        self.aliases = aliases
+private actor GitArtifactCommitResultBox {
+    private var result: GitArtifactCommitProjection?
+
+    func store(aliases: [String], selectionRevision: UInt64) {
+        result = GitArtifactCommitProjection(
+            aliases: aliases,
+            selectionRevision: selectionRevision
+        )
     }
 
-    func value() -> [String] {
-        aliases
+    func value() -> GitArtifactCommitProjection? {
+        result
     }
 }
 
@@ -187,6 +195,11 @@ private struct MCPGitArtifactReadinessPreparation {
     let warningsBySnapshotDir: [String: String]
 }
 
+private struct MCPGitStagedAdvertisement {
+    let artifacts: [GitDiffPublishedArtifact]
+    let expectedSelectionRevision: UInt64?
+}
+
 private struct MCPGitDiffRepoOutcome {
     typealias Reply = ToolResultDTOs.GitToolReplyDTO
 
@@ -197,7 +210,7 @@ private struct MCPGitDiffRepoOutcome {
 @MainActor
 final class MCPGitToolProvider {
     private let dependencies: MCPWindowToolDependencies
-    private var stagedAdvertisementsByInvocation: [UUID: [GitDiffPublishedArtifact]] = [:]
+    private var stagedAdvertisementsByInvocation: [UUID: MCPGitStagedAdvertisement] = [:]
 
     init(runtime _: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
         self.dependencies = dependencies
@@ -354,7 +367,7 @@ final class MCPGitToolProvider {
                 toolName: MCPWindowToolName.git
             )
             try Task.checkCancellation()
-            if let advertised = await takeStagedAdvertisement(invocationID: invocationID) {
+            if let stagedAdvertisement = await takeStagedAdvertisement(invocationID: invocationID) {
                 try await sideEffects.submitAndWait(
                     effectClass: .gitArtifacts,
                     fingerprint: "git_artifact_advertisement"
@@ -363,7 +376,8 @@ final class MCPGitToolProvider {
                     do {
                         _ = try await dependencies.replaceAdvertisedGitArtifactsForCurrentTab(
                             MCPWindowToolName.git,
-                            advertised,
+                            stagedAdvertisement.artifacts,
+                            stagedAdvertisement.expectedSelectionRevision,
                             appContext
                         )
                     } catch let error as CancellationError {
@@ -388,7 +402,7 @@ final class MCPGitToolProvider {
 
     private func takeStagedAdvertisement(
         invocationID: UUID
-    ) -> [GitDiffPublishedArtifact]? {
+    ) -> MCPGitStagedAdvertisement? {
         stagedAdvertisementsByInvocation.removeValue(forKey: invocationID)
     }
 
@@ -619,7 +633,10 @@ final class MCPGitToolProvider {
             publishedOutcomes: [MCPContextBuilderGitPublishedOutcome] = []
         ) async throws -> MCPGitArtifactReadinessPreparation {
             guard !publishedSets.isEmpty else {
-                stagedAdvertisementsByInvocation[advertisementInvocationID] = []
+                stagedAdvertisementsByInvocation[advertisementInvocationID] = MCPGitStagedAdvertisement(
+                    artifacts: [],
+                    expectedSelectionRevision: nil
+                )
                 return MCPGitArtifactReadinessPreparation(
                     autoSelectedAliases: [],
                     warningsBySnapshotDir: [:]
@@ -639,7 +656,10 @@ final class MCPGitToolProvider {
                         "Git artifact readiness: snapshot was published, but the exact Git-data root could not be loaded (\(error.localizedDescription)); no primary artifact was auto-selected."
                     )
                 }
-                stagedAdvertisementsByInvocation[advertisementInvocationID] = []
+                stagedAdvertisementsByInvocation[advertisementInvocationID] = MCPGitStagedAdvertisement(
+                    artifacts: [],
+                    expectedSelectionRevision: nil
+                )
                 return MCPGitArtifactReadinessPreparation(
                     autoSelectedAliases: [],
                     warningsBySnapshotDir: warningParts.mapValues { $0.joined(separator: "\n") }
@@ -656,7 +676,10 @@ final class MCPGitToolProvider {
                         store: dependencies.promptVM.workspaceFileContextStore
                     )
                 } catch let error as MCPContextBuilderGitReviewPolicyError {
-                    stagedAdvertisementsByInvocation[advertisementInvocationID] = []
+                    stagedAdvertisementsByInvocation[advertisementInvocationID] = MCPGitStagedAdvertisement(
+                        artifacts: [],
+                        expectedSelectionRevision: nil
+                    )
                     throw MCPError.invalidParams(error.localizedDescription)
                 }
             }
@@ -691,6 +714,7 @@ final class MCPGitToolProvider {
             }
 
             var autoSelectedAliases: [String] = []
+            var expectedAdvertisementSelectionRevision: UInt64?
             if !readyCandidates.isEmpty {
                 do {
                     let resultBox = GitArtifactCommitResultBox()
@@ -707,9 +731,15 @@ final class MCPGitToolProvider {
                             sourceSelection,
                             appContext
                         )
-                        await resultBox.store(commit.autoSelectedAliases)
+                        await resultBox.store(
+                            aliases: commit.autoSelectedAliases,
+                            selectionRevision: commit.selectionRevision
+                        )
                     }
-                    autoSelectedAliases = await resultBox.value()
+                    if let commit = await resultBox.value() {
+                        autoSelectedAliases = commit.aliases
+                        expectedAdvertisementSelectionRevision = commit.selectionRevision
+                    }
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -723,7 +753,10 @@ final class MCPGitToolProvider {
             }
 
             try Task.checkCancellation()
-            stagedAdvertisementsByInvocation[advertisementInvocationID] = advertisedCandidates
+            stagedAdvertisementsByInvocation[advertisementInvocationID] = MCPGitStagedAdvertisement(
+                artifacts: advertisedCandidates,
+                expectedSelectionRevision: expectedAdvertisementSelectionRevision
+            )
 
             return MCPGitArtifactReadinessPreparation(
                 autoSelectedAliases: autoSelectedAliases,

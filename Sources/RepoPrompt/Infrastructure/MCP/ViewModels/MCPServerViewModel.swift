@@ -1321,13 +1321,14 @@ final class MCPServerViewModel: ObservableObject {
                 capturedContext: capturedContext
             )
         },
-        replaceAdvertisedGitArtifactsForCurrentTab: { [weak self] toolName, artifacts, capturedContext in
+        replaceAdvertisedGitArtifactsForCurrentTab: { [weak self] toolName, artifacts, expectedSelectionRevision, capturedContext in
             guard let self else {
                 throw MCPError.internalError("Window deallocated while registering Git artifact aliases")
             }
             return try await replaceAdvertisedGitArtifactsForCurrentTab(
                 toolName: toolName,
                 artifacts: artifacts,
+                expectedSelectionRevision: expectedSelectionRevision,
                 capturedContext: capturedContext
             )
         },
