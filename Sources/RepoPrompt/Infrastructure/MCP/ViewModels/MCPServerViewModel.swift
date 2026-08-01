@@ -1468,11 +1468,19 @@ final class MCPServerViewModel: ObservableObject {
             return await removeStoredSelectionPaths(existing: existing, paths: paths, rawPaths: rawPaths, mode: mode, lookupRootScope: lookupRootScope)
         },
         promoteStoredSelectionPaths: { [weak self] existing, paths, rawPaths, strict, lookupRootScope in
-            guard let self else { return (existing, [], false) }
+            guard let self else { return (existing, [], false, 0) }
             return await promoteStoredSelectionPaths(existing: existing, paths: paths, rawPaths: rawPaths, strict: strict, lookupRootScope: lookupRootScope)
         },
         demoteStoredSelectionPaths: { [weak self] existing, paths, rawPaths, strict, lookupRootScope in
-            guard let self else { return MCPServerViewModel.DemoteStoredSelectionResult(selection: existing, invalidPaths: [], codemapUnavailable: [], mutated: false) }
+            guard let self else {
+                return MCPServerViewModel.DemoteStoredSelectionResult(
+                    selection: existing,
+                    invalidPaths: [],
+                    codemapUnavailable: [],
+                    mutated: false,
+                    validCandidateCount: 0
+                )
+            }
             return await demoteStoredSelectionPaths(existing: existing, paths: paths, rawPaths: rawPaths, strict: strict, lookupRootScope: lookupRootScope)
         },
         computeSelectionSlicesVirtual: { [weak self] base, entries, mode, lookupRootScope in

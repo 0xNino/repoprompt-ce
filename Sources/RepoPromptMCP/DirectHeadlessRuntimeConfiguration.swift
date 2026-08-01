@@ -83,10 +83,17 @@ enum DirectHeadlessRuntimeLocationResolver {
     private static func resolvedWorkingDirectories(_ rawValue: String?) throws -> [URL] {
         guard let rawValue else { return [] }
         let values = rawValue.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        return try validatedWorkingDirectories(values)
+    }
+
+    static func validatedWorkingDirectories(_ values: [String]) throws -> [URL] {
+        guard !values.isEmpty else {
+            throw DomainStandaloneScopeError.invalidWorkingDirectory("")
+        }
         var seen: Set<String> = []
         return try values.map { value in
             let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else {
+            guard !trimmed.isEmpty, trimmed.hasPrefix("/") else {
                 throw DomainStandaloneScopeError.invalidWorkingDirectory(value)
             }
             let url = URL(fileURLWithPath: trimmed, isDirectory: true)

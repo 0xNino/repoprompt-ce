@@ -137,20 +137,14 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
                     throw MCPError.invalidParams("context_id is unknown or ambiguous")
                 }
                 identity = match.metadata.identity
-            } else if let workingDirs = Self.workingDirectories(from: args["working_dirs"]) {
-                let requested = Set(workingDirs.map {
-                    URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path
-                })
+            } else if args["working_dirs"] != nil {
+                let workingDirs = try Self.workingDirectories(from: args["working_dirs"])
+                let requested = Set(workingDirs.map(\.path))
                 let catalog = await runtime.workspaceStore.snapshot()
-                let candidates = catalog.workspaces.filter { workspace in
-                    let roots = Set(workspace.document.metadata.repoPaths.map {
-                        URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path
-                    })
-                    return roots == requested || roots.isSuperset(of: requested)
-                }
-                guard candidates.count == 1, let workspace = candidates.first else {
-                    throw MCPError.invalidParams("working_dirs did not resolve one existing workspace; direct creation is not implicit")
-                }
+                let workspace = try Self.resolveWorkingDirectoryWorkspace(
+                    requestedRoots: requested,
+                    catalog: catalog
+                )
                 let activeID = workspace.document.metadata.activeContextID
                 guard let chosen = workspace.contexts.first(where: { $0.metadata.identity.contextID == activeID })
                     ?? (workspace.contexts.count == 1 ? workspace.contexts.first : nil)
@@ -318,6 +312,8 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             throw DirectHeadlessDomainContext.Error.invalidWorkspaceDocument
         }
         var selectedContextID: UUID?
+        var closedContextID: UUID?
+        var expectedClosedBinding: DomainBinding?
         switch action {
         case "hide", "unhide":
             object["isHiddenInMenus"] = action == "hide"
@@ -364,6 +360,7 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             else {
                 throw MCPError.invalidParams("close_tab requires an existing tab and refuses to close the last tab")
             }
+            closedContextID = targetID
             let activeID = (object["activeComposeTabID"] as? String).flatMap(UUID.init(uuidString:))
             if activeID == targetID, args["allow_active"]?.boolValue != true {
                 throw MCPError.invalidRequest("close_tab refuses to close the active tab unless allow_active=true")
@@ -376,6 +373,16 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             }
         default:
             throw MCPError.invalidParams("unsupported workspace mutation: \(action)")
+        }
+
+        if let closedContextID,
+           let scope = try? await runtime.standaloneScopeCoordinator.snapshot(scopeID: scopeID),
+           scope.binding.ordinaryContextMatches(DomainContextIdentity(
+               workspaceID: workspace.document.workspaceID,
+               contextID: closedContextID
+           ))
+        {
+            expectedClosedBinding = scope.binding
         }
 
         let bytes = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
@@ -397,7 +404,54 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             "action": .string(action),
             "workspace_revision": .int(Int(outcome.after?.workingRevision ?? workspace.revisions.workingRevision))
         ]
-        if let selectedContextID {
+        var repairedBinding: DomainBinding?
+        var repairedContextID: UUID?
+        if let expectedClosedBinding {
+            let casResult: DomainStandaloneBindingCASResult
+            if let replacementContextID = replacement.metadata.activeContextID
+                ?? replacement.metadata.contexts.first?.identity.contextID
+            {
+                let bindResult = try await runtime.standaloneScopeCoordinator.compareAndSetBinding(
+                    scopeID: scopeID,
+                    expectedBinding: expectedClosedBinding,
+                    replacement: .context(
+                        DomainContextIdentity(
+                            workspaceID: workspace.document.workspaceID,
+                            contextID: replacementContextID
+                        ),
+                        explicit: true
+                    )
+                )
+                if bindResult.disposition == .rejected {
+                    casResult = try await runtime.standaloneScopeCoordinator.compareAndSetBinding(
+                        scopeID: scopeID,
+                        expectedBinding: expectedClosedBinding,
+                        replacement: .unbound
+                    )
+                } else {
+                    casResult = bindResult
+                }
+            } else {
+                casResult = try await runtime.standaloneScopeCoordinator.compareAndSetBinding(
+                    scopeID: scopeID,
+                    expectedBinding: expectedClosedBinding,
+                    replacement: .unbound
+                )
+            }
+            repairedBinding = casResult.snapshot.binding
+            if let repairedBinding,
+               case let .context(identity, _) = repairedBinding
+            {
+                repairedContextID = identity.contextID
+            }
+        }
+        if let repairedBinding {
+            result["binding"] = bindingValue(repairedBinding)
+            if let repairedContextID {
+                result["context_id"] = .string(repairedContextID.uuidString)
+            }
+        }
+        if action == "create_tab", let selectedContextID {
             let binding = try await runtime.standaloneScopeCoordinator.bind(
                 scopeID: scopeID,
                 context: DomainContextIdentity(
@@ -488,16 +542,60 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
         return try .object(result)
     }
 
-    private nonisolated static func workingDirectories(from value: Value?) -> [String]? {
-        guard let value else { return nil }
-        if let string = value.stringValue {
-            return string.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+    nonisolated static func resolveWorkingDirectoryWorkspace(
+        requestedRoots: Set<String>,
+        catalog: DomainWorkspaceCatalogSnapshot
+    ) throws -> DomainWorkspaceSnapshot {
+        var exactMatches: [DomainWorkspaceSnapshot] = []
+        var supersetMatches: [DomainWorkspaceSnapshot] = []
+        for workspace in catalog.workspaces {
+            let roots = Set(workspace.document.metadata.repoPaths.map {
+                URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path
+            })
+            if roots == requestedRoots {
+                exactMatches.append(workspace)
+            } else if roots.isSuperset(of: requestedRoots) {
+                supersetMatches.append(workspace)
+            }
         }
-        if let array = value.arrayValue {
-            let strings = array.compactMap(\.stringValue)
-            return strings.count == array.count ? strings : nil
+        let matches = exactMatches.isEmpty ? supersetMatches : exactMatches
+        guard matches.count == 1, let workspace = matches.first else {
+            throw MCPError.invalidParams("working_dirs did not resolve one existing workspace; direct creation is not implicit")
         }
-        return nil
+        return workspace
+    }
+
+    nonisolated static func workingDirectories(from value: Value?) throws -> [URL] {
+        guard let value else {
+            throw MCPError.invalidParams("headless bind requires context_id or working_dirs")
+        }
+        let values: [String]
+        switch value {
+        case let .string(raw):
+            values = raw.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+        case let .array(items):
+            values = try items.map { item in
+                guard let string = item.stringValue else {
+                    throw MCPError.invalidParams("working_dirs must be an array of strings or a comma-separated string")
+                }
+                return string
+            }
+        default:
+            throw MCPError.invalidParams("working_dirs must be an array of strings or a comma-separated string")
+        }
+
+        do {
+            return try DirectHeadlessRuntimeLocationResolver.validatedWorkingDirectories(values)
+        } catch let error as DomainStandaloneScopeError {
+            switch error {
+            case let .invalidWorkingDirectory(path):
+                throw MCPError.invalidParams(
+                    "working_dirs contains invalid directory '\(path)'; expected unique existing absolute directories"
+                )
+            default:
+                throw MCPError.invalidParams("working_dirs is invalid")
+            }
+        }
     }
 
     private func bindingContext(_ binding: DomainBinding) -> DomainContextIdentity? {

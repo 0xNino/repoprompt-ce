@@ -1,5 +1,6 @@
 import MCP
 @testable import RepoPromptApp
+@testable import RepoPromptMCP
 import RepoPromptShared
 import XCTest
 
@@ -158,6 +159,88 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         XCTAssertFalse(body.contains("private discovery selection"))
         XCTAssertTrue(body.contains("use operation ID \\(operationID) only to correlate this result"))
         XCTAssertFalse(body.contains("reconcile using operation ID"))
+    }
+
+    func testManageSelectionPromoteDemotePersistOnlyWhenMutationOccurs() throws {
+        let source = try Self.source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPSelectionToolProvider.swift")
+        let promote = try XCTUnwrap(source.slice(from: "        case \"promote\":", to: "        case \"demote\":"))
+        try Self.assertOrdered([
+            "let promoteResult = await dependencies.selection.promoteStoredSelectionPaths(",
+            "if promoteResult.validCandidateCount == 0",
+            "throw Self.invalidOnlySelectionError(",
+            "persistAndReply(",
+            "mutated: promoteResult.mutated"
+        ], in: promote)
+        XCTAssertFalse(promote.contains("if strict, !promoteResult.mutated"))
+
+        let demote = try XCTUnwrap(source.slice(from: "        case \"demote\":", to: "        case \"clear\":"))
+        try Self.assertOrdered([
+            "let demoteResult = await dependencies.selection.demoteStoredSelectionPaths(",
+            "if demoteResult.validCandidateCount == 0",
+            "throw Self.invalidOnlySelectionError(",
+            "persistAndReply(",
+            "mutated: demoteResult.mutated"
+        ], in: demote)
+        XCTAssertFalse(demote.contains("if strict, !demoteResult.mutated"))
+
+        let persistence = try XCTUnwrap(source.slice(
+            from: "    private func persistAndReply(",
+            to: "    static func requireCanonicalSelection("
+        ))
+        try Self.assertOrdered([
+            "} else if mutated {",
+            "persistResolvedTabContextSnapshot(",
+            "} else {",
+            "canonicalSelection = baseContext.selection"
+        ], in: persistence)
+        XCTAssertEqual(
+            persistence.components(separatedBy: "persistResolvedTabContextSnapshot(").count - 1,
+            1
+        )
+    }
+
+    func testPromoteDemoteInvalidOnlyDiagnosticsMapToInvalidParamsToolErrors() {
+        let error = MCPSelectionToolProvider.invalidOnlySelectionError(
+            invalidPaths: ["outside/Sources/A.swift"],
+            fallback: "unused fallback"
+        )
+        XCTAssertEqual(
+            String(describing: error),
+            "[-32602] Invalid params: Invalid selection inputs: outside/Sources/A.swift"
+        )
+
+        let fallback = MCPSelectionToolProvider.invalidOnlySelectionError(
+            invalidPaths: [],
+            fallback: "promote could not resolve any files"
+        )
+        XCTAssertEqual(
+            String(describing: fallback),
+            "[-32602] Invalid params: promote could not resolve any files"
+        )
+    }
+
+    func testCloseTabRepairsBoundNonActiveContextAfterCommit() throws {
+        let source = try Self.source("Sources/RepoPromptMCP/DirectHeadlessWorkspaceBackends.swift")
+        let body = try XCTUnwrap(source.slice(
+            from: "        case \"close_tab\":",
+            to: "    private func resolveWorkspace("
+        ))
+
+        try Self.assertOrdered([
+            "closedContextID = targetID",
+            "var expectedClosedBinding: DomainBinding?",
+            "scope.binding.ordinaryContextMatches(",
+            "command: .replaceWorkingDocument(replacement)",
+            "let outcome = await runtime.workspaceStore.execute(",
+            "try requireApplied(outcome)",
+            "compareAndSetBinding(",
+            "expectedBinding: expectedClosedBinding",
+            "repairedBinding = casResult.snapshot.binding",
+            "result[\"binding\"] = bindingValue(repairedBinding)",
+            "if action == \"create_tab\", let selectedContextID"
+        ], in: body)
+        XCTAssertFalse(body.contains("let boundContext = bindingContext(scope.binding)"))
+        XCTAssertFalse(body.contains("standaloneScopeCoordinator.unbind(scopeID: scopeID)"))
     }
 
     func testFileActionsOperationIDSchemaDescribesCorrelationWithoutJournalSemantics() throws {

@@ -2120,6 +2120,40 @@
             )
         }
 
+        func testReadFileRangeHandlesIntMinAndIndexLimitOverflowWithoutTrapping() throws {
+            let prepared = WorkspaceInteractiveReadProcessor.prepare("one\ntwo\nthree")
+
+            let minimumTail = try WorkspaceInteractiveReadProcessor.slice(
+                prepared,
+                startLine1Based: Int.min,
+                lineCount: nil
+            )
+            XCTAssertEqual(minimumTail.content, "one\ntwo\nthree")
+            XCTAssertEqual(minimumTail.firstLine, 1)
+            XCTAssertEqual(minimumTail.lastLine, 3)
+            XCTAssertFalse(minimumTail.startExceededFileLength)
+
+            let overflowingLimit = try WorkspaceInteractiveReadProcessor.slice(
+                prepared,
+                startLine1Based: 2,
+                lineCount: Int.max
+            )
+            XCTAssertEqual(overflowingLimit.content, "two\nthree")
+            XCTAssertEqual(overflowingLimit.firstLine, 2)
+            XCTAssertEqual(overflowingLimit.lastLine, 3)
+            XCTAssertEqual(overflowingLimit.returnedLineCount, 2)
+
+            let overflowingIndex = try WorkspaceInteractiveReadProcessor.slice(
+                prepared,
+                startLine1Based: Int.max,
+                lineCount: nil
+            )
+            XCTAssertEqual(overflowingIndex.content, "")
+            XCTAssertEqual(overflowingIndex.firstLine, Int.max)
+            XCTAssertEqual(overflowingIndex.lastLine, 3)
+            XCTAssertTrue(overflowingIndex.startExceededFileLength)
+        }
+
         @MainActor
         func testWI8GitAndReadProjectionPreserveDTOContents() async throws {
             let patch = """

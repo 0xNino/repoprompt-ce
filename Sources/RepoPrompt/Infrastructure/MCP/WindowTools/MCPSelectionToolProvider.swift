@@ -25,6 +25,17 @@ final class MCPSelectionToolProvider: MCPAppToolProviding {
         dependencies = (context: context, selection: selection, files: files)
     }
 
+    nonisolated static func invalidOnlySelectionError(
+        invalidPaths: [String],
+        fallback: String
+    ) -> MCPError {
+        .invalidParams(
+            invalidPaths.isEmpty
+                ? fallback
+                : "Invalid selection inputs: \(invalidPaths.joined(separator: ", "))"
+        )
+    }
+
     func buildTools() -> [Tool] {
         [manageSelectionTool()]
     }
@@ -543,17 +554,19 @@ final class MCPSelectionToolProvider: MCPAppToolProviding {
             selectionLog("[Virtual] manage_selection op=promote paths=\(selectionPaths.count) tab=\(context.tabID)")
             if physicalSelectionPaths.isEmpty { throw MCPError.invalidParams("paths required for promote") }
             if !physicalSliceInputs.isEmpty { throw MCPError.invalidParams("promote does not support slices") }
-            let (newSelection, invalid, mutated) = await dependencies.selection.promoteStoredSelectionPaths(context.selection, physicalSelectionPaths, rawPaths, strict, lookupRootScope)
+            let promoteResult = await dependencies.selection.promoteStoredSelectionPaths(context.selection, physicalSelectionPaths, rawPaths, strict, lookupRootScope)
             try Task.checkCancellation()
-            var combinedInvalid = invalid
+            var combinedInvalid = promoteResult.invalidPaths
             for error in extraInvalid where !combinedInvalid.contains(error) {
                 combinedInvalid.append(error)
             }
-            if strict, !mutated {
-                let hint = await dependencies.selection.makeSelectionHintError(rawPaths, "promote", lookupContext)
-                throw MCPError.invalidParams(hint)
+            if promoteResult.validCandidateCount == 0 {
+                let hint = combinedInvalid.isEmpty
+                    ? await dependencies.selection.makeSelectionHintError(rawPaths, "promote", lookupContext)
+                    : ""
+                throw Self.invalidOnlySelectionError(invalidPaths: combinedInvalid, fallback: hint)
             }
-            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, lookupContext: lookupContext, baseContext: context, selection: newSelection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view)
+            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, lookupContext: lookupContext, baseContext: context, selection: promoteResult.selection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view, mutated: promoteResult.mutated)
         case "demote":
             let context = resolvedContext.snapshot
             selectionLog("[Virtual] manage_selection op=demote paths=\(selectionPaths.count) tab=\(context.tabID)")
@@ -568,11 +581,13 @@ final class MCPSelectionToolProvider: MCPAppToolProviding {
             for msg in demoteResult.codemapUnavailable where !combinedInvalid.contains(msg) {
                 combinedInvalid.append(msg)
             }
-            if strict, !demoteResult.mutated {
-                let hint = await dependencies.selection.makeSelectionHintError(rawPaths, "demote", lookupContext)
-                throw MCPError.invalidParams(hint)
+            if demoteResult.validCandidateCount == 0 {
+                let hint = combinedInvalid.isEmpty
+                    ? await dependencies.selection.makeSelectionHintError(rawPaths, "demote", lookupContext)
+                    : ""
+                throw Self.invalidOnlySelectionError(invalidPaths: combinedInvalid, fallback: hint)
             }
-            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, lookupContext: lookupContext, baseContext: context, selection: demoteResult.selection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view)
+            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, lookupContext: lookupContext, baseContext: context, selection: demoteResult.selection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view, mutated: demoteResult.mutated)
         case "clear":
             let baseContext = resolvedContext.snapshot
             selectionLog("[Virtual] manage_selection op=clear mode=\(mode) tab=\(baseContext.tabID)")
@@ -599,6 +614,7 @@ final class MCPSelectionToolProvider: MCPAppToolProviding {
         display: FilePathDisplay,
         extraInvalid: [String],
         view: String,
+        mutated: Bool = true,
         artifactFence: MCPManageSelectionArtifactAuthorizationFence? = nil,
         reviewGitContext: FrozenPromptGitReviewContext? = nil
     ) async throws -> ToolResultDTOs.SelectionReply {
@@ -626,7 +642,7 @@ final class MCPSelectionToolProvider: MCPAppToolProviding {
                     "Selection persistence handoff failed for manage_selection: \(reason)."
                 )
             }
-        } else {
+        } else if mutated {
             let verification = await dependencies.selection.persistResolvedTabContextSnapshot(
                 resolvedContext,
                 metadata,
@@ -639,6 +655,8 @@ final class MCPSelectionToolProvider: MCPAppToolProviding {
                 operation: "manage_selection",
                 recovery: "Retry manage_selection for the same context_id or rebind the tab context before continuing."
             )
+        } else {
+            canonicalSelection = baseContext.selection
         }
         await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionPersistence, transition: .completed)
         try Task.checkCancellation()

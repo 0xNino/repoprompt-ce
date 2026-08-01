@@ -244,7 +244,7 @@ enum MCPAppPhysicalCapabilityAdapters {
         _ rawPaths: [String],
         _ strict: Bool,
         _ lookupRootScope: WorkspaceLookupRootScope
-    ) async -> (StoredSelection, [String], Bool)
+    ) async -> (selection: StoredSelection, invalidPaths: [String], mutated: Bool, validCandidateCount: Int)
     typealias DemoteStoredSelectionPaths = @MainActor @Sendable (
         _ existing: StoredSelection,
         _ paths: [String],

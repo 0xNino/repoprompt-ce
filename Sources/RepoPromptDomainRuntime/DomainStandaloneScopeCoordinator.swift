@@ -28,6 +28,22 @@ package struct DomainStandaloneScopeSnapshot: Sendable {
     }
 }
 
+package struct DomainStandaloneBindingCASResult: Sendable {
+    package let disposition: DomainRoutingDisposition
+    package let snapshot: DomainStandaloneScopeSnapshot
+    package let diagnostic: String?
+
+    package init(
+        disposition: DomainRoutingDisposition,
+        snapshot: DomainStandaloneScopeSnapshot,
+        diagnostic: String?
+    ) {
+        self.disposition = disposition
+        self.snapshot = snapshot
+        self.diagnostic = diagnostic
+    }
+}
+
 /// Owns direct-process scope and connection authority without manufacturing an app window.
 /// Working directories are validated physical roots used only for deterministic initial binding;
 /// subsequent routing is always expressed as a domain context identity.
@@ -85,17 +101,7 @@ package actor DomainStandaloneScopeCoordinator {
             throw DomainStandaloneScopeError.unknownScope(scopeID)
         }
         let routing = await routingCoordinator.snapshot()
-        guard let connection = routing.connections.first(where: {
-            $0.registration == state.registration
-        }) else {
-            throw DomainStandaloneScopeError.staleConnection
-        }
-        return DomainStandaloneScopeSnapshot(
-            scopeID: scopeID,
-            registration: state.registration,
-            workingDirectories: state.workingDirectories,
-            binding: connection.binding
-        )
+        return try snapshot(scopeID: scopeID, state: state, routing: routing)
     }
 
     package func bind(
@@ -118,6 +124,29 @@ package actor DomainStandaloneScopeCoordinator {
             throw DomainStandaloneScopeError.staleConnection
         }
         return try await snapshot(scopeID: scopeID)
+    }
+
+    package func compareAndSetBinding(
+        scopeID: DomainStandaloneScopeID,
+        expectedBinding: DomainBinding,
+        replacement: DomainBinding,
+        operationID: UUID = UUID()
+    ) async throws -> DomainStandaloneBindingCASResult {
+        guard let state = scopes[scopeID] else {
+            throw DomainStandaloneScopeError.unknownScope(scopeID)
+        }
+        let outcome = await routingCoordinator.bind(
+            connection: state.registration,
+            binding: replacement,
+            operationID: operationID,
+            expectedBinding: expectedBinding
+        )
+        let snapshot = try snapshot(scopeID: scopeID, state: state, routing: outcome.snapshot)
+        return DomainStandaloneBindingCASResult(
+            disposition: outcome.disposition,
+            snapshot: snapshot,
+            diagnostic: outcome.diagnostic
+        )
     }
 
     package func unbind(
@@ -146,9 +175,27 @@ package actor DomainStandaloneScopeCoordinator {
         )
     }
 
+    private func snapshot(
+        scopeID: DomainStandaloneScopeID,
+        state: ScopeState,
+        routing: DomainRoutingSnapshot
+    ) throws -> DomainStandaloneScopeSnapshot {
+        guard let connection = routing.connections.first(where: {
+            $0.registration == state.registration
+        }) else {
+            throw DomainStandaloneScopeError.staleConnection
+        }
+        return DomainStandaloneScopeSnapshot(
+            scopeID: scopeID,
+            registration: state.registration,
+            workingDirectories: state.workingDirectories,
+            binding: connection.binding
+        )
+    }
+
     private func bindInitialContextIfUnambiguous(_ state: ScopeState) async {
         let catalog = await workspaceStore.snapshot()
-        let requestedRoots = Set(state.workingDirectories.map { $0.standardizedFileURL.path })
+        let requestedRoots = Set(state.workingDirectories.map(\.standardizedFileURL.path))
         let matches = catalog.workspaces.compactMap { workspace -> DomainContextIdentity? in
             let workspaceRoots = Set(workspace.document.metadata.repoPaths.map {
                 URL(fileURLWithPath: $0).standardizedFileURL.path
