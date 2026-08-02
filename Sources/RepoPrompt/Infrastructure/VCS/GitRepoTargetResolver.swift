@@ -119,10 +119,9 @@ struct GitRepoTargetResolver {
             // `worktree` was just obtained from `git worktree list`; authorize its external
             // checkout path only when the advertising repository itself is loaded and the
             // checkout independently resolves as that exact repository root.
-            let advertisingRepositoryIsLoaded = GitRepoRootAuthorization.isPathWithinAuthorizedRoots(
-                worktree.repository.mainWorktreeRoot,
-                roots: rootPaths
-            )
+            let advertisingRepositoryIsLoaded = worktree.repository.mainWorktreeRoot.map {
+                GitRepoRootAuthorization.isPathWithinAuthorizedRoots($0, roots: rootPaths)
+            } ?? false
             let resolvedWorktree = advertisingRepositoryIsLoaded
                 ? await dependencies.resolveRepo(URL(fileURLWithPath: worktree.path))
                 : nil
