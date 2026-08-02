@@ -143,6 +143,20 @@ final class GitRepoTargetResolverTests: XCTestCase {
         }
     }
 
+    func testAllowsVerifiedMainWorktreeAdvertisedByLoadedLinkedRepository() async throws {
+        let fixture = ResolverFixture()
+        let resolved = try await fixture.resolver.resolveWorktree(
+            selector: "@main",
+            repo: fixture.linkedRepo,
+            allRepos: [fixture.linkedRepo],
+            authorizedRoots: [
+                WorkspaceRootRef(id: UUID(), name: "repo-feature", fullPath: fixture.linkedRepo.rootPath)
+            ]
+        )
+
+        XCTAssertEqual(resolved.path, fixture.mainRepo.rootPath)
+    }
+
     func testRejectsVerifiedExternalWorktreeWhenMainWorktreeRootIsNil() async {
         let fixture = ResolverFixture()
         let externalPath = fixture.root.deletingLastPathComponent()
