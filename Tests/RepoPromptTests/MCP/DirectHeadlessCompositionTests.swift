@@ -243,7 +243,7 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         let escapedStarMatches = try XCTUnwrap(escapedStar["matches"] as? [[String: Any]])
         XCTAssertEqual(
             Set(escapedStarMatches.compactMap { $0["path"] as? String }),
-            Set(["foo/bar.log"])
+            Set(["root.log", "nested/deep.log", "foo/bar.log"])
         )
 
         let pathAlias = try await search([
