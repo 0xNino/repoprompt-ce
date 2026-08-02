@@ -443,7 +443,8 @@ import XCTest
             let targetGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
             let rebuildingGeneration = await rebuildGate.waitUntilEntered()
             XCTAssertEqual(rebuildingGeneration, targetGeneration)
-            await XCTAssertEqual(service.pendingGeneration, targetGeneration)
+            let pendingGeneration = await service.pendingGeneration
+            XCTAssertEqual(pendingGeneration, targetGeneration)
 
             let dropped = await service.search("DropTarget", limit: 10)
             let kept = await service.search("KeepTarget", limit: 10)
