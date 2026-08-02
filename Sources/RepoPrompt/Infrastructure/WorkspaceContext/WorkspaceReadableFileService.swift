@@ -1,6 +1,7 @@
 import Foundation
 #if os(macOS)
     import Darwin
+    import RepoPromptC
 #endif
 
 enum WorkspaceReadableFileResolution {
@@ -453,9 +454,9 @@ struct WorkspaceReadableFileService {
 
     private static func openedFilePath(fileDescriptor: Int32) throws -> String {
         #if os(macOS)
-            var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+            var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
             let result = buffer.withUnsafeMutableBufferPointer { buffer in
-                fcntl(fileDescriptor, F_GETPATH, buffer.baseAddress)
+                repo_get_file_descriptor_path(fileDescriptor, buffer.baseAddress, buffer.count)
             }
             guard result == 0 else {
                 throw FileSystemError.failedToReadFile
