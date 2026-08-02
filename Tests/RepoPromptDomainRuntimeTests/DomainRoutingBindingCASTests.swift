@@ -39,8 +39,9 @@ final class DomainRoutingBindingCASTests: XCTestCase {
         XCTAssertEqual(outcomes.count(where: { $0.disposition.rawValue == "applied" }), 1)
         XCTAssertEqual(outcomes.count(where: { $0.disposition.rawValue == "conflict" }), 1)
         XCTAssertTrue(outcomes.contains { $0.snapshot.binding == next })
-        await XCTAssertEqual(try runtime.standaloneScopeCoordinator.snapshot(scopeID: scopeID).binding, next)
-        await XCTAssertEqual(scope.registration.connectionID, try runtime.standaloneScopeCoordinator.snapshot(scopeID: scopeID).registration.connectionID)
+        let finalSnapshot = try await runtime.standaloneScopeCoordinator.snapshot(scopeID: scopeID)
+        XCTAssertEqual(finalSnapshot.binding, next)
+        XCTAssertEqual(scope.registration.connectionID, finalSnapshot.registration.connectionID)
     }
 
     func testCompareAndSetBindingRejectsACompetingOtherWorkspaceBinding() async throws {
