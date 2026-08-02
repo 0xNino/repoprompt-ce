@@ -120,7 +120,7 @@ struct GitRepoTargetResolver {
             // checkout path only when the advertising repository itself is loaded and the
             // checkout independently resolves as that exact repository root.
             let advertisingRepositoryIsLoaded = GitRepoRootAuthorization.isPathWithinAuthorizedRoots(
-                worktree.repository.rootPath,
+                worktree.repository.mainWorktreeRoot,
                 roots: rootPaths
             )
             let resolvedWorktree = advertisingRepositoryIsLoaded
