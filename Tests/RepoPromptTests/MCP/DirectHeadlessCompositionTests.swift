@@ -183,13 +183,15 @@ final class DirectHeadlessCompositionTests: XCTestCase {
 
         func search(_ arguments: [String: Value]) async throws -> [String: Any] {
             let request = try DomainPhysicalReadRequest(
-                request: DomainPhysicalToolRequest(arguments: arguments),
+                request: DomainPhysicalToolRequest(
+                    argumentsJSON: JSONEncoder().encode(arguments),
+                    securityContext: nil
+                ),
                 context: invocationContext,
                 sideEffects: sideEffects
             )
             let result = try await backend.searchFiles(request)
-            let value = try result.mcpValue()
-            return try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(value)) as? [String: Any])
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: result.json) as? [String: Any])
         }
 
         let filtered = try await search([
