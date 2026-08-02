@@ -659,6 +659,13 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             "worktree_id": .string(sourceWorktreeID),
             "session_id": .string(sessionID.uuidString)
         ])
+        XCTAssertFalse(
+            GitRepoRootAuthorization.isPathWithinAuthorizedRoots(
+                fixture.repo.path,
+                roots: [sourcePath]
+            ),
+            "The regression requires the loaded main target to sit outside the bound source worktree."
+        )
 
         let previewValue = try await manageWorktree([
             "op": .string("preview"),

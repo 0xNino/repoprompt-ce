@@ -185,6 +185,26 @@ enum WorktreeMergeEndpointValidation {
         }
         return sameIdentity(endpoint, current)
     }
+
+    static func resolveAuthorizedDescriptor(
+        for endpoint: GitWorktreeMergeEndpoint,
+        roots: [WorkspaceRootRef],
+        resolver: GitRepoTargetResolver = GitRepoTargetResolver()
+    ) async throws -> GitWorktreeDescriptor {
+        let repo = GitRepoDescriptor(rootURL: endpoint.url)
+        let descriptor = try await resolver.resolveWorktree(
+            selector: "@id:\(endpoint.worktreeID)",
+            repo: repo,
+            allRepos: [repo],
+            authorizedRoots: roots
+        )
+        guard matches(endpoint, descriptor: descriptor) else {
+            throw GitRepoTargetResolverError.invalidParams(
+                "Worktree endpoint identity changed before authorization: \(endpoint.path)"
+            )
+        }
+        return descriptor
+    }
 }
 
 /// Pure, MainActor-independent selectors that decide which worktree merge
@@ -395,13 +415,13 @@ extension AgentModeViewModel {
             repoRoot: repoRoot
         )
         let source = try await worktreeMergeEndpoint(from: sourceBinding)
-        try requireAuthorizedWorktreeMergeEndpoint(source, roots: authorizedRoots, label: "Source")
+        try await requireAuthorizedWorktreeMergeEndpoint(source, roots: authorizedRoots, label: "Source")
         let targetEndpoint = try await resolveWorktreeMergeTargetEndpoint(
             selector: target,
             source: source,
             authorizedRoots: authorizedRoots
         )
-        try requireAuthorizedWorktreeMergeEndpoint(targetEndpoint, roots: authorizedRoots, label: "Target")
+        try await requireAuthorizedWorktreeMergeEndpoint(targetEndpoint, roots: authorizedRoots, label: "Target")
         let directory = workspaceDirectory
             ?? workspaceManager?.activeWorkspace?.customStoragePath
             ?? FileManager.default.temporaryDirectory
@@ -417,8 +437,8 @@ extension AgentModeViewModel {
         ))
         let rootsAfterPreview = try await worktreeMergeAuthorizedRoots(for: session)
         let checkedPreview = try await revalidatedWorktreeMergePreview(preview)
-        try requireAuthorizedWorktreeMergeEndpoint(checkedPreview.inspection.source, roots: rootsAfterPreview, label: "Source")
-        try requireAuthorizedWorktreeMergeEndpoint(checkedPreview.inspection.target, roots: rootsAfterPreview, label: "Target")
+        try await requireAuthorizedWorktreeMergeEndpoint(checkedPreview.inspection.source, roots: rootsAfterPreview, label: "Source")
+        try await requireAuthorizedWorktreeMergeEndpoint(checkedPreview.inspection.target, roots: rootsAfterPreview, label: "Target")
         upsertWorktreeMergeOperation(
             AgentWorktreeMergeCoordinator.makeOperation(preview: checkedPreview),
             in: session
@@ -486,8 +506,8 @@ extension AgentModeViewModel {
             throw MCPError.invalidParams("apply is only valid for a previewed worktree merge operation.")
         }
         let rootsBeforePreview = try await worktreeMergeAuthorizedRoots(for: session)
-        try requireAuthorizedWorktreeMergeEndpoint(operation.source, roots: rootsBeforePreview, label: "Source")
-        try requireAuthorizedWorktreeMergeEndpoint(operation.target, roots: rootsBeforePreview, label: "Target")
+        try await requireAuthorizedWorktreeMergeEndpoint(operation.source, roots: rootsBeforePreview, label: "Source")
+        try await requireAuthorizedWorktreeMergeEndpoint(operation.target, roots: rootsBeforePreview, label: "Target")
         let preview = try await worktreeMergePreview(from: operation)
         return try await requestWorktreeMergeReviewAndApply(
             preview: preview,
@@ -508,8 +528,8 @@ extension AgentModeViewModel {
             throw MCPError.invalidParams("apply is only valid for a previewed worktree merge operation.")
         }
         let rootsBeforePreview = try await worktreeMergeAuthorizedRoots(for: session)
-        try requireAuthorizedWorktreeMergeEndpoint(operation.source, roots: rootsBeforePreview, label: "Source")
-        try requireAuthorizedWorktreeMergeEndpoint(operation.target, roots: rootsBeforePreview, label: "Target")
+        try await requireAuthorizedWorktreeMergeEndpoint(operation.source, roots: rootsBeforePreview, label: "Source")
+        try await requireAuthorizedWorktreeMergeEndpoint(operation.target, roots: rootsBeforePreview, label: "Target")
         let preview = try await worktreeMergePreview(from: operation)
         try updateWorktreeMergeOperation(operationID: operationID, in: session) { pending in
             pending.status = .applying
@@ -566,8 +586,8 @@ extension AgentModeViewModel {
             throw MCPError.invalidParams("continue is only valid for a conflicted or awaiting_commit worktree merge operation.")
         }
         let rootsBeforeContinue = try await worktreeMergeAuthorizedRoots(for: session)
-        try requireAuthorizedWorktreeMergeEndpoint(operation.source, roots: rootsBeforeContinue, label: "Source")
-        try requireAuthorizedWorktreeMergeEndpoint(operation.target, roots: rootsBeforeContinue, label: "Target")
+        try await requireAuthorizedWorktreeMergeEndpoint(operation.source, roots: rootsBeforeContinue, label: "Source")
+        try await requireAuthorizedWorktreeMergeEndpoint(operation.target, roots: rootsBeforeContinue, label: "Target")
         try updateWorktreeMergeOperation(operationID: operationID, in: session) { pending in
             pending.status = .applying
             pending.lastError = nil
@@ -610,7 +630,7 @@ extension AgentModeViewModel {
             throw MCPError.invalidParams("abort is only valid for an active worktree merge operation.")
         }
         let rootsBeforeAbort = try await worktreeMergeAuthorizedRoots(for: session)
-        try requireAuthorizedWorktreeMergeEndpoint(operation.target, roots: rootsBeforeAbort, label: "Target")
+        try await requireAuthorizedWorktreeMergeEndpoint(operation.target, roots: rootsBeforeAbort, label: "Target")
         do {
             try await MCPDomainMutationCommitContext.willCommit()
             let checkedEndpoints = try await revalidatedAndAuthorizedWorktreeMergeEndpoints(
@@ -907,11 +927,19 @@ extension AgentModeViewModel {
         _ endpoint: GitWorktreeMergeEndpoint,
         roots: [WorkspaceRootRef],
         label: String
-    ) throws {
+    ) async throws {
         let rootPaths = roots.map(\.standardizedFullPath)
-        guard GitRepoRootAuthorization.isPathWithinAuthorizedRoots(endpoint.path, roots: rootPaths) else {
+        if GitRepoRootAuthorization.isPathWithinAuthorizedRoots(endpoint.path, roots: rootPaths) {
+            return
+        }
+        do {
+            _ = try await WorktreeMergeEndpointValidation.resolveAuthorizedDescriptor(
+                for: endpoint,
+                roots: roots
+            )
+        } catch {
             throw MCPError.invalidParams(
-                "\(label) worktree path must be inside an authorized workspace root. Received: \(endpoint.path)."
+                "\(label) worktree path must be inside an authorized workspace root or advertised by an authorized repository. Received: \(endpoint.path)."
             )
         }
     }
@@ -1022,8 +1050,8 @@ extension AgentModeViewModel {
     ) async throws -> (source: GitWorktreeMergeEndpoint, target: GitWorktreeMergeEndpoint) {
         let roots = try await worktreeMergeAuthorizedRoots(for: session)
         let endpoints = try await revalidatedWorktreeMergeEndpoints(source: source, target: target)
-        try requireAuthorizedWorktreeMergeEndpoint(endpoints.source, roots: roots, label: "Source")
-        try requireAuthorizedWorktreeMergeEndpoint(endpoints.target, roots: roots, label: "Target")
+        try await requireAuthorizedWorktreeMergeEndpoint(endpoints.source, roots: roots, label: "Source")
+        try await requireAuthorizedWorktreeMergeEndpoint(endpoints.target, roots: roots, label: "Target")
         return endpoints
     }
 
@@ -1033,8 +1061,8 @@ extension AgentModeViewModel {
     ) async throws -> GitWorktreeMergePreview {
         let roots = try await worktreeMergeAuthorizedRoots(for: session)
         let checked = try await revalidatedWorktreeMergePreview(preview)
-        try requireAuthorizedWorktreeMergeEndpoint(checked.inspection.source, roots: roots, label: "Source")
-        try requireAuthorizedWorktreeMergeEndpoint(checked.inspection.target, roots: roots, label: "Target")
+        try await requireAuthorizedWorktreeMergeEndpoint(checked.inspection.source, roots: roots, label: "Source")
+        try await requireAuthorizedWorktreeMergeEndpoint(checked.inspection.target, roots: roots, label: "Target")
         return checked
     }
 
@@ -1057,7 +1085,7 @@ extension AgentModeViewModel {
     ) async throws -> GitWorktreeMergeEndpoint {
         let roots = try await worktreeMergeAuthorizedRoots(for: session)
         let checkedTarget = try await revalidatedWorktreeMergeEndpoint(target, label: "Target")
-        try requireAuthorizedWorktreeMergeEndpoint(checkedTarget, roots: roots, label: "Target")
+        try await requireAuthorizedWorktreeMergeEndpoint(checkedTarget, roots: roots, label: "Target")
         return checkedTarget
     }
 
