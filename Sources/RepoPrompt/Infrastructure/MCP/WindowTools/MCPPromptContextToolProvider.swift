@@ -118,37 +118,7 @@ final class MCPPromptContextToolProvider {
                 MCPWindowToolName.prompt
             )
         }
-        if !resolvedContext.usesActiveTabCompatibility {
-            return try await executeTabScopedPrompt(op: op, args: args, resolvedContext: resolvedContext)
-        }
-        switch op {
-        case "get":
-            return try await activePromptReply(op: op)
-        case "set":
-            guard let text = args["text"]?.stringValue else { throw MCPError.invalidParams("text required for set") }
-            try await MCPDomainMutationCommitContext.willCommit()
-            await MainActor.run { dependencies.context.promptVM.promptText = text }
-            return try Value(simplePromptReply(text, op: op))
-        case "append":
-            guard let text = args["text"]?.stringValue else { throw MCPError.invalidParams("text required for append") }
-            let combined = await dependencies.context.promptVM.promptText + text
-            try await MCPDomainMutationCommitContext.willCommit()
-            await MainActor.run { dependencies.context.promptVM.promptText = combined }
-            return try Value(simplePromptReply(combined, op: op))
-        case "clear":
-            try await MCPDomainMutationCommitContext.willCommit()
-            await MainActor.run { dependencies.context.promptVM.promptText = "" }
-            return try Value(simplePromptReply("", op: op))
-        case "export":
-            return try await exportPrompt(args: args, resolvedContext: resolvedContext, tabContext: nil)
-        case "select_preset":
-            let preset = try await resolveRequiredPreset(args["preset"])
-            try await MCPDomainMutationCommitContext.willCommit()
-            await MainActor.run { dependencies.context.promptVM.selectCopyPreset(preset.id) }
-            return try Value(ToolResultDTOs.PromptToolEnvelope.forSelectPreset(dependencies.prompt.copyPresetDescriptorDTO(preset)))
-        default:
-            throw MCPError.invalidParams("invalid op: \(op)")
-        }
+        return try await executeTabScopedPrompt(op: op, args: args, resolvedContext: resolvedContext)
     }
 
     private func executeTabScopedPrompt(op: String, args: [String: Value], resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot) async throws -> Value {

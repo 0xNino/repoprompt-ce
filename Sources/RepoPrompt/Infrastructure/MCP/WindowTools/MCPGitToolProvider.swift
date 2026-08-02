@@ -1150,13 +1150,9 @@ final class MCPGitToolProvider {
                             MCPWindowToolName.git
                         )
                     let snapshotSelection = resolvedContext.snapshot.selection
-                    let stabilizedSelection: StoredSelection = if resolvedContext.usesActiveTabCompatibility {
-                        snapshotSelection
-                    } else {
-                        await dependencies.selection.stabilizedVirtualSelection(
-                            resolvedContext.snapshot
-                        )
-                    }
+                    let stabilizedSelection = await dependencies.selection.stabilizedVirtualSelection(
+                        resolvedContext.snapshot
+                    )
                     let logicalSelection = Self.selectionHasPublishableGitDiffCandidates(stabilizedSelection)
                         ? stabilizedSelection
                         : snapshotSelection

@@ -251,7 +251,7 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         ))
         let postMutation = try XCTUnwrap(body.slice(
             from: "        // The filesystem mutation is durable.",
-            to: "        if action.lowercased() == \"create\", !resolvedContext.usesActiveTabCompatibility {"
+            to: "        var acknowledgementWarnings: [String] = []"
         ))
 
         XCTAssertTrue(postMutation.contains("let freshness = \"fresh\""))
