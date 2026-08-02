@@ -1312,28 +1312,34 @@ final class MCPServerViewModel: ObservableObject {
         logDebug: { message in
             mcpServerViewModelDebugLog(message)
         },
-        commitPrimaryGitDiffArtifactsToCurrentTab: { [weak self] toolName, candidates, sourceSelection in
+        commitPrimaryGitDiffArtifactsToCurrentTab: { [weak self] toolName, candidates, sourceSelection, capturedContext in
             guard let self else {
                 throw MCPError.internalError("Window deallocated while committing Git artifacts")
             }
             return try await commitPrimaryGitArtifactsToCurrentTab(
                 toolName: toolName,
                 candidates: candidates,
-                sourceSelection: sourceSelection
+                sourceSelection: sourceSelection,
+                capturedContext: capturedContext
             )
         },
-        replaceAdvertisedGitArtifactsForCurrentTab: { [weak self] toolName, artifacts in
+        replaceAdvertisedGitArtifactsForCurrentTab: { [weak self] toolName, artifacts, expectedSelectionRevision, capturedContext in
             guard let self else {
                 throw MCPError.internalError("Window deallocated while registering Git artifact aliases")
             }
             return try await replaceAdvertisedGitArtifactsForCurrentTab(
                 toolName: toolName,
-                artifacts: artifacts
+                artifacts: artifacts,
+                expectedSelectionRevision: expectedSelectionRevision,
+                capturedContext: capturedContext
             )
         },
-        invalidateAdvertisedGitArtifactsForCurrentTab: { [weak self] toolName in
+        invalidateAdvertisedGitArtifactsForCurrentTab: { [weak self] toolName, capturedContext in
             guard let self else { return }
-            await invalidateAdvertisedGitArtifactsForCurrentTab(toolName: toolName)
+            await invalidateAdvertisedGitArtifactsForCurrentTab(
+                toolName: toolName,
+                capturedContext: capturedContext
+            )
         }
     )
 
@@ -1740,6 +1746,7 @@ final class MCPServerViewModel: ObservableObject {
             case "git":
                 return try await executionServer.gitToolProvider.executeDomainRead(
                     context: context,
+                    appContext: appContext,
                     args: args,
                     sideEffects: sideEffects
                 )
@@ -1879,7 +1886,11 @@ final class MCPServerViewModel: ObservableObject {
     var domainRoutingConnectionIDs: Set<UUID> = []
     var domainWindowDescriptor: DomainWindowDescriptor?
     var domainWindowRegistrationTask: Task<DomainWindowDescriptor?, Never>?
+    var domainWindowPresentationRevision: UInt64 = 0
     var domainRoutingWindowIsClosing = false
+    /// Serializes routing publications (bind/release) so rapid tab transitions cannot
+    /// commit bindings out of order and teardown can drain in-flight publications.
+    var domainRoutingPublishTask: Task<Void, Never>?
     @MainActor
     var tabContextCancellablesByConnectionID: [UUID: Set<AnyCancellable>] = [:]
     @MainActor
@@ -2692,21 +2703,6 @@ final class MCPServerViewModel: ObservableObject {
             await apply(snap) // @MainActor method
         }
 
-        ToolAvailabilityStore.shared.$toolSummaries
-            .dropFirst()
-            .sink { [weak self] _ in
-                #if DEBUG || EDIT_FLOW_PERF
-                    let invalidationToolSummariesChangeState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.invalidationToolSummariesChange)
-                #endif
-                Task { [weak self] in
-                    await self?.refreshRegisteredWindowToolCatalog()
-                }
-                #if DEBUG || EDIT_FLOW_PERF
-                    EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.invalidationToolSummariesChange, invalidationToolSummariesChangeState)
-                #endif
-            }
-            .store(in: &cancellables)
-
         workspaceManager.$workspaces
             .dropFirst()
             .sink { [weak self] workspaces in
@@ -3040,15 +3036,6 @@ final class MCPServerViewModel: ObservableObject {
         if activeWindowToolRegistrationHandle == handle {
             activeWindowToolRegistrationHandle = nil
         }
-    }
-
-    @MainActor
-    private func refreshRegisteredWindowToolCatalog() async {
-        // Global availability publication can occur while the initial window enable
-        // is awaiting process registration. Only rebuild an already-active window;
-        // otherwise this callback would supersede the in-flight enable intent.
-        guard windowToolsRequested, windowToolsEnabled else { return }
-        _ = await setWindowToolsEnabled(true)
     }
 
     @MainActor
@@ -6309,30 +6296,14 @@ final class MCPServerViewModel: ObservableObject {
         // The filesystem mutation is durable. From this point cancellation must not be
         // misreported as a safe-to-retry pre-mutation failure.
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationCatalog)
-        var freshness = "fresh"
-        do {
-            _ = try await store.awaitAppliedIngressForExplicitRequest(
-                userPath: effectivePath,
-                fallbackScope: lookupContext.rootScope,
-                timeout: .seconds(2)
-            )
-            if let effectiveNewPath {
-                _ = try await store.awaitAppliedIngressForExplicitRequest(
-                    userPath: effectiveNewPath,
-                    fallbackScope: lookupContext.rootScope,
-                    timeout: .seconds(2)
-                )
-            }
-        } catch {
-            freshness = "pending"
-        }
+        // Workspace-backed mutations publish their catalog delta before returning.
+        // Re-entering the store here to await watcher ingress is both redundant and
+        // unsafe for request settlement: a concurrent Context Builder rebuild can hold
+        // the store actor after the durable mutation and strand this acknowledgement.
+        // External watcher reconciliation remains asynchronous by design.
+        let freshness = "fresh"
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationCatalog, transition: .completed)
         var acknowledgementWarnings: [String] = []
-        if freshness == "pending" {
-            acknowledgementWarnings.append(
-                "The filesystem mutation is durable, but workspace freshness is still pending. Inspect the filesystem with read_file or file_search and use operation ID \(operationID) only to correlate this result; do not blindly replay the mutation."
-            )
-        }
         if Task.isCancelled {
             acknowledgementWarnings.append(
                 "Reply delivery was cancelled after the durable mutation. Inspect the filesystem and use operation ID \(operationID) only to correlate this result; do not blindly replay."
@@ -6369,10 +6340,6 @@ final class MCPServerViewModel: ObservableObject {
                         "The file was created, but its selection was not confirmed. \(error)"
                     )
                 }
-            } else if freshness == "pending" {
-                acknowledgementWarnings.append(
-                    "The created path selection was not confirmed while workspace freshness was pending."
-                )
             }
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
         }
@@ -6615,7 +6582,10 @@ final class MCPServerViewModel: ObservableObject {
                 rootMappings: mutationRootMappings
             )
             try await MCPDomainMutationCommitContext.willCommit()
+            let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+            try physicalMutationGuard?.revalidate()
             try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: nil)
+            try physicalMutationGuard?.revalidate()
             try content.write(to: url, atomically: true, encoding: .utf8)
         } catch {
             throw MCPError.invalidParams("File creation failed for '\(resolvedPath)': \(error.localizedDescription)")
@@ -6668,7 +6638,6 @@ final class MCPServerViewModel: ObservableObject {
             [source.standardizedFullPath, destination],
             rootMappings: mutationRootMappings
         )
-        try await MCPDomainMutationCommitContext.willCommit()
         try await store.moveFile(rootID: source.rootID, from: source.standardizedRelativePath, to: newRelativePath)
     }
 
@@ -6688,7 +6657,6 @@ final class MCPServerViewModel: ObservableObject {
                 [file.standardizedFullPath],
                 rootMappings: mutationRootMappings
             )
-            try await MCPDomainMutationCommitContext.willCommit()
             try await store.moveItemToTrash(rootID: file.rootID, relativePath: file.standardizedRelativePath)
             return
         }
@@ -6700,7 +6668,6 @@ final class MCPServerViewModel: ObservableObject {
                 [folder.standardizedFullPath],
                 rootMappings: mutationRootMappings
             )
-            try await MCPDomainMutationCommitContext.willCommit()
             try await store.moveItemToTrash(rootID: folder.rootID, relativePath: folder.standardizedRelativePath)
         } else {
             throw MCPError.invalidParams("Unknown or unloaded path: \(path).")

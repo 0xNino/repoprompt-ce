@@ -102,13 +102,40 @@ struct GitRepoTargetResolver {
     func resolveWorktree(
         selector rawSelector: String?,
         repo: GitRepoDescriptor,
-        allRepos: [GitRepoDescriptor]
+        allRepos: [GitRepoDescriptor],
+        authorizedRoots: [WorkspaceRootRef]? = nil
     ) async throws -> GitWorktreeDescriptor {
         let worktree = try await resolveWorktreeDescriptor(
             selector: rawSelector,
             repo: repo,
             allRepos: allRepos
         )
+        if let authorizedRoots {
+            let rootPaths = authorizedRoots.map(\.standardizedFullPath)
+            let isInsideLoadedRoot = GitRepoRootAuthorization.isPathWithinAuthorizedRoots(
+                worktree.path,
+                roots: rootPaths
+            )
+            // `worktree` was just obtained from `git worktree list`; authorize its external
+            // checkout path only when the advertising repository itself is loaded and the
+            // checkout independently resolves as that exact repository root.
+            let advertisingRepositoryIsLoaded = GitRepoRootAuthorization.isPathWithinAuthorizedRoots(
+                worktree.repository.mainWorktreeRoot,
+                roots: rootPaths
+            )
+            let resolvedWorktree = advertisingRepositoryIsLoaded
+                ? await dependencies.resolveRepo(URL(fileURLWithPath: worktree.path))
+                : nil
+            let isVerifiedLinkedWorktree = resolvedWorktree.map {
+                samePath($0.rootPath, worktree.path)
+            } ?? false
+            guard isInsideLoadedRoot || isVerifiedLinkedWorktree else {
+                let rootsList = rootPaths.joined(separator: ", ")
+                throw GitRepoTargetResolverError.invalidParams(
+                    "worktree path must be inside a loaded root or advertised by a loaded repository. Received: \(worktree.path). Loaded roots: \(rootsList)"
+                )
+            }
+        }
         // Fail closed on stale/prunable worktrees. Git reports a worktree as prunable when its
         // gitdir points to a non-existent location (the checkout was removed or left incomplete).
         // Binding a session to such a worktree, or operating on it, would crawl and search an
@@ -219,8 +246,9 @@ struct GitRepoTargetResolver {
                 trimmed,
                 in: candidateRepos(allRepos: allRepos, defaultRepo: defaultRepo),
                 selectorKind: .path
-            ) {
-                return GitRepoDescriptor(rootURL: URL(fileURLWithPath: worktree.path))
+            ), let resolved = await dependencies.resolveRepo(URL(fileURLWithPath: worktree.path)),
+            samePath(resolved.rootPath, worktree.path) {
+                return resolved
             }
 
             let rootsList = visibleRootPaths.joined(separator: ", ")

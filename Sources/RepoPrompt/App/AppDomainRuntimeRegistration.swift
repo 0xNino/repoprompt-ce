@@ -139,6 +139,16 @@ extension AppDomainRuntimeComposition {
         await runtime.toolRegistry.snapshot()
     }
 
+    func scopePresence(
+        requiredToolNames: [String],
+        scope: MCPDomainToolRegistrationScope
+    ) async -> MCPDomainToolScopePresence {
+        await runtime.toolRegistry.scopePresence(
+            requiredToolNames: requiredToolNames,
+            scope: scope
+        )
+    }
+
     func resolve(
         toolName: String,
         scope: MCPDomainToolRegistrationScope

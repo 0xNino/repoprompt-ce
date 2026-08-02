@@ -88,7 +88,7 @@ actor DirectHeadlessProviderCoordinator {
         }
         arguments += ["exec", "--json", "--skip-git-repo-check", "--full-auto", "-"]
         let carrier = carrierEnvironment ?? DomainChildLaunchContext.current?.environment ?? [:]
-        var childEnvironment = environment
+        var childEnvironment = DirectProcess.withoutPrivateCarrier(from: environment)
         childEnvironment.merge(carrier) { _, supplied in supplied }
         let output = try await DirectProcess.run(
             executable,

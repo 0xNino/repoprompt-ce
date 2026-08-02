@@ -36,6 +36,46 @@ final class WorktreeMergeReviewStateTests: XCTestCase {
         XCTAssertEqual(endpoint.head, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     }
 
+    func testWorktreeMergeEndpointPostCheckRejectsPathOrIdentityChanges() throws {
+        let repository = GitWorktreeRepositoryIdentity(
+            repositoryID: "gitrepo_merge",
+            repoKey: "merge",
+            displayName: "merge",
+            commonGitDir: "/tmp/merge/.git",
+            mainWorktreeRoot: "/tmp/merge"
+        )
+
+        func descriptor(
+            worktreeID: String = "wt_source",
+            path: String = "/tmp/merge-source/../merge-source",
+            head: String = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ) -> GitWorktreeDescriptor {
+            GitWorktreeDescriptor(
+                worktreeID: worktreeID,
+                repository: repository,
+                path: path,
+                gitDir: "/tmp/merge/.git/worktrees/source",
+                name: "source",
+                branch: "feature",
+                head: head,
+                isMain: false,
+                isCurrent: false,
+                isDetached: false,
+                isLocked: false,
+                lockReason: nil,
+                isPrunable: false,
+                prunableReason: nil
+            )
+        }
+
+        let endpoint = try GitWorktreeMergeEndpoint(descriptor: descriptor())
+        XCTAssertEqual(endpoint.path, "/tmp/merge-source")
+        XCTAssertTrue(WorktreeMergeEndpointValidation.matches(endpoint, descriptor: descriptor()))
+        XCTAssertFalse(WorktreeMergeEndpointValidation.matches(endpoint, descriptor: descriptor(path: "/tmp/merge-other")))
+        XCTAssertFalse(WorktreeMergeEndpointValidation.matches(endpoint, descriptor: descriptor(worktreeID: "wt-replaced")))
+        XCTAssertFalse(WorktreeMergeEndpointValidation.matches(endpoint, descriptor: descriptor(head: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")))
+    }
+
     func testPreviewOperationUpsertAndApprovalStateAreReflectedInRunSnapshot() {
         var operations: [AgentSessionWorktreeMergeOperation] = []
         let preview = makePreview(operationID: "merge_state")

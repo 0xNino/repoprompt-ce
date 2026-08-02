@@ -134,8 +134,9 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
         case "manage_worktree":
             let action = arguments["op"]?.stringValue ?? "list"
             let mutating = ["create", "bind", "select", "unbind", "apply", "continue", "abort"].contains(action)
-                || arguments["persist_visuals"]?.boolValue == true
-            return mutating ? .init(toolName: toolName, action: action) : nil
+            let persistsVisuals = ["list", "show"].contains(action)
+                && arguments["persist_visuals"]?.boolValue == true
+            return mutating || persistsVisuals ? .init(toolName: toolName, action: action) : nil
         default:
             return nil
         }
@@ -163,7 +164,13 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
             context: securityContext,
             toolName: operation.toolName,
             action: operation.action,
-            workspaceID: securityContext.workspaceID
+            workspaceID: securityContext.workspaceID,
+            canonicalRoots: Self.canonicalRoots(
+                operation: operation,
+                arguments: effectiveArguments,
+                securityContext: securityContext,
+                includeAuthoritativeRoots: false
+            )
         )
         try Task.checkCancellation()
 
@@ -202,6 +209,10 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
             let controller = DomainMutationCommitController(
                 admitPhysicalTargets: { paths, mappings in
                     try await admissionState.admit(paths: paths, rootMappings: mappings)
+                },
+                physicalMutationGuard: {
+                    guard await commitState.hasBegunCommit() else { return nil }
+                    return try await admissionState.physicalMutationGuard()
                 },
                 willCommit: {
                     try await commitState.beginIfNeeded {
@@ -245,19 +256,29 @@ package struct MCPDomainProtectedMutationToolProvider: Sendable {
     private static func canonicalRoots(
         operation: DomainProtectedMutationOperation,
         arguments: [String: Value],
-        securityContext: DomainToolInvocationSecurityContext
+        securityContext: DomainToolInvocationSecurityContext,
+        includeAuthoritativeRoots: Bool = true
     ) -> Set<String> {
-        var roots = securityContext.authorizedCanonicalRoots
+        var roots = includeAuthoritativeRoots ? securityContext.authorizedCanonicalRoots : []
+        func insertAbsoluteRoot(_ rawPath: String?) {
+            guard let rawPath,
+                  let canonical = DomainMutationPathFence.canonicalPath(rawPath)
+            else { return }
+            roots.insert(canonical)
+        }
         if operation.toolName == "manage_workspaces",
-           ["add_folder", "create"].contains(operation.action),
-           let rawPath = arguments["folder_path"]?.stringValue?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !rawPath.isEmpty
+           ["add_folder", "create"].contains(operation.action)
         {
-            let expanded = (rawPath as NSString).expandingTildeInPath
-            if expanded.hasPrefix("/") {
-                roots.insert(URL(fileURLWithPath: expanded).standardizedFileURL.path)
-            }
+            insertAbsoluteRoot(
+                arguments["folder_path"]?.stringValue?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+        if operation.toolName == "manage_worktree" {
+            insertAbsoluteRoot(
+                arguments["repo_root"]?.stringValue?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            )
         }
         return roots
     }
@@ -408,6 +429,16 @@ private actor DomainMutationPhysicalAdmissionState {
             try await DomainMutationPathFence.revalidate(pathFence)
         }
         try await journal.markCommitting(ticket)
+    }
+
+    func physicalMutationGuard() throws -> DomainMutationPhysicalCommitGuard? {
+        guard let pathFence else {
+            if requiresPhysicalAdmission {
+                throw DomainMutationPathFenceError.scopeUnavailable
+            }
+            return nil
+        }
+        return DomainMutationPhysicalCommitGuard(snapshot: pathFence)
     }
 
     private static func nearestExistingAncestor(of path: String) -> String? {

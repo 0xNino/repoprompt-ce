@@ -27,6 +27,96 @@ final class GitRepoTargetResolverTests: XCTestCase {
         }
     }
 
+    func testRejectsAbsoluteWorktreeSelectorOutsideLoadedRoots() async throws {
+        let fixture = ResolverFixture()
+        let externalPath = fixture.root.deletingLastPathComponent()
+            .appendingPathComponent("external-worktree-\(UUID().uuidString)", isDirectory: true)
+        let externalWorktree = GitWorktreeDescriptor(
+            worktreeID: "wt_external",
+            repository: fixture.repository,
+            path: externalPath.path,
+            gitDir: externalPath.appendingPathComponent(".git", isDirectory: true).path,
+            name: "external-worktree",
+            branch: "feature/external",
+            head: fixture.linkedWorktree.head,
+            isMain: false,
+            isCurrent: false,
+            isDetached: false,
+            isLocked: false,
+            lockReason: nil,
+            isPrunable: false,
+            prunableReason: nil
+        )
+        let resolver = GitRepoTargetResolver(dependencies: .init(
+            resolveRepo: fixture.resolver.dependencies.resolveRepo,
+            listWorktrees: { _ in [fixture.mainWorktree, externalWorktree] }
+        ))
+
+        do {
+            _ = try await resolver.resolveRepoRoots(
+                explicitRootTokens: [externalPath.path],
+                allRepos: [fixture.mainRepo],
+                visibleRoots: fixture.visibleRoots,
+                defaultRepo: fixture.mainRepo
+            )
+            XCTFail("Expected an absolute selector outside loaded roots to be rejected")
+        } catch let error as GitRepoTargetResolverError {
+            XCTAssertTrue(error.message.contains("inside a loaded root"), error.message)
+        }
+
+        do {
+            _ = try await resolver.resolveWorktree(
+                selector: externalPath.path,
+                repo: fixture.mainRepo,
+                allRepos: [fixture.mainRepo],
+                authorizedRoots: fixture.visibleRoots
+            )
+            XCTFail("Expected an absolute worktree selector outside loaded roots to be rejected")
+        } catch let error as GitRepoTargetResolverError {
+            XCTAssertTrue(error.message.contains("inside a loaded root"), error.message)
+        }
+    }
+
+    func testRejectsEquivalentWorktreeSelectorsOutsideLoadedRoots() async throws {
+        let fixture = ResolverFixture()
+        let externalPath = fixture.root.deletingLastPathComponent()
+            .appendingPathComponent("external-worktree-\(UUID().uuidString)", isDirectory: true)
+        let externalWorktree = GitWorktreeDescriptor(
+            worktreeID: "wt_external",
+            repository: fixture.repository,
+            path: externalPath.path,
+            gitDir: externalPath.appendingPathComponent(".git", isDirectory: true).path,
+            name: "external-worktree",
+            branch: "feature/external",
+            head: fixture.linkedWorktree.head,
+            isMain: true,
+            isCurrent: false,
+            isDetached: false,
+            isLocked: false,
+            lockReason: nil,
+            isPrunable: false,
+            prunableReason: nil
+        )
+        let resolver = GitRepoTargetResolver(dependencies: .init(
+            resolveRepo: fixture.resolver.dependencies.resolveRepo,
+            listWorktrees: { _ in [externalWorktree] }
+        ))
+
+        for selector in ["@main", "@branch:feature/external", "@id:wt_external", "external-worktree"] {
+            do {
+                _ = try await resolver.resolveWorktree(
+                    selector: selector,
+                    repo: fixture.mainRepo,
+                    allRepos: [fixture.mainRepo],
+                    authorizedRoots: fixture.visibleRoots
+                )
+                XCTFail("Expected selector \(selector) to be rejected outside loaded roots")
+            } catch let error as GitRepoTargetResolverError {
+                XCTAssertTrue(error.message.contains("inside a loaded root"), "\(selector): \(error.message)")
+            }
+        }
+    }
+
     func testRejectsLegacyWorktreeBranchSpecifier() async throws {
         let fixture = ResolverFixture()
 

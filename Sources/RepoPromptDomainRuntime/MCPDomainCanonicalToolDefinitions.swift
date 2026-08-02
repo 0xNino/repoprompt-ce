@@ -1047,6 +1047,21 @@ package enum MCPDomainCanonicalToolDefinitions {
     private static func canonicalizeGlobalSemantics(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
+        if definition.name == MCPWindowToolName.agentRun {
+            let oldWaitDescription = "Returns `interaction_id` when input is pending."
+            let currentWaitDescription = oldWaitDescription
+                + " A steering interruption may include `wait.steering_message` as caller context; it does not acknowledge provider delivery or instruct the caller to resend."
+            return MCPDomainToolDefinition(
+                name: definition.name,
+                description: definition.description.replacingOccurrences(
+                    of: oldWaitDescription,
+                    with: currentWaitDescription
+                ),
+                inputSchema: definition.inputSchema,
+                annotations: definition.annotations,
+                isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
         guard definition.name == MCPGlobalToolName.bindContext,
               case var .object(schema) = definition.inputSchema,
               case var .object(properties)? = schema["properties"]
