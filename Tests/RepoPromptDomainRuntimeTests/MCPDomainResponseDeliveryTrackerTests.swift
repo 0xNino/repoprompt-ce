@@ -58,7 +58,10 @@ final class MCPDomainResponseDeliveryTrackerTests: XCTestCase {
         let tracker = MCPDomainResponseDeliveryTracker()
         tracker.recordAcceptedClientFrame(Self.frame(#"{"jsonrpc":"2.0","id":9,"method":"tools/call"}"#))
         let waiter = Task { await tracker.waitUntilDrained() }
-        await Task.yield()
+        for _ in 0 ..< 100 where tracker.snapshot().waiterCount == 0 {
+            await Task.yield()
+        }
+        XCTAssertEqual(tracker.snapshot().waiterCount, 1)
         tracker.reset()
 
         let resetWaiterResult = await waiter.value
