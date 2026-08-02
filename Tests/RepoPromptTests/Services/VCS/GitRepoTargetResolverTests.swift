@@ -143,7 +143,7 @@ final class GitRepoTargetResolverTests: XCTestCase {
         }
     }
 
-    func testRejectsVerifiedExternalWorktreeWhenMainWorktreeRootIsNil() async throws {
+    func testRejectsVerifiedExternalWorktreeWhenMainWorktreeRootIsNil() async {
         let fixture = ResolverFixture()
         let externalPath = fixture.root.deletingLastPathComponent()
             .appendingPathComponent("external-worktree-\(UUID().uuidString)", isDirectory: true)
@@ -167,7 +167,7 @@ final class GitRepoTargetResolverTests: XCTestCase {
         )
     }
 
-    func testRejectsVerifiedExternalWorktreeWhenAdvertisingMainIsNotAuthorized() async throws {
+    func testRejectsVerifiedExternalWorktreeWhenAdvertisingMainIsNotAuthorized() async {
         let fixture = ResolverFixture()
         let externalPath = fixture.root.deletingLastPathComponent()
             .appendingPathComponent("external-worktree-\(UUID().uuidString)", isDirectory: true)
@@ -192,7 +192,7 @@ final class GitRepoTargetResolverTests: XCTestCase {
         )
     }
 
-    func testRejectsExternalWorktreeWhenResolvedRootDoesNotExactlyMatch() async throws {
+    func testRejectsExternalWorktreeWhenResolvedRootDoesNotExactlyMatch() async {
         let fixture = ResolverFixture()
         let externalPath = fixture.root.deletingLastPathComponent()
             .appendingPathComponent("external-worktree-\(UUID().uuidString)", isDirectory: true)
