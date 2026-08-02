@@ -950,10 +950,13 @@ actor DirectHeadlessWorkspaceBackend: DomainWorkspaceCapabilityBackend {
     }
 
     private nonisolated static func relativePath(_ url: URL, roots: [URL]) -> String {
-        for root in roots where url.path.hasPrefix(root.path + "/") {
-            return String(url.path.dropFirst(root.path.count + 1))
+        let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+        for root in roots {
+            let rootPath = root.standardizedFileURL.resolvingSymlinksInPath().path
+            guard path.hasPrefix(rootPath + "/") else { continue }
+            return String(path.dropFirst(rootPath.count + 1))
         }
-        return url.path
+        return path
     }
 
     private nonisolated static func matches(_ pattern: String, value: String, regex: NSRegularExpression?) -> Bool {

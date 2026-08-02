@@ -31,7 +31,7 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         XCTAssertThrowsError(
             try DirectHeadlessVersionControlBackend.authorizeWorktreePath(outside, roots: [root])
         ) { error in
-            XCTAssertTrue(String(describing: error).contains("outside the bound workspace roots"), String(describing: error))
+            XCTAssertTrue(error.localizedDescription.contains("outside the bound workspace roots"), error.localizedDescription)
         }
     }
 
@@ -58,8 +58,8 @@ final class DirectHeadlessCompositionTests: XCTestCase {
             )
         ) { error in
             XCTAssertTrue(
-                String(describing: error).contains("outside the bound workspace roots"),
-                String(describing: error)
+                error.localizedDescription.contains("outside the bound workspace roots"),
+                error.localizedDescription
             )
         }
     }

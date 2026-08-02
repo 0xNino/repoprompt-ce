@@ -112,10 +112,27 @@ struct GitRepoTargetResolver {
         )
         if let authorizedRoots {
             let rootPaths = authorizedRoots.map(\.standardizedFullPath)
-            guard GitRepoRootAuthorization.isPathWithinAuthorizedRoots(worktree.path, roots: rootPaths) else {
+            let isInsideLoadedRoot = GitRepoRootAuthorization.isPathWithinAuthorizedRoots(
+                worktree.path,
+                roots: rootPaths
+            )
+            // `worktree` was just obtained from `git worktree list`; authorize its external
+            // checkout path only when the advertising repository itself is loaded and the
+            // checkout independently resolves as that exact repository root.
+            let advertisingRepositoryIsLoaded = GitRepoRootAuthorization.isPathWithinAuthorizedRoots(
+                worktree.repository.rootPath,
+                roots: rootPaths
+            )
+            let resolvedWorktree = advertisingRepositoryIsLoaded
+                ? await dependencies.resolveRepo(URL(fileURLWithPath: worktree.path))
+                : nil
+            let isVerifiedLinkedWorktree = resolvedWorktree.map {
+                samePath($0.rootPath, worktree.path)
+            } ?? false
+            guard isInsideLoadedRoot || isVerifiedLinkedWorktree else {
                 let rootsList = rootPaths.joined(separator: ", ")
                 throw GitRepoTargetResolverError.invalidParams(
-                    "worktree path must be inside a loaded root. Received: \(worktree.path). Loaded roots: \(rootsList)"
+                    "worktree path must be inside a loaded root or advertised by a loaded repository. Received: \(worktree.path). Loaded roots: \(rootsList)"
                 )
             }
         }
@@ -223,6 +240,15 @@ struct GitRepoTargetResolver {
                     return resolved
                 }
                 throw GitRepoTargetResolverError.invalidParams("No VCS repository found at path: \(trimmed)")
+            }
+
+            if let worktree = try await resolveWorktreeSelector(
+                trimmed,
+                in: candidateRepos(allRepos: allRepos, defaultRepo: defaultRepo),
+                selectorKind: .path
+            ), let resolved = await dependencies.resolveRepo(URL(fileURLWithPath: worktree.path)),
+            samePath(resolved.rootPath, worktree.path) {
+                return resolved
             }
 
             let rootsList = visibleRootPaths.joined(separator: ", ")

@@ -80,6 +80,7 @@ package enum MCPToolExecutionContractCatalog {
         )
         var result = Dictionary(uniqueKeysWithValues: orderedAdvertisedToolNames.map { ($0, bounded) })
         for toolName in [
+            MCPWindowToolName.fileActions,
             MCPWindowToolName.getCodeStructure,
             MCPWindowToolName.readFile,
             MCPWindowToolName.getFileTree
