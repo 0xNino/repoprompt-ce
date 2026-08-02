@@ -122,7 +122,7 @@ struct GitRepoTargetResolver {
             let advertisingRepositoryIsLoaded = worktree.repository.mainWorktreeRoot.map {
                 GitRepoRootAuthorization.isPathWithinAuthorizedRoots($0, roots: rootPaths)
             } ?? false
-            let resolvedWorktree = advertisingRepositoryIsLoaded
+            let resolvedWorktree = !isInsideLoadedRoot && advertisingRepositoryIsLoaded
                 ? await dependencies.resolveRepo(URL(fileURLWithPath: worktree.path))
                 : nil
             let isVerifiedLinkedWorktree = resolvedWorktree.map {

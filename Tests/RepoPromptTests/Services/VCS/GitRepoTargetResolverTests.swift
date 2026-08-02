@@ -117,6 +117,98 @@ final class GitRepoTargetResolverTests: XCTestCase {
         }
     }
 
+    func testAllowsVerifiedExternalLinkedWorktreeAdvertisedByLoadedMainRepository() async throws {
+        let fixture = ResolverFixture()
+        let externalPath = fixture.root.deletingLastPathComponent()
+            .appendingPathComponent("external-worktree-\(UUID().uuidString)", isDirectory: true)
+        let externalWorktree = makeExternalWorktree(path: externalPath, repository: fixture.repository)
+        let externalRepo = GitRepoDescriptor(rootURL: externalPath)
+        let resolver = GitRepoTargetResolver(dependencies: .init(
+            resolveRepo: { url in
+                url.standardizedFileURL.path == externalPath.standardizedFileURL.path
+                    ? externalRepo
+                    : await fixture.resolver.dependencies.resolveRepo(url)
+            },
+            listWorktrees: { _ in [externalWorktree] }
+        ))
+
+        for selector in ["@branch:feature/external", "@id:wt_external", "external-worktree", externalPath.path] {
+            let resolved = try await resolver.resolveWorktree(
+                selector: selector,
+                repo: fixture.mainRepo,
+                allRepos: [fixture.mainRepo],
+                authorizedRoots: fixture.visibleRoots
+            )
+            XCTAssertEqual(resolved.path, externalPath.standardizedFileURL.path, selector)
+        }
+    }
+
+    func testRejectsVerifiedExternalWorktreeWhenMainWorktreeRootIsNil() async throws {
+        let fixture = ResolverFixture()
+        let externalPath = fixture.root.deletingLastPathComponent()
+            .appendingPathComponent("external-worktree-\(UUID().uuidString)", isDirectory: true)
+        let unknownMainRepository = GitWorktreeRepositoryIdentity(
+            repositoryID: fixture.repository.repositoryID,
+            repoKey: fixture.repository.repoKey,
+            displayName: fixture.repository.displayName,
+            commonGitDir: fixture.repository.commonGitDir,
+            mainWorktreeRoot: nil
+        )
+        let externalWorktree = makeExternalWorktree(path: externalPath, repository: unknownMainRepository)
+        let resolver = GitRepoTargetResolver(dependencies: .init(
+            resolveRepo: { _ in GitRepoDescriptor(rootURL: externalPath) },
+            listWorktrees: { _ in [externalWorktree] }
+        ))
+
+        await assertExternalWorktreeRejected(
+            resolver: resolver,
+            selector: externalPath.path,
+            fixture: fixture
+        )
+    }
+
+    func testRejectsVerifiedExternalWorktreeWhenAdvertisingMainIsNotAuthorized() async throws {
+        let fixture = ResolverFixture()
+        let externalPath = fixture.root.deletingLastPathComponent()
+            .appendingPathComponent("external-worktree-\(UUID().uuidString)", isDirectory: true)
+        let unauthorizedRepository = GitWorktreeRepositoryIdentity(
+            repositoryID: fixture.repository.repositoryID,
+            repoKey: fixture.repository.repoKey,
+            displayName: fixture.repository.displayName,
+            commonGitDir: fixture.repository.commonGitDir,
+            mainWorktreeRoot: fixture.root.deletingLastPathComponent()
+                .appendingPathComponent("unloaded-main-\(UUID().uuidString)", isDirectory: true).path
+        )
+        let externalWorktree = makeExternalWorktree(path: externalPath, repository: unauthorizedRepository)
+        let resolver = GitRepoTargetResolver(dependencies: .init(
+            resolveRepo: { _ in GitRepoDescriptor(rootURL: externalPath) },
+            listWorktrees: { _ in [externalWorktree] }
+        ))
+
+        await assertExternalWorktreeRejected(
+            resolver: resolver,
+            selector: externalPath.path,
+            fixture: fixture
+        )
+    }
+
+    func testRejectsExternalWorktreeWhenResolvedRootDoesNotExactlyMatch() async throws {
+        let fixture = ResolverFixture()
+        let externalPath = fixture.root.deletingLastPathComponent()
+            .appendingPathComponent("external-worktree-\(UUID().uuidString)", isDirectory: true)
+        let externalWorktree = makeExternalWorktree(path: externalPath, repository: fixture.repository)
+        let resolver = GitRepoTargetResolver(dependencies: .init(
+            resolveRepo: { _ in fixture.mainRepo },
+            listWorktrees: { _ in [externalWorktree] }
+        ))
+
+        await assertExternalWorktreeRejected(
+            resolver: resolver,
+            selector: externalPath.path,
+            fixture: fixture
+        )
+    }
+
     func testRejectsLegacyWorktreeBranchSpecifier() async throws {
         let fixture = ResolverFixture()
 
@@ -282,6 +374,50 @@ final class GitRepoTargetResolverTests: XCTestCase {
         let linked = root.appendingPathComponent("repo-linked", isDirectory: true)
         try runGit(["worktree", "add", "-b", "feature/linked", linked.path], cwd: repo)
         return (repo, gitDir, linked)
+    }
+
+    private func makeExternalWorktree(
+        path: URL,
+        repository: GitWorktreeRepositoryIdentity
+    ) -> GitWorktreeDescriptor {
+        GitWorktreeDescriptor(
+            worktreeID: "wt_external",
+            repository: repository,
+            path: path.standardizedFileURL.path,
+            gitDir: path.appendingPathComponent(".git", isDirectory: true).path,
+            name: "external-worktree",
+            branch: "feature/external",
+            head: "2222222222222222222222222222222222222222",
+            isMain: false,
+            isCurrent: false,
+            isDetached: false,
+            isLocked: false,
+            lockReason: nil,
+            isPrunable: false,
+            prunableReason: nil
+        )
+    }
+
+    private func assertExternalWorktreeRejected(
+        resolver: GitRepoTargetResolver,
+        selector: String,
+        fixture: ResolverFixture,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            _ = try await resolver.resolveWorktree(
+                selector: selector,
+                repo: fixture.mainRepo,
+                allRepos: [fixture.mainRepo],
+                authorizedRoots: fixture.visibleRoots
+            )
+            XCTFail("Expected unverified external worktree to be rejected", file: file, line: line)
+        } catch let error as GitRepoTargetResolverError {
+            XCTAssertTrue(error.message.contains("inside a loaded root"), error.message, file: file, line: line)
+        } catch {
+            XCTFail("Unexpected error: \(error)", file: file, line: line)
+        }
     }
 
     private func makeLiveFixtureResolver(repo: URL, linked: URL?) -> GitRepoTargetResolver {
