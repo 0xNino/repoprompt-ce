@@ -324,9 +324,12 @@ package actor DomainInteractionBroker {
         record.arbiter.invalidate()
         record.providerTask?.cancel()
         record.timeoutTask?.cancel()
-        if result == .timedOut || result == .cancelled {
-            await record.provider.cancel(requestID)
-        }
         record.continuation.resume(returning: result)
+        if result == .timedOut || result == .cancelled {
+            let providerCancel = record.provider.cancel
+            Task.detached(priority: .utility) {
+                await providerCancel(requestID)
+            }
+        }
     }
 }
