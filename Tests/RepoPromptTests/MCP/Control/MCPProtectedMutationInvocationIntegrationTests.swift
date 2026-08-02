@@ -231,6 +231,342 @@ import XCTest
             }
         }
 
+        func testCorrelationReuseExportEscapeAndBoundWorktreeTranslationCrossAppProvider() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await makeFixture(lease: lease)
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                let repo = fixture.contextA.rootURL
+                let worktree = fixture.rootURL.appendingPathComponent("bound-worktree", isDirectory: true)
+                var worktreeCreated = false
+                var physicalRootID: UUID?
+                let sessionID = UUID()
+                do {
+                    try await registerDomainWorkspace(fixture.contextA)
+                    let workspace = try XCTUnwrap(
+                        fixture.contextA.window.workspaceManager.workspaces.first {
+                            $0.id == fixture.contextA.workspaceID
+                        }
+                    )
+                    await fixture.contextA.window.workspaceManager.switchWorkspace(
+                        to: workspace,
+                        saveState: false,
+                        reason: "MCPProtectedMutationInvocationIntegrationTests"
+                    )
+                    let activeWorkspace = try XCTUnwrap(fixture.contextA.window.workspaceManager.activeWorkspace)
+                    fixture.contextA.window.promptManager.loadComposeTabsFromWorkspace(
+                        activeWorkspace,
+                        syncPromptText: true
+                    )
+                    try initializeGitRepository(at: repo)
+                    await manager.debugSetDomainPeerIdentityForTesting(
+                        connectionID: endpoint.connectionID,
+                        identity: .verified(processID: Int(getpid()), fingerprint: "test:verified:worktree")
+                    )
+                    try await bind(endpoint, to: fixture.contextA)
+                    let initialSecurityContext = try await authoritativeContext(
+                        manager: manager,
+                        endpoint: endpoint,
+                        toolName: "file_actions"
+                    )
+                    let runtime = AppDomainRuntimeComposition.shared.runtime
+                    var journalKeys = try await Set(
+                        runtime.mutationJournal.snapshot().recordSnapshots.map(\.key)
+                    )
+                    let sharedCorrelationID = "shared-correlation-id"
+
+                    let firstLogical = repo.appendingPathComponent("CorrelationOne.txt")
+                    let firstResponse = try await endpoint.callTool(
+                        name: "file_actions",
+                        arguments: [
+                            "action": "create",
+                            "path": firstLogical.path,
+                            "content": "one",
+                            "operation_id": sharedCorrelationID
+                        ]
+                    )
+                    XCTAssertFalse(try toolResult(firstResponse).isError)
+                    let firstCapture = try await captureJournalRecord(
+                        runtime: runtime,
+                        excluding: journalKeys,
+                        toolName: "file_actions",
+                        action: "create"
+                    )
+                    journalKeys = firstCapture.allKeys
+                    assertDurableRequestKey(
+                        firstCapture.record,
+                        endpoint: endpoint,
+                        connectionGeneration: initialSecurityContext.connectionGeneration,
+                        operationID: sharedCorrelationID
+                    )
+
+                    _ = await runtime.routingCoordinator.registerConnection(
+                        connectionID: endpoint.connectionID,
+                        operationID: UUID()
+                    )
+                    try await bind(endpoint, to: fixture.contextA)
+                    let routingProbe = try await endpoint.callTool(
+                        name: "get_file_tree",
+                        arguments: ["type": "roots"]
+                    )
+                    XCTAssertFalse(try toolResult(routingProbe).isError)
+                    let reboundSecurityContext = try await authoritativeContext(
+                        manager: manager,
+                        endpoint: endpoint,
+                        toolName: "file_actions"
+                    )
+                    XCTAssertGreaterThan(
+                        reboundSecurityContext.connectionGeneration,
+                        initialSecurityContext.connectionGeneration
+                    )
+
+                    let secondLogical = repo.appendingPathComponent("CorrelationTwo.txt")
+                    let secondResponse = try await endpoint.callTool(
+                        name: "file_actions",
+                        arguments: [
+                            "action": "create",
+                            "path": secondLogical.path,
+                            "content": "two",
+                            "operation_id": sharedCorrelationID
+                        ]
+                    )
+                    XCTAssertFalse(try toolResult(secondResponse).isError)
+                    let secondCapture = try await captureJournalRecord(
+                        runtime: runtime,
+                        excluding: journalKeys,
+                        toolName: "file_actions",
+                        action: "create"
+                    )
+                    journalKeys = secondCapture.allKeys
+                    assertDurableRequestKey(
+                        secondCapture.record,
+                        endpoint: endpoint,
+                        connectionGeneration: reboundSecurityContext.connectionGeneration,
+                        operationID: sharedCorrelationID
+                    )
+                    XCTAssertNotEqual(firstCapture.record.key, secondCapture.record.key)
+
+                    let thirdLogical = repo.appendingPathComponent("CorrelationThree.txt")
+                    let thirdResponse = try await endpoint.callTool(
+                        name: "file_actions",
+                        arguments: [
+                            "action": "create",
+                            "path": thirdLogical.path,
+                            "content": "three",
+                            "operation_id": sharedCorrelationID
+                        ]
+                    )
+                    XCTAssertFalse(try toolResult(thirdResponse).isError)
+                    let thirdCapture = try await captureJournalRecord(
+                        runtime: runtime,
+                        excluding: journalKeys,
+                        toolName: "file_actions",
+                        action: "create"
+                    )
+                    journalKeys = thirdCapture.allKeys
+                    assertDurableRequestKey(
+                        thirdCapture.record,
+                        endpoint: endpoint,
+                        connectionGeneration: reboundSecurityContext.connectionGeneration,
+                        operationID: sharedCorrelationID
+                    )
+                    XCTAssertNotEqual(secondCapture.record.key, thirdCapture.record.key)
+                    XCTAssertEqual(try String(contentsOf: firstLogical, encoding: .utf8), "one")
+                    XCTAssertEqual(try String(contentsOf: secondLogical, encoding: .utf8), "two")
+                    XCTAssertEqual(try String(contentsOf: thirdLogical, encoding: .utf8), "three")
+
+                    await manager.setRunPurpose(.agentModeRun, for: endpoint.connectionID)
+                    for toolName in ["prompt", "workspace_context"] {
+                        let escapedExport = fixture.rootURL.appendingPathComponent(
+                            "outside-workspace-\(toolName)-export.md"
+                        )
+                        let exportResponse = try await endpoint.callTool(
+                            name: toolName,
+                            arguments: ["op": "export", "path": escapedExport.path]
+                        )
+                        let exportResult = try toolResult(exportResponse)
+                        XCTAssertTrue(exportResult.isError)
+                        XCTAssertFalse(FileManager.default.fileExists(atPath: escapedExport.path))
+                    }
+                    await manager.setRunPurpose(.unknown, for: endpoint.connectionID)
+
+                    let session = fixture.contextA.window.agentModeViewModel.session(for: fixture.contextA.tabID)
+                    _ = fixture.contextA.window.agentModeViewModel.test_installPersistentSessionBinding(
+                        sessionID: sessionID,
+                        on: session,
+                        updateWorkspaceMetadata: true
+                    )
+                    let create = try await endpoint.callTool(
+                        name: "manage_worktree",
+                        arguments: [
+                            "op": "create",
+                            "repo_root": repo.path,
+                            "path": worktree.path,
+                            "branch": "test/protected-mutation-\(UUID().uuidString.lowercased())",
+                            "base_ref": "HEAD",
+                            "allow_external_path": true,
+                            "operation_id": sharedCorrelationID
+                        ]
+                    )
+                    XCTAssertFalse(try toolResult(create).isError)
+                    let worktreeCapture = try await captureJournalRecord(
+                        runtime: runtime,
+                        excluding: journalKeys,
+                        toolName: "manage_worktree",
+                        action: "create"
+                    )
+                    journalKeys = worktreeCapture.allKeys
+                    assertDurableRequestKey(
+                        worktreeCapture.record,
+                        endpoint: endpoint,
+                        connectionGeneration: reboundSecurityContext.connectionGeneration,
+                        operationID: sharedCorrelationID
+                    )
+                    worktreeCreated = true
+                    let testBinding = AgentSessionWorktreeBinding(
+                        id: "test-binding-\(UUID().uuidString)",
+                        repositoryID: repo.path,
+                        repoKey: repo.path,
+                        logicalRootPath: repo.path,
+                        worktreeID: worktree.path,
+                        worktreeRootPath: worktree.path,
+                        worktreeName: worktree.lastPathComponent,
+                        branch: nil,
+                        head: nil,
+                        source: "m4-integration-test"
+                    )
+                    session.worktreeBindings = [testBinding]
+                    let materializer = WorkspaceRootBindingProjectionMaterializer(
+                        store: fixture.contextA.window.workspaceFileContextStore
+                    )
+                    let preparation = try await materializer.prepare(
+                        sessionID: sessionID,
+                        bindings: [testBinding]
+                    )
+                    let committedProjection = try await materializer.commit(preparation)
+                    let projection = try XCTUnwrap(committedProjection)
+                    physicalRootID = projection.physicalRootRefs.first?.id
+                    let lookupContext = WorkspaceLookupContext(
+                        rootScope: projection.lookupRootScope,
+                        bindingProjection: projection
+                    )
+                    let frozen = MCPServerViewModel.TabContextSnapshot(
+                        tabID: fixture.contextA.tabID,
+                        windowID: fixture.contextA.window.windowID,
+                        workspaceID: fixture.contextA.workspaceID,
+                        promptText: "",
+                        selection: StoredSelection(),
+                        selectedMetaPromptIDs: [],
+                        tabName: "M4 bound worktree",
+                        runID: sessionID,
+                        activeAgentSessionID: sessionID,
+                        worktreeBindings: [testBinding],
+                        frozenLookupContext: lookupContext,
+                        explicitlyBound: true
+                    )
+                    _ = fixture.contextA.window.mcpServer.installFrozenTabContext(
+                        clientID: endpoint.connectionID.uuidString,
+                        clientName: endpoint.clientName,
+                        context: frozen
+                    )
+                    await manager.debugSeedConnectionRunRouting(
+                        connectionID: endpoint.connectionID,
+                        runID: sessionID,
+                        purpose: .agentModeRun,
+                        windowID: fixture.contextA.window.windowID
+                    )
+                    let registration = try await AppDomainRuntimeComposition.shared.runtime
+                        .routingCoordinator.currentRegistration(connectionID: endpoint.connectionID)
+                    _ = await AppDomainRuntimeComposition.shared.runtime.routingCoordinator.bind(
+                        connection: registration,
+                        binding: .runScoped(
+                            runID: sessionID,
+                            context: .init(
+                                workspaceID: fixture.contextA.workspaceID,
+                                contextID: fixture.contextA.tabID
+                            )
+                        ),
+                        operationID: UUID()
+                    )
+
+                    let logicalTarget = fixture.contextA.fileURL
+                    let relativeTarget = String(logicalTarget.path.dropFirst(repo.path.count))
+                        .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                    let physicalTarget = worktree.appendingPathComponent(relativeTarget)
+                    let replacement = "let translatedProtectedMutation = true"
+                    let translated = try await endpoint.callTool(
+                        name: "apply_edits",
+                        arguments: [
+                            "path": logicalTarget.path,
+                            "search": fixture.contextA.sentinel,
+                            "replace": replacement,
+                            "operation_id": sharedCorrelationID
+                        ]
+                    )
+                    let translatedResult = try toolResult(translated)
+                    XCTAssertFalse(translatedResult.isError)
+                    let applyEditsCapture = try await captureJournalRecord(
+                        runtime: runtime,
+                        excluding: journalKeys,
+                        toolName: "apply_edits",
+                        action: "replace"
+                    )
+                    journalKeys = applyEditsCapture.allKeys
+                    assertDurableRequestKey(
+                        applyEditsCapture.record,
+                        endpoint: endpoint,
+                        connectionGeneration: reboundSecurityContext.connectionGeneration,
+                        operationID: sharedCorrelationID
+                    )
+                    XCTAssertEqual(
+                        Set([
+                            firstCapture.record.key,
+                            secondCapture.record.key,
+                            thirdCapture.record.key,
+                            worktreeCapture.record.key,
+                            applyEditsCapture.record.key
+                        ]).count,
+                        5
+                    )
+                    let logicalContents = try String(contentsOf: logicalTarget, encoding: .utf8)
+                    let physicalContents = try String(contentsOf: physicalTarget, encoding: .utf8)
+                    XCTAssertTrue(logicalContents.contains(fixture.contextA.sentinel))
+                    XCTAssertFalse(logicalContents.contains(replacement))
+                    XCTAssertTrue(
+                        physicalContents.contains(replacement),
+                        "apply_edits result=\(translatedResult.text) physical=\(physicalContents)"
+                    )
+
+                    session.worktreeBindings = []
+                    await WorkspaceRootBindingProjectionMaterializer(
+                        store: fixture.contextA.window.workspaceFileContextStore
+                    ).release(sessionID: sessionID)
+                    if let physicalRootID {
+                        await fixture.contextA.window.workspaceFileContextStore.unloadRoot(id: physicalRootID)
+                    }
+                    try removeWorktreeIfPresent(worktree, from: repo)
+                    worktreeCreated = false
+                    await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await manager.setRunPurpose(.unknown, for: endpoint.connectionID)
+                    await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                    await WorkspaceRootBindingProjectionMaterializer(
+                        store: fixture.contextA.window.workspaceFileContextStore
+                    ).release(sessionID: sessionID)
+                    if let physicalRootID {
+                        await fixture.contextA.window.workspaceFileContextStore.unloadRoot(id: physicalRootID)
+                    }
+                    if worktreeCreated {
+                        try? removeWorktreeIfPresent(worktree, from: repo)
+                    }
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         private func makeFixture(
             lease: MCPSharedServerTestLease.Ownership
         ) async throws -> PersistentMCPTestFixture {
@@ -253,6 +589,35 @@ import XCTest
             let allKeys = Set(document.recordSnapshots.map(\.key))
             XCTAssertEqual(matches.count, 1, "new journal records=\(allKeys.sorted())")
             return try (XCTUnwrap(matches.first), allKeys)
+        }
+
+        private func assertDurableRequestKey(
+            _ record: DomainMutationJournalRecord,
+            endpoint: PersistentMCPTestEndpoint,
+            connectionGeneration: UInt64,
+            operationID: String,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) {
+            let requestKey = [
+                "v1",
+                endpoint.connectionID.uuidString.lowercased(),
+                String(connectionGeneration),
+                record.ownerInvocationID.uuidString.lowercased()
+            ].joined(separator: ":")
+            XCTAssertEqual(
+                record.key,
+                "\(record.toolName).\(record.action):request:\(requestKey)",
+                file: file,
+                line: line
+            )
+            XCTAssertEqual(record.operationID, operationID, file: file, line: line)
+            XCTAssertEqual(
+                record.status.rawValue,
+                DomainMutationJournalStatus.applied.rawValue,
+                file: file,
+                line: line
+            )
         }
 
         private func registerDomainWorkspace(_ context: PersistentMCPTestContext) async throws {
@@ -314,6 +679,41 @@ import XCTest
                 result["isError"] as? Bool == true,
                 content.compactMap { $0["text"] as? String }.joined()
             )
+        }
+
+        private func initializeGitRepository(at repo: URL) throws {
+            try runGit(["init"], cwd: repo)
+            try runGit(["config", "user.name", "RepoPrompt Test"], cwd: repo)
+            try runGit(["config", "user.email", "repoprompt@example.test"], cwd: repo)
+            try runGit(["config", "commit.gpgSign", "false"], cwd: repo)
+            try runGit(["checkout", "-b", "main"], cwd: repo)
+            try runGit(["add", "."], cwd: repo)
+            try runGit(["commit", "-m", "Initial fixture"], cwd: repo)
+        }
+
+        private func removeWorktreeIfPresent(_ worktree: URL, from repo: URL) throws {
+            guard FileManager.default.fileExists(atPath: worktree.path) else { return }
+            try runGit(["worktree", "remove", "--force", worktree.path], cwd: repo)
+        }
+
+        private func runGit(_ arguments: [String], cwd: URL) throws {
+            var environment = ProcessInfo.processInfo.environment
+            environment["GIT_CONFIG_NOSYSTEM"] = "1"
+            environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
+            environment["GIT_TERMINAL_PROMPT"] = "0"
+            let result = try TestProcessRunner.run(
+                executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+                arguments: arguments,
+                currentDirectoryURL: cwd,
+                environment: environment
+            )
+            guard result.terminationStatus == 0 else {
+                throw NSError(
+                    domain: "MCPProtectedMutationInvocationIntegrationTests.git",
+                    code: Int(result.terminationStatus),
+                    userInfo: [NSLocalizedDescriptionKey: result.outputText]
+                )
+            }
         }
     }
 

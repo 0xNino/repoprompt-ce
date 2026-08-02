@@ -5029,6 +5029,15 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     /// Ask the user one structured ask_user interaction and wait for their response.
     @MainActor
+    func canPresentAskUserInteraction(tabID: UUID, runID: UUID) -> Bool {
+        guard sessions[tabID] != nil,
+              let record = runRegistry.activeRecord(tabID: tabID)
+        else {
+            return false
+        }
+        return record.runID == runID
+    }
+
     func askUserInteraction(
         tabID: UUID,
         interaction: AgentAskUserInteraction,
@@ -5094,15 +5103,32 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         )
         updateAgentLogBinding(from: session)
 
-        return try await withCheckedThrowingContinuation { continuation in
-            session.askUserContinuation = continuation
-            schedulePendingAskUserTimeout(
-                for: session,
-                interactionID: interaction.id,
-                runID: record.runID,
-                timeoutSeconds: interaction.timeoutSeconds,
-                startedAt: interaction.askedAt
-            )
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard !Task.isCancelled else {
+                    session.pendingAskUser = nil
+                    session.pendingAskUserRunID = nil
+                    updateRuntimeBindings(from: session)
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                session.askUserContinuation = continuation
+                schedulePendingAskUserTimeout(
+                    for: session,
+                    interactionID: interaction.id,
+                    runID: record.runID,
+                    timeoutSeconds: interaction.timeoutSeconds,
+                    startedAt: interaction.askedAt
+                )
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.cancelAskUserInteraction(
+                    tabID: tabID,
+                    interactionID: interaction.id,
+                    runID: record.runID
+                )
+            }
         }
     }
 
@@ -5209,6 +5235,26 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             pending.timeoutStartedAt = nil
             session.pendingAskUser = pending
         }
+    }
+
+    @discardableResult
+    func cancelAskUserInteraction(
+        tabID: UUID,
+        interactionID: UUID,
+        runID: UUID
+    ) -> Bool {
+        guard let session = sessions[tabID],
+              session.pendingAskUserRunID == runID,
+              session.pendingAskUser?.interaction.id == interactionID,
+              let continuation = session.askUserContinuation
+        else { return false }
+        invalidatePendingAskUserTimeout(for: session)
+        session.pendingAskUser = nil
+        session.pendingAskUserRunID = nil
+        session.askUserContinuation = nil
+        updateRuntimeBindings(from: session)
+        continuation.resume(throwing: CancellationError())
+        return true
     }
 
     func submitAskUserResponse(tabID: UUID, interactionID: UUID) {

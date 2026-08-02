@@ -2827,6 +2827,57 @@ final class TabContextRoutingTests: XCTestCase {
         }
 
         @MainActor
+        func testAgentRunCancelSettlesStartupPendingRunAndPreservesCallerBinding() async throws {
+            try await withCallerBindingFixture(named: "startup-pending-cancel") { fixture in
+                var dispatchedChild: CallerBindingChildIdentity?
+                fixture.window.mcpServer.setAgentRunDispatchOverrideForTesting {
+                    sessionID, tabID, _, _, viewModel in
+                    await viewModel.prepareMCPWaitTrackingForRunStart(
+                        session: viewModel.session(for: tabID)
+                    )
+                    dispatchedChild = CallerBindingChildIdentity(sessionID: sessionID, tabID: tabID)
+                    return .startedRun
+                }
+                installCallerBindingStartMetadata(for: fixture)
+
+                let startValue = try await fixture.window.mcpServer.executeAgentRunForTesting(args: [
+                    "op": .string("start"),
+                    "message": .string("Remain startup-pending until cancellation."),
+                    "model_id": .string("claudeCode:sonnet"),
+                    "detach": .bool(true),
+                    "timeout": .int(0)
+                ])
+                let child = try agentRunChild(from: startValue)
+                XCTAssertEqual(child, dispatchedChild)
+                let controlledSession = try XCTUnwrap(
+                    fixture.window.agentModeViewModel.mcpControlledSession(sessionID: child.sessionID)
+                )
+                XCTAssertFalse(controlledSession.runState.isActive)
+                XCTAssertTrue(controlledSession.mcpFollowUpRunPending)
+                XCTAssertEqual(startValue.objectValue?["status"]?.stringValue, AgentRunMCPSnapshot.Status.running.rawValue)
+
+                let pollValue = try await fixture.window.mcpServer.executeAgentRunForTesting(args: [
+                    "op": .string("poll"),
+                    "session_id": .string(child.sessionID.uuidString)
+                ])
+                XCTAssertEqual(pollValue.objectValue?["status"]?.stringValue, AgentRunMCPSnapshot.Status.running.rawValue)
+
+                let cancelValue = try await fixture.window.mcpServer.executeAgentRunForTesting(args: [
+                    "op": .string("cancel"),
+                    "session_id": .string(child.sessionID.uuidString)
+                ])
+                XCTAssertEqual(cancelValue.objectValue?["status"]?.stringValue, AgentRunMCPSnapshot.Status.cancelled.rawValue)
+                XCTAssertFalse(controlledSession.mcpFollowUpRunPending)
+                XCTAssertEqual(
+                    fixture.window.mcpServer.connectionBindingSnapshot(forConnection: fixture.connectionID).tabID,
+                    fixture.sourceTabID
+                )
+
+                await deactivateCallerBindingChild(child, in: fixture)
+            }
+        }
+
+        @MainActor
         func testAgentRunStartOverlapRoutesManageSelectionToCallerSourceTab() async throws {
             try await withCallerBindingFixture(named: "overlap-selection-routing") { fixture in
                 let gate = CallerBindingDispatchGate()

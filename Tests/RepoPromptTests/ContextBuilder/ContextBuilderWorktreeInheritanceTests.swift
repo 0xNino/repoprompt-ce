@@ -2361,6 +2361,32 @@ import XCTest
                 clientName: endpoint.clientName,
                 context: context
             )
+            if !bindContext {
+                let runtime = AppDomainRuntimeComposition.shared.runtime
+                var registration = try? await runtime.routingCoordinator.currentRegistration(
+                    connectionID: endpoint.connectionID
+                )
+                if registration == nil {
+                    _ = await runtime.routingCoordinator.registerConnection(
+                        connectionID: endpoint.connectionID,
+                        operationID: UUID()
+                    )
+                    registration = try await runtime.routingCoordinator.currentRegistration(
+                        connectionID: endpoint.connectionID
+                    )
+                }
+                _ = try await runtime.routingCoordinator.bind(
+                    connection: XCTUnwrap(registration),
+                    binding: .runScoped(
+                        runID: XCTUnwrap(context.runID),
+                        context: .init(
+                            workspaceID: workspaceID,
+                            contextID: context.tabID
+                        )
+                    ),
+                    operationID: UUID()
+                )
+            }
         }
 
         private func toolResultText(_ response: PersistentMCPTestRPCResponse) throws -> String {

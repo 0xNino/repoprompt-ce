@@ -42,6 +42,50 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertEqual(signatures, Self.expectedSignatures)
     }
 
+    func testLongRunningAppRegistrationPreservesTypedAuthoritativeRoutingDenial() async throws {
+        let window = Self.makeWindowWithoutAutoStart()
+        let registration = try await ServiceRegistry.register(
+            window.mcpServer.windowMCPToolCatalogService
+        )
+        guard let resolved = await ServiceRegistry.resolve(
+            toolName: MCPWindowToolName.askOracle,
+            scope: .window(id: window.windowID)
+        ) else {
+            await ServiceRegistry.unregister(registration.handle)
+            return XCTFail("Expected registered ask_oracle binding")
+        }
+        let runtimeIdentity = AppDomainRuntimeComposition.shared.runtime.identity
+        let context = DomainToolInvocationSecurityContext(
+            principal: .init(
+                principalID: UUID(),
+                stableKey: "m5-app-seam",
+                displayName: "M5 app seam",
+                kind: .runScoped,
+                assurance: .verifiedProcess,
+                processID: runtimeIdentity.processID,
+                runID: UUID(),
+                provider: "fixture",
+                verifiedIdentityFingerprint: "m5-app-seam"
+            ),
+            connectionID: UUID(),
+            connectionGeneration: 1,
+            invocationID: UUID(),
+            runtimeID: runtimeIdentity.runtimeID,
+            runtimeGeneration: runtimeIdentity.lifecycleGeneration,
+            hasAuthoritativeRoutingContext: false,
+            ephemeralGrantedToolNames: [MCPWindowToolName.askOracle]
+        )
+        do {
+            _ = try await MCPDomainInvocationSecurityContext.$current.withValue(context) {
+                try await resolved.binding(["message": .string("must not execute")])
+            }
+            XCTFail("Unrouted run-scoped AI work must fail before its physical provider")
+        } catch {
+            XCTAssertEqual(error as? DomainMutationPolicyError, .routingContextUnavailable)
+        }
+        await ServiceRegistry.unregister(registration.handle)
+    }
+
     func testSharedReadCutoverPreservesUnmigratedFileActionsCatalogProjection() async throws {
         let window = Self.makeWindowWithoutAutoStart()
         let tools = await window.mcpServer.windowMCPTools

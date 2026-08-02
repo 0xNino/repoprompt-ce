@@ -2833,6 +2833,21 @@ import XCTest
                 clientName: endpoint.clientName,
                 context: context
             )
+            for _ in 0 ..< 200 {
+                let securityContext = await fixture.networkManager
+                    .debugDomainInvocationSecurityContextForTesting(
+                        connectionID: endpoint.connectionID,
+                        toolName: MCPWindowToolName.askOracle
+                    )
+                if securityContext.hasAuthoritativeRoutingContext,
+                   securityContext.workspaceID == workspaceID,
+                   !securityContext.authorizedCanonicalRoots.isEmpty
+                {
+                    return
+                }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTFail("Oracle test routing context did not become authoritative")
         }
 
         private func activateWorkspace(_ context: PersistentMCPTestContext) async throws {

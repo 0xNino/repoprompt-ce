@@ -383,8 +383,9 @@ if [[ -d "$workspace_core_source_dir" ]]; then
 fi
 
 # RepoPromptDomainRuntime owns Sendable MCP catalog/runtime values, the M2
-# workspace/context authorities, and the M3 shared read/discovery provider. Physical
-# app backends remain injected and the owner stays free of UI/provider implementations.
+# workspace/context authorities, M3 shared reads, M4 protected mutation policy, and
+# M5 long-running lifecycle wrappers. Physical app backends remain injected and the
+# owner stays free of UI/provider implementations.
 domain_runtime_source_dir="Sources/RepoPromptDomainRuntime"
 if [[ -d "$domain_runtime_source_dir" ]]; then
   unexpected_domain_runtime_files="$(find "$domain_runtime_source_dir" -type f ! -name '*.swift' -print)"
@@ -409,12 +410,60 @@ if [[ -d "$domain_runtime_source_dir" ]]; then
     "DomainReadSideEffectCoordinator.swift"
     "MCPDomainReadToolDefinitions.swift"
     "MCPDomainReadToolProvider.swift"
+    "DomainAgentSessionModels.swift"
+    "DomainAgentRunSessionStore.swift"
+    "DomainInteractionBroker.swift"
+    "DomainCredentialEnvelope.swift"
+    "DomainActivityCenter.swift"
+    "MCPDomainLongRunningToolProvider.swift"
   )
   for file in "${domain_runtime_required_files[@]}"; do
     if [[ ! -f "$domain_runtime_source_dir/$file" ]]; then
-      fail "RepoPromptDomainRuntime M2/M3 authority file missing: $file"
+      fail "RepoPromptDomainRuntime M2-M5 authority file missing: $file"
     fi
   done
+  m5_contract_fixture="Scripts/Fixtures/headless_mcp_domain_runtime_m5_contract.json"
+  if [[ ! -f "$m5_contract_fixture" ]]; then
+    fail "M5 AI/Agent contract fixture missing: $m5_contract_fixture"
+  elif ! python3 - "$m5_contract_fixture" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+expected = {
+    "oracle_utils", "ask_oracle", "oracle_send", "context_builder", "ask_user",
+    "agent_explore", "agent_run", "agent_manage", "share_thoughts", "set_status",
+    "wait_for_next_user_instruction",
+}
+assert value["schema_version"] == 2
+assert value["milestone"] == "M5"
+assert set(value["migrated_tools"]) == expected
+assert value["session_lifecycle"]["false_transient_restoration_allowed"] is False
+assert value["session_lifecycle"]["wait_admission_while_draining"] == "cancelled"
+assert value["session_lifecycle"]["active_prior_owner_claim"] == "unavailable_until_prior_owner_durably_stops"
+assert value["session_persistence"]["write_protocol"] == "advisory_lock_digest_cas_atomic_write"
+assert value["session_persistence"]["duplicate_session_ids"] == "byte_preserved_degraded_read_only"
+assert value["session_persistence"]["committed_base_advances_after_each_successful_cas"] is True
+assert value["session_persistence"]["retained_record_limit"] == 512
+assert value["interaction"]["default_timeout"] == "workspace questionTimeoutSeconds setting"
+assert value["interaction"]["app_presentation_tombstone_limit"] == 256
+assert value["interaction"]["connection_removal_late_waiter"] == "blocked_after_suspended_availability"
+assert value["child_launch"]["real_private_endpoint"] == "deferred_to_M6B"
+assert value["child_launch"]["codex_cached_runtime_behavior"] == "carrier_merged_only_at_final_process_spawn_boundary"
+assert value["child_launch"]["end_to_end_private_connectivity_claimed"] is False
+assert set(value["child_launch"]["launch_environment_consumers"]) == {"claude_native", "codex_app_server", "acp_agent"}
+assert value["credentials"]["packaged_child_keychain_evidence"] == "unresolved_M0_procedure_record"
+assert value["credentials"]["persisted_secret_bytes"] is False
+assert value["credentials"]["actual_owned_bytes_instrumented"] is True
+assert value["approval"]["routing_opt_out"] is False
+assert value["authority"]["typed_policy_errors_preserved"] is True
+assert value["public_contract"]["schema_behavior"] == "wrapped_binding_definition_preserved"
+assert value["public_contract"]["proxy_behavior_changed"] is False
+PY
+  then
+    fail "M5 AI/Agent contract fixture drifted or is invalid JSON"
+  fi
   m3_read_tools=(
     "get_code_structure" "get_file_tree" "read_file" "file_search"
     "workspace_context" "prompt" "oracle_chat_log" "git" "history"
@@ -674,6 +723,7 @@ allowed_tracked_docs=(
   "docs/spec/headless-mcp-domain-runtime-m3-evidence.json"
   "docs/spec/headless-mcp-domain-runtime-m3-read-discovery.md"
   "docs/spec/headless-mcp-domain-runtime-m4-protected-mutations.md"
+  "docs/spec/headless-mcp-domain-runtime-m5-ai-agent-interaction.md"
   "docs/spec/history-query-tools.md"
   "docs/worktrees.md"
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
