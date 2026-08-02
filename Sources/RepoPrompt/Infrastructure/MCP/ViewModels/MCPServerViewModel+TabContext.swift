@@ -2991,7 +2991,7 @@ extension MCPServerViewModel {
         // current request here could publish primary artifacts into a different tab than the read
         // that produced them. Only the legacy non-domain path may resolve the current request.
         let connectionID: UUID
-        let context: TabScopedContext
+        let context: TabContextSnapshot
         if let capturedContext {
             guard let capturedConnectionID = capturedContext.metadata.connectionID else {
                 throw MCPError.internalError(
