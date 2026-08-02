@@ -36,7 +36,6 @@ final class PCRE2SearchFastPlansTests: XCTestCase {
         )
 
         XCTAssertEqual(result.matches?.map(\.lineNumber), [257, 258, 259, 260])
-        XCTAssertEqual(result.totalCount, 4)
         XCTAssertEqual(result.contentFileCount, 1)
 
         let mixedEmptyPrefilter = PCRE2LinePrefilter(

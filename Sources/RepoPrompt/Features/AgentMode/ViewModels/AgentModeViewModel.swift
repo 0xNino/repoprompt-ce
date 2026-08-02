@@ -2743,6 +2743,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         refreshSessionListCache(for: workspace, owner: owner)
     }
 
+    func toggleComposeInspectorIfActive() {
+        guard isAgentModeActive else { return }
+        ui.contextDrawer.toggle()
+    }
+
     /// Toggle whether agent mode UI is active (used to defer heavy session loads).
     func setAgentModeActive(_ isActive: Bool) {
         #if DEBUG
