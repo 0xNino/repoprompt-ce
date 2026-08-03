@@ -553,11 +553,11 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         #endif
     }
 
-    func testRequestedWindowRegistrationFailureStaysFailClosedUntilExplicitRetry() async throws {
+    func testRequestedWindowRegistrationDoesNotStartProcessTransport() async throws {
         #if DEBUG
             try await MCPSharedServerTestLease.shared.withLease { _ in
                 let window = Self.makeWindowWithoutAutoStart()
-                let startProbe = ControlledMCPServiceStartProbe(outcomes: [.failure, .success])
+                let startProbe = ControlledMCPServiceStartProbe(outcomes: [.success])
                 let service = MCPService(
                     controllerStartOperation: { try await startProbe.start() },
                     controllerFullShutdownOperation: {}
@@ -565,43 +565,26 @@ final class ToolCatalogSnapshotTests: XCTestCase {
                 window.mcpServer.setServiceForTesting(service)
                 WindowStatesManager.shared.registerWindowState(window)
 
-                let firstBootstrap = Task { @MainActor in
-                    await window.mcpServer.ensureServerReadyForAgentBootstrap()
-                }
-                await startProbe.waitUntilAttemptCount(1)
-                await startProbe.releaseAttempt(1)
-                let firstBootstrapReady = await firstBootstrap.value
-                XCTAssertFalse(firstBootstrapReady)
-                XCTAssertTrue(window.mcpServer.windowToolsAreRequested)
-                XCTAssertFalse(window.mcpServer.windowToolsEnabled)
-                XCTAssertNotNil(window.mcpServer.windowToolRegistrationFailureDescription)
-                let failedReadiness = await MCPToolCatalogReadiness.shared.awaitReady(
-                    windowID: window.windowID,
-                    timeout: 0.1
-                )
-                XCTAssertFalse(failedReadiness)
-
-                let retryBootstrap = Task { @MainActor in
-                    await window.mcpServer.ensureServerReadyForAgentBootstrap()
-                }
-                await startProbe.waitUntilAttemptCount(2)
-                await startProbe.releaseAttempt(2)
-                let retryBootstrapReady = await retryBootstrap.value
-                XCTAssertTrue(retryBootstrapReady)
+                let bootstrapReady = await window.mcpServer.ensureServerReadyForAgentBootstrap()
+                XCTAssertTrue(bootstrapReady)
                 XCTAssertTrue(window.mcpServer.windowToolsAreRequested)
                 XCTAssertTrue(window.mcpServer.windowToolsEnabled)
                 XCTAssertNil(window.mcpServer.windowToolRegistrationFailureDescription)
-                let readyAfterRetry = await MCPToolCatalogReadiness.shared.awaitReady(
+                let startAttemptCount = await startProbe.attemptCount
+                let serviceIsRunning = await service.currentState().isRunning
+                XCTAssertEqual(startAttemptCount, 0)
+                XCTAssertFalse(serviceIsRunning)
+                let ready = await MCPToolCatalogReadiness.shared.awaitReady(
                     windowID: window.windowID,
                     timeout: 0.2
                 )
-                XCTAssertTrue(readyAfterRetry)
+                XCTAssertTrue(ready)
 
                 await window.mcpServer.stopServer()
                 WindowStatesManager.shared.unregisterWindowState(window)
             }
         #else
-            throw XCTSkip("Window registration retry probes require DEBUG service injection.")
+            throw XCTSkip("Window registration ownership probes require DEBUG service injection.")
         #endif
     }
 

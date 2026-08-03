@@ -210,11 +210,12 @@ package struct MCPDomainCanonicalWorkspaceService: Sendable {
         let filter = Self.searchFilter(args)
         let searchesPaths = mode == "path" || mode == "both" || (mode == "auto" && pattern.contains("*"))
         let searchesContent = mode == "content" || mode == "both" || (mode == "auto" && !searchesPaths)
+        let relativeRoots = Self.relativeRoots(snapshot.roots)
         var results: [Value] = []
         for file in Self.files(under: snapshot.roots) {
             try Task.checkCancellation()
             if results.count >= maxResults { break }
-            let relative = Self.relativePath(file, roots: snapshot.roots)
+            let relative = Self.relativePath(file, roots: relativeRoots)
             guard Self.includes(relativePath: relative, file: file, filter: filter) else {
                 continue
             }
@@ -499,11 +500,29 @@ package struct MCPDomainCanonicalWorkspaceService: Sendable {
         return lines
     }
 
-    private static func relativePath(_ url: URL, roots: [URL]) -> String {
-        for root in roots where url.path.hasPrefix(root.path + "/") {
-            return String(url.path.dropFirst(root.path.count + 1))
+    private struct RelativeRoot {
+        let rawPath: String
+        let canonicalPath: String
+    }
+
+    private static func relativeRoots(_ roots: [URL]) -> [RelativeRoot] {
+        roots.map {
+            RelativeRoot(
+                rawPath: $0.standardizedFileURL.path,
+                canonicalPath: $0.resolvingSymlinksInPath().standardizedFileURL.path
+            )
         }
-        return url.path
+    }
+
+    private static func relativePath(_ url: URL, roots: [RelativeRoot]) -> String {
+        let path = url.standardizedFileURL.path
+        for root in roots {
+            for rootPath in [root.rawPath, root.canonicalPath] {
+                guard path.hasPrefix(rootPath + "/") else { continue }
+                return String(path.dropFirst(rootPath.count + 1))
+            }
+        }
+        return path
     }
 
     private static func matches(

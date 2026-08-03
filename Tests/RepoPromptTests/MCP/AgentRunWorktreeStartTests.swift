@@ -2218,7 +2218,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
 
                 XCTAssertEqual(result, .submitted, testCase.label)
                 if result == .submitted {
-                    try namespace.acceptedSubmitAndVerifyOwnedSocket()
+                    try await namespace.acceptedSubmitAndVerifyOwnedSocket()
                 }
                 let activeTabID = try XCTUnwrap(
                     window.workspaceManager.activeWorkspace?.activeComposeTabID,
@@ -2359,7 +2359,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
 
             XCTAssertEqual(result, .submitted)
             if result == .submitted {
-                try namespace.acceptedSubmitAndVerifyOwnedSocket()
+                try await namespace.acceptedSubmitAndVerifyOwnedSocket()
             }
             let destinationTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
             let destination = viewModel.session(for: destinationTabID)
@@ -4179,6 +4179,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 case defaultSocketURLWasNotProduction
                 case installedSocketURLDidNotResolve
                 case trackedSessionMissing
+                case trackedAgentTaskDidNotStart
                 case ownedPathWasNotSocket
                 case ownedSocketDidNotAppear
                 case trackedAgentTaskWasNotCleared
@@ -4276,10 +4277,22 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 trackedSession = session
             }
 
-            func acceptedSubmitAndVerifyOwnedSocket() throws {
+            func acceptedSubmitAndVerifyOwnedSocket() async throws {
                 acceptedSubmit = true
-                guard trackedSession != nil else {
+                guard let trackedSession else {
                     throw FixtureError.trackedSessionMissing
+                }
+                do {
+                    try await AsyncTestWait.waitUntilThrowing(
+                        "submitted Agent Run task installation",
+                        timeout: 5.0,
+                        initialDelayNanoseconds: 10_000_000,
+                        maximumDelayNanoseconds: 100_000_000
+                    ) {
+                        trackedSession.agentTask != nil
+                    }
+                } catch is AsyncTestConditionTimeout {
+                    throw FixtureError.trackedAgentTaskDidNotStart
                 }
                 observeFirstAgentTaskIfNeeded()
                 guard ownedSocketObserved else {

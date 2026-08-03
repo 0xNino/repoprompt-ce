@@ -975,8 +975,17 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
     private func registerWindowTeardown(_ window: WindowState) {
         addTeardownBlock { @MainActor in
-            await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
+            let activeTabIDs = window.agentModeViewModel.sessions.values
+                .filter { $0.agentTask != nil || $0.runState.isActive }
+                .map(\.tabID)
+            for tabID in activeTabIDs {
+                await window.agentModeViewModel.cancelAgentRun(
+                    tabID: tabID,
+                    completion: .terminalTeardownCompleted
+                )
+            }
             let rootIDs = await window.workspaceFileContextStore.rootRefs(scope: .allLoaded).map(\.id)
+            window.beginClose()
             await window.tearDown()
             await window.workspaceFileContextStore.unloadRoots(ids: rootIDs)
             WindowStatesManager.shared.unregisterWindowState(window)

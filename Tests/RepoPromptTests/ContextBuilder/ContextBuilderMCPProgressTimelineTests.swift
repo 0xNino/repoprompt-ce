@@ -917,6 +917,12 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             let connectionID = UUID()
             let identity = WorkspaceSelectionIdentity(workspaceID: activeWorkspace.id, tabID: tabID)
             let initialSelection = StoredSelection(selectedPaths: [selectedFile.path])
+            _ = await window.selectionCoordinator.persistSelection(
+                initialSelection,
+                for: identity,
+                source: .mcpTabContext,
+                mirrorToUIIfActive: true
+            )
             var initialTab = try XCTUnwrap(window.workspaceManager.composeTab(for: identity))
             initialTab.promptText = "Immutable initial prompt"
             initialTab.selection = initialSelection
@@ -924,12 +930,6 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 initialTab,
                 inWorkspaceID: activeWorkspace.id
             ))
-            _ = await window.selectionCoordinator.persistSelection(
-                initialSelection,
-                for: identity,
-                source: .mcpTabContext,
-                mirrorToUIIfActive: true
-            )
             window.promptManager.promptText = initialTab.promptText
             try window.mcpServer.bindTabForConnection(
                 connectionID: connectionID,
