@@ -156,123 +156,17 @@ private actor MCPConnectionStopRace {
     }
 }
 
-struct MCPResponseDeliverySnapshot: Equatable {
-    let pendingRequestCount: Int
-    let waiterCount: Int
-    let isTerminal: Bool
+typealias MCPResponseDeliverySnapshot = RepoPromptDomainRuntime.MCPDomainResponseDeliverySnapshot
 
-    var acceptedRequestsFullyResponded: Bool {
-        pendingRequestCount == 0
-    }
+typealias MCPProgressDeliveryResult = RepoPromptDomainRuntime.MCPProgressDeliveryResult
+typealias MCPRequestProgressState = RepoPromptDomainRuntime.MCPRequestProgressState
+
+enum MCPRequestProgressContext {
+    case domain(MCPDomainRequestProgressHandle)
+    case direct(MCPRequestProgressState)
 }
 
-enum MCPProgressDeliveryResult: Equatable {
-    case delivered
-    case failed
-    case connectionTerminal
-}
-
-/// Request-scoped standard MCP progress state. Progress is advisory: one delivery
-/// may be in flight and one latest-wins update may be pending. Finalization stops
-/// admission and discards the pending update without waiting for transport I/O;
-/// the already in-flight notification may therefore trail the final result.
-actor MCPRequestProgressState {
-    private struct PendingDelivery {
-        let connection: any MCPServerConnection
-        let message: String?
-    }
-
-    private let token: ProgressToken
-    private var sequence: Double = 0
-    private var acceptsProgress = true
-    private var pendingDelivery: PendingDelivery?
-    private var deliveryWorker: Task<Void, Never>?
-    #if DEBUG
-        private var quiescenceContinuations: [CheckedContinuation<Void, Never>] = []
-    #endif
-
-    init(token: ProgressToken) {
-        self.token = token
-    }
-
-    /// Enqueues without waiting for transport delivery. While a notification is
-    /// in flight, repeated emissions coalesce into the single latest pending value.
-    func send(
-        through connection: any MCPServerConnection,
-        message: String?
-    ) {
-        guard acceptsProgress else { return }
-        pendingDelivery = PendingDelivery(connection: connection, message: message)
-        guard deliveryWorker == nil else { return }
-
-        deliveryWorker = Task { [weak self] in
-            await self?.deliverBurst()
-        }
-    }
-
-    /// Final results take priority over advisory progress. This cooperatively
-    /// prevents new sends and drops the one bounded pending update, but does not
-    /// cancel or await a socket write that is already in flight.
-    func invalidate() {
-        acceptsProgress = false
-        pendingDelivery = nil
-    }
-
-    private func deliverBurst() async {
-        // Re-evaluate admission after every suspended transport send so
-        // finalization can stop the burst before another delivery is dequeued.
-        while acceptsProgress, let delivery = pendingDelivery {
-            pendingDelivery = nil
-            sequence += 1
-            let progress = sequence
-
-            let result = await delivery.connection.deliverMCPProgress(
-                token: token,
-                progress: progress,
-                message: delivery.message
-            )
-            if result == .connectionTerminal {
-                acceptsProgress = false
-                pendingDelivery = nil
-                break
-            }
-        }
-
-        deliveryWorker = nil
-        #if DEBUG
-            let continuations = quiescenceContinuations
-            quiescenceContinuations = []
-            continuations.forEach { $0.resume() }
-        #endif
-    }
-
-    #if DEBUG
-        struct Snapshot: Equatable {
-            let acceptsProgress: Bool
-            let pendingDeliveryCount: Int
-            let workerActive: Bool
-            let assignedSequence: Double
-        }
-
-        func snapshot() -> Snapshot {
-            Snapshot(
-                acceptsProgress: acceptsProgress,
-                pendingDeliveryCount: pendingDelivery == nil ? 0 : 1,
-                workerActive: deliveryWorker != nil,
-                assignedSequence: sequence
-            )
-        }
-
-        func waitUntilQuiescent() async {
-            guard deliveryWorker != nil else { return }
-            await withCheckedContinuation { continuation in
-                quiescenceContinuations.append(continuation)
-            }
-        }
-    #endif
-}
-
-protocol MCPServerConnection: Actor {
+protocol MCPServerConnection: MCPDomainProgressTransport {
     func start(approvalHandler: @escaping (MCP.Client.Info) async -> Bool) async throws
     func stop() async
     /// Immediately severs transport delivery for a tool execution that ignored cancellation.
@@ -518,14 +412,11 @@ private final class BootstrapTransferredSocketLedger: @unchecked Sendable {
     #endif
 }
 
-enum MCPConnectionCallLane: String, CaseIterable {
-    /// Legacy diagnostics name for the explicit exclusive class.
-    case ordinary
-    case control
-    case smallRead = "small_read"
-    case gitRead = "git_read"
-    case fileSearch = "file_search"
-}
+typealias MCPConnectionCallLane = MCPDomainConnectionCallLane
+typealias MCPConnectionCallLimiters = MCPDomainConnectionCallLimiters
+typealias MCPConnectionCallLimiterWatchdogDiagnostics = MCPDomainConnectionCallLimiterWatchdogDiagnostics
+typealias MCPConnectionCallLimiterDebugSnapshot = MCPDomainConnectionCallLimiterDebugSnapshot
+typealias AsyncLimiter = MCPDomainAsyncLimiter
 
 enum MCPRunRouteAuthorityDecision: Equatable {
     case committed
@@ -864,16 +755,19 @@ actor ServerNetworkManager {
 
     private let bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming
     private let bootstrapPeerPIDResolver: (@Sendable (Int32) -> Int?)?
+    private let domainHost: MCPDomainHost
     private var isRunningState: Bool = false
     private var lifecycleGeneration: UInt64 = 0
     private var isEnabledState: Bool = true
 
     init(
         bootstrapLifecycleTiming: MCPBootstrapLifecycleTiming = .production,
-        bootstrapPeerPIDResolver: (@Sendable (Int32) -> Int?)? = nil
+        bootstrapPeerPIDResolver: (@Sendable (Int32) -> Int?)? = nil,
+        domainHost: MCPDomainHost = AppDomainRuntimeComposition.shared.runtime.domainHost
     ) {
         self.bootstrapLifecycleTiming = bootstrapLifecycleTiming
         self.bootstrapPeerPIDResolver = bootstrapPeerPIDResolver
+        self.domainHost = domainHost
     }
 
     // Bootstrap socket server. Startup candidates remain separate until bind/listen and
@@ -1147,7 +1041,7 @@ actor ServerNetworkManager {
     private var connectionLifecycleGenerationByID: [UUID: UInt64] = [:]
     private var bootstrapClaimedPIDByConnectionID: [UUID: Int] = [:]
     private var bootstrapObservedPeerPIDByConnectionID: [UUID: Int] = [:]
-    private var terminalRecordClaimsByConnectionID: [UUID: MCPFirstTerminalRecordClaim] = [:]
+    private let terminalRecordClaimsByConnectionID = MCPDomainTerminalClaimRegistry<MCPTerminalRecord>()
     private var connectionTasks: [UUID: Task<Void, Never>] = [:]
     private var pendingConnections: [UUID: String] = [:]
 
@@ -1383,379 +1277,13 @@ actor ServerNetworkManager {
     private var connectionWindowMap: [UUID: Int] = [:]
     private var runIDByConnectionID: [UUID: UUID] = [:]
 
-    private struct MCPConnectionCallLimiterWatchdogDiagnostics {
-        let admittedCallCount: Int
-    }
-
-    private actor MCPConnectionCallLimiters {
-        struct AdmissionRejected: Error {}
-
-        private enum AdmissionCloseState {
-            case open
-            case tentative
-            case restored(MCPConnectionCallLimiters)
-            case committed
-        }
-
-        private let ordinary: AsyncLimiter
-        private let control: AsyncLimiter
-        private let smallRead: AsyncLimiter
-        private let gitRead: AsyncLimiter
-        private let fileSearch: AsyncLimiter
-        private var admittedCallCount = 0
-        private var admissionCloseState: AdmissionCloseState = .open
-        private var admissionRetryWaiters: [UUID: CheckedContinuation<MCPConnectionCallLimiters?, Never>] = [:]
-
-        #if DEBUG
-            init(
-                limit: Int,
-                controlLimit: Int,
-                smallReadLimit: Int,
-                gitReadLimit: Int,
-                fileSearchLimit: Int,
-                idleWaitSleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
-                    try await Task.sleep(for: duration)
-                }
-            ) {
-                ordinary = AsyncLimiter(limit: limit, idleWaitSleep: idleWaitSleep)
-                control = AsyncLimiter(limit: controlLimit, idleWaitSleep: idleWaitSleep)
-                smallRead = AsyncLimiter(limit: smallReadLimit, idleWaitSleep: idleWaitSleep)
-                gitRead = AsyncLimiter(limit: gitReadLimit, idleWaitSleep: idleWaitSleep)
-                fileSearch = AsyncLimiter(limit: fileSearchLimit, idleWaitSleep: idleWaitSleep)
-            }
-        #else
-            init(limit: Int, controlLimit: Int, smallReadLimit: Int, gitReadLimit: Int, fileSearchLimit: Int) {
-                ordinary = AsyncLimiter(limit: limit)
-                control = AsyncLimiter(limit: controlLimit)
-                smallRead = AsyncLimiter(limit: smallReadLimit)
-                gitRead = AsyncLimiter(limit: gitReadLimit)
-                fileSearch = AsyncLimiter(limit: fileSearchLimit)
-            }
-        #endif
-
-        func withPermit<T>(
-            lane: MCPConnectionCallLane,
-            cancellationResult: @Sendable () -> T,
-            _ operation: @Sendable () async -> T
-        ) async -> T {
-            guard case .open = admissionCloseState else { return cancellationResult() }
-            admittedCallCount += 1
-            defer { admittedCallCount -= 1 }
-            return await limiter(for: lane).withPermit(
-                cancellationResult: cancellationResult,
-                operation
-            )
-        }
-
-        func withPermit<T>(
-            lane: MCPConnectionCallLane,
-            toolName: String? = nil,
-            lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
-            ownerResource: String? = nil,
-            ownerWindowID: Int? = nil,
-            ownerRunID: String? = nil,
-            _ operation: @Sendable () async throws -> T
-        ) async throws -> T {
-            guard case .open = admissionCloseState else { throw AdmissionRejected() }
-            admittedCallCount += 1
-            defer { admittedCallCount -= 1 }
-
-            let laneLimiter = limiter(for: lane)
-            #if DEBUG
-                let queuedSnapshot = await laneLimiter.debugSnapshot()
-                EditFlowPerf.lifecycleEvent(
-                    EditFlowPerf.Lifecycle.MCPToolCall.permitQueued,
-                    correlation: lifecycleCorrelation,
-                    EditFlowPerf.Dimensions(
-                        toolName: toolName,
-                        outcome: "queued",
-                        activeCount: queuedSnapshot.activePermitCount,
-                        admissionClass: lane.rawValue,
-                        queueDepth: queuedSnapshot.waiterCount + (queuedSnapshot.permits == 0 ? 1 : 0),
-                        windowID: ownerWindowID,
-                        runID: ownerRunID,
-                        ownerResource: ownerResource,
-                        permitActive: false,
-                        publicationPending: false,
-                        terminalBarrier: false
-                    )
-                )
-            #endif
-
-            do {
-                let result = try await laneLimiter.withPermit {
-                    #if DEBUG
-                        let acquiredSnapshot = await laneLimiter.debugSnapshot()
-                        EditFlowPerf.lifecycleEvent(
-                            EditFlowPerf.Lifecycle.MCPToolCall.permitAcquired,
-                            correlation: lifecycleCorrelation,
-                            EditFlowPerf.Dimensions(
-                                toolName: toolName,
-                                outcome: "acquired",
-                                activeCount: acquiredSnapshot.activePermitCount,
-                                admissionClass: lane.rawValue,
-                                queueDepth: acquiredSnapshot.waiterCount,
-                                windowID: ownerWindowID,
-                                runID: ownerRunID,
-                                ownerResource: ownerResource,
-                                permitActive: true,
-                                publicationPending: false,
-                                terminalBarrier: false
-                            )
-                        )
-                    #endif
-                    return try await operation()
-                }
-                #if DEBUG
-                    await recordPermitReleased(
-                        laneLimiter: laneLimiter,
-                        lane: lane,
-                        toolName: toolName,
-                        lifecycleCorrelation: lifecycleCorrelation,
-                        ownerResource: ownerResource,
-                        ownerWindowID: ownerWindowID,
-                        ownerRunID: ownerRunID,
-                        outcome: "completed"
-                    )
-                #endif
-                return result
-            } catch {
-                #if DEBUG
-                    await recordPermitReleased(
-                        laneLimiter: laneLimiter,
-                        lane: lane,
-                        toolName: toolName,
-                        lifecycleCorrelation: lifecycleCorrelation,
-                        ownerResource: ownerResource,
-                        ownerWindowID: ownerWindowID,
-                        ownerRunID: ownerRunID,
-                        outcome: error is CancellationError ? "cancelled" : "failed"
-                    )
-                #endif
-                throw error
-            }
-        }
-
-        #if DEBUG
-            private func recordPermitReleased(
-                laneLimiter: AsyncLimiter,
-                lane: MCPConnectionCallLane,
-                toolName: String?,
-                lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?,
-                ownerResource: String?,
-                ownerWindowID: Int?,
-                ownerRunID: String?,
-                outcome: String
-            ) async {
-                let releasedSnapshot = await laneLimiter.debugSnapshot()
-                EditFlowPerf.lifecycleEvent(
-                    EditFlowPerf.Lifecycle.MCPToolCall.permitReleased,
-                    correlation: lifecycleCorrelation,
-                    EditFlowPerf.Dimensions(
-                        toolName: toolName,
-                        outcome: outcome,
-                        activeCount: releasedSnapshot.activePermitCount,
-                        admissionClass: lane.rawValue,
-                        queueDepth: releasedSnapshot.waiterCount,
-                        windowID: ownerWindowID,
-                        runID: ownerRunID,
-                        ownerResource: ownerResource,
-                        permitActive: false,
-                        publicationPending: true,
-                        terminalBarrier: false
-                    )
-                )
-            }
-        #endif
-
-        func hasInFlightCalls() -> Bool {
-            admittedCallCount > 0
-        }
-
-        func executionWatchdogDiagnostics() -> MCPConnectionCallLimiterWatchdogDiagnostics {
-            MCPConnectionCallLimiterWatchdogDiagnostics(admittedCallCount: admittedCallCount)
-        }
-
-        func admissionRetryReplacement() async -> MCPConnectionCallLimiters? {
-            guard !Task.isCancelled else { return nil }
-            switch admissionCloseState {
-            case .open, .committed:
-                return nil
-            case let .restored(replacement):
-                return replacement
-            case .tentative:
-                return await waitForAdmissionCloseOutcome()
-            }
-        }
-
-        func markTentativeCloseRestored(by replacement: MCPConnectionCallLimiters) {
-            guard case .tentative = admissionCloseState else { return }
-            admissionCloseState = .restored(replacement)
-            resumeAdmissionRetryWaiters(with: replacement)
-        }
-
-        func markTentativeCloseCommitted() {
-            guard case .tentative = admissionCloseState else { return }
-            admissionCloseState = .committed
-            resumeAdmissionRetryWaiters(with: nil)
-        }
-
-        func cancelAll() async {
-            switch admissionCloseState {
-            case .open, .tentative:
-                admissionCloseState = .committed
-                resumeAdmissionRetryWaiters(with: nil)
-            case .restored, .committed:
-                break
-            }
-            await closeLanes()
-        }
-
-        #if DEBUG
-            func closeIfIdle(
-                afterClosingBegan: (@Sendable () async -> Void)? = nil
-            ) async -> Bool {
-                guard case .open = admissionCloseState, admittedCallCount == 0 else { return false }
-                admissionCloseState = .tentative
-                if let afterClosingBegan {
-                    await afterClosingBegan()
-                }
-                await closeLanes()
-                return true
-            }
-        #else
-            func closeIfIdle() async -> Bool {
-                guard case .open = admissionCloseState, admittedCallCount == 0 else { return false }
-                admissionCloseState = .tentative
-                await closeLanes()
-                return true
-            }
-        #endif
-
-        func waitUntilIdle(timeout: Duration) async -> [(MCPConnectionCallLane, Bool)] {
-            await withTaskGroup(of: (MCPConnectionCallLane, Bool).self) { group in
-                for (lane, limiter) in lanes {
-                    group.addTask {
-                        await (lane, limiter.waitUntilIdle(timeout: timeout))
-                    }
-                }
-                var results: [(MCPConnectionCallLane, Bool)] = []
-                for await result in group {
-                    results.append(result)
-                }
-                return results
-            }
-        }
-
-        #if DEBUG
-            func limiterForTesting(_ lane: MCPConnectionCallLane) -> AsyncLimiter {
-                limiter(for: lane)
-            }
-
-            func diagnosticsSnapshot() async -> MCPConnectionCallLimiterDebugSnapshot {
-                async let ordinarySnapshot = ordinary.debugSnapshot()
-                async let controlSnapshot = control.debugSnapshot()
-                async let smallReadSnapshot = smallRead.debugSnapshot()
-                async let gitReadSnapshot = gitRead.debugSnapshot()
-                async let fileSearchSnapshot = fileSearch.debugSnapshot()
-                return await MCPConnectionCallLimiterDebugSnapshot(
-                    ordinary: ordinarySnapshot,
-                    control: controlSnapshot,
-                    smallRead: smallReadSnapshot,
-                    gitRead: gitReadSnapshot,
-                    fileSearch: fileSearchSnapshot
-                )
-            }
-
-            func diagnosticsSnapshot(for lane: MCPConnectionCallLane) async -> AsyncLimiter.DebugSnapshot {
-                await limiter(for: lane).debugSnapshot()
-            }
-
-            func admissionRetryWaiterCountForTesting() -> Int {
-                admissionRetryWaiters.count
-            }
-        #endif
-
-        private func waitForAdmissionCloseOutcome() async -> MCPConnectionCallLimiters? {
-            let waiterID = UUID()
-            return await withTaskCancellationHandler {
-                await withCheckedContinuation { continuation in
-                    guard !Task.isCancelled else {
-                        continuation.resume(returning: nil)
-                        return
-                    }
-                    switch admissionCloseState {
-                    case .open, .committed:
-                        continuation.resume(returning: nil)
-                    case let .restored(replacement):
-                        continuation.resume(returning: replacement)
-                    case .tentative:
-                        admissionRetryWaiters[waiterID] = continuation
-                    }
-                }
-            } onCancel: {
-                Task { await self.cancelAdmissionRetryWaiter(waiterID) }
-            }
-        }
-
-        private func cancelAdmissionRetryWaiter(_ waiterID: UUID) {
-            admissionRetryWaiters.removeValue(forKey: waiterID)?.resume(returning: nil)
-        }
-
-        private func resumeAdmissionRetryWaiters(with replacement: MCPConnectionCallLimiters?) {
-            let waiters = Array(admissionRetryWaiters.values)
-            admissionRetryWaiters.removeAll()
-            for waiter in waiters {
-                waiter.resume(returning: replacement)
-            }
-        }
-
-        private func closeLanes() async {
-            async let cancelOrdinary: Void = ordinary.cancelAll()
-            async let cancelControl: Void = control.cancelAll()
-            async let cancelSmallRead: Void = smallRead.cancelAll()
-            async let cancelGitRead: Void = gitRead.cancelAll()
-            async let cancelFileSearch: Void = fileSearch.cancelAll()
-            _ = await (cancelOrdinary, cancelControl, cancelSmallRead, cancelGitRead, cancelFileSearch)
-        }
-
-        private func limiter(for lane: MCPConnectionCallLane) -> AsyncLimiter {
-            switch lane {
-            case .ordinary:
-                ordinary
-            case .control:
-                control
-            case .smallRead:
-                smallRead
-            case .gitRead:
-                gitRead
-            case .fileSearch:
-                fileSearch
-            }
-        }
-
-        private var lanes: [(MCPConnectionCallLane, AsyncLimiter)] {
-            [
-                (.ordinary, ordinary),
-                (.control, control),
-                (.smallRead, smallRead),
-                (.gitRead, gitRead),
-                (.fileSearch, fileSearch)
-            ]
-        }
-    }
+    // Connection-lane ownership lives in RepoPromptDomainRuntime.
 
     // 🆕 Admission control
     private var activeConnectionsByClient: [String: Set<UUID>] = [:]
     private var clientIDByConnection: [UUID: String] = [:]
-    private var callLimiters: [UUID: MCPConnectionCallLimiters] = [:]
+    private let callLimiters = MCPDomainConnectionCallAdmissionRegistry()
 
-    private nonisolated let mutationAdmissionController = MCPToolResourceAdmissionController(
-        limit: MCPToolAdmissionPolicy.exclusiveConnectionLimit
-    )
-    private nonisolated let smallReadAdmissionController = MCPToolResourceAdmissionController(
-        limit: MCPToolAdmissionPolicy.smallReadPerWindowLimit
-    )
     private nonisolated let codeStructureSettlementRegistry = MCPCodeStructureSettlementRegistry()
     private nonisolated let toolCardOwnershipLedger = MCPToolCardOwnershipLedger()
     #if DEBUG
@@ -2320,7 +1848,7 @@ actor ServerNetworkManager {
     @TaskLocal
     static var currentConnectionID: UUID?
     @TaskLocal
-    static var currentProgressState: MCPRequestProgressState?
+    static var currentProgressState: MCPRequestProgressContext?
     @TaskLocal
     static var currentTabContextHint: MCPServerViewModel.TabContextHint?
     @TaskLocal
@@ -2732,6 +2260,28 @@ actor ServerNetworkManager {
         return (restricted, additional, preassigned, purpose, taskLabelKind, allowsAgentExternalControlTools)
     }
 
+    private static func domainPolicySnapshot(
+        restricted: Set<String>,
+        additional: Set<String>,
+        taskLabelKind: AgentModelCatalog.TaskLabelKind?,
+        allowsAgentExternalControlTools: Bool
+    ) -> MCPDomainClientPolicySnapshot {
+        let role: MCPClientTaskRole = switch taskLabelKind {
+        case .explore:
+            .explore
+        case .engineer, .pair, .design:
+            .engineer
+        case nil:
+            .direct
+        }
+        return MCPDomainClientPolicySnapshot(
+            restrictedToolNames: restricted,
+            additionalToolNames: additional,
+            role: role,
+            allowsAgentExternalControlTools: allowsAgentExternalControlTools
+        )
+    }
+
     #if DEBUG
         private func debugPolicyDiagnosticFields(
             connectionID: UUID,
@@ -2931,10 +2481,38 @@ actor ServerNetworkManager {
         progressState: MCPRequestProgressState? = nil,
         operation: () async throws -> T
     ) async rethrows -> T {
+        try await withConnectionID(
+            connectionID,
+            lifecycleCorrelation: lifecycleCorrelation,
+            progressContext: progressState.map(MCPRequestProgressContext.direct),
+            operation: operation
+        )
+    }
+
+    nonisolated static func withConnectionID<T>(
+        _ connectionID: UUID?,
+        lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
+        progressHandle: MCPDomainRequestProgressHandle?,
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        try await withConnectionID(
+            connectionID,
+            lifecycleCorrelation: lifecycleCorrelation,
+            progressContext: progressHandle.map(MCPRequestProgressContext.domain),
+            operation: operation
+        )
+    }
+
+    private nonisolated static func withConnectionID<T>(
+        _ connectionID: UUID?,
+        lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?,
+        progressContext: MCPRequestProgressContext?,
+        operation: () async throws -> T
+    ) async rethrows -> T {
         // Nested window-tool dispatches re-establish the connection TaskLocal.
         // Preserve an already-authorized request progress state unless the caller
         // supplies a new one for a new top-level request.
-        let effectiveProgressState = progressState
+        let effectiveProgressState = progressContext
             ?? (connectionID == currentConnectionID ? currentProgressState : nil)
         return try await $currentProgressState.withValue(effectiveProgressState) {
             #if DEBUG || EDIT_FLOW_PERF
@@ -5894,7 +5472,7 @@ actor ServerNetworkManager {
                 context: shutdownContext
             )
         }
-        let limitersToStop = Array(callLimiters)
+        let limitersToStop = Array(callLimiters.snapshot())
         let committingBootstrapConnectionsToStop = bootstrapReservations.values.compactMap { reservation in
             reservation.lifecycleGeneration == stoppedLifecycleGeneration
                 ? reservation.committingConnection
@@ -6774,6 +6352,16 @@ actor ServerNetworkManager {
         // Later termination/watchdog cleanup must not overwrite the event that
         // actually initiated removal.
         persistAcceptedSocketTerminalRecord(connectionID: id, context: context)
+
+        // Fence this exact connection generation in the domain host before any
+        // cleanup suspension can let a parked invocation cross final admission.
+        let removedConnectionGeneration = connectionLifecycleGenerationByID[id]
+        if let removedConnectionGeneration {
+            await domainHost.cancelInvocations(
+                connectionID: id,
+                connectionGeneration: removedConnectionGeneration
+            )
+        }
 
         // Capture run ownership before any suspension or connection-dictionary cleanup.
         // A discovery child can finish successfully and then disappear through several
@@ -9866,7 +9454,7 @@ actor ServerNetworkManager {
             let disabled = await MainActor.run {
                 ToolAvailabilityStore.shared.effectiveDisabledTools
             }
-            let catalog = await ServiceRegistry.catalogSnapshot()
+            let catalog = await domainHost.catalogSnapshot()
             let policy = effectivePolicyState(for: connectionID)
             let restricted = policy.restricted
             let additionalTools = policy.additional
@@ -10094,10 +9682,19 @@ actor ServerNetworkManager {
         #endif
         guard let mgr = connections[connectionID] else { return }
         if let standardProgressState {
-            await standardProgressState.send(
-                through: mgr,
-                message: "\(tool) [\(stage)]: \(message)"
-            )
+            switch standardProgressState {
+            case let .domain(handle):
+                await domainHost.sendRequestProgress(
+                    handle,
+                    through: mgr,
+                    message: "\(tool) [\(stage)]: \(message)"
+                )
+            case let .direct(state):
+                await state.send(
+                    through: mgr,
+                    message: "\(tool) [\(stage)]: \(message)"
+                )
+            }
         } else if supportsRepoPromptControl {
             await mgr.sendProgress(tool: tool, kind: kind, stage: stage, message: message)
         }
@@ -11245,85 +10842,57 @@ actor ServerNetworkManager {
             let disabled = await MainActor.run {
                 ToolAvailabilityStore.shared.effectiveDisabledTools
             }
-            // Listing consumes one immutable actor snapshot. No per-service scan may
-            // observe a partially-mutated catalog or create a second schema authority.
-            let catalog = await ServiceRegistry.catalogSnapshot()
             let policy = await effectivePolicyState(for: connectionID)
-            let restricted = policy.restricted
-            let additionalTools = policy.additional
+            let domainPolicy = Self.domainPolicySnapshot(
+                restricted: policy.restricted,
+                additional: policy.additional,
+                taskLabelKind: policy.taskLabelKind,
+                allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
+            )
+            // The domain host owns canonical filtering; this app shell retains only
+            // purpose-specific schema/description and client annotation projection.
+            let advertisement = await domainHost.advertisedCatalog(
+                MCPDomainCatalogAdvertisementRequest(
+                    isGloballyEnabled: isEnabledState,
+                    disabledToolNames: disabled,
+                    policy: domainPolicy
+                )
+            )
             #if DEBUG
                 var hiddenToolReasons: [String: Int] = [:]
                 var hiddenToolSamples: [String] = []
-                func recordHiddenTool(_ toolName: String, reason: String) {
-                    hiddenToolReasons[reason, default: 0] += 1
-                    guard hiddenToolSamples.count < 20 else { return }
-                    hiddenToolSamples.append("\(toolName):\(reason)")
+                for (toolName, reason) in advertisement.hiddenReasonsByToolName.sorted(by: { $0.key < $1.key }) {
+                    hiddenToolReasons[reason.rawValue, default: 0] += 1
+                    guard hiddenToolSamples.count < 20 else { continue }
+                    hiddenToolSamples.append("\(toolName):\(reason.rawValue)")
                 }
             #endif
 
             var tools: [MCP.Tool] = []
+            tools.reserveCapacity(advertisement.definitions.count)
+            for definition in advertisement.definitions {
+                let schemaValue = try await cachedSchema(
+                    for: definition.name,
+                    schema: definition.inputSchema,
+                    purpose: policy.purpose
+                )
+                let description = advertisedToolDescription(
+                    for: definition.name,
+                    baseDescription: definition.description,
+                    purpose: policy.purpose
+                )
 
-            // Only proceed when the global MCP switch is ON
-            if await isEnabledState {
-                for definition in catalog.definitions {
-                    if disabled.contains(definition.name) {
-                        #if DEBUG
-                            recordHiddenTool(definition.name, reason: "disabled")
-                        #endif
-                        continue
-                    }
-                    if restricted.contains(definition.name) {
-                        #if DEBUG
-                            recordHiddenTool(definition.name, reason: "restricted")
-                        #endif
-                        continue
-                    }
-
-                    // • hide policy-gated tools unless explicitly granted via additionalTools
-                    if MCPPolicyGatedTools.names.contains(definition.name),
-                       !additionalTools.contains(definition.name)
-                    {
-                        #if DEBUG
-                            recordHiddenTool(definition.name, reason: "missing_additional_tool_grant")
-                        #endif
-                        continue
-                    }
-
-                    // • role-based advertisement filtering (advertisement-only, not execution-time)
-                    if !AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
-                        toolName: definition.name,
-                        taskLabelKind: policy.taskLabelKind,
-                        allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
-                    ) {
-                        #if DEBUG
-                            recordHiddenTool(definition.name, reason: "role_advertisement_policy")
-                        #endif
-                        continue
-                    }
-
-                    let schemaValue = try await cachedSchema(
-                        for: definition.name,
-                        schema: definition.inputSchema,
-                        purpose: policy.purpose
-                    )
-                    let description = advertisedToolDescription(
-                        for: definition.name,
-                        baseDescription: definition.description,
-                        purpose: policy.purpose
-                    )
-
-                    tools.append(
-                        .init(
-                            name: definition.name,
-                            description: description,
-                            inputSchema: schemaValue,
-                            annotations: CodexMCPToolAnnotationProjection.project(
-                                definition.annotations.mcpAnnotations,
-                                clientIdentifier: clientIdentifier
-                            )
+                tools.append(
+                    .init(
+                        name: definition.name,
+                        description: description,
+                        inputSchema: schemaValue,
+                        annotations: CodexMCPToolAnnotationProjection.project(
+                            definition.annotations.mcpAnnotations,
+                            clientIdentifier: clientIdentifier
                         )
                     )
-                }
+                )
             }
 
             #if DEBUG
@@ -11560,18 +11129,28 @@ actor ServerNetworkManager {
                 // tools/list already performs any needed persisted routing hydration.
                 // Avoid repeating that work while a tool call is in-flight.
 
-                // Block policy-gated tools unless explicitly granted via additionalTools
-                if MCPPolicyGatedTools.names.contains(toolName) {
-                    let effectivePolicy = await effectivePolicyState(for: connectionID)
-                    if !effectivePolicy.additional.contains(toolName) {
-                        #if DEBUG
-                            await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [
-                                "toolName": toolName,
-                                "reason": "missing_additional_tool_grant"
-                            ])
-                        #endif
-                        return CallTool.Result.err("Tool '\(toolName)' is only available during discovery or agent mode runs.")
-                    }
+                let effectivePolicy = await effectivePolicyState(for: connectionID)
+                let domainPolicy = Self.domainPolicySnapshot(
+                    restricted: effectivePolicy.restricted,
+                    additional: effectivePolicy.additional,
+                    taskLabelKind: effectivePolicy.taskLabelKind,
+                    allowsAgentExternalControlTools: effectivePolicy.allowsAgentExternalControlTools
+                )
+                do {
+                    try await domainHost.evaluateEarlyCallPolicy(
+                        toolName: toolName,
+                        policy: domainPolicy
+                    )
+                } catch MCPDomainCallPolicyDenial.missingAdditionalGrant {
+                    #if DEBUG
+                        await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [
+                            "toolName": toolName,
+                            "reason": "missing_additional_tool_grant"
+                        ])
+                    #endif
+                    return CallTool.Result.err("Tool '\(toolName)' is only available during discovery or agent mode runs.")
+                } catch {
+                    // Early policy intentionally owns only explicit-grant gating.
                 }
             }
 
@@ -11617,28 +11196,41 @@ actor ServerNetworkManager {
                 await self.effectivePolicyState(for: connectionID)
             }
             connectionLog("tools/call \(toolName): policy ready")
+            let preAdmissionDecision: MCPDomainPreAdmissionDecision
             do {
                 let policyState = EditFlowPerf.begin(
                     EditFlowPerf.Stage.MCPToolCall.policyGating,
                     EditFlowPerf.Dimensions(toolName: toolName)
                 )
                 defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.policyGating, policyState) }
-                if policy.restricted.contains(toolName) {
-                    log.notice("Connection \(connectionID) attempted to call restricted tool \(toolName)")
-                    return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool '\(toolName)' is disabled for this connection.")
-                }
-                if MCPToolCapabilities.capabilities(for: toolName).contains(.agentExploreControl),
-                   !AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
-                       toolName: toolName,
-                       taskLabelKind: policy.taskLabelKind,
-                       allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
-                   )
-                {
-                    return Self.toolErrorResult(
-                        rawJSON: capturedRawJSON,
-                        message: "Tool 'agent_explore' is only available to MCP-started non-explore Agent Mode runs."
-                    )
-                }
+                let domainPolicy = Self.domainPolicySnapshot(
+                    restricted: policy.restricted,
+                    additional: policy.additional,
+                    taskLabelKind: policy.taskLabelKind,
+                    allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
+                )
+                preAdmissionDecision = try await domainHost.evaluatePreAdmissionCallPolicy(
+                    toolName: toolName,
+                    policy: domainPolicy
+                )
+            } catch MCPDomainCallPolicyDenial.restricted {
+                log.notice("Connection \(connectionID) attempted to call restricted tool \(toolName)")
+                return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool '\(toolName)' is disabled for this connection.")
+            } catch MCPDomainCallPolicyDenial.roleUnavailable {
+                return Self.toolErrorResult(
+                    rawJSON: capturedRawJSON,
+                    message: "Tool 'agent_explore' is only available to MCP-started non-explore Agent Mode runs."
+                )
+            } catch {
+                MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
+                    classKey: .unclassified,
+                    reason: .unclassifiedTool
+                )
+                return Self.executionContractToolErrorResult(
+                    rawJSON: capturedRawJSON,
+                    code: "tool_execution_admission_unclassified",
+                    message: "No static admission classification exists for tool '\(toolName)'."
+                )
             }
 
             // Create immutable copies for Swift 6 concurrency safety
@@ -11650,11 +11242,23 @@ actor ServerNetworkManager {
             let capturedPreResolvedWindowID = preResolvedWindowID
             let capturedArguments = dispatchArguments
             let capturedArgsForFormatter = argsForFormatter
-            let capturedProgressState = params._meta?.progressToken.map {
-                MCPRequestProgressState(token: $0)
+            let capturedConnectionGeneration = await requestTimelineConnectionGeneration(for: connectionID)
+            let capturedProgressState: MCPDomainRequestProgressHandle? = if let progressToken = params._meta?.progressToken,
+                                                                            let connectionGeneration = capturedConnectionGeneration
+            {
+                await domainHost.beginRequestProgress(
+                    connectionID: connectionID,
+                    connectionGeneration: connectionGeneration,
+                    invocationID: invocationID,
+                    token: progressToken
+                )
+            } else {
+                nil
             }
             func finalizeToolResult(_ result: CallTool.Result) async -> CallTool.Result {
-                await capturedProgressState?.invalidate()
+                if let capturedProgressState {
+                    await domainHost.finishRequestProgress(capturedProgressState)
+                }
                 return result
             }
 
@@ -11685,19 +11289,7 @@ actor ServerNetworkManager {
 
             // Connection lanes provide bounded FIFO admission only. Shared-state correctness is
             // enforced below by explicit window/app/repository resource ownership.
-            guard let admissionClass = Self.admissionClass(forCanonicalToolName: toolName) else {
-                MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
-                    classKey: .unclassified,
-                    reason: .unclassifiedTool
-                )
-                return await finalizeToolResult(
-                    Self.executionContractToolErrorResult(
-                        rawJSON: capturedRawJSON,
-                        code: "tool_execution_admission_unclassified",
-                        message: "No static admission classification exists for tool '\(toolName)'."
-                    )
-                )
-            }
+            let admissionClass = preAdmissionDecision.admissionClass
             let callLane = admissionClass.connectionLane
             connectionLog("tools/call \(toolName): acquiring limiter lane=\(callLane.rawValue)")
             let limiterResolution = await EditFlowPerf.measure(
@@ -11781,7 +11373,7 @@ actor ServerNetworkManager {
                         await Self.withConnectionID(
                             connectionID,
                             lifecycleCorrelation: lifecycleCorrelation,
-                            progressState: capturedProgressState
+                            progressHandle: capturedProgressState
                         ) {
                             await Self.$currentTabContextHint.withValue(capturedTabContextHint) {
                                 let permitPreDispatchEnvelopeState = EditFlowPerf.begin(
@@ -11816,7 +11408,7 @@ actor ServerNetworkManager {
 
                                 let (windowCount, multiWindowModeEffective) = routingSnapshot
                                 var chosenID: Int?
-                                var singleWindowFallbackResolvedTool: MCPDomainResolvedTool?
+                                var singleWindowFallbackResolvedTool: MCPDomainHostResolution?
                                 let windowStr: String
                                 let observerRunIDForCallbacksFinal: UUID?
                                 do {
@@ -11942,7 +11534,7 @@ actor ServerNetworkManager {
                                     if !bypassWindowRouting,
                                        windowCount == 1,
                                        chosenID == nil,
-                                       let fallback = await ServiceRegistry.resolveUniqueWindowTool(toolName: toolName),
+                                       let fallback = try? await self.domainHost.resolveUniqueWindowTool(toolName: toolName),
                                        case let .window(fallbackWindowID) = fallback.scope
                                     {
                                         singleWindowFallbackResolvedTool = fallback
@@ -11984,9 +11576,9 @@ actor ServerNetworkManager {
                                         ? nil
                                         : await self.runIDForConnection(connectionID)
                                 }
-                                let mutationAdmissionLease: MCPToolResourceAdmissionController.Lease?
+                                let mutationAdmissionLease: MCPDomainToolResourceAdmissionController.Lease?
                                 if admissionClass == .exclusive {
-                                    let mutationResource: MCPToolResourceAdmissionController.Resource
+                                    let mutationResource: MCPDomainToolResourceAdmissionController.Resource
                                     if MCPGlobalToolName.orderedToolNames.contains(toolName) {
                                         mutationResource = .appWide
                                     } else if let chosenID {
@@ -12000,7 +11592,7 @@ actor ServerNetworkManager {
                                     }
                                     do {
                                         let evidenceLeaseWaitStart = evidenceClock.now
-                                        mutationAdmissionLease = try await self.mutationAdmissionController.acquire(mutationResource)
+                                        mutationAdmissionLease = try await self.domainHost.acquireMutationResourceAdmission(mutationResource)
                                         MCPToolConcurrencyEvidenceRecorder.shared.recordLeaseWait(
                                             classKey: evidenceClass,
                                             milliseconds: evidenceLeaseWaitStart.duration(to: evidenceClock.now).mcpMilliseconds
@@ -12021,7 +11613,7 @@ actor ServerNetworkManager {
                                 }
                                 defer { mutationAdmissionLease?.release() }
 
-                                let smallReadAdmissionLease: MCPToolResourceAdmissionController.Lease?
+                                let smallReadAdmissionLease: MCPDomainToolResourceAdmissionController.Lease?
                                 if admissionClass == .smallRead {
                                     guard let chosenID else {
                                         return Self.executionContractToolErrorResult(
@@ -12032,7 +11624,7 @@ actor ServerNetworkManager {
                                     }
                                     do {
                                         let evidenceLeaseWaitStart = evidenceClock.now
-                                        smallReadAdmissionLease = try await self.smallReadAdmissionController.acquire(.window(chosenID))
+                                        smallReadAdmissionLease = try await self.domainHost.acquireSmallReadResourceAdmission(windowID: chosenID)
                                         MCPToolConcurrencyEvidenceRecorder.shared.recordLeaseWait(
                                             classKey: evidenceClass,
                                             milliseconds: evidenceLeaseWaitStart.duration(to: evidenceClock.now).mcpMilliseconds
@@ -12772,17 +12364,19 @@ actor ServerNetworkManager {
                                         return .application
                                     case .window:
                                         return chosenID.map(MCPDomainToolRegistrationScope.window)
+                                    case .standalone:
+                                        return nil
                                     }
                                 }()
                                 var resolvedTool = singleWindowFallbackResolvedTool
                                 if resolvedTool == nil, let registrationScope {
-                                    resolvedTool = await ServiceRegistry.resolve(
+                                    resolvedTool = try? await self.domainHost.resolve(
                                         toolName: toolName,
                                         scope: registrationScope
                                     )
                                 }
                                 if let resolvedTool {
-                                    let toolDef = resolvedTool.binding.definition
+                                    let toolDef = resolvedTool.definition
                                     connectionLog("tools/call \(toolName): dispatching exact domain binding scope=\(String(describing: registrationScope))")
 
                                     // Inject window_id from routing if tool schema declares it and caller didn't provide it.
@@ -12836,11 +12430,13 @@ actor ServerNetworkManager {
                                                 return try await operation()
                                             }
                                         #endif
-                                        return try await MCPDomainInvocationSecurityContext.$current.withValue(
-                                            invocationSecurityContext
-                                        ) {
-                                            try await resolvedTool.binding(effectiveArgs)
-                                        }
+                                        return try await self.domainHost.invoke(MCPDomainHostInvocation(
+                                            invocationID: invocationID,
+                                            connectionID: connectionID,
+                                            resolution: resolvedTool,
+                                            arguments: effectiveArgs,
+                                            securityContext: invocationSecurityContext
+                                        ))
                                     }
 
                                     // Window-scoped bindings retain exact registry generation ownership.
@@ -12848,7 +12444,7 @@ actor ServerNetworkManager {
                                         let ownershipWindowID = chosenID ?? registeredWindowID
                                         guard let windowDispatchIdentity = await self.captureWindowToolDispatchIdentity(
                                             windowID: ownershipWindowID,
-                                            catalogRegistrationHandle: resolvedTool.handle
+                                            catalogRegistrationHandle: resolvedTool.registrationHandle
                                         ) else {
                                             return Self.executionContractToolErrorResult(
                                                 rawJSON: capturedRawJSON,
@@ -14934,384 +14530,84 @@ actor ServerNetworkManager {
 }
 
 #if DEBUG
-    struct MCPConnectionCallLimiterDebugSnapshot: Equatable {
-        let ordinary: AsyncLimiter.DebugSnapshot
-        let control: AsyncLimiter.DebugSnapshot
-        let smallRead: AsyncLimiter.DebugSnapshot
-        let gitRead: AsyncLimiter.DebugSnapshot
-        let fileSearch: AsyncLimiter.DebugSnapshot
-
-        var laneCount: Int {
-            MCPConnectionCallLane.allCases.count
+    extension MCPDomainConnectionCallLimiters {
+        func withPermit<T: Sendable>(
+            lane: MCPConnectionCallLane,
+            toolName: String? = nil,
+            lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
+            ownerResource: String? = nil,
+            ownerWindowID: Int? = nil,
+            ownerRunID: String? = nil,
+            _ operation: @Sendable () async throws -> T
+        ) async throws -> T {
+            let queuedSnapshot = await diagnosticsSnapshot(for: lane)
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.MCPToolCall.permitQueued,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(
+                    toolName: toolName, outcome: "queued",
+                    activeCount: queuedSnapshot.activePermitCount,
+                    admissionClass: lane.rawValue,
+                    queueDepth: queuedSnapshot.waiterCount + (queuedSnapshot.permits == 0 ? 1 : 0),
+                    windowID: ownerWindowID, runID: ownerRunID, ownerResource: ownerResource,
+                    permitActive: false, publicationPending: false, terminalBarrier: false
+                )
+            )
+            do {
+                let result = try await withPermit(lane: lane) {
+                    let acquiredSnapshot = await self.diagnosticsSnapshot(for: lane)
+                    EditFlowPerf.lifecycleEvent(
+                        EditFlowPerf.Lifecycle.MCPToolCall.permitAcquired,
+                        correlation: lifecycleCorrelation,
+                        EditFlowPerf.Dimensions(
+                            toolName: toolName, outcome: "acquired",
+                            activeCount: acquiredSnapshot.activePermitCount,
+                            admissionClass: lane.rawValue,
+                            queueDepth: acquiredSnapshot.waiterCount,
+                            windowID: ownerWindowID, runID: ownerRunID, ownerResource: ownerResource,
+                            permitActive: true, publicationPending: false, terminalBarrier: false
+                        )
+                    )
+                    return try await operation()
+                }
+                let releasedSnapshot = await diagnosticsSnapshot(for: lane)
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.MCPToolCall.permitReleased, correlation: lifecycleCorrelation,
+                    EditFlowPerf.Dimensions(
+                        toolName: toolName, outcome: "completed", activeCount: releasedSnapshot.activePermitCount,
+                        admissionClass: lane.rawValue, queueDepth: releasedSnapshot.waiterCount,
+                        windowID: ownerWindowID, runID: ownerRunID, ownerResource: ownerResource,
+                        permitActive: false, publicationPending: true, terminalBarrier: false
+                    )
+                )
+                return result
+            } catch {
+                let releasedSnapshot = await diagnosticsSnapshot(for: lane)
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.MCPToolCall.permitReleased, correlation: lifecycleCorrelation,
+                    EditFlowPerf.Dimensions(
+                        toolName: toolName, outcome: error is CancellationError ? "cancelled" : "failed",
+                        activeCount: releasedSnapshot.activePermitCount, admissionClass: lane.rawValue,
+                        queueDepth: releasedSnapshot.waiterCount, windowID: ownerWindowID, runID: ownerRunID,
+                        ownerResource: ownerResource, permitActive: false, publicationPending: true, terminalBarrier: false
+                    )
+                )
+                throw error
+            }
         }
-
-        var limit: Int {
-            ordinary.limit + control.limit + smallRead.limit + gitRead.limit + fileSearch.limit
-        }
-
-        var permits: Int {
-            ordinary.permits + control.permits + smallRead.permits + gitRead.permits + fileSearch.permits
-        }
-
-        var activePermitCount: Int {
-            ordinary.activePermitCount + control.activePermitCount + smallRead.activePermitCount + gitRead.activePermitCount + fileSearch.activePermitCount
-        }
-
-        var waiterCount: Int {
-            ordinary.waiterCount + control.waiterCount + smallRead.waiterCount + gitRead.waiterCount + fileSearch.waiterCount
-        }
-
-        var inFlight: Int {
-            ordinary.inFlight + control.inFlight + smallRead.inFlight + gitRead.inFlight + fileSearch.inFlight
-        }
-
-        var oldestWaiterAgeMilliseconds: UInt64? {
-            [
-                ordinary.oldestWaiterAgeMilliseconds,
-                control.oldestWaiterAgeMilliseconds,
-                smallRead.oldestWaiterAgeMilliseconds,
-                gitRead.oldestWaiterAgeMilliseconds,
-                fileSearch.oldestWaiterAgeMilliseconds
-            ]
-            .compactMap(\.self)
-            .max()
-        }
-
-        var cancelledWaiterCount: Int {
-            ordinary.cancelledWaiterCount + control.cancelledWaiterCount + smallRead.cancelledWaiterCount + gitRead.cancelledWaiterCount + fileSearch.cancelledWaiterCount
-        }
-
-        var isClosed: Bool {
-            ordinary.isClosed && control.isClosed && smallRead.isClosed && gitRead.isClosed && fileSearch.isClosed
-        }
-
-        var isIdle: Bool {
-            ordinary.isIdle && control.isIdle && smallRead.isIdle && gitRead.isIdle && fileSearch.isIdle
+    }
+#else
+    extension MCPDomainConnectionCallLimiters {
+        func withPermit<T: Sendable>(
+            lane: MCPConnectionCallLane,
+            toolName _: String? = nil,
+            lifecycleCorrelation _: EditFlowPerf.LifecycleCorrelation? = nil,
+            ownerResource _: String? = nil,
+            ownerWindowID _: Int? = nil,
+            ownerRunID _: String? = nil,
+            _ operation: @Sendable () async throws -> T
+        ) async throws -> T {
+            try await withPermit(lane: lane, operation)
         }
     }
 #endif
-
-/// Cancellation-aware async semaphore used to serialize calls per connection.
-actor AsyncLimiter {
-    private struct Waiter {
-        let id: UUID
-        let continuation: CheckedContinuation<Void, Error>
-        let enqueuedAtNanoseconds: UInt64
-        var previousID: UUID?
-        var nextID: UUID?
-    }
-
-    private let limit: Int
-    private var permits: Int
-    private var activePermitCount = 0
-    private var inFlight = 0
-    private var isClosed = false
-    private var waiterByID: [UUID: Waiter] = [:]
-    private var firstWaiterID: UUID?
-    private var lastWaiterID: UUID?
-    private var idleWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
-    private var cancelledWaiterCount = 0
-    private let idleWaitSleep: @Sendable (Duration) async throws -> Void
-
-    #if DEBUG
-        struct DebugSnapshot: Equatable {
-            let limit: Int
-            let permits: Int
-            let activePermitCount: Int
-            let waiterCount: Int
-            let inFlight: Int
-            let oldestWaiterAgeMilliseconds: UInt64?
-            let cancelledWaiterCount: Int
-            let isClosed: Bool
-            let isIdle: Bool
-        }
-
-        private let debugNowNanoseconds: @Sendable () -> UInt64
-        private var debugStateObserver: ((DebugSnapshot) -> Void)?
-        private var debugQueuedPermitHandoffHandler: (@Sendable () async -> Void)?
-    #endif
-
-    #if DEBUG
-        init(
-            limit: Int,
-            debugNowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
-            idleWaitSleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
-                try await Task.sleep(for: duration)
-            }
-        ) {
-            self.limit = max(1, limit)
-            permits = max(1, limit)
-            self.debugNowNanoseconds = debugNowNanoseconds
-            self.idleWaitSleep = idleWaitSleep
-        }
-    #else
-        init(limit: Int) {
-            self.limit = max(1, limit)
-            permits = max(1, limit)
-            idleWaitSleep = { duration in
-                try await Task.sleep(for: duration)
-            }
-        }
-    #endif
-
-    private func acquirePermit() async throws {
-        try Task.checkCancellation()
-        guard !isClosed else { throw CancellationError() }
-
-        if permits > 0 {
-            permits -= 1
-            activePermitCount += 1
-            notifyDebugStateChanged()
-            return
-        }
-
-        let waiterID = UUID()
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                guard !isClosed else {
-                    continuation.resume(throwing: CancellationError())
-                    return
-                }
-                appendWaiter(Waiter(
-                    id: waiterID,
-                    continuation: continuation,
-                    enqueuedAtNanoseconds: currentDebugNanoseconds(),
-                    previousID: lastWaiterID,
-                    nextID: nil
-                ))
-                notifyDebugStateChanged()
-            }
-        } onCancel: {
-            Task { await self.cancelWaiter(waiterID) }
-        }
-
-        #if DEBUG
-            if let debugQueuedPermitHandoffHandler {
-                await debugQueuedPermitHandoffHandler()
-            }
-        #endif
-        guard !isClosed else {
-            releasePermit()
-            throw CancellationError()
-        }
-    }
-
-    private func appendWaiter(_ waiter: Waiter) {
-        if let lastWaiterID, var lastWaiter = waiterByID[lastWaiterID] {
-            lastWaiter.nextID = waiter.id
-            waiterByID[lastWaiterID] = lastWaiter
-        } else {
-            firstWaiterID = waiter.id
-        }
-        waiterByID[waiter.id] = waiter
-        lastWaiterID = waiter.id
-    }
-
-    @discardableResult
-    private func removeWaiter(_ waiterID: UUID) -> Waiter? {
-        guard let waiter = waiterByID.removeValue(forKey: waiterID) else { return nil }
-        if let previousID = waiter.previousID, var previous = waiterByID[previousID] {
-            previous.nextID = waiter.nextID
-            waiterByID[previousID] = previous
-        } else {
-            firstWaiterID = waiter.nextID
-        }
-        if let nextID = waiter.nextID, var next = waiterByID[nextID] {
-            next.previousID = waiter.previousID
-            waiterByID[nextID] = next
-        } else {
-            lastWaiterID = waiter.previousID
-        }
-        return waiter
-    }
-
-    private func popFirstWaiter() -> Waiter? {
-        guard let firstWaiterID else { return nil }
-        return removeWaiter(firstWaiterID)
-    }
-
-    private func cancelWaiter(_ waiterID: UUID) {
-        guard let waiter = removeWaiter(waiterID) else { return }
-        cancelledWaiterCount += 1
-        waiter.continuation.resume(throwing: CancellationError())
-        notifyDebugStateChanged()
-    }
-
-    private func releasePermit() {
-        if let waiter = popFirstWaiter() {
-            waiter.continuation.resume()
-        } else {
-            activePermitCount = max(0, activePermitCount - 1)
-            permits = min(permits + 1, limit)
-        }
-        notifyDebugStateChanged()
-    }
-
-    /// Rejects new acquisitions and promptly cancels every queued waiter.
-    func cancelAll() {
-        isClosed = true
-        while let waiter = popFirstWaiter() {
-            cancelledWaiterCount += 1
-            waiter.continuation.resume(throwing: CancellationError())
-        }
-        notifyDebugStateChanged()
-        resumeIdleWaitersIfNeeded()
-    }
-
-    /// Waits until active owners and cancelled queued callers have left `withPermit`.
-    /// Returns `false` when the caller cancels its join; active owners are never force-released.
-    func waitUntilIdle() async -> Bool {
-        guard !Task.isCancelled else { return false }
-        guard !isIdle else { return true }
-        let waiterID = UUID()
-        return await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                guard !Task.isCancelled else {
-                    continuation.resume(returning: false)
-                    return
-                }
-                guard !isIdle else {
-                    continuation.resume(returning: true)
-                    return
-                }
-                idleWaiters[waiterID] = continuation
-            }
-        } onCancel: {
-            Task { await self.cancelIdleWaiter(waiterID) }
-        }
-    }
-
-    /// Gives active owners a bounded cooperative cleanup grace. A timed-out owner remains
-    /// attached only to this closed limiter and may settle later without blocking teardown.
-    func waitUntilIdle(timeout: Duration) async -> Bool {
-        guard !Task.isCancelled else { return false }
-        guard !isIdle else { return true }
-        let sleep = idleWaitSleep
-        return await withTaskGroup(of: Bool?.self) { group in
-            group.addTask { [weak self] in
-                guard let self else { return true }
-                return await waitUntilIdle()
-            }
-            group.addTask {
-                do {
-                    try await sleep(timeout)
-                    return false
-                } catch {
-                    return nil
-                }
-            }
-            let first = await group.next() ?? false
-            group.cancelAll()
-            return first ?? false
-        }
-    }
-
-    /// Number of active and queued operations (0 means idle).
-    func activeCount() -> Int {
-        inFlight
-    }
-
-    private var isIdle: Bool {
-        inFlight == 0 && activePermitCount == 0 && waiterByID.isEmpty
-    }
-
-    private func cancelIdleWaiter(_ waiterID: UUID) {
-        idleWaiters.removeValue(forKey: waiterID)?.resume(returning: false)
-    }
-
-    private func resumeIdleWaitersIfNeeded() {
-        guard isIdle, !idleWaiters.isEmpty else { return }
-        let continuations = Array(idleWaiters.values)
-        idleWaiters.removeAll()
-        for continuation in continuations {
-            continuation.resume(returning: true)
-        }
-    }
-
-    #if DEBUG
-        func debugSnapshot() -> DebugSnapshot {
-            makeDebugSnapshot()
-        }
-
-        func setDebugStateObserver(
-            _ observer: ((DebugSnapshot) -> Void)?
-        ) {
-            debugStateObserver = observer
-            observer?(makeDebugSnapshot())
-        }
-
-        func setDebugQueuedPermitHandoffHandler(
-            _ handler: (@Sendable () async -> Void)?
-        ) {
-            debugQueuedPermitHandoffHandler = handler
-        }
-
-        private func makeDebugSnapshot() -> DebugSnapshot {
-            let now = debugNowNanoseconds()
-            let oldestWaiterAgeMilliseconds = firstWaiterID
-                .flatMap { waiterByID[$0] }
-                .map { Self.elapsedMilliseconds(since: $0.enqueuedAtNanoseconds, now: now) }
-            return DebugSnapshot(
-                limit: limit,
-                permits: permits,
-                activePermitCount: activePermitCount,
-                waiterCount: waiterByID.count,
-                inFlight: inFlight,
-                oldestWaiterAgeMilliseconds: oldestWaiterAgeMilliseconds,
-                cancelledWaiterCount: cancelledWaiterCount,
-                isClosed: isClosed,
-                isIdle: isIdle
-            )
-        }
-
-        private static func elapsedMilliseconds(since start: UInt64, now: UInt64) -> UInt64 {
-            guard now >= start else { return 0 }
-            return (now - start) / 1_000_000
-        }
-
-        private func currentDebugNanoseconds() -> UInt64 {
-            debugNowNanoseconds()
-        }
-
-        private func notifyDebugStateChanged() {
-            debugStateObserver?(makeDebugSnapshot())
-        }
-    #else
-        private func currentDebugNanoseconds() -> UInt64 {
-            0
-        }
-
-        private func notifyDebugStateChanged() {}
-    #endif
-
-    /// Executes an operation with a permit, limiting concurrency.
-    func withPermit<T>(
-        _ op: @Sendable () async throws -> T
-    ) async throws -> T {
-        inFlight += 1
-        notifyDebugStateChanged()
-        defer {
-            inFlight -= 1
-            notifyDebugStateChanged()
-            resumeIdleWaitersIfNeeded()
-        }
-
-        try await acquirePermit()
-        defer { releasePermit() }
-        try Task.checkCancellation()
-        return try await op()
-    }
-
-    func withPermit<T>(
-        cancellationResult: @Sendable () -> T,
-        _ op: @Sendable () async -> T
-    ) async -> T {
-        do {
-            return try await withPermit {
-                await op()
-            }
-        } catch {
-            return cancellationResult()
-        }
-    }
-}

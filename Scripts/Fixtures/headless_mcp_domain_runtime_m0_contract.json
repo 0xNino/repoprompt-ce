@@ -163,7 +163,7 @@
         "behavior": "source_declares_typed_invalid_params",
         "error_type": "ApplyEditsError.invalidParams",
         "source_evidence": {
-          "path": "Sources/RepoPrompt/Infrastructure/MCP/ApplyEdits/ApplyEditsRequestBuilder.swift",
+          "path": "Sources/RepoPromptDomainRuntime/ApplyEdits/ApplyEditsRequestBuilder.swift",
           "marker": "Provide exactly one of: `rewrite`, `replace`, or `edits`.",
           "type_marker": "ApplyEditsError.invalidParams"
         }

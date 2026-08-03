@@ -1092,7 +1092,9 @@ final class DomainCredentialAndChildLaunchTests: XCTestCase {
             windowID: nil,
             clientPrincipal: "agent",
             providerIdentifier: "codex",
-            runPurpose: "explore"
+            runPurpose: "explore",
+            restrictedTools: ["file_actions"],
+            additionalTools: ["ask_user"]
         )
         let scope = DomainCredentialScope(
             providerIdentifier: "codex",
@@ -1135,9 +1137,11 @@ final class DomainCredentialAndChildLaunchTests: XCTestCase {
             clientPrincipal: request.clientPrincipal,
             providerIdentifier: request.providerIdentifier
         )
-        guard case .accepted = accepted else {
+        guard case let .accepted(redemption) = accepted else {
             return XCTFail("Injected harness token was not accepted: \(accepted)")
         }
+        XCTAssertEqual(redemption.restrictedTools, ["file_actions"])
+        XCTAssertEqual(redemption.additionalTools, ["ask_user"])
         let replay = await runtime.routingCoordinator.redeemLaunchToken(
             material: material,
             runtimeID: runtime.identity.runtimeID,
@@ -1148,6 +1152,61 @@ final class DomainCredentialAndChildLaunchTests: XCTestCase {
             providerIdentifier: request.providerIdentifier
         )
         XCTAssertEqual(replay, .alreadyConsumed)
+
+        let foreignRuntimeRequest = DomainRunLaunchReservationRequest(
+            runID: UUID(),
+            context: request.context,
+            expectedContextRevision: request.expectedContextRevision,
+            windowID: nil,
+            clientPrincipal: request.clientPrincipal,
+            providerIdentifier: request.providerIdentifier,
+            runPurpose: "foreign-runtime"
+        )
+        let foreignRuntimeToken = try await runtime.routingCoordinator.issueLaunchToken(foreignRuntimeRequest)
+        let foreignRuntime = await runtime.routingCoordinator.redeemLaunchToken(
+            material: foreignRuntimeToken.material,
+            runtimeID: UUID(),
+            runtimeGeneration: runtime.identity.lifecycleGeneration,
+            connectionID: UUID(),
+            processID: nil,
+            clientPrincipal: request.clientPrincipal,
+            providerIdentifier: request.providerIdentifier
+        )
+        XCTAssertEqual(foreignRuntime, .generationMismatch)
+        let acceptedAfterForeignAttempt = await runtime.routingCoordinator.redeemLaunchToken(
+            material: foreignRuntimeToken.material,
+            runtimeID: runtime.identity.runtimeID,
+            runtimeGeneration: runtime.identity.lifecycleGeneration,
+            connectionID: UUID(),
+            processID: nil,
+            clientPrincipal: request.clientPrincipal,
+            providerIdentifier: request.providerIdentifier
+        )
+        guard case .accepted = acceptedAfterForeignAttempt else {
+            return XCTFail("A foreign-runtime attempt must not consume the token: \(acceptedAfterForeignAttempt)")
+        }
+
+        let expiredRequest = DomainRunLaunchReservationRequest(
+            runID: UUID(),
+            context: request.context,
+            expectedContextRevision: request.expectedContextRevision,
+            windowID: nil,
+            clientPrincipal: request.clientPrincipal,
+            providerIdentifier: request.providerIdentifier,
+            runPurpose: "expired",
+            lifetime: .zero
+        )
+        let expiredToken = try await runtime.routingCoordinator.issueLaunchToken(expiredRequest)
+        let expiredRedemption = await runtime.routingCoordinator.redeemLaunchToken(
+            material: expiredToken.material,
+            runtimeID: runtime.identity.runtimeID,
+            runtimeGeneration: runtime.identity.lifecycleGeneration,
+            connectionID: UUID(),
+            processID: nil,
+            clientPrincipal: request.clientPrincipal,
+            providerIdentifier: request.providerIdentifier
+        )
+        XCTAssertEqual(expiredRedemption, .expired)
         _ = await runtime.shutdown()
     }
 }

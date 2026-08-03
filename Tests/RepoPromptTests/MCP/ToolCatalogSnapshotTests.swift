@@ -35,11 +35,46 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             "Window catalog should keep .git providers ordered as git, manage_worktree."
         )
 
-        if ProcessInfo.processInfo.environment["RECORD_MCP_WINDOW_TOOL_CATALOG"] == "1" {
-            print(Self.renderGolden(signatures))
-        }
-
         XCTAssertEqual(signatures, Self.expectedSignatures)
+    }
+
+    func testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot() throws {
+        let generated = try MCPDomainCanonicalToolDefinitions.reviewSnapshotData()
+        let repoRoot = try RepoRoot.url()
+        let snapshotURL = repoRoot
+            .appendingPathComponent("docs/spec/mcp-domain-canonical-tool-definitions.generated.json")
+        let updateMarker = repoRoot.appendingPathComponent(".build/update-mcp-domain-schema-review-snapshot")
+        if FileManager.default.fileExists(atPath: updateMarker.path) {
+            try generated.write(to: snapshotURL, options: .atomic)
+            try FileManager.default.removeItem(at: updateMarker)
+        }
+        let committed = try Data(contentsOf: snapshotURL)
+        XCTAssertEqual(
+            committed,
+            generated,
+            "Regenerate the readable projection with the command recorded in its provenance block."
+        )
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: committed) as? [String: Any])
+        let provenance = try XCTUnwrap(object["provenance"] as? [String: Any])
+        XCTAssertEqual(provenance["authority"] as? String, "generated-review-projection-only")
+        XCTAssertEqual((object["tools"] as? [[String: Any]])?.count, 27)
+    }
+
+    func testShippingAppRegistrationUsesCanonicalTwentySevenSchemaFingerprints() async throws {
+        let window = Self.makeWindowWithoutAutoStart()
+        let expected = try Dictionary(uniqueKeysWithValues: MCPDomainCanonicalToolDefinitions.definitions.map {
+            try ($0.name, MCPDomainToolFingerprint(definition: $0))
+        })
+        try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+        let registration = try await ServiceRegistry.register(
+            window.mcpServer.windowMCPToolCatalogService
+        )
+        let snapshot = await AppDomainRuntimeComposition.shared.runtime.toolRegistry.snapshot()
+
+        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definitions.count, 27)
+        XCTAssertEqual(snapshot.fingerprintsByToolName, expected)
+        XCTAssertEqual(Set(snapshot.toolNames), Set(MCPDomainToolCatalog.orderedToolNames))
+        await ServiceRegistry.unregister(registration.handle)
     }
 
     func testLongRunningAppRegistrationPreservesTypedAuthoritativeRoutingDenial() async throws {
@@ -899,6 +934,18 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         #endif
     }
 
+    func testAppDelegateTerminationInvokesDomainRuntimeShutdownSeam() async {
+        let probe = AppDelegateTerminationProbe()
+        let appDelegate = AppDelegate()
+        appDelegate.setDomainRuntimeShutdownOperationForTesting {
+            await probe.shutdown()
+        }
+
+        await appDelegate.shutdownDomainRuntimeForTerminationForTesting()
+
+        XCTAssertEqual(probe.invocationCount, 1)
+    }
+
     func testAppDelegateStartupPublishesGlobalRegistrationBeforeObservationOnlyReadiness() async {
         let wiringProbe = AppDelegateRegistrationProbe()
         let wiringDelegate = AppDelegate()
@@ -1492,6 +1539,15 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             }
         }
     #endif
+
+    @MainActor
+    private final class AppDelegateTerminationProbe {
+        private(set) var invocationCount = 0
+
+        func shutdown() {
+            invocationCount += 1
+        }
+    }
 
     @MainActor
     private final class AppDelegateRegistrationProbe {

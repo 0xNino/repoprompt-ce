@@ -105,19 +105,23 @@ extension Tool {
     }
 
     func domainBinding() throws -> MCPDomainToolBinding {
-        let definition = try MCPDomainToolDefinition(
-            name: name,
-            description: description,
-            inputSchema: Value(inputSchema),
-            annotations: MCPDomainToolAnnotations(
-                title: annotations.title,
-                readOnlyHint: annotations.readOnlyHint,
-                destructiveHint: annotations.destructiveHint,
-                idempotentHint: annotations.idempotentHint,
-                openWorldHint: annotations.openWorldHint
-            ),
-            isEnabledByDefault: isEnabledByDefault
-        )
+        let definition: MCPDomainToolDefinition = if let canonical = MCPDomainCanonicalToolDefinitions.definition(named: name) {
+            canonical
+        } else {
+            try MCPDomainToolDefinition(
+                name: name,
+                description: description,
+                inputSchema: Value(inputSchema),
+                annotations: MCPDomainToolAnnotations(
+                    title: annotations.title,
+                    readOnlyHint: annotations.readOnlyHint,
+                    destructiveHint: annotations.destructiveHint,
+                    idempotentHint: annotations.idempotentHint,
+                    openWorldHint: annotations.openWorldHint
+                ),
+                isEnabledByDefault: isEnabledByDefault
+            )
+        }
         return MCPDomainToolBinding(definition: definition) { arguments in
             try await self(arguments)
         }

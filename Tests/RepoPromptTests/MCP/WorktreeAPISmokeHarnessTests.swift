@@ -8,10 +8,10 @@ import XCTest
 final class WorktreeAPISmokeHarnessTests: XCTestCase {
     func testManageWorktreeAndAgentRunAPISmokeFlow() async throws {
         let fixture = try Self.makeGitFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+        addTeardownBlock { try? FileManager.default.removeItem(at: fixture.sandbox) }
 
         let window = try await Self.makeWindow(root: fixture.repo)
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        registerWindowTeardown(window)
         let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
 
         let graphList = try await manageWorktree([
@@ -116,10 +116,10 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
     func testManageWorktreeListExcludesStalePrunableWorktrees() async throws {
         let fixture = try Self.makeGitFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+        addTeardownBlock { try? FileManager.default.removeItem(at: fixture.sandbox) }
 
         let window = try await Self.makeWindow(root: fixture.repo)
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        registerWindowTeardown(window)
         let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
 
         // Create a real linked worktree, then delete its checkout directory. Git keeps the admin
@@ -155,10 +155,10 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
     func testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections() async throws {
         let fixture = try Self.makeGitFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+        addTeardownBlock { try? FileManager.default.removeItem(at: fixture.sandbox) }
 
         let window = try await Self.makeWindow(root: fixture.repo)
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        registerWindowTeardown(window)
         let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
         let manageSelection = try await Self.windowTool(named: MCPWindowToolName.manageSelection, in: window)
         let readFile = try await Self.windowTool(named: MCPWindowToolName.readFile, in: window)
@@ -507,14 +507,14 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
     func testContextBuilderExportUsesResolvedWorktreeContextAndIsReadableFromFreshConnection() async throws {
         #if DEBUG
             let fixture = try Self.makeGitFixture()
-            defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+            addTeardownBlock { try? FileManager.default.removeItem(at: fixture.sandbox) }
 
             let provider = WorktreeContextBuilderImmediateCompletionProvider()
             let window = try await Self.makeWindow(
                 root: fixture.repo,
                 contextBuilderProviderFactory: { _, _, _ in provider }
             )
-            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            registerWindowTeardown(window)
             let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
             let contextBuilder = try await Self.windowTool(named: MCPWindowToolName.contextBuilder, in: window)
             let readFile = try await Self.windowTool(named: MCPWindowToolName.readFile, in: window)
@@ -627,10 +627,10 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
     func testManageWorktreeMergePreviewCleanApplyRawAndFormattedContract() async throws {
         let fixture = try Self.makeGitFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+        addTeardownBlock { try? FileManager.default.removeItem(at: fixture.sandbox) }
 
         let window = try await Self.makeWindow(root: fixture.repo)
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        registerWindowTeardown(window)
         let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
         let sessionID = UUID()
         let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
@@ -659,6 +659,13 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             "worktree_id": .string(sourceWorktreeID),
             "session_id": .string(sessionID.uuidString)
         ])
+        XCTAssertFalse(
+            GitRepoRootAuthorization.isPathWithinAuthorizedRoots(
+                fixture.repo.path,
+                roots: [sourcePath]
+            ),
+            "The regression requires the loaded main target to sit outside the bound source worktree."
+        )
 
         let previewValue = try await manageWorktree([
             "op": .string("preview"),
@@ -696,6 +703,91 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let formattedApply = try Self.onlyText(ToolOutputFormatter.formatManageWorktree(args: ["op": .string("apply")], value: applyValue))
         XCTAssertTrue(formattedApply.contains("## Manage Worktree Apply"), formattedApply)
         XCTAssertTrue(formattedApply.contains("Validate from target cwd"), formattedApply)
+    }
+
+    func testManageWorktreeApplyRejectsBindingRepositoryIdentityDriftBeforeMutation() async throws {
+        let fixture = try Self.makeGitFixture()
+        addTeardownBlock { try? FileManager.default.removeItem(at: fixture.sandbox) }
+
+        let window = try await Self.makeWindow(root: fixture.repo)
+        registerWindowTeardown(window)
+        let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+        let sessionID = UUID()
+        let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let session = window.agentModeViewModel.session(for: tabID)
+        _ = window.agentModeViewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID,
+            on: session,
+            updateWorkspaceMetadata: true
+        )
+
+        let createValue = try await manageWorktree([
+            "op": .string("create"),
+            "branch": .string("feature/merge-binding-drift-\(fixture.suffix)"),
+            "base_ref": .string("HEAD")
+        ])
+        let created = try Self.worktreeObject(createValue, key: "created_worktree")
+        let sourceWorktreeID = try XCTUnwrap(created["worktree_id"]?.stringValue)
+        let sourcePath = try XCTUnwrap(created["path"]?.stringValue)
+        let sourceURL = URL(fileURLWithPath: sourcePath, isDirectory: true)
+        try "feature\n".write(to: sourceURL.appendingPathComponent("Feature.txt"), atomically: true, encoding: .utf8)
+        try Self.runGit(["add", "Feature.txt"], cwd: sourceURL)
+        try Self.runGit(["commit", "-m", "Feature commit"], cwd: sourceURL)
+
+        _ = try await manageWorktree([
+            "op": .string("bind"),
+            "worktree_id": .string(sourceWorktreeID),
+            "session_id": .string(sessionID.uuidString)
+        ])
+        let previewValue = try await manageWorktree([
+            "op": .string("preview"),
+            "session_id": .string(sessionID.uuidString),
+            "target": .string("@main")
+        ])
+        let operationID = try XCTUnwrap(
+            previewValue.objectValue?["merge"]?.objectValue?["operation_id"]?.stringValue
+        )
+
+        let targetHeadBefore = try Self.gitOutput(["rev-parse", "HEAD"], cwd: fixture.repo)
+        let targetStatusBefore = try Self.gitOutput(["status", "--porcelain=v1"], cwd: fixture.repo)
+        let binding = try XCTUnwrap(session.worktreeBindings.first)
+        session.worktreeBindings = [AgentSessionWorktreeBinding(
+            id: binding.id,
+            repositoryID: "gitrepo_drifted_after_preview",
+            repoKey: binding.repoKey,
+            logicalRootPath: binding.logicalRootPath,
+            logicalRootName: binding.logicalRootName,
+            worktreeID: binding.worktreeID,
+            worktreeRootPath: binding.worktreeRootPath,
+            worktreeName: binding.worktreeName,
+            branch: binding.branch,
+            head: binding.head,
+            visualLabel: binding.visualLabel,
+            visualColorHex: binding.visualColorHex,
+            boundAt: binding.boundAt,
+            source: binding.source
+        )]
+
+        do {
+            _ = try await manageWorktree([
+                "op": .string("apply"),
+                "session_id": .string(sessionID.uuidString),
+                "operation_id": .string(operationID),
+                "confirm_preview": .bool(true)
+            ])
+            XCTFail("Expected protected mutation admission to reject the drifted repository binding.")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains("Worktree merge target is outside the authorized workspace roots"),
+                String(describing: error)
+            )
+        }
+        XCTAssertEqual(try Self.gitOutput(["rev-parse", "HEAD"], cwd: fixture.repo), targetHeadBefore)
+        XCTAssertEqual(try Self.gitOutput(["status", "--porcelain=v1"], cwd: fixture.repo), targetStatusBefore)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: fixture.repo.appendingPathComponent("Feature.txt").path),
+            "Rejected admission must not mutate the target worktree."
+        )
     }
 
     private func assertManageWorktreeGraphListContract(_ value: Value) throws {
@@ -881,6 +973,16 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         return service
     }
 
+    private func registerWindowTeardown(_ window: WindowState) {
+        addTeardownBlock { @MainActor in
+            await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
+            let rootIDs = await window.workspaceFileContextStore.rootRefs(scope: .allLoaded).map(\.id)
+            await window.tearDown()
+            await window.workspaceFileContextStore.unloadRoots(ids: rootIDs)
+            WindowStatesManager.shared.unregisterWindowState(window)
+        }
+    }
+
     private static func makeWindow(
         root: URL,
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil
@@ -922,6 +1024,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
         _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: root.path)
+        await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
         return window
     }
 
@@ -965,6 +1068,10 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
     }
 
     private static func runGit(_ arguments: [String], cwd: URL) throws {
+        _ = try gitOutput(arguments, cwd: cwd)
+    }
+
+    private static func gitOutput(_ arguments: [String], cwd: URL) throws -> String {
         var environment = ProcessInfo.processInfo.environment
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
         environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
@@ -982,6 +1089,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
                 userInfo: [NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed: \(result.outputText)"]
             )
         }
+        return result.outputText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func worktreeObject(_ value: Value, key: String) throws -> [String: Value] {

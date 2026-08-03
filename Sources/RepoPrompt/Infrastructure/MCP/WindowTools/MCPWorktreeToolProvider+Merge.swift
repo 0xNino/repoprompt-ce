@@ -194,18 +194,58 @@ extension MCPWorktreeToolProvider {
         sessionID: UUID
     ) async throws {
         let paths = [operation.source.path, operation.target.path]
+        let metadata = await dependencies.captureRequestMetadata()
+        let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+        var mappings = await lookupContext.domainMutationPhysicalRootMappings(
+            store: dependencies.promptVM.workspaceFileContextStore
+        )
         let bindings = try dependencies.requireTargetWindow().agentModeViewModel
             .worktreeBindings(forAgentSessionID: sessionID)
-        var mappings = bindings.map {
+        mappings.append(contentsOf: bindings.map {
             DomainMutationPhysicalRootMapping(
                 canonicalRoot: $0.logicalRootPath,
                 physicalRoot: $0.worktreeRootPath
             )
+        })
+        let targetIsMapped = mappings.contains { mapping in
+            GitRepoRootAuthorization.isPathWithinAuthorizedRoots(
+                operation.target.path,
+                roots: [mapping.physicalRoot]
+            )
         }
-        for path in paths where !mappings.contains(where: {
-            path == $0.physicalRoot || path.hasPrefix($0.physicalRoot + "/")
-        }) {
-            mappings.append(.init(canonicalRoot: path, physicalRoot: path))
+        if !targetIsMapped {
+            guard let targetBinding = bindings.first(where: {
+                $0.repositoryID == operation.target.repositoryID
+                    && $0.repoKey == operation.target.repoKey
+            }) else {
+                throw MCPError.invalidParams("Worktree merge target is outside the authorized workspace roots.")
+            }
+            let authorizedRoots = mappings.enumerated().map { index, mapping in
+                WorkspaceRootRef(
+                    id: UUID(),
+                    name: "worktree-merge-root-\(index)",
+                    fullPath: mapping.physicalRoot
+                )
+            }
+            do {
+                _ = try await WorktreeMergeEndpointValidation.resolveAuthorizedDescriptor(
+                    for: operation.target,
+                    roots: authorizedRoots
+                )
+            } catch {
+                throw MCPError.invalidParams("Worktree merge target is outside the authorized workspace roots.")
+            }
+            mappings.append(DomainMutationPhysicalRootMapping(
+                canonicalRoot: targetBinding.logicalRootPath,
+                physicalRoot: operation.target.path
+            ))
+        }
+        guard paths.allSatisfy({ path in
+            mappings.contains { mapping in
+                GitRepoRootAuthorization.isPathWithinAuthorizedRoots(path, roots: [mapping.physicalRoot])
+            }
+        }) else {
+            throw MCPError.invalidParams("Worktree merge target is outside the authorized workspace roots.")
         }
         try await MCPDomainMutationCommitContext.admitPhysicalTargets(
             paths,
