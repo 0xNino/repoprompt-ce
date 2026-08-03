@@ -1033,7 +1033,6 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
         _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: root.path)
-        await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
         return window
     }
 
