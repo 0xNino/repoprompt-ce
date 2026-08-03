@@ -436,6 +436,7 @@ private final class RuntimeFixture: @unchecked Sendable {
                 annotations: .init(readOnlyHint: false, destructiveHint: true)
             ),
             operation: { _ in
+                try await MCPDomainMutationCommitContext.willCommit()
                 await calls.increment()
                 return .string("ok")
             }

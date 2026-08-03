@@ -565,11 +565,11 @@ final class HeadlessMCPDomainRuntimeM0ContractTests: XCTestCase {
         // The primary artifact commit is the third advertisement-adjacent seam: it must accept
         // the captured context and fail closed when the captured connection identity is missing.
         XCTAssertTrue(tabContextExtension.contains("Connection identity is unavailable for Git artifact publication"))
-        let windowToolDependencies = try source(
-            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolDependencies.swift"
+        let physicalCapabilityAdapters = try source(
+            "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAppPhysicalCapabilityAdapters.swift"
         )
         XCTAssertEqual(
-            windowToolDependencies.components(
+            physicalCapabilityAdapters.components(
                 separatedBy: "_ capturedContext: MCPServerViewModel.DomainReadAppExecutionContext?"
             ).count - 1,
             3,

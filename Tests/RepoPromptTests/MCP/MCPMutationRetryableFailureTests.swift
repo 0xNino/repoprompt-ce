@@ -85,7 +85,7 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         ))
 
         try Self.assertOrdered([
-            "let (resolvedContext, lookupContext) = try await dependencies.resolveMutationFileToolContext(",
+            "let (resolvedContext, lookupContext) = try await dependencies.selection.resolveMutationFileToolContext(",
             "MCPMutationRetryableFailure.unresolvedRouteFailure(",
             "return Self.retryableFailureSummary(request: request, failure: failure)",
             "if let failure = await MCPMutationRetryableFailure.mutationScopeFailure(",
@@ -222,16 +222,16 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
     func testCloseTabRepairsBoundNonActiveContextAfterCommit() throws {
         let source = try Self.source("Sources/RepoPromptMCP/DirectHeadlessWorkspaceBackends.swift")
         let body = try XCTUnwrap(source.slice(
-            from: "        case \"close_tab\":",
+            from: "        var selectedContextID: UUID?",
             to: "    private func resolveWorkspace("
         ))
 
         try Self.assertOrdered([
-            "closedContextID = targetID",
             "var expectedClosedBinding: DomainBinding?",
+            "closedContextID = targetID",
             "scope.binding.ordinaryContextMatches(",
-            "command: .replaceWorkingDocument(replacement)",
             "let outcome = await runtime.workspaceStore.execute(",
+            "command: .replaceWorkingDocument(replacement)",
             "try requireApplied(outcome)",
             "compareAndSetBinding(",
             "expectedBinding: expectedClosedBinding",
@@ -278,7 +278,7 @@ final class MCPMutationRetryableFailureTests: XCTestCase {
         let body = try XCTUnwrap(source.privateFunction(named: "fileActionsTool"))
 
         try Self.assertOrdered([
-            "let acknowledgement = try await dependencies.performFileAction(action, path, content, newPath, ifExists, operationID)",
+            "let acknowledgement = try await dependencies.files.performFileAction(action, path, content, newPath, ifExists, operationID)",
             "catch let failure as MCPMutationRetryableFailure",
             "ToolResultDTOs.FileActionReply.retryableFailure(",
             "failure: failure"

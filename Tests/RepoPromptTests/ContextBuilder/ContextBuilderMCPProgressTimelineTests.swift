@@ -915,13 +915,6 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
             )
             let connectionID = UUID()
-            try window.mcpServer.bindTabForConnection(
-                connectionID: connectionID,
-                clientName: "context-builder-pre-commit-cancellation-test",
-                tabID: tabID,
-                workspaceID: activeWorkspace.id,
-                windowID: window.windowID
-            )
             let identity = WorkspaceSelectionIdentity(workspaceID: activeWorkspace.id, tabID: tabID)
             let initialSelection = StoredSelection(selectedPaths: [selectedFile.path])
             var initialTab = try XCTUnwrap(window.workspaceManager.composeTab(for: identity))
@@ -938,6 +931,13 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 mirrorToUIIfActive: true
             )
             window.promptManager.promptText = initialTab.promptText
+            try window.mcpServer.bindTabForConnection(
+                connectionID: connectionID,
+                clientName: "context-builder-pre-commit-cancellation-test",
+                tabID: tabID,
+                workspaceID: activeWorkspace.id,
+                windowID: window.windowID
+            )
 
             let committedSnapshotRecorder = ContextBuilderCommittedSnapshotRecorder()
             let selectionReplyRecorder = ContextBuilderSelectionReplyRecorder()

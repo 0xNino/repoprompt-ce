@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import MCP
+import RepoPromptC
 import RepoPromptCodeMapCore
 
 package extension DomainPhysicalToolRequest {
@@ -199,20 +200,34 @@ package struct MCPDomainCanonicalWorkspaceService: Sendable {
         }
         let maxResults = max(1, min(args["max_results"]?.intValue ?? 50, 1000))
         let regexEnabled = args["regex"]?.boolValue ?? Self.looksLikeRegex(pattern)
-        let regex = regexEnabled ? try NSRegularExpression(pattern: pattern) : nil
-        let mode = args["mode"]?.stringValue ?? "auto"
+        let wholeWord = args["whole_word"]?.boolValue ?? false
+        let regexPattern = wholeWord ? "\\b(?:\(pattern))\\b" : pattern
+        let regex = regexEnabled ? try NSRegularExpression(pattern: regexPattern) : nil
+        let mode = (args["mode"]?.stringValue ?? "auto").lowercased()
+        guard ["auto", "path", "content", "both"].contains(mode) else {
+            throw MCPError.invalidParams("mode must be auto, path, content, or both")
+        }
+        let filter = Self.searchFilter(args)
+        let searchesPaths = mode == "path" || mode == "both" || (mode == "auto" && pattern.contains("*"))
+        let searchesContent = mode == "content" || mode == "both" || (mode == "auto" && !searchesPaths)
         var results: [Value] = []
         for file in Self.files(under: snapshot.roots) {
+            try Task.checkCancellation()
             if results.count >= maxResults { break }
             let relative = Self.relativePath(file, roots: snapshot.roots)
-            let pathMatch = Self.matches(pattern, value: relative, regex: regex)
-            if mode == "path" || (mode == "auto" && pattern.contains("*")) {
-                if pathMatch { results.append(.object(["path": .string(relative)])) }
+            guard Self.includes(relativePath: relative, file: file, filter: filter) else {
                 continue
             }
+            if searchesPaths,
+               Self.matches(pattern, value: relative, regex: regex, wholeWord: wholeWord)
+            {
+                results.append(.object(["path": .string(relative)]))
+                if results.count >= maxResults { break }
+            }
+            guard searchesContent else { continue }
             guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
             for (index, line) in text.components(separatedBy: .newlines).enumerated() {
-                if Self.matches(pattern, value: line, regex: regex) {
+                if Self.matches(pattern, value: line, regex: regex, wholeWord: wholeWord) {
                     results.append(.object([
                         "path": .string(relative),
                         "line": .int(index + 1),
@@ -226,6 +241,95 @@ package struct MCPDomainCanonicalWorkspaceService: Sendable {
             return try .object(["count": .int(results.count)])
         }
         return try .object(["matches": .array(results), "count": .int(results.count)])
+    }
+
+    private struct SearchFilter {
+        let extensions: Set<String>
+        let paths: [String]
+        let excludes: [String]
+    }
+
+    private static func searchFilter(_ args: [String: Value]) -> SearchFilter {
+        let object = args["filter"]?.objectValue ?? [:]
+        let extensions = Set(strings(object["extensions"]).map {
+            let normalized = $0.lowercased()
+            return normalized.hasPrefix(".") ? normalized : "." + normalized
+        })
+        var paths = strings(object["paths"])
+        if let path = args["path"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !path.isEmpty
+        {
+            paths.append(path)
+        }
+        return SearchFilter(
+            extensions: extensions,
+            paths: paths,
+            excludes: strings(object["exclude"])
+        )
+    }
+
+    private static func strings(_ value: Value?) -> [String] {
+        guard let value else { return [] }
+        switch value {
+        case let .array(values):
+            values.compactMap(\.stringValue).map {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            }.filter { !$0.isEmpty }
+        case let .string(value):
+            value.split(separator: ",").map {
+                String($0).trimmingCharacters(in: .whitespacesAndNewlines)
+            }.filter { !$0.isEmpty }
+        default:
+            []
+        }
+    }
+
+    private static func includes(relativePath: String, file: URL, filter: SearchFilter) -> Bool {
+        if !filter.extensions.isEmpty {
+            let fileExtension = file.pathExtension.isEmpty ? "" : "." + file.pathExtension.lowercased()
+            guard filter.extensions.contains(fileExtension) else { return false }
+        }
+        if !filter.paths.isEmpty,
+           !filter.paths.contains(where: { matchesPathFilter($0, relativePath: relativePath) })
+        {
+            return false
+        }
+        return !filter.excludes.contains(where: { matchesExclude($0, relativePath: relativePath) })
+    }
+
+    private static func matchesPathFilter(_ rawPattern: String, relativePath: String) -> Bool {
+        let pattern = rawPattern
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !pattern.isEmpty else { return true }
+        if containsWildcard(pattern) {
+            return globMatches(pattern, relativePath)
+        }
+        let candidate = pattern.lowercased()
+        let relative = relativePath.lowercased()
+        return relative == candidate || relative.hasPrefix(candidate + "/")
+    }
+
+    private static func matchesExclude(_ pattern: String, relativePath: String) -> Bool {
+        if containsWildcard(pattern) {
+            return globMatches(pattern, relativePath)
+        }
+        return relativePath.localizedCaseInsensitiveContains(pattern)
+    }
+
+    private static func containsWildcard(_ pattern: String) -> Bool {
+        pattern.contains("*") || pattern.contains("?") || pattern.contains("[")
+    }
+
+    private static func globMatches(_ pattern: String, _ path: String) -> Bool {
+        let wildstar: UInt32 = 0x40
+        let casefold: UInt32 = 0x10
+        let flags = (pattern.contains("**") ? wildstar : 0) | casefold
+        return pattern.withCString { patternCString in
+            path.withCString { pathCString in
+                repo_wildmatch(patternCString, pathCString, flags) == 0
+            }
+        }
     }
 
     package func renderWorkspaceContext(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
@@ -402,17 +506,22 @@ package struct MCPDomainCanonicalWorkspaceService: Sendable {
         return url.path
     }
 
-    private static func matches(_ pattern: String, value: String, regex: NSRegularExpression?) -> Bool {
+    private static func matches(
+        _ pattern: String,
+        value: String,
+        regex: NSRegularExpression?,
+        wholeWord: Bool
+    ) -> Bool {
         if let regex {
             return regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil
         }
-        if pattern.contains("*") {
-            let escaped = NSRegularExpression.escapedPattern(for: pattern)
-                .replacingOccurrences(of: "\\*", with: ".*")
-            return (try? NSRegularExpression(pattern: "^\(escaped)$"))?
-                .firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil
+        if containsWildcard(pattern) {
+            return globMatches(pattern, value)
         }
-        return value.localizedCaseInsensitiveContains(pattern)
+        guard wholeWord else { return value.localizedCaseInsensitiveContains(pattern) }
+        let escaped = NSRegularExpression.escapedPattern(for: pattern)
+        return (try? NSRegularExpression(pattern: "\\b\(escaped)\\b", options: .caseInsensitive))?
+            .firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil
     }
 
     private static func looksLikeRegex(_ pattern: String) -> Bool {
