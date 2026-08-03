@@ -272,15 +272,15 @@ package struct MCPDomainCanonicalWorkspaceService: Sendable {
         guard let value else { return [] }
         switch value {
         case let .array(values):
-            values.compactMap(\.stringValue).map {
+            return values.compactMap(\.stringValue).map {
                 $0.trimmingCharacters(in: .whitespacesAndNewlines)
             }.filter { !$0.isEmpty }
         case let .string(value):
-            value.split(separator: ",").map {
+            return value.split(separator: ",").map {
                 String($0).trimmingCharacters(in: .whitespacesAndNewlines)
             }.filter { !$0.isEmpty }
         default:
-            []
+            return []
         }
     }
 
