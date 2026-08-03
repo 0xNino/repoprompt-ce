@@ -118,18 +118,14 @@ final class FileSystemSeedWatcherFlushRunner: @unchecked Sendable {
             await completion.value
             race.resolve(true)
         }
-        let timeout = Task {
-            do {
-                try await Task.sleep(nanoseconds: timeoutNanoseconds)
-                race.resolve(false)
-            } catch {
-                // The completion path won and canceled the deadline.
-            }
+        let clampedTimeoutNanoseconds = Int(min(timeoutNanoseconds, UInt64(Int.max)))
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(
+            deadline: .now() + .nanoseconds(clampedTimeoutNanoseconds)
+        ) {
+            race.resolve(false)
         }
         let completedBeforeDeadline = await race.wait()
-        if completedBeforeDeadline {
-            timeout.cancel()
-        } else {
+        if !completedBeforeDeadline {
             completionNotifier.cancel()
         }
         return Attempt(

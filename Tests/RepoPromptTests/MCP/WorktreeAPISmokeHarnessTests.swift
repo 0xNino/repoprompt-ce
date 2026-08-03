@@ -96,7 +96,9 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         )
         Self.traceSmokePhase("bound-read-apply.ready")
 
+        Self.traceSmokePhase("create-start.begin")
         let createStartTab = try await Self.createBackgroundTab(in: window, name: "Item 12 Create Start")
+        Self.traceSmokePhase("create-start.tab-ready")
         let createStart = try await Self.makeAgentRunService(window: window, targetTabID: createStartTab.id).execute(args: [
             "op": .string("start"),
             "message": .string("Smoke created worktree binding"),
