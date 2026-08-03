@@ -934,10 +934,17 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             resolveSpawnParentSourceTabID: { _ in nil },
             resolveSpawnParentSessionID: { _, _ in nil },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { target, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _, _, _ in
+            startRun: { target, _, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, _, _, _ in
                 guard let sessionID = target.sessionID else {
                     throw MCPError.internalError("Smoke start target did not resolve a session ID.")
                 }
+                try await agentModeVM.mcpActivateControlContext(
+                    forTabID: target.tabID,
+                    sessionID: sessionID,
+                    originatingConnectionID: metadata.connectionID,
+                    taskLabelKind: taskLabelKind,
+                    startPending: true
+                )
                 let bindings = agentModeVM.worktreeBindings(forAgentSessionID: sessionID, tabID: target.tabID)
                 let snapshot = AgentRunMCPSnapshot(
                     sessionID: sessionID,
@@ -1051,7 +1058,21 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         }
         let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
-        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: root.path)
+        let loadedRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: root.path
+        )
+        let admission = try await window.workspaceFileContextStore.admitReusableSnapshotForLoadedRoot(
+            rootID: loadedRoot.id,
+            expectedStandardizedPath: loadedRoot.standardizedFullPath
+        )
+        guard case .admitted = admission else {
+            throw NSError(
+                domain: "WorktreeAPISmokeHarnessTests",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Loaded root did not admit reusable startup evidence: \(admission)"]
+            )
+        }
         return window
     }
 
