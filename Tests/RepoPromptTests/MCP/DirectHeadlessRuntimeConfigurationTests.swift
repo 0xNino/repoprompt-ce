@@ -143,18 +143,24 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
             _ = await runtime.shutdown()
             try? FileManager.default.removeItem(at: root)
         }
-        _ = try await runtime.workspaceStore.registerReadDocument(makeWorkspaceDocument(
-            workspaceID: primaryWorkspaceID,
-            contextID: primaryContextID,
-            roots: [primaryRoot],
-            fileURL: storageRoot.appendingPathComponent("primary.json")
-        ))
-        _ = try await runtime.workspaceStore.registerReadDocument(makeWorkspaceDocument(
-            workspaceID: secondaryWorkspaceID,
-            contextID: secondaryContextID,
-            roots: [primaryRoot, secondaryRoot],
-            fileURL: storageRoot.appendingPathComponent("secondary.json")
-        ))
+        try await createWorkspace(
+            makeWorkspaceDocument(
+                workspaceID: primaryWorkspaceID,
+                contextID: primaryContextID,
+                roots: [primaryRoot],
+                fileURL: storageRoot.appendingPathComponent("primary.json")
+            ),
+            in: runtime
+        )
+        try await createWorkspace(
+            makeWorkspaceDocument(
+                workspaceID: secondaryWorkspaceID,
+                contextID: secondaryContextID,
+                roots: [primaryRoot, secondaryRoot],
+                fileURL: storageRoot.appendingPathComponent("secondary.json")
+            ),
+            in: runtime
+        )
         let scopeID = DomainStandaloneScopeID()
         let connectionID = UUID()
         _ = try await runtime.standaloneScopeCoordinator.register(
@@ -203,19 +209,25 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
             _ = await runtime.shutdown()
             try? FileManager.default.removeItem(at: root)
         }
-        _ = try await runtime.workspaceStore.registerReadDocument(makeWorkspaceDocument(
-            workspaceID: closedWorkspaceID,
-            contextID: closedTabID,
-            additionalContextID: replacementTabID,
-            roots: [root],
-            fileURL: storageRoot.appendingPathComponent("closed.json")
-        ))
-        _ = try await runtime.workspaceStore.registerReadDocument(makeWorkspaceDocument(
-            workspaceID: otherWorkspaceID,
-            contextID: otherContextID,
-            roots: [root],
-            fileURL: storageRoot.appendingPathComponent("other.json")
-        ))
+        try await createWorkspace(
+            makeWorkspaceDocument(
+                workspaceID: closedWorkspaceID,
+                contextID: closedTabID,
+                additionalContextID: replacementTabID,
+                roots: [root],
+                fileURL: storageRoot.appendingPathComponent("closed.json")
+            ),
+            in: runtime
+        )
+        try await createWorkspace(
+            makeWorkspaceDocument(
+                workspaceID: otherWorkspaceID,
+                contextID: otherContextID,
+                roots: [root],
+                fileURL: storageRoot.appendingPathComponent("other.json")
+            ),
+            in: runtime
+        )
         let scopeID = DomainStandaloneScopeID()
         let connectionID = UUID()
         _ = try await runtime.standaloneScopeCoordinator.register(
@@ -247,6 +259,20 @@ final class DirectHeadlessRuntimeConfigurationTests: XCTestCase {
 
         let snapshot = try await runtime.standaloneScopeCoordinator.snapshot(scopeID: scopeID)
         XCTAssertEqual(snapshot.binding, .context(unrelatedBinding, explicit: true))
+    }
+
+    private func createWorkspace(
+        _ document: DomainWorkspaceDocument,
+        in runtime: MCPDomainRuntime
+    ) async throws {
+        let catalog = await runtime.workspaceStore.snapshot()
+        let outcome = await runtime.workspaceStore.execute(DomainWorkspaceCommandEnvelope(
+            operationID: UUID(),
+            expectedCatalogRevision: catalog.catalogRevision,
+            origin: .standalone,
+            command: .createWorkspace(document)
+        ))
+        XCTAssertEqual(outcome.disposition, .applied, outcome.diagnostic ?? String(describing: outcome.disposition))
     }
 
     private func bindRequest(workingDirs: [URL]) throws -> DomainPhysicalToolRequest {

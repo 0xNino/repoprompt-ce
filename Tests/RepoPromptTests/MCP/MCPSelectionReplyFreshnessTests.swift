@@ -1038,6 +1038,18 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 path: root.path
             )
             await window.promptManager.tokenCountingViewModel.forceImmediateRecount()
+            try restoreCanonicalSelection(
+                activeSelection,
+                in: window,
+                workspaceID: workspaceID,
+                tabID: activeTabID
+            )
+            try restoreCanonicalSelection(
+                boundSelection,
+                in: window,
+                workspaceID: workspaceID,
+                tabID: boundTabID
+            )
 
             let activeContext = makeContext(
                 window: window,
@@ -1049,8 +1061,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 includeBlocks: false,
                 display: .relative,
                 resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot(
-                    snapshot: activeContext,
-                    usesActiveTabCompatibility: true
+                    snapshot: activeContext
                 ),
                 lookupContext: .visibleWorkspace
             )
@@ -1066,8 +1077,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 includeBlocks: false,
                 display: .relative,
                 resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot(
-                    snapshot: boundContext,
-                    usesActiveTabCompatibility: false
+                    snapshot: boundContext
                 ),
                 lookupContext: .visibleWorkspace
             )
@@ -1086,8 +1096,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 includeBlocks: false,
                 display: .relative,
                 resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot(
-                    snapshot: boundContext,
-                    usesActiveTabCompatibility: false
+                    snapshot: boundContext
                 ),
                 lookupContext: .visibleWorkspace
             )
@@ -1116,6 +1125,12 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 path: root.path
             )
             await window.promptManager.tokenCountingViewModel.forceImmediateRecount()
+            try restoreCanonicalSelection(
+                selection,
+                in: window,
+                workspaceID: workspaceID,
+                tabID: tabID
+            )
 
             let context = makeContext(
                 window: window,
@@ -1124,8 +1139,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 selection: selection
             )
             let boundResolution = MCPServerViewModel.ResolvedTabContextSnapshot(
-                snapshot: context,
-                usesActiveTabCompatibility: false
+                snapshot: context
             )
             _ = await window.mcpServer.buildCurrentSelectionReply(
                 includeBlocks: false,
@@ -1851,6 +1865,23 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         )
         window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
         return (window, workspace.id)
+    }
+
+    private func restoreCanonicalSelection(
+        _ selection: StoredSelection,
+        in window: WindowState,
+        workspaceID: UUID,
+        tabID: UUID
+    ) throws {
+        let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
+        var tab = try XCTUnwrap(window.workspaceManager.composeTab(for: identity))
+        tab.selection = selection
+        XCTAssertTrue(
+            window.workspaceManager.updateComposeTabStoredOnly(
+                tab,
+                inWorkspaceID: workspaceID
+            )
+        )
     }
 
     private func makeContext(

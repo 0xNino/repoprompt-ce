@@ -3727,7 +3727,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                         "arguments": [
                             "op": "bind",
                             "window_id": window.windowID,
-                            "context_id": Self.tabID.uuidString
+                            "context_id": tabID.uuidString
                         ]
                     ]
                 )

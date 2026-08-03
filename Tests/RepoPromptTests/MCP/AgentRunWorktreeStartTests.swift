@@ -2218,7 +2218,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
 
                 XCTAssertEqual(result, .submitted, testCase.label)
                 if result == .submitted {
-                    try await namespace.acceptedSubmitAndAwaitOwnedSocket()
+                    try namespace.acceptedSubmitAndVerifyOwnedSocket()
                 }
                 let activeTabID = try XCTUnwrap(
                     window.workspaceManager.activeWorkspace?.activeComposeTabID,
@@ -2359,7 +2359,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
 
             XCTAssertEqual(result, .submitted)
             if result == .submitted {
-                try await namespace.acceptedSubmitAndAwaitOwnedSocket()
+                try namespace.acceptedSubmitAndVerifyOwnedSocket()
             }
             let destinationTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
             let destination = viewModel.session(for: destinationTabID)
@@ -4227,17 +4227,42 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 self.socketURL = socketURL
             }
 
-            func install() async throws {
+            func install(window: WindowState) async throws {
                 let manager = ServerNetworkManager.shared
                 guard await manager.debugResolvedBootstrapSocketURL() == productionSocketURL else {
                     throw FixtureError.defaultSocketURLWasNotProduction
                 }
                 previousEnabledState = await manager.debugIsEnabledForBootstrapSocketURLOverride()
                 installStarted = true
+
+                await manager.debugResumeAllLifecycleFenceCheckpoints()
+                await window.mcpServer.shutdownListener()
                 try await manager.debugInstallBootstrapSocketURLOverride(socketURL)
                 overrideInstalled = true
                 guard await manager.debugResolvedBootstrapSocketURL() == socketURL else {
                     throw FixtureError.installedSocketURLDidNotResolve
+                }
+
+                try await window.mcpServer.service.start()
+                do {
+                    try await AsyncTestWait.waitUntilThrowing(
+                        "isolated process bootstrap socket",
+                        timeout: 5.0,
+                        initialDelayNanoseconds: 10_000_000,
+                        maximumDelayNanoseconds: 100_000_000
+                    ) {
+                        guard FileManager.default.fileExists(atPath: self.socketURL.path) else {
+                            return false
+                        }
+                        let attributes = try FileManager.default.attributesOfItem(atPath: self.socketURL.path)
+                        guard attributes[.type] as? FileAttributeType == .typeSocket else {
+                            throw FixtureError.ownedPathWasNotSocket
+                        }
+                        return true
+                    }
+                    ownedSocketObserved = true
+                } catch is AsyncTestConditionTimeout {
+                    throw FixtureError.ownedSocketDidNotAppear
                 }
             }
 
@@ -4251,31 +4276,18 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 trackedSession = session
             }
 
-            func acceptedSubmitAndAwaitOwnedSocket() async throws {
+            func acceptedSubmitAndVerifyOwnedSocket() throws {
                 acceptedSubmit = true
                 guard trackedSession != nil else {
                     throw FixtureError.trackedSessionMissing
                 }
-                do {
-                    try await AsyncTestWait.waitUntilThrowing(
-                        "acceptedSubmitAndAwaitOwnedSocket",
-                        timeout: 5.0,
-                        initialDelayNanoseconds: 10_000_000,
-                        maximumDelayNanoseconds: 100_000_000
-                    ) {
-                        self.observeFirstAgentTaskIfNeeded()
-                        guard FileManager.default.fileExists(atPath: self.socketURL.path) else {
-                            return false
-                        }
-                        let attributes = try FileManager.default.attributesOfItem(atPath: self.socketURL.path)
-                        guard attributes[.type] as? FileAttributeType == .typeSocket else {
-                            throw FixtureError.ownedPathWasNotSocket
-                        }
-                        return true
-                    }
-                    ownedSocketObserved = true
-                } catch is AsyncTestConditionTimeout {
+                observeFirstAgentTaskIfNeeded()
+                guard ownedSocketObserved else {
                     throw FixtureError.ownedSocketDidNotAppear
+                }
+                let attributes = try FileManager.default.attributesOfItem(atPath: socketURL.path)
+                guard attributes[.type] as? FileAttributeType == .typeSocket else {
+                    throw FixtureError.ownedPathWasNotSocket
                 }
             }
 
@@ -4629,20 +4641,22 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         operation: (BootstrapSocketNamespaceFixture) async throws -> Void
     ) async throws {
         #if DEBUG
-            let namespace = try lifecycleFixture.makeBootstrapNamespace(window: window)
-            do {
-                try await namespace.install()
-                try await operation(namespace)
-            } catch {
-                let operationError = error
+            try await MCPSharedServerTestLease.shared.withLease(owner: #function) { _ in
+                let namespace = try lifecycleFixture.makeBootstrapNamespace(window: window)
                 do {
-                    try await namespace.cleanup(window: window)
+                    try await namespace.install(window: window)
+                    try await operation(namespace)
                 } catch {
-                    XCTFail("Failed to contain isolated Agent Run bootstrap socket namespace: \(error)")
+                    let operationError = error
+                    do {
+                        try await namespace.cleanup(window: window)
+                    } catch {
+                        XCTFail("Failed to contain isolated Agent Run bootstrap socket namespace: \(error)")
+                    }
+                    throw operationError
                 }
-                throw operationError
+                try await namespace.cleanup(window: window)
             }
-            try await namespace.cleanup(window: window)
         #else
             throw XCTSkip("Bootstrap socket URL override seam is DEBUG-only")
         #endif

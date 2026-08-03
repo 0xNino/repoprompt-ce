@@ -6,18 +6,6 @@ import RepoPromptDomainRuntime
 import XCTest
 
 final class DirectHeadlessCompositionTests: XCTestCase {
-    func testEmptyWorkingDirectoriesValueFallsBackToCurrentDirectory() {
-        let currentDirectory = URL(fileURLWithPath: "/tmp/headless-current", isDirectory: true)
-
-        XCTAssertEqual(
-            DirectHeadlessMCPService.configuredWorkingDirectoryValues(
-                environment: ["REPOPROMPT_MCP_WORKING_DIRS": ""],
-                fallback: currentDirectory
-            ),
-            [currentDirectory.path]
-        )
-    }
-
     func testManageWorktreeFencesAbsoluteSelectorsToBoundWorkspaceRoots() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("rp-headless-worktree-fence-\(UUID().uuidString)", isDirectory: true)

@@ -186,7 +186,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         #if DEBUG
             for waiterCount in [1, 10, 100] {
                 let queryProbe = MCPReadinessScopePresenceProbe()
-                let joinedBarrier = AsyncTestBarrier(participantCount: waiterCount)
+                let joinedObservations = AsyncTestCondition<[Int?]>([])
                 let readiness = MCPToolCatalogReadiness(
                     scopePresenceOperation: { requiredNames, scope in
                         await queryProbe.query(requiredNames: requiredNames, scope: scope)
@@ -197,34 +197,53 @@ final class ToolCatalogSnapshotTests: XCTestCase {
                             toolsRequested: true
                         )
                     },
-                    checkJoinedOperation: { _ in
-                        await joinedBarrier.arriveAndWait()
+                    checkJoinedOperation: { windowID in
+                        joinedObservations.update { $0.append(windowID) }
                     }
                 )
 
                 let waiters = (0 ..< waiterCount).map { _ in
-                    Task { await readiness.awaitReady(windowID: 901, timeout: 60) }
+                    Task { await readiness.awaitReady(windowID: 901, timeout: 5) }
                 }
-                await queryProbe.waitUntilFirstQueryEntered()
-                await joinedBarrier.waitUntilComplete()
-                let queriesWhileBlocked = await queryProbe.queryCount
-                XCTAssertEqual(
-                    queriesWhileBlocked,
-                    1,
-                    "\(waiterCount) concurrent waiters must share the initial application-scope query."
-                )
+                do {
+                    try await AsyncTestWait.waitUntil("first readiness scope query", timeout: 3) {
+                        await queryProbe.queryCount == 1
+                    }
+                    try await joinedObservations.waitUntil(
+                        "\(waiterCount) readiness callers joining the shared check",
+                        timeout: 3
+                    ) { $0.count >= waiterCount }
+                    let queriesWhileBlocked = await queryProbe.queryCount
+                    XCTAssertEqual(
+                        queriesWhileBlocked,
+                        1,
+                        "\(waiterCount) concurrent waiters must share the initial application-scope query."
+                    )
 
-                await queryProbe.releaseFirstQuery()
-                for waiter in waiters {
-                    let ready = await waiter.value
-                    XCTAssertTrue(ready)
+                    await queryProbe.releaseFirstQuery()
+                    for waiter in waiters {
+                        let ready = await waiter.value
+                        XCTAssertTrue(ready)
+                    }
+                    let finalQueryCount = await queryProbe.queryCount
+                    XCTAssertEqual(
+                        finalQueryCount,
+                        2,
+                        "Readiness should perform one application and one window scope-presence query regardless of waiter count."
+                    )
+                } catch {
+                    waiters.forEach { $0.cancel() }
+                    await queryProbe.releaseFirstQuery()
+                    for waiter in waiters {
+                        _ = await waiter.value
+                    }
+                    let observedCount = joinedObservations.snapshot().count
+                    let queryCount = await queryProbe.queryCount
+                    XCTFail(
+                        "Readiness coalescing setup failed for \(waiterCount) waiters: \(error); "
+                            + "joined=\(observedCount), queries=\(queryCount)"
+                    )
                 }
-                let finalQueryCount = await queryProbe.queryCount
-                XCTAssertEqual(
-                    finalQueryCount,
-                    2,
-                    "Readiness should perform one application and one window scope-presence query regardless of waiter count."
-                )
             }
         #else
             throw XCTSkip("Readiness operation-count probes require DEBUG test seams.")
@@ -1214,7 +1233,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
 
     private static func purgeStaleWindowScopeRegistrations() async {
         let liveWindowIDs = Set(WindowStatesManager.shared.allWindows.map(\.windowID))
-        let snapshot = await ServiceRegistry.catalogSnapshot()
+        let snapshot = await AppDomainRuntimeComposition.shared.catalogSnapshot()
         var staleScopes = Set<MCPDomainToolRegistrationScope>()
         for scopes in snapshot.activeScopesByToolName.values {
             for scope in scopes {
@@ -1228,13 +1247,13 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         var staleHandles = Set<MCPDomainToolRegistrationHandle>()
         for scope in staleScopes {
             for toolName in MCPDomainToolCatalog.windowToolNames {
-                if let resolved = await ServiceRegistry.resolve(toolName: toolName, scope: scope) {
+                if let resolved = await AppDomainRuntimeComposition.shared.resolve(toolName: toolName, scope: scope) {
                     staleHandles.insert(resolved.handle)
                 }
             }
         }
         for handle in staleHandles {
-            await ServiceRegistry.unregister(handle)
+            await AppDomainRuntimeComposition.shared.unregister(handle)
         }
     }
 
@@ -1530,49 +1549,8 @@ private actor MCPReadinessScopePresenceProbe {
         return MCPDomainToolScopePresence(revision: 1, isComplete: true)
     }
 
-    func waitUntilFirstQueryEntered() async {
-        await firstQueryGate.waitUntilEntered()
-    }
-
     func releaseFirstQuery() async {
         await firstQueryGate.release()
-    }
-}
-
-private actor AsyncTestBarrier {
-    private let participantCount: Int
-    private var arrivals = 0
-    private var participantWaiters: [CheckedContinuation<Void, Never>] = []
-    private var completionWaiters: [CheckedContinuation<Void, Never>] = []
-    private var isComplete = false
-
-    init(participantCount: Int) {
-        self.participantCount = participantCount
-    }
-
-    func arriveAndWait() async {
-        guard !isComplete else { return }
-        arrivals += 1
-        if arrivals == participantCount {
-            isComplete = true
-            let participants = participantWaiters
-            let completions = completionWaiters
-            participantWaiters.removeAll()
-            completionWaiters.removeAll()
-            participants.forEach { $0.resume() }
-            completions.forEach { $0.resume() }
-            return
-        }
-        await withCheckedContinuation { continuation in
-            participantWaiters.append(continuation)
-        }
-    }
-
-    func waitUntilComplete() async {
-        guard !isComplete else { return }
-        await withCheckedContinuation { continuation in
-            completionWaiters.append(continuation)
-        }
     }
 }
 
