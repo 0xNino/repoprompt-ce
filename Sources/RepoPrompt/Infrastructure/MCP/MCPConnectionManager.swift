@@ -538,18 +538,18 @@ actor ServerNetworkManager {
     /// Fast path prefers actor-local caches (run routing/policy state) and only falls
     /// back to scanning live windows when no cached mapping exists.
     private func windowIDForRunID(_ runID: UUID) async -> Int? {
-        if let cachedWindowID = windowIDByRunID[runID] {
+        if let cachedWindowID = presentationWindowByRun[runID] {
             return cachedWindowID
         }
         if let policyWindowID = runPolicyStateByRunID[runID]?.windowID {
-            windowIDByRunID[runID] = policyWindowID
+            presentationWindowByRun[runID] = policyWindowID
             return policyWindowID
         }
         let resolvedWindowID = await MainActor.run {
             WindowStatesManager.shared.allWindows.first { $0.mcpServer.hasLiveRunID(runID) }?.windowID
         }
         if let resolvedWindowID {
-            windowIDByRunID[runID] = resolvedWindowID
+            presentationWindowByRun[runID] = resolvedWindowID
         }
         return resolvedWindowID
     }
@@ -578,37 +578,6 @@ actor ServerNetworkManager {
         toolName == "bind_context"
     }
 
-    /// Migrated tools resolve tab-context snapshots from request metadata, including
-    /// the one-shot TaskLocal hint populated from dispatch-level context_id/_tabID.
-    nonisolated static func shouldUseGenericTabBindingCompatibility(for toolName: String) -> Bool {
-        guard !shouldSkipGenericTabBinding(for: toolName) else { return false }
-        let migrated: Set = [
-            "manage_selection",
-            "workspace_context",
-            "get_file_tree",
-            "get_code_structure",
-            "read_file",
-            "file_search",
-            "file_actions",
-            "apply_edits",
-            "prompt",
-            "agent_run",
-            "agent_explore",
-            "agent_manage",
-            "ask_oracle",
-            "oracle_send",
-            "oracle_utils",
-            "oracle_chat_log",
-            "git",
-            "manage_worktree"
-        ]
-        return !migrated.contains(toolName)
-    }
-
-    nonisolated static func shouldInjectLegacyTabIDForCompatibility(for toolName: String) -> Bool {
-        shouldRehydrateLegacyTabID(for: toolName) || shouldUseGenericTabBindingCompatibility(for: toolName)
-    }
-
     /// bind_context manages its own window_id semantics — the dispatch layer must not
     /// auto-inject a routing window_id into its public args, because that would silently
     /// scope `op=list` to a single window instead of returning all windows.
@@ -622,10 +591,6 @@ actor ServerNetworkManager {
 
     nonisolated static func shouldBypassLogicalContextPreResolution(for toolName: String) -> Bool {
         toolName == "bind_context" || isAppWideTool(toolName)
-    }
-
-    nonisolated static func shouldSkipGenericTabBinding(for toolName: String) -> Bool {
-        toolName == "manage_workspaces" || toolName == "bind_context" || toolName == "context_builder" || isAppWideTool(toolName)
     }
 
     nonisolated static func shouldSkipPerCallRunScopedTabRebindFallback(
@@ -668,8 +633,8 @@ actor ServerNetworkManager {
             "**Alternatives:**\n" +
             "- `bind_context` with `{\"op\":\"list\"}` to see windows and context_id values\n" +
             "- `bind_context` with `{\"op\":\"bind\",\"context_id\":\"<id>\"}` to bind a specific tab context\n" +
-            "- `bind_context` with `{\"op\":\"bind\",\"window_id\":<id>}` to set window affinity only\n" +
-            "- Pass `_windowID` as a hidden parameter on any tool call for one-shot routing"
+            "- `bind_context` with `{\"op\":\"bind\",\"window_id\":<id>}` to capture and bind that window's current tab context\n" +
+            "- Pass `_windowID` as a hidden parameter on any tool call to capture that window's current tab for that call only"
     }
 
     nonisolated static func multiWindowSelectionGuidance(
@@ -698,37 +663,6 @@ actor ServerNetworkManager {
         }
         return "Window \(windowID) not found or MCP tools not enabled.\n" +
             "Call `bind_context` with `{\"op\":\"list\"}` to see available windows."
-    }
-
-    nonisolated static func tabBindingTroubleshooting(
-        purpose: MCPRunPurpose,
-        restrictedTools: Set<String>,
-        windowID: Int? = nil
-    ) -> [String] {
-        if purpose == .agentModeRun {
-            return [
-                "RepoPrompt could not route this Agent Mode MCP call to the active run.",
-                "Retry the tool call once. If it fails again, tell the user the RepoPrompt connection failed and ask them to restart this Agent Mode run."
-            ]
-        }
-        if restrictedTools.contains("bind_context") {
-            return [
-                "RepoPrompt could not route this restricted MCP connection.",
-                "Retry once. If it fails again, tell the user the RepoPrompt connection failed and ask them to restart the MCP client or Agent Mode run."
-            ]
-        }
-        if let windowID {
-            return [
-                "Call `bind_context` with `{\"op\":\"list\",\"window_id\":\(windowID)}` to see available context_id values in this window.",
-                "The tab may exist in a different window - verify `_windowID` is correct.",
-                "Use `bind_context` with `op=bind` for explicit tab binding with validation."
-            ]
-        }
-        return [
-            "Include `_windowID` alongside `_tabID` to specify the target window.",
-            "Or call `bind_context` with `{\"op\":\"bind\",\"window_id\":<window_id>}` first.",
-            "Or use `bind_context` with `op=bind` and a `context_id` for sticky tab binding."
-        ]
     }
 
     private nonisolated static func agentModeRoutingFailureGuidance() -> String {
@@ -1151,7 +1085,7 @@ actor ServerNetworkManager {
     private var restrictedToolsByConnection: [UUID: Set<String>] = [:]
     private var additionalToolsByConnection: [UUID: Set<String>] = [:]
     private var runPurposeByConnection: [UUID: MCPRunPurpose] = [:]
-    private var windowAssignmentByConnection: [UUID: Int] = [:]
+    private var resolvedPresentationWindowByConnection: [UUID: Int] = [:]
     private var preassignedConnections: Set<UUID> = []
 
     /// Tracks the window count at the time each connection was established.
@@ -1267,14 +1201,14 @@ actor ServerNetworkManager {
     private var expectedAgentPIDsByRunID: [UUID: Set<pid_t>] = [:]
     private var runPolicyStateByRunID: [UUID: RunConnectionPolicyState] = [:]
     private var admittedPolicyRunIDs: Set<UUID> = []
-    private var windowIDByRunID: [UUID: Int] = [:]
+    private var presentationWindowByRun: [UUID: Int] = [:]
     private var pendingPolicyApplicationIDByConnectionID: [UUID: UUID] = [:]
     private var pendingPolicyApplicationIDByRunID: [UUID: UUID] = [:]
     private var runRoutingAuthorityGenerationByRunID: [UUID: UInt64] = [:]
     private var revocationFenceGenerationByRunID: [UUID: UInt64] = [:]
 
     // 🆕 Per-connection → windowID routing map
-    private var connectionWindowMap: [UUID: Int] = [:]
+    private var presentationWindowByConnection: [UUID: Int] = [:]
     private var runIDByConnectionID: [UUID: UUID] = [:]
 
     // Connection-lane ownership lives in RepoPromptDomainRuntime.
@@ -2056,7 +1990,7 @@ actor ServerNetworkManager {
         windowID: Int,
         catalogRegistrationHandle: MCPDomainToolRegistrationHandle
     ) async -> WindowToolDispatchIdentity? {
-        guard await ServiceRegistry.isActive(catalogRegistrationHandle) else { return nil }
+        guard await AppDomainRuntimeComposition.shared.isActive(catalogRegistrationHandle) else { return nil }
         return await MainActor.run {
             guard let window = WindowStatesManager.shared.window(withID: windowID),
                   !window.isClosing
@@ -2074,7 +2008,7 @@ actor ServerNetworkManager {
         _ identity: WindowToolDispatchIdentity,
         expectedServerViewModelIdentity: ObjectIdentifier? = nil
     ) async -> Bool {
-        guard await ServiceRegistry.isActive(identity.catalogRegistrationHandle) else { return false }
+        guard await AppDomainRuntimeComposition.shared.isActive(identity.catalogRegistrationHandle) else { return false }
         return await MainActor.run {
             guard identity.windowID > 0,
                   let window = WindowStatesManager.shared.window(withID: identity.windowID),
@@ -2185,12 +2119,12 @@ actor ServerNetworkManager {
     }
 
     func selectedWindow(for connectionID: UUID) -> Int? {
-        connectionWindowMap[connectionID]
+        presentationWindowByConnection[connectionID]
     }
 
     private func setConnectionWindowMapping(_ connectionID: UUID, windowID: Int) {
-        connectionWindowMap[connectionID] = windowID
-        windowAssignmentByConnection[connectionID] = windowID
+        presentationWindowByConnection[connectionID] = windowID
+        resolvedPresentationWindowByConnection[connectionID] = windowID
 
         // Update per-client memory and persist routing (token-backed only)
         guard let clientID = clientIdentifier(forConnection: connectionID) else { return }
@@ -2208,8 +2142,8 @@ actor ServerNetworkManager {
     }
 
     private func clearConnectionWindowMapping(_ connectionID: UUID) {
-        connectionWindowMap.removeValue(forKey: connectionID)
-        windowAssignmentByConnection.removeValue(forKey: connectionID)
+        presentationWindowByConnection.removeValue(forKey: connectionID)
+        resolvedPresentationWindowByConnection.removeValue(forKey: connectionID)
     }
 
     private func clearPersistedWindowAffinity(for connectionID: UUID) {
@@ -2295,7 +2229,7 @@ actor ServerNetworkManager {
             fields["connectionID"] = connectionID.uuidString
             fields["runID"] = runID?.uuidString ?? "nil"
             fields["tabID"] = runState?.tabID?.uuidString ?? "nil"
-            fields["windowID"] = connectionWindowMap[connectionID].map(String.init) ?? runState.map { String($0.windowID) } ?? "nil"
+            fields["windowID"] = presentationWindowByConnection[connectionID].map(String.init) ?? runState.map { String($0.windowID) } ?? "nil"
             fields["purpose"] = effective.purpose.rawValue
             fields["taskLabel"] = effective.taskLabelKind?.rawValue ?? "nil"
             fields["additionalTools"] = Self.debugDescribeToolSet(effective.additional)
@@ -2320,10 +2254,10 @@ actor ServerNetworkManager {
     #endif
 
     func clearWindowSelectionIfClosed(_ windowID: Int) {
-        let toClear = connectionWindowMap.filter { $0.value == windowID }.map(\.key)
+        let toClear = presentationWindowByConnection.filter { $0.value == windowID }.map(\.key)
         for cid in toClear {
-            connectionWindowMap[cid] = nil
-            windowAssignmentByConnection[cid] = nil // Keep both maps consistent
+            presentationWindowByConnection[cid] = nil
+            resolvedPresentationWindowByConnection[cid] = nil // Keep both maps consistent
             runIDByConnectionID[cid] = nil
         }
 
@@ -2331,11 +2265,11 @@ actor ServerNetworkManager {
         removeActiveToolScopesForWindow(windowID)
 
         // Remove stale run→window cache entries for the closed window.
-        let staleRunIDs = windowIDByRunID.compactMap { runID, mappedWindowID in
+        let staleRunIDs = presentationWindowByRun.compactMap { runID, mappedWindowID in
             mappedWindowID == windowID ? runID : nil
         }
         for runID in staleRunIDs {
-            windowIDByRunID.removeValue(forKey: runID)
+            presentationWindowByRun.removeValue(forKey: runID)
         }
         if !staleRunIDs.isEmpty {
             let staleRunIDSet = Set(staleRunIDs)
@@ -2401,7 +2335,7 @@ actor ServerNetworkManager {
     /// 5. Otherwise → nil (multi-window ambiguous, caller should fail closed or prompt selection)
     private func ensureWindowBindingIfUnambiguous(connectionID: UUID, reason: String) async -> Int? {
         // Check existing mapping first
-        if let existing = connectionWindowMap[connectionID] {
+        if let existing = presentationWindowByConnection[connectionID] {
             return existing
         }
 
@@ -2462,7 +2396,7 @@ actor ServerNetworkManager {
 
     func currentConnectionWindowID() -> Int? {
         guard let connectionID = Self.currentConnectionID else { return nil }
-        return connectionWindowMap[connectionID]
+        return presentationWindowByConnection[connectionID]
     }
 
     func currentConnectionUUID() -> UUID? {
@@ -2557,7 +2491,7 @@ actor ServerNetworkManager {
     }
 
     private func reusableWindowForClient(newConnectionID: UUID, clientName: String) async -> Int? {
-        for (existingID, windowID) in connectionWindowMap where existingID != newConnectionID {
+        for (existingID, windowID) in presentationWindowByConnection where existingID != newConnectionID {
             guard MCPClientIdentity.matches(clientIDByConnection[existingID], clientName) else { continue }
             if let existingManager = connections[existingID] {
                 let existingViable = await existingManager.isViableForRetention()
@@ -2603,7 +2537,7 @@ actor ServerNetworkManager {
         }
 
         runIDByConnectionID[connectionID] = resolved.runID
-        windowIDByRunID[resolved.runID] = resolved.windowID
+        presentationWindowByRun[resolved.runID] = resolved.windowID
         return resolved.runID
     }
 
@@ -2797,7 +2731,7 @@ actor ServerNetworkManager {
               admittedPolicyRunIDs.contains(runID),
               runPolicyStateByRunID[runID]?.windowID == windowID,
               runPolicyStateByRunID[runID]?.tabID == tabID,
-              windowIDByRunID[runID] == windowID
+              presentationWindowByRun[runID] == windowID
         else { return nil }
         // A reconnect/handover can leave a displaced connection's actor-side mapping
         // behind until its removal completes, so several connections may map to this
@@ -2846,8 +2780,8 @@ actor ServerNetworkManager {
             pendingRunApplicationID: pendingPolicyApplicationIDByRunID[runID],
             pendingConnectionApplicationID: pendingPolicyApplicationIDByConnectionID[connectionID],
             mappedRunID: runIDByConnectionID[connectionID],
-            runWindowID: windowIDByRunID[runID],
-            connectionWindowID: connectionWindowMap[connectionID],
+            runWindowID: presentationWindowByRun[runID],
+            connectionWindowID: presentationWindowByConnection[connectionID],
             policyWindowID: runPolicyStateByRunID[runID]?.windowID,
             policyTabID: runPolicyStateByRunID[runID]?.tabID,
             isRunAdmitted: admittedPolicyRunIDs.contains(runID),
@@ -2935,7 +2869,7 @@ actor ServerNetworkManager {
     ) async -> Bool {
         let resolvedWindowID: Int? = if let explicitWindowID {
             explicitWindowID
-        } else if let mappedWindowID = connectionWindowMap[connectionID] {
+        } else if let mappedWindowID = presentationWindowByConnection[connectionID] {
             mappedWindowID
         } else {
             await windowIDForRunID(runID)
@@ -2959,13 +2893,13 @@ actor ServerNetworkManager {
             if signalRouting {
                 await MCPRoutingWaiter.notifyRouted(runID: runID)
             }
-            if persistWindowBinding, connectionWindowMap[connectionID] != windowID {
+            if persistWindowBinding, presentationWindowByConnection[connectionID] != windowID {
                 setConnectionWindowMapping(connectionID, windowID: windowID)
             }
             if persistWindowBinding {
                 runIDByConnectionID[connectionID] = runID
             }
-            windowIDByRunID[runID] = windowID
+            presentationWindowByRun[runID] = windowID
             return true
         }
 
@@ -2992,13 +2926,13 @@ actor ServerNetworkManager {
             return false
         }
 
-        if persistWindowBinding, connectionWindowMap[connectionID] != windowID {
+        if persistWindowBinding, presentationWindowByConnection[connectionID] != windowID {
             setConnectionWindowMapping(connectionID, windowID: windowID)
         }
         if persistWindowBinding {
             runIDByConnectionID[connectionID] = runID
         }
-        windowIDByRunID[runID] = windowID
+        presentationWindowByRun[runID] = windowID
         updateLiveRunAffinity(
             clientName: clientIdentifier(forConnection: connectionID) ?? "",
             sessionKey: connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID],
@@ -3037,11 +2971,11 @@ actor ServerNetworkManager {
             return nil
         }
 
-        if connectionWindowMap[connectionID] != windowID {
+        if presentationWindowByConnection[connectionID] != windowID {
             setConnectionWindowMapping(connectionID, windowID: windowID)
         }
         runIDByConnectionID[connectionID] = runID
-        windowIDByRunID[runID] = windowID
+        presentationWindowByRun[runID] = windowID
         updateLiveRunAffinity(
             clientName: clientIdentifier(forConnection: connectionID) ?? "",
             sessionKey: connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID],
@@ -3083,7 +3017,7 @@ actor ServerNetworkManager {
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
             updatedAt: updatedAt
         )
-        windowIDByRunID[runID] = windowID
+        presentationWindowByRun[runID] = windowID
     }
 
     private func cacheRunPolicyStateIfNeeded(_ policy: ClientConnectionPolicy) {
@@ -3327,7 +3261,7 @@ actor ServerNetworkManager {
             runIDByConnectionID[connectionID] = runID
         }
 
-        if persistWindowBinding, connectionWindowMap[connectionID] != cached.windowID {
+        if persistWindowBinding, presentationWindowByConnection[connectionID] != cached.windowID {
             setConnectionWindowMapping(connectionID, windowID: cached.windowID)
         }
         updateLiveRunAffinity(
@@ -3351,16 +3285,16 @@ actor ServerNetworkManager {
     }
 
     func connectionID(for clientName: String, windowID: Int) -> UUID? {
-        // Use canonical connectionWindowMap for consistency
+        // Use canonical presentationWindowByConnection for consistency
         if let active = activeConnectionsByClient[clientName] {
             for id in active {
-                if connectionWindowMap[id] == windowID {
+                if presentationWindowByConnection[id] == windowID {
                     return id
                 }
             }
         }
         for (id, pendingName) in pendingConnections where pendingName == clientName {
-            if connectionWindowMap[id] == windowID {
+            if presentationWindowByConnection[id] == windowID {
                 return id
             }
         }
@@ -3435,7 +3369,7 @@ actor ServerNetworkManager {
     func cleanupRunRoutingState(for runID: UUID, windowID: Int? = nil) async {
         runPolicyStateByRunID.removeValue(forKey: runID)
         admittedPolicyRunIDs.remove(runID)
-        windowIDByRunID.removeValue(forKey: runID)
+        presentationWindowByRun.removeValue(forKey: runID)
         pendingPolicyApplicationIDByRunID.removeValue(forKey: runID)
         runRoutingAuthorityGenerationByRunID.removeValue(forKey: runID)
         revocationFenceGenerationByRunID.removeValue(forKey: runID)
@@ -5616,9 +5550,9 @@ actor ServerNetworkManager {
     }
 
     private func resetInMemoryRoutingCachesForRestart() {
-        connectionWindowMap.removeAll()
+        presentationWindowByConnection.removeAll()
         runIDByConnectionID.removeAll()
-        windowAssignmentByConnection.removeAll()
+        resolvedPresentationWindowByConnection.removeAll()
         restrictedToolsByConnection.removeAll()
         additionalToolsByConnection.removeAll()
         runPurposeByConnection.removeAll()
@@ -5629,7 +5563,7 @@ actor ServerNetworkManager {
         expectedAgentPIDsByRunID.removeAll()
         runPolicyStateByRunID.removeAll()
         admittedPolicyRunIDs.removeAll()
-        windowIDByRunID.removeAll()
+        presentationWindowByRun.removeAll()
         pendingPolicyApplicationIDByConnectionID.removeAll()
         pendingPolicyApplicationIDByRunID.removeAll()
         runRoutingAuthorityGenerationByRunID.removeAll()
@@ -6394,7 +6328,7 @@ actor ServerNetworkManager {
         let limiters = callLimiters.removeValue(forKey: id)
         await limiters?.cancelAll()
 
-        let assignedWindowID = connectionWindowMap[id]
+        let assignedWindowID = presentationWindowByConnection[id]
         let cleanupClientID = clientIDByConnection[id]
         let cleanupClientName = pendingConnections[id] ?? cleanupClientID
         let sessionToken = capabilityTokenByConnection[id] ?? connections[id]?.capabilityToken
@@ -6414,7 +6348,7 @@ actor ServerNetworkManager {
         runPurposeByConnection.removeValue(forKey: id)
         runIDByConnectionID.removeValue(forKey: id)
         pendingPolicyApplicationIDByConnectionID.removeValue(forKey: id)
-        windowAssignmentByConnection.removeValue(forKey: id)
+        resolvedPresentationWindowByConnection.removeValue(forKey: id)
         preassignedConnections.remove(id)
         windowCountAtConnectionTime.removeValue(forKey: id)
         identityContextByConnection.removeValue(forKey: id)
@@ -6454,7 +6388,7 @@ actor ServerNetworkManager {
                 )
             }
         #endif
-        connectionWindowMap[id] = nil
+        presentationWindowByConnection[id] = nil
 
         // Stop the connection manager unless the exact committed owner was already stopped
         // before entering cleanup (bootstrap predecessor handoff).
@@ -6593,8 +6527,24 @@ actor ServerNetworkManager {
                     }
                 }
             },
+            collectActiveMatchForWindowID: { windowID in
+                await MainActor.run {
+                    guard let window = WindowStatesManager.shared.allWindows.first(where: { $0.windowID == windowID }),
+                          let workspace = window.workspaceManager.activeWorkspace,
+                          let tab = workspace.composeTabs.first(where: { $0.id == workspace.activeComposeTabID })
+                          ?? workspace.composeTabs.first
+                    else { return nil }
+                    return MCPContextBindingMatch(
+                        windowID: window.windowID,
+                        tabID: tab.id,
+                        workspaceID: workspace.id,
+                        workspaceName: workspace.name,
+                        repoPaths: workspace.repoPaths
+                    )
+                }
+            },
             existingWindowIDForConnection: { [self] connectionID in
-                connectionWindowMap[connectionID]
+                presentationWindowByConnection[connectionID]
             },
             clientIdentifier: { [self] connectionID in
                 clientIdentifier(forConnection: connectionID)
@@ -7548,7 +7498,7 @@ actor ServerNetworkManager {
                 restrictedTools: restrictedToolsByConnection[connectionID] ?? [],
                 additionalTools: additionalToolsByConnection[connectionID] ?? [],
                 purpose: runPurposeByConnection[connectionID] ?? .unknown,
-                windowID: connectionWindowMap[connectionID]
+                windowID: presentationWindowByConnection[connectionID]
             )
         }
 
@@ -7567,8 +7517,8 @@ actor ServerNetworkManager {
                 runPurposeByConnection[connectionID] = purpose
             }
             if let windowID {
-                connectionWindowMap[connectionID] = windowID
-                windowIDByRunID[runID] = windowID
+                presentationWindowByConnection[connectionID] = windowID
+                presentationWindowByRun[runID] = windowID
             }
         }
 
@@ -7653,7 +7603,6 @@ actor ServerNetworkManager {
             private nonisolated func debugBindingKindString(_ kind: MCPServerViewModel.ConnectionBindingSnapshot.BindingKind) -> String {
                 switch kind {
                 case .tabContext: "tab_context"
-                case .windowOnly: "window_only"
                 case .unbound: "unbound"
                 }
             }
@@ -7791,7 +7740,7 @@ actor ServerNetworkManager {
                     clientName: resolvedClientName,
                     normalizedClientID: debugNormalizedClientID(for: resolvedClientName),
                     sessionFingerprint: debugSessionFingerprint(forToken: resolvedSessionToken),
-                    windowID: overrideWindowID ?? connectionID.flatMap { connectionWindowMap[$0] },
+                    windowID: overrideWindowID ?? connectionID.flatMap { presentationWindowByConnection[$0] },
                     state: resolvedState,
                     reason: reason,
                     transportIngress: transportIngress
@@ -7974,7 +7923,7 @@ actor ServerNetworkManager {
             }
 
             func debugBindingKind(for connectionID: UUID) async -> String {
-                let snapshot = await debugBindingSnapshot(for: connectionID, selectedWindowID: connectionWindowMap[connectionID])
+                let snapshot = await debugBindingSnapshot(for: connectionID, selectedWindowID: presentationWindowByConnection[connectionID])
                 return debugBindingKindString(snapshot.bindingKind)
             }
 
@@ -8075,7 +8024,7 @@ actor ServerNetworkManager {
                 let clientName = clientNameFilter ?? entry?.clientName ?? clientIdentifier(forConnection: targetID)
                 let sessionKey = entry?.sessionKey ?? sessionToken(for: targetID)
                 let fingerprint = debugSessionFingerprint(forToken: sessionKey)
-                let selectedWindowID = entry?.windowID ?? connectionWindowMap[targetID]
+                let selectedWindowID = entry?.windowID ?? presentationWindowByConnection[targetID]
                 let binding = await debugBindingSnapshot(for: targetID, selectedWindowID: selectedWindowID)
                 let liveAffinity = debugLiveAffinityObject(clientName: clientName, sessionKey: sessionKey)
                 var payload: [String: Any] = [
@@ -9400,11 +9349,11 @@ actor ServerNetworkManager {
 
         func debugSetConnectionWindowForTesting(connectionID: UUID, windowID: Int?) {
             if let windowID {
-                connectionWindowMap[connectionID] = windowID
-                windowAssignmentByConnection[connectionID] = windowID
+                presentationWindowByConnection[connectionID] = windowID
+                resolvedPresentationWindowByConnection[connectionID] = windowID
             } else {
-                connectionWindowMap.removeValue(forKey: connectionID)
-                windowAssignmentByConnection.removeValue(forKey: connectionID)
+                presentationWindowByConnection.removeValue(forKey: connectionID)
+                resolvedPresentationWindowByConnection.removeValue(forKey: connectionID)
             }
         }
 
@@ -10175,13 +10124,13 @@ actor ServerNetworkManager {
             restrictedTools: restrictedToolsByConnection[connectionID],
             additionalTools: additionalToolsByConnection[connectionID],
             runPurpose: runPurposeByConnection[connectionID],
-            windowID: connectionWindowMap[connectionID],
-            windowAssignment: windowAssignmentByConnection[connectionID],
+            windowID: presentationWindowByConnection[connectionID],
+            windowAssignment: resolvedPresentationWindowByConnection[connectionID],
             runID: runIDByConnectionID[connectionID],
             wasPreassigned: preassignedConnections.contains(connectionID),
             wasRunAdmitted: policy.runID.map { admittedPolicyRunIDs.contains($0) } ?? false,
             runPolicyState: policy.runID.flatMap { runPolicyStateByRunID[$0] },
-            runWindowID: policy.runID.flatMap { windowIDByRunID[$0] }
+            runWindowID: policy.runID.flatMap { presentationWindowByRun[$0] }
         )
         let pendingPolicyApplicationID = UUID()
         let routingAuthorityGeneration = policy.runID.map {
@@ -10208,8 +10157,8 @@ actor ServerNetworkManager {
         } else {
             additionalToolsByConnection.removeValue(forKey: connectionID)
         }
-        connectionWindowMap[connectionID] = policy.windowID
-        windowAssignmentByConnection[connectionID] = policy.windowID
+        presentationWindowByConnection[connectionID] = policy.windowID
+        resolvedPresentationWindowByConnection[connectionID] = policy.windowID
 
         #if DEBUG
             await debugSuspendPendingPolicyRouteInstallationIfNeeded()
@@ -10568,14 +10517,14 @@ actor ServerNetworkManager {
                 runPurposeByConnection.removeValue(forKey: connectionID)
             }
             if let windowID = restorePoint.windowID {
-                connectionWindowMap[connectionID] = windowID
+                presentationWindowByConnection[connectionID] = windowID
             } else {
-                connectionWindowMap.removeValue(forKey: connectionID)
+                presentationWindowByConnection.removeValue(forKey: connectionID)
             }
             if let windowAssignment = restorePoint.windowAssignment {
-                windowAssignmentByConnection[connectionID] = windowAssignment
+                resolvedPresentationWindowByConnection[connectionID] = windowAssignment
             } else {
-                windowAssignmentByConnection.removeValue(forKey: connectionID)
+                resolvedPresentationWindowByConnection.removeValue(forKey: connectionID)
             }
             if let runID = restorePoint.runID {
                 runIDByConnectionID[connectionID] = runID
@@ -10601,9 +10550,9 @@ actor ServerNetworkManager {
             runPolicyStateByRunID.removeValue(forKey: policyRunID)
         }
         if let runWindowID = restorePoint.runWindowID {
-            windowIDByRunID[policyRunID] = runWindowID
+            presentationWindowByRun[policyRunID] = runWindowID
         } else {
-            windowIDByRunID.removeValue(forKey: policyRunID)
+            presentationWindowByRun.removeValue(forKey: policyRunID)
         }
     }
 
@@ -11082,13 +11031,24 @@ actor ServerNetworkManager {
                 defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.logicalContextResolution, logicalContextState) }
                 if !Self.shouldBypassLogicalContextPreResolution(for: toolName) {
                     do {
-                        if let logicalBinding = try await bindingResolver.resolveLogicalContextBinding(
-                            connectionID: connectionID,
-                            explicitContextID: extractedContextID,
-                            legacyTabID: extractedTabID,
-                            workingDirs: [],
-                            requestedWindowID: extractedWindowID
-                        ) {
+                        let logicalBinding: MCPLogicalContextBindingResolution? = if extractedContextID == nil,
+                                                                                     extractedTabID == nil,
+                                                                                     let extractedWindowID
+                        {
+                            try await bindingResolver.resolvePresentationWindowBinding(
+                                connectionID: connectionID,
+                                requestedWindowID: extractedWindowID
+                            )
+                        } else {
+                            try await bindingResolver.resolveLogicalContextBinding(
+                                connectionID: connectionID,
+                                explicitContextID: extractedContextID,
+                                legacyTabID: extractedTabID,
+                                workingDirs: [],
+                                requestedWindowID: extractedWindowID
+                            )
+                        }
+                        if let logicalBinding {
                             dispatchTabContextHint = MCPServerViewModel.TabContextHint(
                                 tabID: logicalBinding.logicalContext.tabID,
                                 workspaceID: logicalBinding.logicalContext.workspaceID,
@@ -11171,10 +11131,10 @@ actor ServerNetworkManager {
                 dispatchArguments["working_dirs"] = .array(extractedWorkingDirs.map { .string($0) })
             }
 
-            // Prepare args for formatter. Hidden _tabID is injected only for explicit
-            // compatibility paths that still inspect legacy args directly.
+            // Prepare args for the formatter. Only context_builder still declares
+            // the historical _tabID field in its public schema.
             var argsForFormatter = dispatchArguments
-            if Self.shouldInjectLegacyTabIDForCompatibility(for: toolName),
+            if Self.shouldRehydrateLegacyTabID(for: toolName),
                let tabID = dispatchTabContextHint?.tabID ?? extractedTabID
             {
                 argsForFormatter["_tabID"] = .string(tabID.uuidString)
@@ -11235,9 +11195,6 @@ actor ServerNetworkManager {
 
             // Create immutable copies for Swift 6 concurrency safety
             let capturedTabContextHint = dispatchTabContextHint
-            let capturedTabID = Self.shouldUseGenericTabBindingCompatibility(for: toolName)
-                ? (dispatchTabContextHint?.tabID ?? extractedTabID)
-                : nil
             let capturedWindowID = extractedWindowID
             let capturedPreResolvedWindowID = preResolvedWindowID
             let capturedArguments = dispatchArguments
@@ -11419,7 +11376,7 @@ actor ServerNetworkManager {
                                     defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.windowRunResolution, windowRunResolutionState) }
 
                                     let bypassWindowRouting = Self.shouldBypassWindowRouting(for: toolName)
-                                    let existingMapping = bypassWindowRouting ? nil : await self.connectionWindowMap[connectionID]
+                                    let existingMapping = bypassWindowRouting ? nil : await self.presentationWindowByConnection[connectionID]
                                     chosenID = bypassWindowRouting ? nil : capturedPreResolvedWindowID
                                     let preassigned = await self.preassignedConnections.contains(connectionID)
                                     if let cid = existingMapping {
@@ -11741,8 +11698,7 @@ actor ServerNetworkManager {
                                 // ────────────────────────────────────────────────────────
                                 // Run-scoped tab rebind fallback on reconnect handovers
                                 // ────────────────────────────────────────────────────────
-                                let shouldAttemptRunScopedTabRebindFallback = capturedTabID == nil
-                                    && observerRunIDForCallbacksFinal != nil
+                                let shouldAttemptRunScopedTabRebindFallback = observerRunIDForCallbacksFinal != nil
                                     && chosenID != nil
                                     && !Self.shouldSkipPerCallRunScopedTabRebindFallback(
                                         toolName: toolName,
@@ -11768,75 +11724,6 @@ actor ServerNetworkManager {
                                             runID: runID,
                                             windowID: windowID
                                         )
-                                    }
-                                }
-
-                                // ────────────────────────────────────────────────────────
-                                // Legacy compatibility: sticky tab binding via hidden _tabID for unmigrated tools only
-                                // ────────────────────────────────────────────────────────
-                                let shouldAttemptLegacyTabBindingCompatibility = capturedTabID != nil
-                                    && !Self.shouldSkipGenericTabBinding(for: toolName)
-                                do {
-                                    let legacyTabBindingCompatibilityState = EditFlowPerf.begin(
-                                        EditFlowPerf.Stage.MCPToolCall.legacyTabBindingCompatibility,
-                                        EditFlowPerf.Dimensions(
-                                            toolName: toolName,
-                                            outcome: shouldAttemptLegacyTabBindingCompatibility ? "attempted" : "skipped"
-                                        )
-                                    )
-                                    defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.legacyTabBindingCompatibility, legacyTabBindingCompatibilityState) }
-                                    if shouldAttemptLegacyTabBindingCompatibility, let tabID = capturedTabID {
-                                        // Guard: _tabID requires a resolved window
-                                        guard let windowID = chosenID else {
-                                            let msg = ToolOutputFormatter.operationFailed(
-                                                title: "Tab Binding Failed",
-                                                issue: "Cannot bind to tab \(tabID.uuidString.prefix(8))... - no window is selected.",
-                                                troubleshooting: Self.tabBindingTroubleshooting(
-                                                    purpose: policy.purpose,
-                                                    restrictedTools: policy.restricted
-                                                )
-                                            )
-                                            return CallTool.Result(content: [.text(text: msg, annotations: nil, _meta: nil)], isError: true)
-                                        }
-
-                                        let clientName = await self.clientIdentifier(forConnection: connectionID)
-
-                                        do {
-                                            try await MainActor.run {
-                                                guard let windowState = WindowStatesManager.shared.window(withID: windowID) else {
-                                                    throw MCPError.invalidParams("Window \(windowID) not found")
-                                                }
-                                                let resolvedWorkspaceID = capturedTabContextHint?.workspaceID
-                                                    ?? windowState.workspaceManager.resolveComposeTabRoutingSnapshot(for: tabID)?.workspaceID
-                                                    ?? windowState.workspaceManager.activeWorkspace?.id
-                                                guard let workspaceID = resolvedWorkspaceID else {
-                                                    throw MCPError.invalidParams("No workspace containing tab \(tabID) is available in window \(windowID). Use bind_context op='list' to verify context_id/window routing.")
-                                                }
-                                                try windowState.mcpServer.bindTabForConnection(
-                                                    connectionID: connectionID,
-                                                    clientName: clientName,
-                                                    tabID: tabID,
-                                                    workspaceID: workspaceID,
-                                                    windowID: windowID
-                                                )
-                                            }
-                                            await self.setConnectionWindowMapping(connectionID, windowID: windowID)
-                                            connectionLog("Tab binding: bound connection \(connectionID) to tab \(tabID) in window \(windowID)")
-                                        } catch {
-                                            // Tab binding failed - provide detailed error with window context
-                                            let shortTabID = tabID.uuidString.prefix(8)
-                                            let issue = "Tab \(shortTabID)... not found in window \(windowID)."
-                                            let msg = ToolOutputFormatter.operationFailed(
-                                                title: "Tab Binding Failed",
-                                                issue: issue,
-                                                troubleshooting: Self.tabBindingTroubleshooting(
-                                                    purpose: policy.purpose,
-                                                    restrictedTools: policy.restricted,
-                                                    windowID: windowID
-                                                )
-                                            )
-                                            return CallTool.Result(content: [.text(text: msg, annotations: nil, _meta: nil)], isError: true)
-                                        }
                                     }
                                 }
 
@@ -12424,6 +12311,19 @@ actor ServerNetworkManager {
                                         invocationID: invocationID,
                                         toolName: toolName
                                     )
+                                    let admittedDomainContext: MCPDomainAdmittedContext? = if let hint = capturedTabContextHint,
+                                                                                              let workspaceID = hint.workspaceID,
+                                                                                              let admittedWindowID = hint.windowID ?? chosenID
+                                    {
+                                        MCPDomainAdmittedContext(
+                                            connectionID: connectionID,
+                                            windowID: admittedWindowID,
+                                            workspaceID: workspaceID,
+                                            contextID: hint.tabID
+                                        )
+                                    } else {
+                                        nil
+                                    }
                                     let resolvedOperation: @Sendable () async throws -> Value = {
                                         #if DEBUG
                                             if let operation = await self.debugResolvedToolOperationOverrides[toolName] {
@@ -12435,7 +12335,8 @@ actor ServerNetworkManager {
                                             connectionID: connectionID,
                                             resolution: resolvedTool,
                                             arguments: effectiveArgs,
-                                            securityContext: invocationSecurityContext
+                                            securityContext: invocationSecurityContext,
+                                            admittedContext: admittedDomainContext
                                         ))
                                     }
 
@@ -12817,7 +12718,7 @@ actor ServerNetworkManager {
         var entries: [ConnectionDashboardEntry] = []
         // Capture ownership and assignment together before this method suspends on connection actors.
         let activeToolScopesSnapshot = activeToolScopesByWindow
-        let assignedWindowSnapshot = connectionWindowMap
+        let assignedWindowSnapshot = presentationWindowByConnection
 
         for (id, manager) in connections {
             guard !connectionsBeingRemoved.contains(id) else { continue }
@@ -13377,7 +13278,7 @@ actor ServerNetworkManager {
         }
 
         let transport: MCPRoutingState.ClientRecord.Transport = manager.isFilesystemBacked ? .filesystem : .network
-        let windowID = connectionWindowMap[connectionID]
+        let windowID = presentationWindowByConnection[connectionID]
         let runID = if let mappedRunID = runIDByConnectionID[connectionID] {
             mappedRunID
         } else {
@@ -13688,7 +13589,7 @@ actor ServerNetworkManager {
                 #endif
                 #if DEBUG
                     let ownerResource = "connection:\(connectionID.uuidString)"
-                    let ownerWindowID = connectionWindowMap[connectionID]
+                    let ownerWindowID = presentationWindowByConnection[connectionID]
                     let ownerRunID = runIDByConnectionID[connectionID]?.uuidString
                 #else
                     let ownerResource: String? = nil
@@ -13827,7 +13728,7 @@ actor ServerNetworkManager {
                 toolName: toolName,
                 lifecycleCorrelation: lifecycleCorrelation,
                 ownerResource: "connection:\(connectionID.uuidString)",
-                ownerWindowID: connectionWindowMap[connectionID],
+                ownerWindowID: presentationWindowByConnection[connectionID],
                 ownerRunID: runIDByConnectionID[connectionID]?.uuidString,
                 operation
             )

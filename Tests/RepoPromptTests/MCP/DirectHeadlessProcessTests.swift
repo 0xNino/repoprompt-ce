@@ -194,11 +194,17 @@ final class DirectHeadlessProcessTests: XCTestCase {
         XCTAssertEqual(process.terminationStatus, 0)
         let stderr = errors.fileHandleForReading.readDataToEndOfFile()
         XCTAssertEqual(String(decoding: stderr, as: UTF8.self), "")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: profile.appendingPathComponent("Runtime").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: profile.appendingPathComponent("Workspaces").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: profile.appendingPathComponent("Headless").path))
     }
 
-    func testHeadlessRejectsInteractiveAndExecModes() throws {
-        for arguments in [["--backend", "headless", "--interactive"], ["--backend", "headless", "-e", "windows"]] {
+    func testNonAppBackendsRejectInteractiveAndExecModes() throws {
+        for arguments in [
+            ["--backend", "headless", "--interactive"],
+            ["--backend", "headless", "-e", "windows"],
+            ["--backend", "auto", "--interactive"],
+            ["--backend", "auto", "-e", "windows"]
+        ] {
             let process = Process()
             process.executableURL = try Self.executableURL()
             process.arguments = arguments
@@ -210,8 +216,36 @@ final class DirectHeadlessProcessTests: XCTestCase {
             process.waitUntilExit()
             XCTAssertEqual(process.terminationStatus, 2, "arguments=\(arguments)")
             let stderr = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            XCTAssertTrue(stderr.contains("headless"))
+            XCTAssertTrue(stderr.contains(arguments[1]))
             XCTAssertTrue(stderr.contains("interactive and exec"))
+        }
+    }
+
+    func testBackendParserRejectsBareAndDuplicateBackendArguments() throws {
+        let cases = [
+            ["auto"],
+            ["app"],
+            ["headless"],
+            ["--backend", "app", "--backend", "auto"],
+            ["--backend=app", "--backend=headless"]
+        ]
+        for arguments in cases {
+            let process = Process()
+            process.executableURL = try Self.executableURL()
+            process.arguments = arguments
+            process.standardInput = FileHandle.nullDevice
+            process.standardOutput = FileHandle.nullDevice
+            let errors = Pipe()
+            process.standardError = errors
+            try process.run()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 2, "arguments=\(arguments)")
+            let stderr = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            if arguments.count == 1 {
+                XCTAssertTrue(stderr.contains("no command or mode specified"), "arguments=\(arguments) stderr=\(stderr)")
+            } else {
+                XCTAssertTrue(stderr.contains("specified only once"), "arguments=\(arguments) stderr=\(stderr)")
+            }
         }
     }
 

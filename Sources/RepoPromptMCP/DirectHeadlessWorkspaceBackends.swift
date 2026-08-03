@@ -1,8 +1,5 @@
-import CryptoKit
 import Foundation
 import MCP
-import RepoPromptC
-import RepoPromptCodeMapCore
 import RepoPromptDomainRuntime
 
 private extension DomainSettingValue {
@@ -140,20 +137,14 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
                     throw MCPError.invalidParams("context_id is unknown or ambiguous")
                 }
                 identity = match.metadata.identity
-            } else if let workingDirs = Self.workingDirectories(from: args["working_dirs"]) {
-                let requested = Set(workingDirs.map {
-                    URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path
-                })
+            } else if args["working_dirs"] != nil {
+                let workingDirs = try Self.workingDirectories(from: args["working_dirs"])
+                let requested = Set(workingDirs.map(\.path))
                 let catalog = await runtime.workspaceStore.snapshot()
-                let candidates = catalog.workspaces.filter { workspace in
-                    let roots = Set(workspace.document.metadata.repoPaths.map {
-                        URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path
-                    })
-                    return roots == requested || roots.isSuperset(of: requested)
-                }
-                guard candidates.count == 1, let workspace = candidates.first else {
-                    throw MCPError.invalidParams("working_dirs did not resolve one existing workspace; direct creation is not implicit")
-                }
+                let workspace = try Self.resolveWorkingDirectoryWorkspace(
+                    requestedRoots: requested,
+                    catalog: catalog
+                )
                 let activeID = workspace.document.metadata.activeContextID
                 guard let chosen = workspace.contexts.first(where: { $0.metadata.identity.contextID == activeID })
                     ?? (workspace.contexts.count == 1 ? workspace.contexts.first : nil)
@@ -321,6 +312,8 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             throw DirectHeadlessDomainContext.Error.invalidWorkspaceDocument
         }
         var selectedContextID: UUID?
+        var closedContextID: UUID?
+        var expectedClosedBinding: DomainBinding?
         switch action {
         case "hide", "unhide":
             object["isHiddenInMenus"] = action == "hide"
@@ -367,6 +360,7 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             else {
                 throw MCPError.invalidParams("close_tab requires an existing tab and refuses to close the last tab")
             }
+            closedContextID = targetID
             let activeID = (object["activeComposeTabID"] as? String).flatMap(UUID.init(uuidString:))
             if activeID == targetID, args["allow_active"]?.boolValue != true {
                 throw MCPError.invalidRequest("close_tab refuses to close the active tab unless allow_active=true")
@@ -379,6 +373,16 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             }
         default:
             throw MCPError.invalidParams("unsupported workspace mutation: \(action)")
+        }
+
+        if let closedContextID,
+           let scope = try? await runtime.standaloneScopeCoordinator.snapshot(scopeID: scopeID),
+           scope.binding.ordinaryContextMatches(DomainContextIdentity(
+               workspaceID: workspace.document.workspaceID,
+               contextID: closedContextID
+           ))
+        {
+            expectedClosedBinding = scope.binding
         }
 
         let bytes = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
@@ -400,7 +404,54 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             "action": .string(action),
             "workspace_revision": .int(Int(outcome.after?.workingRevision ?? workspace.revisions.workingRevision))
         ]
-        if let selectedContextID {
+        var repairedBinding: DomainBinding?
+        var repairedContextID: UUID?
+        if let expectedClosedBinding {
+            let casResult: DomainStandaloneBindingCASResult
+            if let replacementContextID = replacement.metadata.activeContextID
+                ?? replacement.metadata.contexts.first?.identity.contextID
+            {
+                let bindResult = try await runtime.standaloneScopeCoordinator.compareAndSetBinding(
+                    scopeID: scopeID,
+                    expectedBinding: expectedClosedBinding,
+                    replacement: .context(
+                        DomainContextIdentity(
+                            workspaceID: workspace.document.workspaceID,
+                            contextID: replacementContextID
+                        ),
+                        explicit: true
+                    )
+                )
+                if bindResult.disposition == .rejected {
+                    casResult = try await runtime.standaloneScopeCoordinator.compareAndSetBinding(
+                        scopeID: scopeID,
+                        expectedBinding: expectedClosedBinding,
+                        replacement: .unbound
+                    )
+                } else {
+                    casResult = bindResult
+                }
+            } else {
+                casResult = try await runtime.standaloneScopeCoordinator.compareAndSetBinding(
+                    scopeID: scopeID,
+                    expectedBinding: expectedClosedBinding,
+                    replacement: .unbound
+                )
+            }
+            repairedBinding = casResult.snapshot.binding
+            if let repairedBinding,
+               case let .context(identity, _) = repairedBinding
+            {
+                repairedContextID = identity.contextID
+            }
+        }
+        if let repairedBinding {
+            result["binding"] = bindingValue(repairedBinding)
+            if let repairedContextID {
+                result["context_id"] = .string(repairedContextID.uuidString)
+            }
+        }
+        if action == "create_tab", let selectedContextID {
             let binding = try await runtime.standaloneScopeCoordinator.bind(
                 scopeID: scopeID,
                 context: DomainContextIdentity(
@@ -491,16 +542,60 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
         return try .object(result)
     }
 
-    private nonisolated static func workingDirectories(from value: Value?) -> [String]? {
-        guard let value else { return nil }
-        if let string = value.stringValue {
-            return string.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+    nonisolated static func resolveWorkingDirectoryWorkspace(
+        requestedRoots: Set<String>,
+        catalog: DomainWorkspaceCatalogSnapshot
+    ) throws -> DomainWorkspaceSnapshot {
+        var exactMatches: [DomainWorkspaceSnapshot] = []
+        var supersetMatches: [DomainWorkspaceSnapshot] = []
+        for workspace in catalog.workspaces {
+            let roots = Set(workspace.document.metadata.repoPaths.map {
+                URL(fileURLWithPath: $0).standardizedFileURL.resolvingSymlinksInPath().path
+            })
+            if roots == requestedRoots {
+                exactMatches.append(workspace)
+            } else if roots.isSuperset(of: requestedRoots) {
+                supersetMatches.append(workspace)
+            }
         }
-        if let array = value.arrayValue {
-            let strings = array.compactMap(\.stringValue)
-            return strings.count == array.count ? strings : nil
+        let matches = exactMatches.isEmpty ? supersetMatches : exactMatches
+        guard matches.count == 1, let workspace = matches.first else {
+            throw MCPError.invalidParams("working_dirs did not resolve one existing workspace; direct creation is not implicit")
         }
-        return nil
+        return workspace
+    }
+
+    nonisolated static func workingDirectories(from value: Value?) throws -> [URL] {
+        guard let value else {
+            throw MCPError.invalidParams("headless bind requires context_id or working_dirs")
+        }
+        let values: [String]
+        switch value {
+        case let .string(raw):
+            values = raw.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+        case let .array(items):
+            values = try items.map { item in
+                guard let string = item.stringValue else {
+                    throw MCPError.invalidParams("working_dirs must be an array of strings or a comma-separated string")
+                }
+                return string
+            }
+        default:
+            throw MCPError.invalidParams("working_dirs must be an array of strings or a comma-separated string")
+        }
+
+        do {
+            return try DirectHeadlessRuntimeLocationResolver.validatedWorkingDirectories(values)
+        } catch let error as DomainStandaloneScopeError {
+            switch error {
+            case let .invalidWorkingDirectory(path):
+                throw MCPError.invalidParams(
+                    "working_dirs contains invalid directory '\(path)'; expected unique existing absolute directories"
+                )
+            default:
+                throw MCPError.invalidParams("working_dirs is invalid")
+            }
+        }
     }
 
     private func bindingContext(_ binding: DomainBinding) -> DomainContextIdentity? {
@@ -535,443 +630,69 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
 }
 
 actor DirectHeadlessWorkspaceBackend: DomainWorkspaceCapabilityBackend {
-    private let context: DirectHeadlessDomainContext
+    private let service: MCPDomainCanonicalWorkspaceService
 
     init(context: DirectHeadlessDomainContext) {
-        self.context = context
+        service = MCPDomainCanonicalWorkspaceService(
+            adapter: DomainCanonicalWorkspaceAdapter(
+                toolSnapshot: { request in
+                    try await Self.canonicalSnapshot(context.snapshot(for: request))
+                },
+                readSnapshot: { request in
+                    try await Self.canonicalSnapshot(context.snapshot(for: request))
+                },
+                mutate: { request, mutation in
+                    let updated: DirectHeadlessDomainContext.Snapshot = switch mutation {
+                    case let .setPrompt(prompt):
+                        try await context.mutate(request: request, mutation: .setPrompt(prompt))
+                    case let .setSelection(selection):
+                        try await context.mutate(request: request, mutation: .setSelection(selection))
+                    }
+                    return Self.canonicalSnapshot(updated)
+                },
+                resolvePath: { rawPath, roots, allowMissingLeaf in
+                    try context.resolvePath(rawPath, roots: roots, allowMissingLeaf: allowMissingLeaf)
+                }
+            )
+        )
     }
 
     func mutateSelection(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
-        let args = try request.mcpArguments()
-        let snapshot = try await context.snapshot(for: request)
-        let op = args["op"]?.stringValue ?? "get"
-        var paths = snapshot.selection
-        let requested = args["paths"]?.arrayValue?.compactMap(\.stringValue) ?? []
-        switch op {
-        case "get", "preview":
-            break
-        case "clear":
-            paths = []
-        case "set":
-            paths = requested
-        case "add":
-            for path in requested where !paths.contains(path) {
-                paths.append(path)
-            }
-        case "remove":
-            let removed = Set(requested)
-            paths.removeAll { removed.contains($0) }
-        case "promote", "demote":
-            break
-        default:
-            throw MCPError.invalidParams("unknown manage_selection op: \(op)")
-        }
-        if paths != snapshot.selection {
-            _ = try await context.mutate(request: request, mutation: .setSelection(paths))
-        }
-        return try .object([
-            "selection": .array(paths.map(Value.string)),
-            "count": .int(paths.count),
-            "operation": .string(op)
-        ])
+        try await service.mutateSelection(request)
     }
 
     func inspectCodeStructure(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
-        let args = try request.request.mcpArguments()
-        let snapshot = try await context.snapshot(for: request)
-        let requested = args["paths"]?.arrayValue?.compactMap(\.stringValue) ?? snapshot.selection
-        let candidates: [URL] = if requested.isEmpty {
-            Self.files(under: snapshot.roots).filter {
-                CodeMapSyntaxEngine.supportsCodeMap(fileExtension: $0.pathExtension)
-            }
-        } else {
-            try requested.prefix(256).flatMap { raw -> [URL] in
-                let resolved = try context.resolvePath(raw, roots: snapshot.roots)
-                var isDirectory: ObjCBool = false
-                if FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDirectory), isDirectory.boolValue {
-                    return Self.files(under: [resolved])
-                }
-                return [resolved]
-            }
-        }
-        let limited = Array(candidates.filter {
-            CodeMapSyntaxEngine.supportsCodeMap(fileExtension: $0.pathExtension)
-        }.prefix(256))
-        let files = try await Self.runBlocking {
-            try limited.map(Self.codeMapResult)
-        }
-        return try .object([
-            "files": .array(files),
-            "updates_pending": .bool(false),
-            "backend": .string("headless")
-        ])
+        try await service.inspectCodeStructure(request)
     }
 
     func renderFileTree(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
-        let args = try request.request.mcpArguments()
-        let snapshot = try await context.snapshot(for: request)
-        if args["type"]?.stringValue == "roots" {
-            return try .mcp(.string(snapshot.roots.map(\.path).joined(separator: "\n")))
-        }
-        let maxDepth = max(0, min(args["max_depth"]?.intValue ?? 6, 32))
-        let roots: [URL] = if let path = args["path"]?.stringValue {
-            try [context.resolvePath(path, roots: snapshot.roots)]
-        } else {
-            snapshot.roots
-        }
-        let lines = roots.flatMap { root in Self.treeLines(root: root, maxDepth: maxDepth) }
-        return try .mcp(.string(lines.joined(separator: "\n")))
+        try await service.renderFileTree(request)
     }
 
     func readFile(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
-        let args = try request.request.mcpArguments()
-        let snapshot = try await context.snapshot(for: request)
-        guard let rawPath = args["path"]?.stringValue else { throw MCPError.invalidParams("missing path") }
-        let url = try context.resolvePath(rawPath, roots: snapshot.roots)
-        let text = try String(contentsOf: url, encoding: .utf8)
-        let lines = text.components(separatedBy: .newlines)
-        let start = args["start_line"]?.intValue
-        let limit = args["limit"]?.intValue
-        let selected: ArraySlice<String>
-        if let start, start < 0 {
-            selected = lines.suffix(min(lines.count, abs(start)))
-        } else if let start {
-            let index = max(0, start - 1)
-            guard index < lines.count else { return try .mcp(.string("")) }
-            selected = lines[index ..< min(lines.count, index + max(0, limit ?? lines.count))]
-        } else {
-            selected = lines[...]
-        }
-        return try .mcp(.string(selected.joined(separator: "\n")))
+        try await service.readFile(request)
     }
 
     func searchFiles(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
-        let args = try request.request.mcpArguments()
-        let snapshot = try await context.snapshot(for: request)
-        guard let pattern = args["pattern"]?.stringValue, !pattern.isEmpty else {
-            throw MCPError.invalidParams("pattern cannot be empty")
-        }
-        let maxResults = max(1, min(args["max_results"]?.intValue ?? 50, 1000))
-        let regexEnabled = args["regex"]?.boolValue ?? Self.looksLikeRegex(pattern)
-        let regex = regexEnabled ? try NSRegularExpression(pattern: pattern) : nil
-        let mode = args["mode"]?.stringValue ?? "auto"
-        let filter = args["filter"]?.objectValue
-        let includeExtensions = filter?["extensions"]?.arrayValue?.compactMap(\.stringValue) ?? []
-        let excludePatterns = filter?["exclude"]?.arrayValue?.compactMap(\.stringValue) ?? []
-        var scopeInputs = filter?["paths"]?.arrayValue?.compactMap(\.stringValue) ?? []
-        if scopeInputs.isEmpty, let singlePath = args["path"]?.stringValue {
-            scopeInputs = [singlePath]
-        }
-        let candidates = try searchFiles(
-            in: snapshot.roots,
-            scopeInputs: scopeInputs
-        )
-        let files = try Self.filterSearchFiles(
-            candidates,
-            roots: snapshot.roots,
-            includeExtensions: includeExtensions,
-            excludePatterns: excludePatterns
-        )
-        let pathOnly = mode == "path" || (mode == "auto" && pattern.contains("*"))
-        var results: [Value] = []
-        for file in files {
-            if results.count >= maxResults { break }
-            let relative = Self.relativePath(file, roots: snapshot.roots)
-            let pathMatch = Self.matches(pattern, value: relative, regex: regex)
-            if pathOnly {
-                if pathMatch { results.append(.object(["path": .string(relative)])) }
-                continue
-            }
-            guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
-            for (index, line) in text.components(separatedBy: .newlines).enumerated() {
-                if Self.matches(pattern, value: line, regex: regex) {
-                    results.append(.object([
-                        "path": .string(relative),
-                        "line": .int(index + 1),
-                        "text": .string(line)
-                    ]))
-                    if results.count >= maxResults { break }
-                }
-            }
-        }
-        if args["count_only"]?.boolValue == true {
-            return try .object(["count": .int(results.count)])
-        }
-        return try .object(["matches": .array(results), "count": .int(results.count)])
-    }
-
-    private func searchFiles(in roots: [URL], scopeInputs: [String]) throws -> [URL] {
-        guard !scopeInputs.isEmpty else { return Self.files(under: roots) }
-
-        var seen = Set<String>()
-        return try scopeInputs.flatMap { rawPath -> [URL] in
-            let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return [] }
-            let scope = try resolveSearchScope(trimmed, roots: roots)
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: scope.path, isDirectory: &isDirectory) else {
-                throw MCPError.invalidParams("search path does not exist: \(trimmed)")
-            }
-            let files = isDirectory.boolValue ? Self.files(under: [scope]) : [scope]
-            return files.filter { seen.insert($0.path).inserted }
-        }
-    }
-
-    private func resolveSearchScope(_ rawPath: String, roots: [URL]) throws -> URL {
-        if let root = roots.first(where: { $0.lastPathComponent == rawPath }) {
-            return root
-        }
-        if let separator = rawPath.firstIndex(of: "/") {
-            let rootName = String(rawPath[..<separator])
-            if let root = roots.first(where: { $0.lastPathComponent == rootName }) {
-                let relative = String(rawPath[rawPath.index(after: separator)...])
-                return relative.isEmpty
-                    ? root
-                    : try context.resolvePath(relative, roots: [root])
-            }
-        }
-        return try context.resolvePath(rawPath, roots: roots)
+        try await service.searchFiles(request)
     }
 
     func renderWorkspaceContext(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
-        let args = try request.request.mcpArguments()
-        let snapshot = try await context.snapshot(for: request)
-        let op = args["op"]?.stringValue ?? "snapshot"
-        switch op {
-        case "snapshot":
-            return try .object([
-                "prompt": .string(snapshot.prompt),
-                "selection": .array(snapshot.selection.map(Value.string)),
-                "roots": .array(snapshot.roots.map { .string($0.path) }),
-                "workspace_id": .string(snapshot.identity.workspaceID.uuidString),
-                "context_id": .string(snapshot.identity.contextID.uuidString)
-            ])
-        case "export":
-            guard let path = args["path"]?.stringValue else { throw MCPError.invalidParams("export requires path") }
-            let destination = try context.resolvePath(path, roots: snapshot.roots, allowMissingLeaf: true)
-            try await admitExport(destination, roots: snapshot.roots)
-            let content = "Prompt:\n\(snapshot.prompt)\n\nSelection:\n\(snapshot.selection.joined(separator: "\n"))\n"
-            try content.write(to: destination, atomically: true, encoding: .utf8)
-            return try .object(["path": .string(destination.path), "exported": .bool(true)])
-        case "list_presets":
-            return try .object(["presets": .array([])])
-        case "select_preset":
-            throw MCPError.invalidRequest("copy presets are unavailable without an extracted preset backend")
-        default:
-            throw MCPError.invalidParams("unknown workspace_context op: \(op)")
-        }
+        try await service.renderWorkspaceContext(request)
     }
 
     func accessPrompt(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
-        let args = try request.request.mcpArguments()
-        let snapshot = try await context.snapshot(for: request)
-        let op = args["op"]?.stringValue ?? "get"
-        switch op {
-        case "get":
-            return try .object(["prompt": .string(snapshot.prompt)])
-        case "set", "append", "clear":
-            let prompt: String = switch op {
-            case "set": args["text"]?.stringValue ?? ""
-            case "append": snapshot.prompt + (args["text"]?.stringValue ?? "")
-            default: ""
-            }
-            let physical = DomainPhysicalToolRequest(
-                argumentsJSON: request.request.argumentsJSON,
-                securityContext: request.request.securityContext
-            )
-            let updated = try await context.mutate(request: physical, mutation: .setPrompt(prompt))
-            return try .object(["prompt": .string(updated.prompt), "operation": .string(op)])
-        case "export":
-            guard let path = args["path"]?.stringValue else { throw MCPError.invalidParams("export requires path") }
-            let destination = try context.resolvePath(path, roots: snapshot.roots, allowMissingLeaf: true)
-            try await admitExport(destination, roots: snapshot.roots)
-            try snapshot.prompt.write(to: destination, atomically: true, encoding: .utf8)
-            return try .object(["path": .string(destination.path), "exported": .bool(true)])
-        case "list_presets":
-            return try .object(["presets": .array([])])
-        case "select_preset":
-            throw MCPError.invalidRequest("select_preset is unavailable without an extracted preset backend")
-        default:
-            throw MCPError.invalidParams("unknown prompt op: \(op)")
-        }
+        try await service.accessPrompt(request)
     }
 
-    private func admitExport(_ destination: URL, roots: [URL]) async throws {
-        let mappings = roots.map {
-            DomainMutationPhysicalRootMapping(canonicalRoot: $0.path, physicalRoot: $0.path)
-        }
-        try await MCPDomainMutationCommitContext.admitPhysicalTargets(
-            [destination.path],
-            rootMappings: mappings
+    private nonisolated static func canonicalSnapshot(
+        _ snapshot: DirectHeadlessDomainContext.Snapshot
+    ) -> DomainCanonicalWorkspaceSnapshot {
+        DomainCanonicalWorkspaceSnapshot(
+            identity: snapshot.identity,
+            roots: snapshot.roots,
+            prompt: snapshot.prompt,
+            selection: snapshot.selection
         )
-        try await MCPDomainMutationCommitContext.willCommit()
-    }
-
-    private nonisolated static func codeMapResult(_ url: URL) throws -> Value {
-        let data = try Data(contentsOf: url)
-        guard let content = String(data: data, encoding: .utf8) else {
-            return .object([
-                "path": .string(url.path),
-                "diagnostic": .string("undecodable_source")
-            ])
-        }
-        guard let language = CodeMapSyntaxEngine.shared.language(forFileExtension: url.pathExtension) else {
-            return .object([
-                "path": .string(url.path),
-                "diagnostic": .string("unsupported_language")
-            ])
-        }
-        let snapshot = CodeMapCoreSourceSnapshot(
-            rawByteCount: data.count,
-            rawSHA256: CodeMapRawSourceDigest(bytes: Data(SHA256.hash(data: data))),
-            decoderPolicy: .workspaceAutomaticV1,
-            decodeResult: .decoded(CodeMapDecodedSource(text: content, detectedEncodingRawValue: String.Encoding.utf8.rawValue))
-        )
-        let outcome = try CodeMapSyntaxArtifactBuilder.build(source: snapshot, language: language)
-        switch outcome {
-        case let .ready(artifact):
-            return .object([
-                "path": .string(url.path),
-                "language": .string(language.rawValue),
-                "signatures": .string(artifact.apiDescription)
-            ])
-        case .readyNoSymbols:
-            return .object([
-                "path": .string(url.path),
-                "language": .string(language.rawValue),
-                "signatures": .string(""),
-                "diagnostic": .string("no_symbols")
-            ])
-        case .oversize:
-            return .object(["path": .string(url.path), "diagnostic": .string("source_oversize")])
-        case .parseFailed:
-            return .object(["path": .string(url.path), "diagnostic": .string("parse_failed")])
-        case .decodeFailed:
-            return .object(["path": .string(url.path), "diagnostic": .string("decode_failed")])
-        }
-    }
-
-    private nonisolated static func runBlocking<T: Sendable>(
-        _ operation: @escaping @Sendable () throws -> T
-    ) async throws -> T {
-        try Task.checkCancellation()
-        let value = try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .utility).async {
-                continuation.resume(with: Result { try operation() })
-            }
-        }
-        try Task.checkCancellation()
-        return value
-    }
-
-    private nonisolated static func files(under roots: [URL]) -> [URL] {
-        roots.flatMap { root -> [URL] in
-            guard let enumerator = FileManager.default.enumerator(
-                at: root,
-                includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
-                options: [.skipsHiddenFiles, .skipsPackageDescendants]
-            ) else { return [] }
-            return enumerator.compactMap { item -> URL? in
-                guard let url = item as? URL,
-                      (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
-                else { return nil }
-                return url
-            }
-        }
-    }
-
-    private nonisolated static func treeLines(root: URL, maxDepth: Int) -> [String] {
-        var lines = [root.lastPathComponent + "/"]
-        guard let enumerator = FileManager.default.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]
-        ) else { return lines }
-        for case let url as URL in enumerator {
-            let relative = url.path.replacingOccurrences(of: root.path + "/", with: "")
-            let depth = relative.split(separator: "/").count
-            if depth > maxDepth {
-                enumerator.skipDescendants()
-                continue
-            }
-            let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-            lines.append(String(repeating: "  ", count: depth) + url.lastPathComponent + (isDirectory ? "/" : ""))
-        }
-        return lines
-    }
-
-    private struct SearchExcludeMatcher {
-        private static let wildstarFlag: Int32 = 0x40
-        private static let casefoldFlag: Int32 = 0x10
-
-        let pattern: String
-        let wildmatchFlags: Int32?
-
-        init?(rawPattern: String) {
-            let pattern = rawPattern.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !pattern.isEmpty else { return nil }
-            self.pattern = pattern
-            if pattern.contains("*") || pattern.contains("?") {
-                wildmatchFlags = (pattern.contains("**") ? Self.wildstarFlag : 0) | Self.casefoldFlag
-            } else {
-                wildmatchFlags = nil
-            }
-        }
-
-        func matches(_ value: String) -> Bool {
-            guard let wildmatchFlags else {
-                return value.localizedCaseInsensitiveContains(pattern)
-            }
-            return pattern.withCString { patternC in
-                value.withCString { valueC in
-                    wildmatch(patternC, valueC, wildmatchFlags) == 0
-                }
-            }
-        }
-    }
-
-    private nonisolated static func filterSearchFiles(
-        _ files: [URL],
-        roots: [URL],
-        includeExtensions: [String],
-        excludePatterns: [String]
-    ) throws -> [URL] {
-        let normalizedExtensions = Set(includeExtensions.map { $0.lowercased() })
-        let excludeMatchers = excludePatterns.compactMap(SearchExcludeMatcher.init(rawPattern:))
-
-        return files.filter { file in
-            if !normalizedExtensions.isEmpty {
-                let fileExtension = file.pathExtension.isEmpty ? "" : ".\(file.pathExtension)"
-                guard normalizedExtensions.contains(fileExtension.lowercased()) else { return false }
-            }
-            let relative = relativePath(file, roots: roots)
-            return !excludeMatchers.contains { $0.matches(relative) }
-        }
-    }
-
-    private nonisolated static func relativePath(_ url: URL, roots: [URL]) -> String {
-        let path = url.standardizedFileURL.resolvingSymlinksInPath().path
-        for root in roots {
-            let rootPath = root.standardizedFileURL.resolvingSymlinksInPath().path
-            guard path.hasPrefix(rootPath + "/") else { continue }
-            return String(path.dropFirst(rootPath.count + 1))
-        }
-        return path
-    }
-
-    private nonisolated static func matches(_ pattern: String, value: String, regex: NSRegularExpression?) -> Bool {
-        if let regex {
-            return regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil
-        }
-        if pattern.contains("*") {
-            let escaped = NSRegularExpression.escapedPattern(for: pattern).replacingOccurrences(of: "\\*", with: ".*")
-            return (try? NSRegularExpression(pattern: "^\(escaped)$"))?
-                .firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil
-        }
-        return value.localizedCaseInsensitiveContains(pattern)
-    }
-
-    private nonisolated static func looksLikeRegex(_ pattern: String) -> Bool {
-        pattern.range(of: #"[\[\](){}|+?^$\\]"#, options: .regularExpression) != nil
     }
 }

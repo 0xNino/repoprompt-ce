@@ -30,6 +30,50 @@ final class MCPDomainHostTests: XCTestCase {
         XCTAssertEqual(snapshot.connectionsWithActiveInvocationsCount, 0)
     }
 
+    func testHostCarriesAdmittedContextIntoHostOwnedExecutionTask() async throws {
+        let workspaceID = UUID()
+        let contextID = UUID()
+        let fixture = try await makeFixture(binding: Self.binding { _ in
+            guard let admitted = MCPDomainAdmittedContextValues.current else {
+                return .string("missing")
+            }
+            return .string(
+                "\(admitted.connectionID.uuidString)|\(admitted.windowID)|" +
+                    "\(admitted.workspaceID.uuidString)|\(admitted.contextID.uuidString)"
+            )
+        })
+        let resolution = try await fixture.runtime.domainHost.resolve(
+            toolName: MCPWindowToolName.readFile,
+            scope: MCPDomainToolRegistrationScope.window(id: 1)
+        )
+        let invocationID = UUID()
+        let admitted = MCPDomainAdmittedContext(
+            connectionID: fixture.connection.connectionID,
+            windowID: 1,
+            workspaceID: workspaceID,
+            contextID: contextID
+        )
+
+        let value = try await fixture.runtime.domainHost.invoke(MCPDomainHostInvocation(
+            invocationID: invocationID,
+            connectionID: fixture.connection.connectionID,
+            resolution: resolution,
+            arguments: [:],
+            securityContext: securityContext(
+                identity: fixture.runtime.identity,
+                connection: fixture.connection,
+                invocationID: invocationID
+            ),
+            admittedContext: admitted
+        ))
+
+        XCTAssertEqual(
+            value.stringValue,
+            "\(fixture.connection.connectionID.uuidString)|1|\(workspaceID.uuidString)|\(contextID.uuidString)"
+        )
+        XCTAssertNil(MCPDomainAdmittedContextValues.current)
+    }
+
     func testHostRejectsStaleResolutionAfterRegistrationReplacement() async throws {
         let fixture = try await makeFixture()
         let stale = try await fixture.runtime.domainHost.resolve(

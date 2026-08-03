@@ -30,6 +30,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     private(set) var domainRuntimeStartupFailureDescription: String?
     private var globalMCPRegistrationOperation: GlobalMCPRegistrationOperation = {
         try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+        try await WindowState.sharedMCPService.start()
     }
 
     private var domainRuntimeShutdownOperation: DomainRuntimeShutdownOperation = {

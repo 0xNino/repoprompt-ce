@@ -271,8 +271,8 @@ else:
         for dependency in domain_runtime.get("dependencies", [])
         if "product" in dependency
     }
-    if runtime_by_name != ["RepoPromptShared", "RepoPromptC"] or runtime_products != {("Logging", "swift-log"), ("MCP", "swift-sdk")} or len(domain_runtime.get("dependencies", [])) != 4:
-        errors.append("RepoPromptDomainRuntime dependencies must remain RepoPromptShared, RepoPromptC, Logging, and pinned MCP")
+    if runtime_by_name != ["RepoPromptShared", "RepoPromptC", "RepoPromptCodeMapCore"] or runtime_products != {("Logging", "swift-log"), ("MCP", "swift-sdk")} or len(domain_runtime.get("dependencies", [])) != 5:
+        errors.append("RepoPromptDomainRuntime dependencies must remain RepoPromptShared, RepoPromptC, RepoPromptCodeMapCore, Logging, and pinned MCP")
 if domain_runtime_tests is None:
     errors.append("RepoPromptDomainRuntimeTests target missing")
 else:
@@ -737,6 +737,7 @@ allowed_tracked_docs=(
   "docs/spec/headless-mcp-domain-runtime-m4-protected-mutations.md"
   "docs/spec/headless-mcp-domain-runtime-m5-ai-agent-interaction.md"
   "docs/spec/headless-mcp-domain-runtime-m6-host-extraction.md"
+  "docs/spec/headless-mcp-domain-runtime-m7-cutover.md"
   "docs/spec/history-query-tools.md"
   "docs/spec/mcp-domain-canonical-tool-definitions.generated.json"
   "docs/worktrees.md"

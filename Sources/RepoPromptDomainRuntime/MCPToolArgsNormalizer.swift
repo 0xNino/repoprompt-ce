@@ -322,7 +322,10 @@ package enum MCPToolArgsNormalizer {
         case "read_file":
             return common.union(["start_line", "offset", "limit"])
         case "file_search":
-            return common.union(["pattern", "regex", "mode", "context_lines", "count_only", "max_results"])
+            return common.union([
+                "pattern", "regex", "mode", "context_lines", "count_only", "max_results",
+                "whole_word", "filter"
+            ])
         case "get_code_structure":
             return common.union(["paths", "expand", "depth", "signatures", "size"])
         default:

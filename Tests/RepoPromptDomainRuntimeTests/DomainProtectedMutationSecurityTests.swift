@@ -4,7 +4,7 @@ import MCP
 import XCTest
 
 final class DomainProtectedMutationSecurityTests: XCTestCase {
-    func testM4AClassifiesOnlyProtectedMutationActions() {
+    func testFinalRuntimeClassifiesAllProtectedMutationActions() {
         XCTAssertNil(operation("manage_selection", ["op": .string("get")]))
         XCTAssertEqual(operation("manage_selection", ["op": .string("set")])?.action, "set")
         XCTAssertNil(operation("prompt", ["op": .string("get")]))
@@ -13,9 +13,9 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         XCTAssertEqual(operation("workspace_context", ["op": .string("select_preset")])?.action, "select_preset")
         XCTAssertEqual(operation("bind_context", ["op": .string("bind")])?.action, "bind")
         XCTAssertEqual(operation("manage_workspaces", ["action": .string("create")])?.action, "create")
-        XCTAssertNil(operation("file_actions", ["action": .string("create")]))
-        XCTAssertNil(operation("apply_edits", ["path": .string("file.swift")]))
-        XCTAssertNil(operation("manage_worktree", ["op": .string("create")]))
+        XCTAssertEqual(operation("file_actions", ["action": .string("create")])?.action, "create")
+        XCTAssertEqual(operation("apply_edits", ["path": .string("file.swift")])?.action, "replace")
+        XCTAssertEqual(operation("manage_worktree", ["op": .string("create")])?.action, "create")
     }
 
     func testProtectedBindingDefaultsToDenyAndNeverCallsBackendWithoutPrincipal() async throws {
@@ -385,8 +385,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
     private func operation(_ toolName: String, _ arguments: [String: Value]) -> DomainProtectedMutationOperation? {
         MCPDomainProtectedMutationToolProvider.operation(
             toolName: toolName,
-            arguments: arguments,
-            stage: .m4A
+            arguments: arguments
         )
     }
 
@@ -420,8 +419,7 @@ private final class RuntimeFixture: @unchecked Sendable {
                 storageDirectory: storage,
                 eventDirectory: storage.appendingPathComponent("events", isDirectory: true),
                 temporaryDirectory: storage.appendingPathComponent("tmp", isDirectory: true),
-                externalReloadInterval: nil,
-                protectedMutationStage: .m4A
+                externalReloadInterval: nil
             ),
             runtimeID: UUID(),
             lifecycleGeneration: 7,
@@ -438,6 +436,7 @@ private final class RuntimeFixture: @unchecked Sendable {
                 annotations: .init(readOnlyHint: false, destructiveHint: true)
             ),
             operation: { _ in
+                try await MCPDomainMutationCommitContext.willCommit()
                 await calls.increment()
                 return .string("ok")
             }

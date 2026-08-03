@@ -2,14 +2,25 @@ import Foundation
 import Logging
 import RepoPromptDomainRuntime
 
-private let serviceRegistryLog = Logger(label: "com.repoprompt.mcp.service-registry")
+private let appDomainRegistrationLog = Logger(label: "com.repoprompt.mcp.domain-registration")
 
-/// App adapter over the runtime-owned catalog registry. This facade stores no services,
-/// schemas, registrations, or tool definitions of its own.
-enum ServiceRegistry {
+/// App composition operations over the runtime-owned catalog registry.
+extension AppDomainRuntimeComposition {
     @MainActor
     @discardableResult
-    static func register(
+    func register(
+        _ service: MCPAppToolCatalogRegistration
+    ) async throws -> MCPDomainToolRegistrationResult {
+        try await register(
+            service: service,
+            tools: service.materializeTools(),
+            interactionAdapter: service.longRunningInteractionAdapter
+        )
+    }
+
+    @MainActor
+    @discardableResult
+    func register(
         _ service: any Service
     ) async throws -> MCPDomainToolRegistrationResult {
         #if DEBUG || EDIT_FLOW_PERF
@@ -23,23 +34,33 @@ enum ServiceRegistry {
                 EditFlowPerf.Stage.MCPToolCall.serviceToolLookupServiceToolsAwait,
                 serviceToolsAwaitState
             )
+        #endif
+        return try await register(service: service, tools: tools, interactionAdapter: nil)
+    }
+
+    @MainActor
+    private func register(
+        service: any Service,
+        tools: [Tool],
+        interactionAdapter: DomainLongRunningInteractionAdapter?
+    ) async throws -> MCPDomainToolRegistrationResult {
+        #if DEBUG || EDIT_FLOW_PERF
             let definitionScanState = EditFlowPerf.begin(
                 EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan
             )
         #endif
         let bindings: [MCPDomainToolBinding]
         do {
-            let runtime = AppDomainRuntimeComposition.shared.runtime
-            let interactionAdapter = (service as? MCPWindowToolCatalogService)?.longRunningInteractionAdapter
+            let domainRuntime = runtime
             bindings = try tools.map {
                 let domainBinding = try $0.domainBinding()
-                let longRunningBinding = runtime.longRunningToolProvider.wrapping(
+                let longRunningBinding = domainRuntime.longRunningToolProvider.wrapping(
                     domainBinding,
                     interactionAdapter: domainBinding.definition.name == MCPWindowToolName.askUser
                         ? interactionAdapter
                         : nil
                 )
-                return try runtime.protectedMutationProvider.protectedBinding(longRunningBinding)
+                return try domainRuntime.protectedMutationProvider.protectedBinding(longRunningBinding)
             }
         } catch {
             #if DEBUG || EDIT_FLOW_PERF
@@ -48,7 +69,7 @@ enum ServiceRegistry {
                     definitionScanState
                 )
             #endif
-            serviceRegistryLog.error(
+            appDomainRegistrationLog.error(
                 "Domain tool definition materialization failed registration=\(service.domainRegistrationID.rawValue.uuidString) error=\(String(reflecting: error))"
             )
             throw error
@@ -61,7 +82,7 @@ enum ServiceRegistry {
         #endif
 
         do {
-            let result = try await AppDomainRuntimeComposition.shared.runtime.toolRegistry.registerWithResult(
+            let result = try await runtime.toolRegistry.registerWithResult(
                 registrationID: service.domainRegistrationID,
                 scope: registrationScope(for: service),
                 bindings: bindings
@@ -70,20 +91,20 @@ enum ServiceRegistry {
 
             #if DEBUG || EDIT_FLOW_PERF
                 let publicationState = EditFlowPerf.begin(
-                    EditFlowPerf.Stage.MCPWindowToolCatalog.serviceRegistryToolsPublication
+                    EditFlowPerf.Stage.MCPWindowToolCatalog.domainRegistrationToolsPublication
                 )
             #endif
             ToolAvailabilityStore.shared.registerTools(tools)
             #if DEBUG || EDIT_FLOW_PERF
                 EditFlowPerf.end(
-                    EditFlowPerf.Stage.MCPWindowToolCatalog.serviceRegistryToolsPublication,
+                    EditFlowPerf.Stage.MCPWindowToolCatalog.domainRegistrationToolsPublication,
                     publicationState
                 )
             #endif
             await ServerNetworkManager.shared.broadcastToolListChanged()
             return result
         } catch {
-            serviceRegistryLog.error(
+            appDomainRegistrationLog.error(
                 "Domain tool registration failed registration=\(service.domainRegistrationID.rawValue.uuidString) scope=\(String(describing: registrationScope(for: service))) error=\(String(reflecting: error))"
             )
             throw error
@@ -91,8 +112,8 @@ enum ServiceRegistry {
     }
 
     @MainActor
-    static func unregister(_ service: any Service) async {
-        let removal = await AppDomainRuntimeComposition.shared.runtime.toolRegistry.unregister(
+    func unregister(_ service: any Service) async {
+        let removal = await runtime.toolRegistry.unregister(
             registrationID: service.domainRegistrationID
         )
         if removal == .removed {
@@ -100,58 +121,58 @@ enum ServiceRegistry {
         }
     }
 
-    static func unregister(_ handle: MCPDomainToolRegistrationHandle) async {
-        let removal = await AppDomainRuntimeComposition.shared.runtime.toolRegistry.unregister(handle)
+    func unregister(_ handle: MCPDomainToolRegistrationHandle) async {
+        let removal = await runtime.toolRegistry.unregister(handle)
         if removal == .removed {
             await ServerNetworkManager.shared.broadcastToolListChanged()
         }
     }
 
     @MainActor
-    static func isRegistered(_ service: any Service) async -> Bool {
-        await AppDomainRuntimeComposition.shared.runtime.toolRegistry.isRegistered(
+    func isRegistered(_ service: any Service) async -> Bool {
+        await runtime.toolRegistry.isRegistered(
             service.domainRegistrationID
         )
     }
 
-    static func catalogSnapshot() async -> MCPDomainToolCatalogSnapshot {
-        await AppDomainRuntimeComposition.shared.runtime.toolRegistry.snapshot()
+    func catalogSnapshot() async -> MCPDomainToolCatalogSnapshot {
+        await runtime.toolRegistry.snapshot()
     }
 
-    static func scopePresence(
+    func scopePresence(
         requiredToolNames: [String],
         scope: MCPDomainToolRegistrationScope
     ) async -> MCPDomainToolScopePresence {
-        await AppDomainRuntimeComposition.shared.runtime.toolRegistry.scopePresence(
+        await runtime.toolRegistry.scopePresence(
             requiredToolNames: requiredToolNames,
             scope: scope
         )
     }
 
-    static func resolve(
+    func resolve(
         toolName: String,
         scope: MCPDomainToolRegistrationScope
     ) async -> MCPDomainResolvedTool? {
-        await AppDomainRuntimeComposition.shared.runtime.toolRegistry.resolve(
+        await runtime.toolRegistry.resolve(
             toolName: toolName,
             scope: scope
         )
     }
 
-    static func resolveUniqueWindowTool(
+    func resolveUniqueWindowTool(
         toolName: String
     ) async -> MCPDomainResolvedTool? {
-        await AppDomainRuntimeComposition.shared.runtime.toolRegistry.resolveUniqueWindowTool(
+        await runtime.toolRegistry.resolveUniqueWindowTool(
             toolName: toolName
         )
     }
 
-    static func isActive(_ handle: MCPDomainToolRegistrationHandle) async -> Bool {
-        await AppDomainRuntimeComposition.shared.runtime.toolRegistry.isActive(handle)
+    func isActive(_ handle: MCPDomainToolRegistrationHandle) async -> Bool {
+        await runtime.toolRegistry.isActive(handle)
     }
 
     @MainActor
-    private static func registrationScope(
+    private func registrationScope(
         for service: any Service
     ) -> MCPDomainToolRegistrationScope {
         if let windowService = service as? WindowScopedService {

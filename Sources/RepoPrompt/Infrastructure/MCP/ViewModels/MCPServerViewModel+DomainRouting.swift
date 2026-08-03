@@ -57,7 +57,7 @@ extension MCPServerViewModel {
     /// M3 read providers may continue reading the local cache, but new binding decisions
     /// and run launch reservations must use the coordinator snapshot/token APIs.
     @MainActor
-    func publishDomainRoutingBinding(connectionID: UUID, context: TabScopedContext) {
+    func publishDomainRoutingBinding(connectionID: UUID, context: TabContextSnapshot) {
         guard let coordinator = domainRoutingCoordinator else { return }
         if domainWindowPresentationRevision < .max {
             domainWindowPresentationRevision += 1
@@ -217,7 +217,27 @@ extension MCPServerViewModel {
             return DomainReadInvocationContext(handle: nil, connectionID: nil)
         }
 
-        let metadata = await captureRequestMetadata()
+        let metadata: RequestMetadata
+        if let admitted = MCPDomainAdmittedContextValues.current {
+            guard admitted.windowID == windowID else {
+                throw MCPError.internalError(
+                    "Admitted domain context window \(admitted.windowID) does not match provider window \(windowID)"
+                )
+            }
+            metadata = await RequestMetadata(
+                connectionID: admitted.connectionID,
+                clientName: nil,
+                windowID: admitted.windowID,
+                runPurpose: ServerNetworkManager.shared.runPurpose(for: admitted.connectionID),
+                tabContextHint: TabContextHint(
+                    tabID: admitted.contextID,
+                    workspaceID: admitted.workspaceID,
+                    windowID: admitted.windowID
+                )
+            )
+        } else {
+            metadata = await captureRequestMetadata()
+        }
         let connectionID = metadata.connectionID
 
         // App compatibility remains the physical fallback for graceful/no-workspace tools and
@@ -226,8 +246,7 @@ extension MCPServerViewModel {
         do {
             resolved = try resolveTabContextSnapshot(
                 from: metadata,
-                toolName: toolName,
-                policy: .allowLegacyImplicitRouting
+                toolName: toolName
             )
         } catch {
             return try domainReadUnavailable(

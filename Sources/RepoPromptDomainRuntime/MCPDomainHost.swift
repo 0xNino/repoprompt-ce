@@ -36,12 +36,36 @@ package struct MCPDomainHostResolution: Sendable {
     }
 }
 
+package struct MCPDomainAdmittedContext: Equatable, Sendable {
+    package let connectionID: UUID
+    package let windowID: Int
+    package let workspaceID: UUID
+    package let contextID: UUID
+
+    package init(
+        connectionID: UUID,
+        windowID: Int,
+        workspaceID: UUID,
+        contextID: UUID
+    ) {
+        self.connectionID = connectionID
+        self.windowID = windowID
+        self.workspaceID = workspaceID
+        self.contextID = contextID
+    }
+}
+
+package enum MCPDomainAdmittedContextValues {
+    @TaskLocal package static var current: MCPDomainAdmittedContext?
+}
+
 package struct MCPDomainHostInvocation: Sendable {
     package let invocationID: UUID
     package let connectionID: UUID
     package let resolution: MCPDomainHostResolution
     package let arguments: [String: Value]
     package let securityContext: DomainToolInvocationSecurityContext
+    package let admittedContext: MCPDomainAdmittedContext?
     package let submittedAt: ContinuousClock.Instant
 
     package init(
@@ -50,13 +74,16 @@ package struct MCPDomainHostInvocation: Sendable {
         resolution: MCPDomainHostResolution,
         arguments: [String: Value],
         securityContext: DomainToolInvocationSecurityContext,
+        admittedContext: MCPDomainAdmittedContext? = nil,
         submittedAt: ContinuousClock.Instant = ContinuousClock().now
     ) {
+        precondition(admittedContext == nil || admittedContext?.connectionID == connectionID)
         self.invocationID = invocationID
         self.connectionID = connectionID
         self.resolution = resolution
         self.arguments = arguments
         self.securityContext = securityContext
+        self.admittedContext = admittedContext
         self.submittedAt = submittedAt
     }
 }
@@ -228,7 +255,11 @@ package actor MCPDomainHost {
                 let value = try await MCPDomainInvocationSecurityContext.$current.withValue(
                     invocation.securityContext
                 ) {
-                    try await resolved.binding(invocation.arguments)
+                    try await MCPDomainAdmittedContextValues.$current.withValue(
+                        invocation.admittedContext
+                    ) {
+                        try await resolved.binding(invocation.arguments)
+                    }
                 }
                 Self.recordTimingMetric(
                     metrics: metrics,

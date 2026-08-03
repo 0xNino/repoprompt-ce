@@ -45,7 +45,14 @@ package enum DomainBinding: Codable, Equatable {
     case runScoped(runID: UUID, context: DomainContextIdentity)
 }
 
-package struct DomainConnectionBindingSnapshot: Codable, Equatable {
+package extension DomainBinding {
+    func ordinaryContextMatches(_ identity: DomainContextIdentity) -> Bool {
+        guard case let .context(boundIdentity, _) = self else { return false }
+        return boundIdentity == identity
+    }
+}
+
+package struct DomainConnectionBindingSnapshot: Codable, Equatable, Sendable {
     package let registration: DomainConnectionRegistration
     package let binding: DomainBinding
 }
@@ -431,7 +438,8 @@ package actor DomainRoutingCoordinator {
         connection: DomainConnectionRegistration,
         binding: DomainBinding,
         operationID: UUID,
-        expectedRevision: UInt64? = nil
+        expectedRevision: UInt64? = nil,
+        expectedBinding: DomainBinding? = nil
     ) async -> DomainRoutingOutcome {
         guard !isStopped else { return stoppedOutcome(operationID) }
         // Resolve the async context dependency first so validation and commit below run
@@ -451,6 +459,9 @@ package actor DomainRoutingCoordinator {
         }
         guard let current = connections[connection.connectionID], current.registration == connection else {
             return finish(operationID, disposition: .staleGeneration, diagnostic: "connection_generation_stale")
+        }
+        guard expectedBinding == nil || current.binding == expectedBinding else {
+            return finish(operationID, disposition: .conflict, diagnostic: "connection_binding_mismatch")
         }
         if case .runScoped = current.binding,
            current.binding != binding

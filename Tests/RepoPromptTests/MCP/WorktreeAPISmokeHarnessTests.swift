@@ -7,12 +7,17 @@ import XCTest
 @MainActor
 final class WorktreeAPISmokeHarnessTests: XCTestCase {
     func testManageWorktreeAndAgentRunAPISmokeFlow() async throws {
+        Self.traceSmokePhase("fixture.begin")
         let fixture = try Self.makeGitFixture()
+        Self.traceSmokePhase("fixture.ready")
         addTeardownBlock { try? FileManager.default.removeItem(at: fixture.sandbox) }
 
+        Self.traceSmokePhase("window.begin")
         let window = try await Self.makeWindow(root: fixture.repo)
+        Self.traceSmokePhase("window.ready")
         registerWindowTeardown(window)
         let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+        Self.traceSmokePhase("tool.ready")
 
         let graphList = try await manageWorktree([
             "op": .string("list"),
@@ -21,6 +26,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             "persist_visuals": .bool(true)
         ])
         try assertManageWorktreeGraphListContract(graphList)
+        Self.traceSmokePhase("list.ready")
 
         let createValue = try await manageWorktree([
             "op": .string("create"),
@@ -34,6 +40,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let createdWorktreeID = try XCTUnwrap(createdWorktree["worktree_id"]?.stringValue)
         let createdWorktreePath = try XCTUnwrap(createdWorktree["path"]?.stringValue)
         XCTAssertTrue(FileManager.default.fileExists(atPath: createdWorktreePath), createdWorktreePath)
+        Self.traceSmokePhase("create.ready")
 
         let bindSessionID = UUID()
         let bindTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
@@ -57,6 +64,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         XCTAssertEqual(binding["worktree_root_path"]?.stringValue, createdWorktreePath)
         XCTAssertEqual(binding["logical_root_path"]?.stringValue, fixture.repo.path)
         XCTAssertEqual(binding["visual_label"]?.stringValue, "Bound Item 12")
+        Self.traceSmokePhase("bind.ready")
 
         try await assertDiscoveryToolsReportWorktreeScope(
             window: window,
@@ -64,6 +72,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             effectiveRootPath: createdWorktreePath,
             worktreeID: createdWorktreeID
         )
+        Self.traceSmokePhase("discovery.ready")
 
         let existingStartTab = try await Self.createBackgroundTab(in: window, name: "Item 12 Existing Start")
         let existingStart = try await Self.makeAgentRunService(window: window, targetTabID: existingStartTab.id).execute(args: [
@@ -78,14 +87,18 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let existingStartBinding = try Self.firstWorktreeBinding(existingStart)
         XCTAssertEqual(existingStartBinding["worktree_id"]?.stringValue, createdWorktreeID)
         XCTAssertEqual(existingStartBinding["worktree_root_path"]?.stringValue, createdWorktreePath)
+        Self.traceSmokePhase("existing-start.ready")
         try await assertBoundSessionReadAndApplyUseWorktree(
             value: existingStart,
             window: window,
             logicalRoot: fixture.repo,
             originalTrackedFile: fixture.trackedFile
         )
+        Self.traceSmokePhase("bound-read-apply.ready")
 
+        Self.traceSmokePhase("create-start.begin")
         let createStartTab = try await Self.createBackgroundTab(in: window, name: "Item 12 Create Start")
+        Self.traceSmokePhase("create-start.tab-ready")
         let createStart = try await Self.makeAgentRunService(window: window, targetTabID: createStartTab.id).execute(args: [
             "op": .string("start"),
             "message": .string("Smoke created worktree binding"),
@@ -103,6 +116,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let createStartPath = try XCTUnwrap(createStartBinding["worktree_root_path"]?.stringValue)
         XCTAssertNotEqual(createStartPath, fixture.repo.path)
         XCTAssertTrue(FileManager.default.fileExists(atPath: createStartPath), createStartPath)
+        Self.traceSmokePhase("create-start.ready")
 
         let formattedList = try Self.onlyText(ToolOutputFormatter.formatManageWorktree(args: ["op": .string("list")], value: graphList))
         XCTAssertTrue(formattedList.contains("## Manage Worktree List"), formattedList)
@@ -112,6 +126,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let formattedStart = try Self.onlyText(ToolOutputFormatter.formatAgentRun(args: ["op": .string("start")], value: createStart))
         XCTAssertTrue(formattedStart.contains("Worktree:"), formattedStart)
         XCTAssertTrue(formattedStart.contains("Agent Created WT"), formattedStart)
+        Self.traceSmokePhase("complete")
     }
 
     func testManageWorktreeListExcludesStalePrunableWorktrees() async throws {
@@ -790,6 +805,10 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         )
     }
 
+    private static func traceSmokePhase(_ phase: String) {
+        FileHandle.standardError.write(Data("[WorktreeAPISmoke] phase=\(phase)\n".utf8))
+    }
+
     private func assertManageWorktreeGraphListContract(_ value: Value) throws {
         let object = try XCTUnwrap(value.objectValue)
         XCTAssertEqual(object["op"]?.stringValue, "list")
@@ -975,8 +994,17 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
     private func registerWindowTeardown(_ window: WindowState) {
         addTeardownBlock { @MainActor in
-            await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
+            let activeTabIDs = window.agentModeViewModel.sessions.values
+                .filter { $0.agentTask != nil || $0.runState.isActive }
+                .map(\.tabID)
+            for tabID in activeTabIDs {
+                await window.agentModeViewModel.cancelAgentRun(
+                    tabID: tabID,
+                    completion: .terminalTeardownCompleted
+                )
+            }
             let rootIDs = await window.workspaceFileContextStore.rootRefs(scope: .allLoaded).map(\.id)
+            window.beginClose()
             await window.tearDown()
             await window.workspaceFileContextStore.unloadRoots(ids: rootIDs)
             WindowStatesManager.shared.unregisterWindowState(window)
@@ -1024,7 +1052,6 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
         _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: root.path)
-        await window.workspaceManager.waitUntilPostSwitchGitDataLoadComplete()
         return window
     }
 
@@ -1039,7 +1066,55 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
 
     private static func windowTool(named name: String, in window: WindowState) async throws -> RepoPromptApp.Tool {
         let tools = await window.mcpServer.windowMCPTools
-        return try XCTUnwrap(tools.first { $0.name == name })
+        let tool = try XCTUnwrap(tools.first { $0.name == name })
+        return RepoPromptApp.Tool(
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+            annotations: tool.annotations,
+            isEnabledByDefault: tool.isEnabledByDefault,
+            returnsValue: { arguments in
+                if ServerNetworkManager.currentConnectionID != nil {
+                    return try await tool(arguments)
+                }
+
+                let connectionID = UUID()
+                try await MainActor.run {
+                    let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+                    let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+                    try window.mcpServer.bindTabForConnection(
+                        connectionID: connectionID,
+                        clientName: "Worktree API Smoke",
+                        tabID: tabID,
+                        workspaceID: workspace.id,
+                        windowID: window.windowID,
+                        explicitlyBound: true
+                    )
+                }
+                do {
+                    let result = try await ServerNetworkManager.withConnectionID(connectionID) {
+                        try await tool(arguments)
+                    }
+                    await MainActor.run {
+                        window.mcpServer.removeTabContext(
+                            forConnectionID: connectionID,
+                            clientName: "Worktree API Smoke",
+                            windowID: window.windowID
+                        )
+                    }
+                    return result
+                } catch {
+                    await MainActor.run {
+                        window.mcpServer.removeTabContext(
+                            forConnectionID: connectionID,
+                            clientName: "Worktree API Smoke",
+                            windowID: window.windowID
+                        )
+                    }
+                    throw error
+                }
+            }
+        )
     }
 
     private struct GitFixture {

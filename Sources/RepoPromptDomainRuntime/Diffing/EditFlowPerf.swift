@@ -488,7 +488,7 @@ package enum EditFlowPerf {
             package static let ownershipPurposeResolution: StaticString = "EditFlow.MCPToolCall.OwnershipPurposeResolution"
             package static let toolCallRecording: StaticString = "EditFlow.MCPToolCall.ToolCallRecording"
             package static let runScopedTabRebindFallback: StaticString = "EditFlow.MCPToolCall.RunScopedTabRebindFallback"
-            package static let legacyTabBindingCompatibility: StaticString = "EditFlow.MCPToolCall.LegacyTabBindingCompatibility"
+            package static let presentationContextResolution: StaticString = "EditFlow.MCPToolCall.PresentationContextResolution"
             package static let serviceToolLookup: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup"
             package static let serviceToolLookupServiceToolsAwait: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.ServiceToolsAwait"
             package static let serviceToolLookupToolDefinitionScan: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.ToolDefinitionScan"
@@ -523,7 +523,7 @@ package enum EditFlowPerf {
             package static let registrationUpdateWindowToolsEnabledDidSet: StaticString = "EditFlow.MCPWindowToolCatalog.RegistrationUpdate.WindowToolsEnabledDidSet"
             package static let registrationUpdateAgentBootstrap: StaticString = "EditFlow.MCPWindowToolCatalog.RegistrationUpdate.AgentBootstrap"
             package static let readinessWarmAccess: StaticString = "EditFlow.MCPWindowToolCatalog.ReadinessWarmAccess"
-            package static let serviceRegistryToolsPublication: StaticString = "EditFlow.MCPWindowToolCatalog.ServiceRegistryToolsPublication"
+            package static let domainRegistrationToolsPublication: StaticString = "EditFlow.MCPAppToolCatalog.DomainRegistrationToolsPublication"
             package static let codexTurnMCPServerEnable: StaticString = "EditFlow.MCPWindowToolCatalog.CodexTurnMCPServerEnable"
         }
 
