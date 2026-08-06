@@ -4417,6 +4417,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         } else if !projectedWorkspaces.contains(where: { $0.id == activeWorkspaceID }) {
             activeWorkspaceID = projectedWorkspaces.first?.id
         }
+        if domainWorkspaceAuthorityIssue?.kind == .projectionFailure {
+            publishDomainAuthorityIssueIfChanged(nil)
+        }
         synchronizeDomainAuthorityIssueForActiveWorkspace(operation: "authority_projection")
     }
 

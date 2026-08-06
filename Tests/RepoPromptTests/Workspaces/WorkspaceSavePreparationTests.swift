@@ -187,6 +187,12 @@ import XCTest
             // End-to-end: a domain projection publication re-validates the cache through the same
             // seam. Without an authority client this composition conservatively clears it.
             try confirmRegistration()
+            manager.reportDomainProjectionFailure(NSError(
+                domain: "WorkspaceSavePreparationTests",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "transient projection failure"]
+            ))
+            XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.kind, .projectionFailure)
             manager.applyDomainWorkspaceProjection(
                 [workspace],
                 fileURLsByWorkspaceID: [workspace.id: fileURL],
@@ -200,6 +206,10 @@ import XCTest
             XCTAssertNotNil(
                 manager.domainReadRegistrationToken(for: workspace, fileURL: fileURL),
                 "A projected catalog publication must invalidate confirmed read registrations."
+            )
+            XCTAssertNil(
+                manager.domainWorkspaceAuthorityIssue,
+                "A successful full-model projection must clear its stale projection failure."
             )
         }
 
@@ -757,6 +767,17 @@ import XCTest
             XCTAssertEqual(canonicalAfterAdmission?.revisions, conflictedSnapshot.revisions)
             XCTAssertEqual(canonicalAfterAdmission?.document.contentDigest, conflictedSnapshot.document.contentDigest)
             XCTAssertEqual(canonicalAfterAdmission?.health, conflictedSnapshot.health)
+
+            manager.reportDomainAuthorityFailure(
+                NSError(
+                    domain: "WorkspaceSavePreparationTests",
+                    code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: "transient command failure"]
+                ),
+                workspaceID: workspaceID,
+                operation: "test_command_failure"
+            )
+            XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.kind, .commandFailure)
 
             let conflictResolved = await manager.resolveDomainWorkspaceConflict(
                 workspaceID: workspaceID,
