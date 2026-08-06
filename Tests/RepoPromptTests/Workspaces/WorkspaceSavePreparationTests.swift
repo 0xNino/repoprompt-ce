@@ -721,6 +721,43 @@ import XCTest
             XCTAssertTrue(issue.agentAdmissionMessage.contains("Keep Local"))
             XCTAssertTrue(issue.agentAdmissionMessage.contains("Use External"))
             XCTAssertTrue(issue.canResolveExternalConflict)
+
+            let canonicalBaseline = manager.debugDomainAuthorityBaseline(for: workspaceID)
+            XCTAssertEqual(canonicalBaseline.revisions, conflictedSnapshot.revisions)
+            XCTAssertEqual(canonicalBaseline.digest, conflictedSnapshot.document.contentDigest)
+            XCTAssertEqual(canonicalBaseline.health, conflictedSnapshot.health)
+
+            var readOverlay = localDirty
+            readOverlay.currentPromptText = "transient read-routing overlay"
+            let readOverlayDocument = try DomainWorkspaceDocument.decode(
+                documentBytes: JSONEncoder().encode(readOverlay),
+                fileURL: savedDocument.document.fileURL
+            )
+            let registeredOverlay = await runtime.workspaceStore.registerReadDocument(readOverlayDocument)
+            XCTAssertEqual(registeredOverlay.health, .writable)
+            XCTAssertNotEqual(registeredOverlay.revisions, conflictedSnapshot.revisions)
+            XCTAssertNotEqual(registeredOverlay.document.contentDigest, conflictedSnapshot.document.contentDigest)
+            let routedOverlay = await runtime.contextStore.workspaceSnapshot(workspaceID)
+            XCTAssertEqual(routedOverlay?.document.contentDigest, readOverlayDocument.contentDigest)
+
+            let admissionResult = await manager.domainAuthorityAdmissionIssue(for: workspaceID)
+            let admissionIssue = try XCTUnwrap(admissionResult)
+            XCTAssertEqual(admissionIssue.kind, .externalConflict)
+            XCTAssertEqual(admissionIssue.reason, "saved_document_changed_while_working_state_dirty")
+            XCTAssertEqual(admissionIssue.stableCode, "workspace_external_conflict")
+            let retainedIssue = try XCTUnwrap(manager.domainWorkspaceAuthorityIssue)
+            XCTAssertEqual(retainedIssue.kind, .externalConflict)
+            XCTAssertEqual(retainedIssue.reason, "saved_document_changed_while_working_state_dirty")
+
+            let baselineAfterAdmission = manager.debugDomainAuthorityBaseline(for: workspaceID)
+            XCTAssertEqual(baselineAfterAdmission.revisions, conflictedSnapshot.revisions)
+            XCTAssertEqual(baselineAfterAdmission.digest, conflictedSnapshot.document.contentDigest)
+            XCTAssertEqual(baselineAfterAdmission.health, conflictedSnapshot.health)
+            let canonicalAfterAdmission = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspaceID)
+            XCTAssertEqual(canonicalAfterAdmission?.revisions, conflictedSnapshot.revisions)
+            XCTAssertEqual(canonicalAfterAdmission?.document.contentDigest, conflictedSnapshot.document.contentDigest)
+            XCTAssertEqual(canonicalAfterAdmission?.health, conflictedSnapshot.health)
+
             let conflictResolved = await manager.resolveDomainWorkspaceConflict(
                 workspaceID: workspaceID,
                 acceptExternal: true

@@ -42,6 +42,12 @@ package struct DomainWorkspaceStore {
     package func workspaceSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceSnapshot? {
         await authority.workspaceSnapshot(workspaceID)
     }
+
+    /// Returns only persisted command-authority state. Read registrations are routing overlays and
+    /// must not influence mutation admission, recovery CAS baselines, or authority health.
+    package func canonicalWorkspaceSnapshot(_ workspaceID: UUID) async -> DomainWorkspaceSnapshot? {
+        await authority.canonicalWorkspaceSnapshot(workspaceID)
+    }
 }
 
 package struct DomainContextStore {
@@ -222,9 +228,9 @@ actor DomainWorkspaceContextAuthority {
         readRegistrations[workspaceID] ?? records[workspaceID].map(makeSnapshot)
     }
 
-    /// Command outcomes must report canonical record state; the read overlay is routing-only and
-    /// must never leak into dedup replay or transient-outcome revision lines.
-    private func canonicalWorkspaceSnapshot(_ workspaceID: UUID) -> DomainWorkspaceSnapshot? {
+    /// Command outcomes and mutation admission must report canonical record state; the read
+    /// overlay is routing-only and must never leak into recovery health or revision baselines.
+    func canonicalWorkspaceSnapshot(_ workspaceID: UUID) -> DomainWorkspaceSnapshot? {
         records[workspaceID].map(makeSnapshot)
     }
 

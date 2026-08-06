@@ -642,6 +642,16 @@ class WorkspaceManagerViewModel: ObservableObject {
             lastSyncedRepoPathsByWorkspaceID[workspaceID]
         }
 
+        func debugDomainAuthorityBaseline(
+            for workspaceID: UUID
+        ) -> (revisions: DomainRevisionState?, digest: String?, health: DomainAuthorityHealth?) {
+            (
+                domainWorkspaceRevisionsByID[workspaceID],
+                domainWorkspaceDigestsByID[workspaceID],
+                domainWorkspaceHealthByID[workspaceID]
+            )
+        }
+
         func debugPublishWorkingDocumentToDomainAuthority(_ workspace: WorkspaceModel) async {
             publishWorkingDocumentToDomainAuthority(workspace)
             await debugAwaitWorkingDocumentCommitToDomainAuthority(workspaceID: workspace.id)
@@ -4338,7 +4348,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     func domainAuthorityAdmissionIssue(for workspaceID: UUID) async -> DomainWorkspaceAuthorityIssue? {
         guard let domainWorkspaceAuthorityClient else { return nil }
-        guard let snapshot = await domainWorkspaceAuthorityClient.store.workspaceSnapshot(workspaceID) else {
+        guard let snapshot = await domainWorkspaceAuthorityClient.canonicalWorkspaceSnapshot(workspaceID) else {
             return authorityIssue(
                 workspaceID: workspaceID,
                 operation: "agent_admission",

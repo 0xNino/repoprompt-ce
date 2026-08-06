@@ -305,17 +305,16 @@ private enum DomainWorkspaceDocumentDecoder {
                 contentDigest: DomainContentDigest.sha256(bytes)
             )
         }
+        // WorkspaceModel treats stashed tabs as recoverable compatibility data: malformed arrays
+        // decode as empty and composed/stashed ID collisions are removed during normalization.
+        // Mirror that behavior for identity claims instead of making the whole workspace unreadable.
         for raw in (object["stashedTabs"] as? [Any]) ?? [] {
             guard let stashed = raw as? [String: Any],
                   let tab = stashed["tab"] as? [String: Any],
                   let tabIDString = tab["id"] as? String,
-                  let tabID = UUID(uuidString: tabIDString)
-            else {
-                throw DomainWorkspaceDocumentError.invalidContext(nil)
-            }
-            guard contextIDs.insert(tabID).inserted else {
-                throw DomainWorkspaceDocumentError.invalidContext(tabID)
-            }
+                  let tabID = UUID(uuidString: tabIDString),
+                  contextIDs.insert(tabID).inserted
+            else { continue }
             agentIdentityClaims.append(DomainProtectedAgentIdentity(
                 tabID: tabID,
                 location: .stashed,

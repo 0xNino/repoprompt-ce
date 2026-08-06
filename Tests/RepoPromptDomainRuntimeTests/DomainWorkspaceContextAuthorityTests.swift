@@ -86,6 +86,12 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
             canonicalDocument.contentDigest,
             "Fixture must produce a divergent overlay digest for the assertion to be meaningful."
         )
+        let canonicalWhileOverlayActive = await runtime.workspaceStore.canonicalWorkspaceSnapshot(
+            fixture.workspaceID
+        )
+        XCTAssertEqual(canonicalWhileOverlayActive?.document.contentDigest, canonicalDocument.contentDigest)
+        XCTAssertEqual(canonicalWhileOverlayActive?.revisions, created.workspace?.revisions)
+        XCTAssertEqual(canonicalWhileOverlayActive?.health, .writable)
 
         // Transient outcome path: a catalog-revision conflict is recorded while the overlay shadows
         // read routing. The outcome must still report canonical record state.
@@ -813,6 +819,38 @@ final class DomainWorkspaceContextAuthorityTests: XCTestCase {
         XCTAssertNil(recovered.revisions.dirtyRevision)
         XCTAssertEqual(recovered.document.documentBytes, external.documentBytes)
         XCTAssertEqual(recovered.document.metadata.agentIdentityClaims, external.metadata.agentIdentityClaims)
+    }
+
+    func testDomainDecodeIgnoresMalformedAndComposedDuplicateStashedIdentityClaims() throws {
+        let fixture = try Fixture.make()
+        defer { fixture.remove() }
+        let sessionID = UUID()
+        let composed = try fixture.agentDocument(
+            prompt: "composed agent",
+            activeAgentSessionID: sessionID,
+            isPinned: true,
+            location: .composed
+        )
+        var object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: composed.documentBytes) as? [String: Any]
+        )
+        let composedTab = try XCTUnwrap((object["composeTabs"] as? [[String: Any]])?.first)
+        object["stashedTabs"] = [
+            ["malformed": true],
+            [
+                "id": UUID().uuidString,
+                "tab": composedTab,
+                "stashedAt": 0
+            ]
+        ]
+        let bytes = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+
+        let decoded = try DomainWorkspaceDocument.decode(
+            documentBytes: bytes,
+            fileURL: fixture.workspaceFile
+        )
+
+        XCTAssertEqual(decoded.metadata.agentIdentityClaims, composed.metadata.agentIdentityClaims)
     }
 
     func testSaveTimeExternalConflictCapturesResolvableDocument() async throws {
