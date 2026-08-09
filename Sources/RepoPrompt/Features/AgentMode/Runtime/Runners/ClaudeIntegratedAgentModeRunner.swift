@@ -151,6 +151,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         runID: runID,
                         for: session
                     ) {
+                        self.hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
                         let revision = await self.finalize(
                             session: session,
                             runID: runID,

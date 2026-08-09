@@ -452,6 +452,7 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .cancelled)
         XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
         XCTAssertEqual(recorder.events.count(where: { $0 == "run-active:false" }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "handoff:false" }), 1)
         XCTAssertTrue(recorder.contains("attachments:deleteFiles"))
         XCTAssertTrue(recorder.contains("runner-superseded:shutdown"))
         XCTAssertFalse(recorder.contains("runner-replacement:shutdown"))
