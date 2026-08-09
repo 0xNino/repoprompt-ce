@@ -400,6 +400,63 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertTrue(recorder.contains("stale-send:shutdown"))
     }
 
+    func testClaudeRunnerSettlesCurrentAttemptWhenControllerReplacementSupersedesSend() async throws {
+        let recorder = LifecycleRecorder()
+        let sendGate = LifecycleAsyncGate()
+        let oldController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "runner-superseded",
+            sendUserMessageGate: sendGate
+        )
+        let replacementController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "runner-replacement"
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeController: oldController
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.claudeController = oldController
+        harness.host.test_installLiveSession(session)
+        let runtime = resolvedClaudeLaunchPolicy(
+            profile: session.permissionProfile,
+            harness: harness
+        )
+        setClaudeControllerLaunchSettings(
+            for: session,
+            coordinator: harness.host.claudeCoordinator,
+            permissionMode: runtime?.permissionMode,
+            allowNativeBashTool: runtime?.allowNativeBashTool,
+            mcpStrictMode: runtime?.mcpStrictMode
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "settle superseded send",
+            initialMessageForRun: "settle superseded send",
+            attachments: []
+        )
+        let ownership = try XCTUnwrap(session.activeRunOwnership)
+        await sendGate.waitUntilArrived()
+        let agentTask = try XCTUnwrap(session.agentTask)
+        session.claudeController = replacementController
+        await sendGate.release()
+        await agentTask.value
+
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, ownership)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .cancelled)
+        XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "run-active:false" }), 1)
+        XCTAssertTrue(recorder.contains("attachments:deleteFiles"))
+        XCTAssertTrue(recorder.contains("runner-superseded:shutdown"))
+        XCTAssertFalse(recorder.contains("runner-replacement:shutdown"))
+    }
+
     func testClaudeSendFailureReportsEvidenceWithoutTerminalizingSession() async {
         let recorder = LifecycleRecorder()
         let controller = LifecycleFakeNativeController(

@@ -146,7 +146,26 @@ final class ClaudeIntegratedAgentModeRunner {
                     )
                     return
                 case .superseded:
-                    await lease.cancelAndCleanup()
+                    if self.claudeCoordinator.runAttemptIsCurrent(
+                        ownership,
+                        runID: runID,
+                        for: session
+                    ) {
+                        let revision = await self.finalize(
+                            session: session,
+                            runID: runID,
+                            ownership: ownership,
+                            attachmentReservationID: attachmentReservationID,
+                            terminalState: .cancelled,
+                            errorText: nil,
+                            notifyTurnComplete: false
+                        )
+                        if revision == nil {
+                            await lease.cancelAndCleanup()
+                        }
+                    } else {
+                        await lease.cancelAndCleanup()
+                    }
                     return
                 }
 
@@ -351,6 +370,7 @@ final class ClaudeIntegratedAgentModeRunner {
         ))
     }
 
+    @discardableResult
     private func finalize(
         session: AgentModeViewModel.TabSession,
         runID: UUID,
@@ -360,7 +380,7 @@ final class ClaudeIntegratedAgentModeRunner {
         errorText: String?,
         notifyTurnComplete: Bool,
         shouldShutdownSession: Bool = false
-    ) async {
+    ) async -> AgentRunTerminalCommitRevision? {
         await terminalCommitBarrier.commit(.init(
             binding: hooks.bindTerminalSession(session),
             ownership: ownership,

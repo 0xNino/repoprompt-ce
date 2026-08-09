@@ -320,6 +320,17 @@ final class ClaudeAgentModeCoordinator {
         hostCapabilities.isSessionCurrent(session) && intent.isCurrent(for: session)
     }
 
+    func runAttemptIsCurrent(
+        _ ownership: AgentRunOwnership,
+        runID: UUID,
+        for session: AgentModeViewModel.TabSession
+    ) -> Bool {
+        intentIsCurrent(
+            .runAttempt(ownership: ownership, runID: runID),
+            for: session
+        )
+    }
+
     func ensureClaudeNativeSession(
         session: AgentModeViewModel.TabSession,
         intent: NativeSessionIntent
