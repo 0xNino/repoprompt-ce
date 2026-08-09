@@ -667,7 +667,8 @@ final class AgentModeRunService {
         guard !session.pendingClaudeSteeringInstructions.isEmpty else { return false }
 
         guard let runID = session.runID,
-              let runAttemptID = session.activeRunAttemptID else { return false }
+              let ownership = session.activeRunOwnership else { return false }
+        let runAttemptID = ownership.attemptID
 
         if let firstQueuedSteeringID = session.pendingClaudeSteeringInstructions.first?.id {
             protectCurrentClaudeTurnForAcceptedSteeringIfNeeded(
@@ -785,24 +786,29 @@ final class AgentModeRunService {
                     session
                 )
                 steeringDebugLog("[AgentRunSteeringWake] Claude flush sending native interrupt id=\(steering.id) tab=\(tabID) runID=\(runID) attempt=\(runAttemptID)")
-                let sent = await dependencies.claudeCoordinator.sendClaudeNativeMessage(
+                let sendOutcome = await dependencies.claudeCoordinator.sendClaudeNativeMessage(
                     session: session,
                     text: augmentedSteeringText,
-                    attachments: []
+                    attachments: [],
+                    intent: .runAttempt(ownership: ownership, runID: runID)
                 )
-                steeringDebugLog("[AgentRunSteeringWake] Claude flush send completed id=\(steering.id) tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) sent=\(sent)")
-                hooks.providerInput.recordPendingHandoffSendOutcome(session, sent)
-                if sent {
+                steeringDebugLog("[AgentRunSteeringWake] Claude flush send completed id=\(steering.id) tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) outcome=\(String(describing: sendOutcome))")
+                switch sendOutcome {
+                case .sent:
+                    hooks.providerInput.recordPendingHandoffSendOutcome(session, true)
                     await hooks.continuation.signalMCPInstructionDelivered(session)
-                }
-                if !sent {
-                    // Re-insert the failed instruction so it's included in the restore
+                case .failed:
+                    hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
+                    // Re-insert the failed instruction so it's included in the restore.
+                    // The coordinator deliberately leaves the live run state and
+                    // ownership untouched; the owner event loop settles later.
                     session.pendingClaudeSteeringInstructions.insert(steering, at: 0)
                     if let dequeuedUserInputTokens {
                         session.pendingNonCodexUserInputTokenQueue.insert(dequeuedUserInputTokens, at: 0)
                     }
-                    // Restore ALL remaining queued drafts (including the one that failed)
                     restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+                    return
+                case .superseded:
                     return
                 }
             }
