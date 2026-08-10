@@ -112,17 +112,29 @@ final class ClaudeIntegratedAgentModeRunner {
 
                 let providerName = session.selectedAgent.rawValue
                 await lease.providerInitializationStarted(provider: providerName)
-                let sent = await self.claudeCoordinator.sendClaudeNativeMessage(
+                let sendOutcome = await self.claudeCoordinator.sendClaudeNativeMessage(
                     session: session,
                     text: initialMessageForRun,
-                    attachments: attachments
+                    attachments: attachments,
+                    intent: .runAttempt(ownership: ownership, runID: runID)
                 )
+                let providerInitializationOutcome = switch sendOutcome {
+                case .sent:
+                    "ready"
+                case .failed:
+                    Task.isCancelled ? "cancelled" : "failed"
+                case .superseded:
+                    "superseded"
+                }
                 await lease.providerInitializationCompleted(
                     provider: providerName,
-                    outcome: sent ? "ready" : (Task.isCancelled ? "cancelled" : "failed")
+                    outcome: providerInitializationOutcome
                 )
-                self.hooks.providerInput.recordPendingHandoffSendOutcome(session, sent)
-                guard sent else {
+                switch sendOutcome {
+                case .sent:
+                    self.hooks.providerInput.recordPendingHandoffSendOutcome(session, true)
+                case .failed:
+                    self.hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
                     await self.finalize(
                         session: session,
                         runID: runID,
@@ -132,6 +144,29 @@ final class ClaudeIntegratedAgentModeRunner {
                         errorText: nil,
                         notifyTurnComplete: false
                     )
+                    return
+                case .superseded:
+                    if self.claudeCoordinator.runAttemptIsCurrent(
+                        ownership,
+                        runID: runID,
+                        for: session
+                    ) {
+                        self.hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
+                        let revision = await self.finalize(
+                            session: session,
+                            runID: runID,
+                            ownership: ownership,
+                            attachmentReservationID: attachmentReservationID,
+                            terminalState: .cancelled,
+                            errorText: nil,
+                            notifyTurnComplete: false
+                        )
+                        if revision == nil {
+                            await lease.cancelAndCleanup()
+                        }
+                    } else {
+                        await lease.cancelAndCleanup()
+                    }
                     return
                 }
 
@@ -336,6 +371,7 @@ final class ClaudeIntegratedAgentModeRunner {
         ))
     }
 
+    @discardableResult
     private func finalize(
         session: AgentModeViewModel.TabSession,
         runID: UUID,
@@ -345,7 +381,7 @@ final class ClaudeIntegratedAgentModeRunner {
         errorText: String?,
         notifyTurnComplete: Bool,
         shouldShutdownSession: Bool = false
-    ) async {
+    ) async -> AgentRunTerminalCommitRevision? {
         await terminalCommitBarrier.commit(.init(
             binding: hooks.bindTerminalSession(session),
             ownership: ownership,

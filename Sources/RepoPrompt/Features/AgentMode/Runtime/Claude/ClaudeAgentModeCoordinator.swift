@@ -18,8 +18,57 @@ final class ClaudeAgentModeCoordinator {
     typealias MCPActiveToolQuery = (_ runID: UUID) -> Bool
     typealias ActiveAgentRunWaitQuery = (_ runID: UUID) -> Bool
 
+    enum NativeSessionIntent: Equatable {
+        case runAttempt(ownership: AgentRunOwnership, runID: UUID)
+        case reconnect(
+            runID: UUID,
+            providerSessionID: String,
+            currency: AgentModeViewModel.PersistentBindingTransitionToken
+        )
+
+        var runID: UUID {
+            switch self {
+            case let .runAttempt(_, runID), let .reconnect(runID, _, _):
+                runID
+            }
+        }
+
+        var allowsFreshStartRecovery: Bool {
+            if case .runAttempt = self { return true }
+            return false
+        }
+
+        @MainActor
+        func isCurrent(for session: AgentModeViewModel.TabSession) -> Bool {
+            switch self {
+            case let .runAttempt(ownership, runID):
+                session.isCurrentRunAttemptForCurrentBinding(
+                    ownership,
+                    expectedRunID: runID
+                )
+            case let .reconnect(runID, providerSessionID, currency):
+                session.persistentBindingTransitionToken() == currency
+                    && session.activeRunOwnership == nil
+                    && session.runID == runID
+                    && session.providerSessionID == providerSessionID
+            }
+        }
+    }
+
+    enum EnsureSessionOutcome: Equatable {
+        case ready
+        case failed(message: String)
+        case superseded
+    }
+
+    enum NativeSendOutcome: Equatable {
+        case sent
+        case failed(message: String)
+        case superseded
+    }
+
     struct HostCapabilities {
-        let setAgentRunActive: @MainActor (_ session: AgentModeViewModel.TabSession, _ isActive: Bool) -> Void
+        let isSessionCurrent: @MainActor (_ session: AgentModeViewModel.TabSession) -> Bool
         let requestUIRefresh: @MainActor (_ session: AgentModeViewModel.TabSession, _ urgent: Bool) -> Void
         let scheduleSave: @MainActor (_ session: AgentModeViewModel.TabSession) -> Void
         let stageClaudeResumeRecoveryHandoff: @MainActor (_ session: AgentModeViewModel.TabSession) async -> Void
@@ -27,7 +76,7 @@ final class ClaudeAgentModeCoordinator {
 
         static var noOp: Self {
             Self(
-                setAgentRunActive: { _, _ in },
+                isSessionCurrent: { _ in true },
                 requestUIRefresh: { _, _ in },
                 scheduleSave: { _ in },
                 stageClaudeResumeRecoveryHandoff: { _ in },
@@ -196,21 +245,6 @@ final class ClaudeAgentModeCoordinator {
         }
     }
 
-    private func finalizeSession(
-        _ session: AgentModeViewModel.TabSession,
-        state: AgentSessionRunState,
-        save: Bool = false
-    ) {
-        session.runState = state
-        session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
-        session.setRunningStatus(nil, source: nil)
-        hostCapabilities.setAgentRunActive(session, false)
-        hostCapabilities.requestUIRefresh(session, true)
-        if save {
-            hostCapabilities.scheduleSave(session)
-        }
-    }
-
     func events(for session: AgentModeViewModel.TabSession) async -> AsyncStream<NativeAgentRuntimeEvent>? {
         guard let controller = session.claudeController else { return nil }
         // Ensure the stream has a live continuation before returning. This
@@ -279,13 +313,43 @@ final class ClaudeAgentModeCoordinator {
         return handler
     }
 
-    func ensureClaudeNativeSession(
-        session: AgentModeViewModel.TabSession
-    ) async {
-        guard session.selectedAgent.usesClaudeNativeRuntime else { return }
-        await awaitPendingClaudeResumeTransferIfNeeded(for: session)
+    private func intentIsCurrent(
+        _ intent: NativeSessionIntent,
+        for session: AgentModeViewModel.TabSession
+    ) -> Bool {
+        hostCapabilities.isSessionCurrent(session) && intent.isCurrent(for: session)
+    }
 
-        let runID = AgentModeProcessRunIdentity.ensureProcessRunID(for: session)
+    func runAttemptIsCurrent(
+        _ ownership: AgentRunOwnership,
+        runID: UUID,
+        for session: AgentModeViewModel.TabSession
+    ) -> Bool {
+        intentIsCurrent(
+            .runAttempt(ownership: ownership, runID: runID),
+            for: session
+        )
+    }
+
+    func ensureClaudeNativeSession(
+        session: AgentModeViewModel.TabSession,
+        intent: NativeSessionIntent
+    ) async -> EnsureSessionOutcome {
+        guard session.selectedAgent.usesClaudeNativeRuntime,
+              intentIsCurrent(intent, for: session)
+        else {
+            return .superseded
+        }
+
+        switch intent {
+        case .runAttempt:
+            await awaitPendingClaudeResumeTransferIfNeeded(for: session)
+        case .reconnect:
+            guard !hasPendingResumeTransfer(for: session) else { return .superseded }
+        }
+        guard intentIsCurrent(intent, for: session) else { return .superseded }
+
+        let runID = intent.runID
         let launchModelRaw = session.selectedModelRaw
         let runtimeVariant = session.selectedAgent.claudeRuntimeVariant ?? .standard
         let runtimePermission = effectiveClaudeRuntimePermission(for: session)
@@ -310,25 +374,30 @@ final class ClaudeAgentModeCoordinator {
         if let existingController = session.claudeController,
            runtimeVariantChanged || permissionModeChanged || bashToolChanged || mcpStrictModeChanged
         {
-            guard await !(existingController.hasTurnInFlight) else {
-                return
+            let hasTurnInFlight = await existingController.hasTurnInFlight
+            guard intentIsCurrent(intent, for: session),
+                  sessionOwnsClaudeController(existingController, for: session)
+            else {
+                return .superseded
+            }
+            guard !hasTurnInFlight else { return .ready }
+            if case .reconnect = intent, runtimeVariantChanged {
+                return .failed(message: "Claude reconnect requires a fresh session after the runtime provider changed.")
             }
             await recycleClaudeControllerForLaunchSettingsChange(
                 session: session,
                 existingController: existingController,
                 runtimeVariantChanged: runtimeVariantChanged
             )
+            guard intentIsCurrent(intent, for: session) else { return .superseded }
         }
 
         let runtimeWorkspacePath: String?
         do {
             runtimeWorkspacePath = try workspacePathProvider(session)
         } catch {
-            let message = Self.providerStartupFailureMessage(for: error)
-            let errorItem = AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex)
-            session.appendItem(errorItem)
-            finalizeSession(session, state: .failed, save: true)
-            return
+            guard intentIsCurrent(intent, for: session) else { return .superseded }
+            return .failed(message: Self.providerStartupFailureMessage(for: error))
         }
 
         if let existingController = session.claudeController,
@@ -339,16 +408,18 @@ final class ClaudeAgentModeCoordinator {
                 from: session,
                 removeToolTracking: true
             ) else {
-                return
+                return .superseded
             }
             _ = await retireClaudeController(
                 detached,
                 for: session,
-                captureProviderSessionID: true
+                captureProviderSessionID: intent.allowsFreshStartRecovery
             )
+            guard intentIsCurrent(intent, for: session) else { return .superseded }
         }
 
         if session.claudeController == nil {
+            guard intentIsCurrent(intent, for: session) else { return .superseded }
             let launchSettings = ControllerLaunchSettings(
                 runtimeVariant: runtimeVariant,
                 workspacePath: runtimeWorkspacePath,
@@ -366,35 +437,37 @@ final class ClaudeAgentModeCoordinator {
             session.claudeController = createdController
             controllerLaunchSettingsByTabID[session.tabID] = launchSettings
             await createdController.ensureEventsStreamReady()
-            guard sessionOwnsClaudeController(createdController, for: session) else {
-                await createdController.shutdown()
-                return
+            guard intentIsCurrent(intent, for: session),
+                  sessionOwnsClaudeController(createdController, for: session)
+            else {
+                if !sessionOwnsClaudeController(createdController, for: session) {
+                    await createdController.shutdown()
+                }
+                return .superseded
             }
         }
 
-        guard let controller = session.claudeController else { return }
+        guard let controller = session.claudeController else { return .superseded }
         do {
             let model = effectiveClaudeModel(selectedModelRaw: launchModelRaw)
             let sessionRef = try await startOrResumeWithFallback(
                 controller: controller,
                 session: session,
-                runID: runID,
+                intent: intent,
                 model: model,
                 runtimeVariant: runtimeVariant,
                 effectivePermissionMode: effectivePermissionMode,
                 effectiveAllowNativeBashTool: effectiveAllowNativeBashTool,
                 effectiveMCPStrictMode: effectiveMCPStrictMode
             )
+            guard intentIsCurrent(intent, for: session) else { return .superseded }
             updateProviderSessionIDIfNeeded(sessionRef.sessionID, for: session)
+            return .ready
         } catch ControllerLifecycleError.superseded {
-            return
+            return .superseded
         } catch {
-            let errorItem = AgentChatItem.error(
-                "Claude native start failed: \(error.localizedDescription)",
-                sequenceIndex: session.nextSequenceIndex
-            )
-            session.appendItem(errorItem)
-            finalizeSession(session, state: .failed, save: true)
+            guard intentIsCurrent(intent, for: session) else { return .superseded }
+            return .failed(message: "Claude native start failed: \(error.localizedDescription)")
         }
     }
 
@@ -566,7 +639,7 @@ final class ClaudeAgentModeCoordinator {
     private func startOrResumeWithFallback(
         controller: any NativeAgentRuntimeControlling,
         session: AgentModeViewModel.TabSession,
-        runID: UUID,
+        intent: NativeSessionIntent,
         model: String?,
         runtimeVariant: ClaudeCodeRuntimeVariant,
         effectivePermissionMode: String,
@@ -583,48 +656,51 @@ final class ClaudeAgentModeCoordinator {
                 effortLevel: effortLevel,
                 systemPromptOverride: systemPromptOverride
             )
-            guard sessionOwnsClaudeController(controller, for: session) else {
-                await controller.shutdown()
+            guard intentIsCurrent(intent, for: session),
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                if !sessionOwnsClaudeController(controller, for: session) {
+                    await controller.shutdown()
+                }
                 throw ControllerLifecycleError.superseded
             }
             return sessionRef
         } catch ControllerLifecycleError.superseded {
             throw ControllerLifecycleError.superseded
         } catch {
-            guard sessionOwnsClaudeController(controller, for: session) else {
-                await controller.shutdown()
+            guard intentIsCurrent(intent, for: session),
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                if !sessionOwnsClaudeController(controller, for: session) {
+                    await controller.shutdown()
+                }
                 throw ControllerLifecycleError.superseded
             }
-            guard shouldRetryFreshStartWithoutResume(after: error, existingSessionID: existingSessionID) else {
+            guard intent.allowsFreshStartRecovery,
+                  shouldRetryFreshStartWithoutResume(after: error, existingSessionID: existingSessionID)
+            else {
                 throw error
             }
 
             await hostCapabilities.stageClaudeResumeRecoveryHandoff(session)
-            guard sessionOwnsClaudeController(controller, for: session) else {
-                await controller.shutdown()
+            guard intentIsCurrent(intent, for: session),
+                  let detached = detachClaudeController(
+                      controller,
+                      from: session,
+                      removeToolTracking: true
+                  )
+            else {
                 throw ControllerLifecycleError.superseded
             }
-            await controller.shutdown()
-            guard let detached = detachClaudeController(
-                controller,
-                from: session,
-                removeToolTracking: true
-            ) else {
-                throw ControllerLifecycleError.superseded
-            }
+            await detached.controller.shutdown()
             await stopToolTracking(detached, for: session)
-            // Run-scoped retry: if a successor installed its own run identity
-            // while tool tracking stopped, this fresh-start retry is superseded
-            // and must not touch the successor's state.
-            guard session.clearRunID(ifCurrent: runID) else {
+            guard intentIsCurrent(intent, for: session) else {
                 throw ControllerLifecycleError.superseded
             }
-            session.providerSessionID = nil
-            session.providerCleanupHandle = nil
-            session.isDirty = true
-            hostCapabilities.scheduleSave(session)
 
-            let freshRunID = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
+            // A resume fallback is still the same canonical run attempt. Reuse
+            // its process identity and retain the previous provider identity
+            // until the fresh controller has actually started successfully.
             let retryWorkspacePath = try workspacePathProvider(session)
             let launchSettings = ControllerLaunchSettings(
                 runtimeVariant: runtimeVariant,
@@ -634,7 +710,7 @@ final class ClaudeAgentModeCoordinator {
                 mcpStrictMode: effectiveMCPStrictMode
             )
             let freshController = claudeControllerFactory(
-                freshRunID,
+                intent.runID,
                 session.tabID,
                 windowID,
                 launchSettings
@@ -648,8 +724,12 @@ final class ClaudeAgentModeCoordinator {
                 effortLevel: effortLevel,
                 systemPromptOverride: systemPromptOverride
             )
-            guard sessionOwnsClaudeController(freshController, for: session) else {
-                await freshController.shutdown()
+            guard intentIsCurrent(intent, for: session),
+                  sessionOwnsClaudeController(freshController, for: session)
+            else {
+                if !sessionOwnsClaudeController(freshController, for: session) {
+                    await freshController.shutdown()
+                }
                 throw ControllerLifecycleError.superseded
             }
             return sessionRef
@@ -825,22 +905,26 @@ final class ClaudeAgentModeCoordinator {
     func sendClaudeNativeMessage(
         session: AgentModeViewModel.TabSession,
         text: String,
-        attachments _: [AgentImageAttachment]
-    ) async -> Bool {
-        session.waitingPrompt = nil
-        session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
-        session.setRunningStatus("Thinking…", source: .transport)
-        session.runState = .running
+        attachments _: [AgentImageAttachment],
+        intent: NativeSessionIntent
+    ) async -> NativeSendOutcome {
+        guard intentIsCurrent(intent, for: session) else { return .superseded }
         var handler = toolHandler(for: session)
         handler.resetTurnState(for: session)
-        hostCapabilities.setAgentRunActive(session, true)
-        hostCapabilities.requestUIRefresh(session, true)
 
         for _ in 0 ..< 3 {
-            await ensureClaudeNativeSession(session: session)
-            guard let controller = session.claudeController else {
-                finalizeSession(session, state: .failed)
-                return false
+            switch await ensureClaudeNativeSession(session: session, intent: intent) {
+            case .ready:
+                break
+            case let .failed(message):
+                return recordSendFailure(message, session: session, intent: intent)
+            case .superseded:
+                return .superseded
+            }
+            guard intentIsCurrent(intent, for: session),
+                  let controller = session.claudeController
+            else {
+                return .superseded
             }
 
             if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session) {
@@ -849,33 +933,45 @@ final class ClaudeAgentModeCoordinator {
                     controller: controller,
                     handler: handler
                 ) else {
-                    if !sessionOwnsClaudeController(controller, for: session) {
-                        continue
+                    guard intentIsCurrent(intent, for: session),
+                          sessionOwnsClaudeController(controller, for: session)
+                    else {
+                        return .superseded
                     }
-                    return false
+                    return recordSendFailure(
+                        "Claude native send failed because the active turn could not be interrupted safely.",
+                        session: session,
+                        intent: intent
+                    )
                 }
-                guard sessionOwnsClaudeController(controller, for: session) else {
-                    continue
+                guard intentIsCurrent(intent, for: session),
+                      sessionOwnsClaudeController(controller, for: session)
+                else {
+                    return .superseded
                 }
                 await recycleClaudeControllerForLaunchSettingsChange(
                     session: session,
                     existingController: controller,
                     runtimeVariantChanged: effectiveClaudeRuntimeVariantChanged(for: session)
                 )
-                if let runID = session.runID {
-                    await ensureClaudeToolTrackingIfNeeded(for: session, runID: runID)
-                    handler = toolHandler(for: session)
-                }
+                guard intentIsCurrent(intent, for: session) else { return .superseded }
+                await ensureClaudeToolTrackingIfNeeded(for: session, runID: intent.runID)
+                handler = toolHandler(for: session)
                 continue
             }
 
             let hasActiveSession = await controller.hasActiveSession
-            guard sessionOwnsClaudeController(controller, for: session) else {
-                continue
+            guard intentIsCurrent(intent, for: session),
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                return .superseded
             }
             guard hasActiveSession else {
-                finalizeSession(session, state: .failed)
-                return false
+                return recordSendFailure(
+                    "Claude native send failed because the provider session is not active.",
+                    session: session,
+                    intent: intent
+                )
             }
 
             guard await interruptClaudeTurnIfNeeded(
@@ -883,13 +979,21 @@ final class ClaudeAgentModeCoordinator {
                 controller: controller,
                 handler: handler
             ) else {
-                if !sessionOwnsClaudeController(controller, for: session) {
-                    continue
+                guard intentIsCurrent(intent, for: session),
+                      sessionOwnsClaudeController(controller, for: session)
+                else {
+                    return .superseded
                 }
-                return false
+                return recordSendFailure(
+                    "Claude native send failed because the active turn could not be interrupted safely.",
+                    session: session,
+                    intent: intent
+                )
             }
-            guard sessionOwnsClaudeController(controller, for: session) else {
-                continue
+            guard intentIsCurrent(intent, for: session),
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                return .superseded
             }
 
             // Ensure the events stream has a live continuation before sending. If a
@@ -899,8 +1003,10 @@ final class ClaudeAgentModeCoordinator {
             // so events that arrive in between must be buffered in a live stream.
             // ensureEventsStreamReady is idempotent — it only recreates if nil.
             await controller.ensureEventsStreamReady()
-            guard sessionOwnsClaudeController(controller, for: session) else {
-                continue
+            guard intentIsCurrent(intent, for: session),
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                return .superseded
             }
 
             // This is the final launch-settings validation before dispatch. There is
@@ -912,10 +1018,9 @@ final class ClaudeAgentModeCoordinator {
                     existingController: controller,
                     runtimeVariantChanged: effectiveClaudeRuntimeVariantChanged(for: session)
                 )
-                if let runID = session.runID {
-                    await ensureClaudeToolTrackingIfNeeded(for: session, runID: runID)
-                    handler = toolHandler(for: session)
-                }
+                guard intentIsCurrent(intent, for: session) else { return .superseded }
+                await ensureClaudeToolTrackingIfNeeded(for: session, runID: intent.runID)
+                handler = toolHandler(for: session)
                 continue
             }
 
@@ -924,34 +1029,58 @@ final class ClaudeAgentModeCoordinator {
                 let instructions = agentModeInstructionInjection(for: session)
                 let providerBoundText = providerBoundUserMessage(outboundText, instructions: instructions)
                 let turnID = try await controller.sendUserMessage(providerBoundText)
-                guard sessionOwnsClaudeController(controller, for: session) else {
-                    await controller.shutdown()
-                    return false
+                guard intentIsCurrent(intent, for: session),
+                      sessionOwnsClaudeController(controller, for: session)
+                else {
+                    if !sessionOwnsClaudeController(controller, for: session) {
+                        await controller.shutdown()
+                    }
+                    return .superseded
                 }
                 session.claudeExpectedTurnIDs.insert(turnID)
-                return true
+                return .sent
             } catch {
-                guard sessionOwnsClaudeController(controller, for: session) else {
-                    await controller.shutdown()
-                    return false
+                guard intentIsCurrent(intent, for: session),
+                      sessionOwnsClaudeController(controller, for: session)
+                else {
+                    if !sessionOwnsClaudeController(controller, for: session) {
+                        await controller.shutdown()
+                    }
+                    return .superseded
                 }
-                let errorItem = AgentChatItem.error(
+                return recordSendFailure(
                     "Claude native send failed: \(error.localizedDescription)",
-                    sequenceIndex: session.nextSequenceIndex
+                    session: session,
+                    intent: intent
                 )
-                session.appendItem(errorItem)
-                finalizeSession(session, state: .failed, save: true)
-                return false
             }
         }
 
-        let errorItem = AgentChatItem.error(
+        return recordSendFailure(
             "Claude native send failed because launch settings changed repeatedly before dispatch.",
-            sequenceIndex: session.nextSequenceIndex
+            session: session,
+            intent: intent
         )
-        session.appendItem(errorItem)
-        finalizeSession(session, state: .failed, save: true)
-        return false
+    }
+
+    private func recordSendFailure(
+        _ message: String,
+        session: AgentModeViewModel.TabSession,
+        intent: NativeSessionIntent
+    ) -> NativeSendOutcome {
+        guard intentIsCurrent(intent, for: session) else { return .superseded }
+        if session.items.last?.kind != .error || session.items.last?.text != message {
+            session.appendItem(
+                AgentChatItem.error(
+                    message,
+                    sequenceIndex: session.nextSequenceIndex
+                )
+            )
+        }
+        session.isDirty = true
+        hostCapabilities.requestUIRefresh(session, true)
+        hostCapabilities.scheduleSave(session)
+        return .failed(message: message)
     }
 
     private func interruptClaudeTurnIfNeeded(
