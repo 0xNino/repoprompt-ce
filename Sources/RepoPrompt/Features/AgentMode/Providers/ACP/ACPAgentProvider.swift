@@ -3,6 +3,7 @@ import Foundation
 enum ACPProviderID: String, Hashable {
     case openCode
     case cursor
+    case grokBuild
 }
 
 enum ACPSupportResult: Equatable {
@@ -177,6 +178,42 @@ enum NormalizedAgentRuntimeEvent {
     case terminal(state: AgentSessionRunState, errorText: String?)
 }
 
+/// Result of parsing a provider-specific session-open model advertisement.
+enum ACPProviderModelSnapshotResult: Equatable {
+    /// The provider response carries no usable model metadata.
+    case absent
+    /// A valid snapshot was parsed.
+    case valid(ACPDiscoveredSessionModels)
+    /// Metadata was present but malformed; explicit model selection must be
+    /// unavailable and the failure recorded/diagnosed. Never persisted.
+    case malformed(reason: String)
+}
+
+/// A provider-owned direct model-selection RPC (e.g. Grok's `session/set_model`).
+/// The controller stays unaware of provider method names and parameter keys.
+struct ACPDirectModelSelectionRequest {
+    let method: String
+    let params: [String: Any]
+}
+
+/// Bounded capability for ACP providers that advertise session models outside the
+/// modern `configOptions` contract (e.g. Grok's top-level `SessionModelState`) and
+/// apply selections through a provider-specific RPC instead of
+/// `session/set_config_option`.
+///
+/// The controller consults this ONLY when modern `configOptions` metadata is
+/// absent; a malformed modern selector never falls back to this path.
+protocol ACPDirectSessionModelProvider: Sendable {
+    func parseDirectSessionModelSnapshot(
+        from sessionResponse: [String: Any]
+    ) -> ACPProviderModelSnapshotResult
+
+    func makeDirectModelSelectionRequest(
+        sessionID: String,
+        modelRaw: String
+    ) -> ACPDirectModelSelectionRequest
+}
+
 protocol ACPAgentProvider: Sendable {
     var providerID: ACPProviderID { get }
 
@@ -197,6 +234,11 @@ protocol ACPAgentProvider: Sendable {
     func preferredAuthMethodID(context: ACPAuthenticationContext) -> String?
     func cleanupLaunchArtifacts(for configuration: ACPLaunchConfiguration) async
     func normalizeError(_ error: Error) -> Error
+
+    /// Whether a provider's stderr line should be surfaced into the transcript as a system
+    /// event. Must be declared here (not only in the extension) so the controller's call
+    /// through the existential dispatches to provider overrides.
+    func shouldEmitStderrLine(_ line: String) -> Bool
 }
 
 extension ACPAgentProvider {
@@ -205,4 +247,11 @@ extension ACPAgentProvider {
     }
 
     func cleanupLaunchArtifacts(for _: ACPLaunchConfiguration) async {}
+
+    /// Whether a provider's stderr line should be surfaced into the transcript as a system
+    /// event. Default surfaces everything; providers with known-noisy background logging
+    /// can suppress specific patterns (diagnostics still record every line).
+    func shouldEmitStderrLine(_: String) -> Bool {
+        true
+    }
 }

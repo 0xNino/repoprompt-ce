@@ -469,6 +469,7 @@ actor DirectHeadlessMCPService {
         if normalized.contains("claude") { return .agentModeClaudeEngineer }
         if normalized.contains("opencode") { return .agentModeOpenCodeEngineer }
         if normalized.contains("cursor") { return .agentModeCursorEngineer }
+        if normalized.contains("grok") { return .agentModeGrokBuildEngineer }
         return .agentModeGenericEngineer
     }
 
