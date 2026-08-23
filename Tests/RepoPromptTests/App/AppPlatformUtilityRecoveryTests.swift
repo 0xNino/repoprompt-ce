@@ -2,6 +2,41 @@
 import XCTest
 
 final class AppPlatformUtilityRecoveryTests: XCTestCase {
+    func testSparkleUpdaterStartDecisionFailsClosedForIdentityMigration() {
+        XCTAssertEqual(
+            SparkleUpdaterManager.startDecision(
+                sparkleConfigurationValid: true,
+                updaterStarted: false,
+                identityMigrationBlockedMessage: "migration blocked"
+            ),
+            .blocked("migration blocked")
+        )
+        XCTAssertEqual(
+            SparkleUpdaterManager.startDecision(
+                sparkleConfigurationValid: true,
+                updaterStarted: false,
+                identityMigrationBlockedMessage: nil
+            ),
+            .start
+        )
+        XCTAssertEqual(
+            SparkleUpdaterManager.startDecision(
+                sparkleConfigurationValid: false,
+                updaterStarted: false,
+                identityMigrationBlockedMessage: "migration blocked"
+            ),
+            .ignore
+        )
+        XCTAssertEqual(
+            SparkleUpdaterManager.startDecision(
+                sparkleConfigurationValid: true,
+                updaterStarted: true,
+                identityMigrationBlockedMessage: "migration blocked"
+            ),
+            .ignore
+        )
+    }
+
     func testAgentSessionDeepLinkURLRoundTripsAndRejectsInvalidScopedRoutes() throws {
         let route = try AgentSessionDeepLinkRoute(
             windowID: 7,

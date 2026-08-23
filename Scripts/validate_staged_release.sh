@@ -164,12 +164,13 @@ REPOPROMPT_RELEASE_SOURCE_ROOT="$APPROVED_SOURCE_ROOT" \
     "$SCRIPT_DIR/validate_packaged_legal.sh" "$APP_BUNDLE"
 
 python3 - "$APPROVED_SOURCE_ROOT/AppBundle/Info.plist.template" "$APP_BUNDLE/Contents/Info.plist" \
-    "$APP_NAME" "$DISPLAY_NAME" "$BUNDLE_ID" "$MARKETING_VERSION" "$BUILD_NUMBER" <<'PYTHON'
+    "$APP_NAME" "$DISPLAY_NAME" "$BUNDLE_ID" "$MARKETING_VERSION" "$BUILD_NUMBER" \
+    "${REPOPROMPT_IDENTITY_MIGRATION_PHASE:-disabled}" <<'PYTHON'
 import plistlib
 import sys
 from pathlib import Path
 
-template, actual, app_name, display_name, bundle_id, version, build = sys.argv[1:]
+template, actual, app_name, display_name, bundle_id, version, build, identity_migration_phase = sys.argv[1:]
 text = Path(template).read_text(encoding="utf-8")
 for key, value in {
     "__APP_NAME__": app_name,
@@ -181,10 +182,19 @@ for key, value in {
     "__SIGNING_MODE__": "release-candidate-adhoc",
     "__LOCAL_SIGNING_CERTIFICATE_SHA256__": "",
     "__LOCAL_SECURE_STORAGE_GENERATION__": "",
+    "__IDENTITY_MIGRATION_PHASE__": identity_migration_phase,
 }.items():
     text = text.replace(key, value)
-if plistlib.loads(text.encode("utf-8")) != plistlib.loads(Path(actual).read_bytes()):
+expected_plist = plistlib.loads(text.encode("utf-8"))
+actual_plist = plistlib.loads(Path(actual).read_bytes())
+if expected_plist != actual_plist:
     raise SystemExit("ERROR: staged Info.plist does not match the approved release candidate")
+actual_identity_migration_phase = actual_plist.get("RepoPromptIdentityMigrationPhase", "disabled")
+if actual_identity_migration_phase != identity_migration_phase:
+    raise SystemExit(
+        "ERROR: staged identity migration phase mismatch: "
+        f"expected {identity_migration_phase}, got {actual_identity_migration_phase}"
+    )
 PYTHON
 
 printf 'OK: staged release payload matches approved source and confined path policy.\n'

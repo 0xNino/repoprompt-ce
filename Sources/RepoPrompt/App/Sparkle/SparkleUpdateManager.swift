@@ -9,6 +9,12 @@ import Combine
 import Sparkle
 import SwiftUI
 
+enum SparkleUpdaterStartDecision: Equatable {
+    case ignore
+    case blocked(String)
+    case start
+}
+
 #if DEBUG
     private var sparkleUpdaterManagerDebugLoggingEnabled = false
     private func sparkleUpdaterManagerDebugLog(_ message: @autoclosure () -> String) {
@@ -166,7 +172,20 @@ final class SparkleUpdaterManager: ObservableObject {
     }
 
     func startUpdater() {
-        guard sparkleConfigurationValid, !updaterStarted else { return }
+        switch Self.startDecision(
+            sparkleConfigurationValid: sparkleConfigurationValid,
+            updaterStarted: updaterStarted,
+            identityMigrationBlockedMessage: IdentityMigrationRuntimeState.shared.updatesBlockedMessage()
+        ) {
+        case .ignore:
+            return
+        case let .blocked(blockedMessage):
+            updatesDisabledMessage = blockedMessage
+            canCheckForUpdates = false
+            return
+        case .start:
+            break
+        }
 
         // Install observers before activation so no Sparkle event can race registration.
         setupObservers()
@@ -182,6 +201,18 @@ final class SparkleUpdaterManager: ObservableObject {
 
         // Setup periodic passive update checking if enabled.
         setupPeriodicUpdateCheck()
+    }
+
+    static func startDecision(
+        sparkleConfigurationValid: Bool,
+        updaterStarted: Bool,
+        identityMigrationBlockedMessage: String?
+    ) -> SparkleUpdaterStartDecision {
+        guard sparkleConfigurationValid, !updaterStarted else { return .ignore }
+        if let identityMigrationBlockedMessage {
+            return .blocked(identityMigrationBlockedMessage)
+        }
+        return .start
     }
 
     private static func loadPassiveAppcastChecksPreference(defaultingTo sparkleAutomaticChecks: Bool) -> Bool {

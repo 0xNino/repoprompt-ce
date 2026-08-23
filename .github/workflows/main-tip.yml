@@ -158,6 +158,9 @@ jobs:
           TIP_TAG: ${{ needs.setup.outputs.tag }}
           REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
           REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/tip-source
+          # Tip is rolling and cannot preserve a migration phase across automatic
+          # workflow_run publishes. Preparers are Stable-only release artifacts.
+          REPOPROMPT_IDENTITY_MIGRATION_PHASE: disabled
           # Link Sentry and preserve dSYMs without exposing DSN or auth in this stage.
           REPOPROMPT_ENABLE_SENTRY: "1"
         run: ./trusted-control-plane/Scripts/main_tip_release.sh stage
@@ -208,6 +211,7 @@ jobs:
         env:
           RELEASE_COMMIT: ${{ needs.setup.outputs.commit }}
           REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE: ${{ needs.setup.outputs.build-number }}
+          REPOPROMPT_IDENTITY_MIGRATION_PHASE: disabled
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -289,6 +293,7 @@ jobs:
           REPOPROMPT_APPROVED_SOURCE_ROOT: ${{ github.workspace }}/approved-source
           REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE: ${{ needs.setup.outputs.build-number }}
           REPOPROMPT_ENABLE_SENTRY: "1"
+          REPOPROMPT_IDENTITY_MIGRATION_PHASE: disabled
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}
           REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}

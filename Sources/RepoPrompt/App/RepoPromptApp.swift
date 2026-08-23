@@ -183,6 +183,7 @@ struct RepoPromptSwiftUIApp: App {
 @MainActor
 public enum RepoPromptApplication {
     public static func main() {
+        SecureStorageIdentityMigrationBootstrap.prepareIfConfigured()
         RepoPromptSwiftUIApp.main()
     }
 }
