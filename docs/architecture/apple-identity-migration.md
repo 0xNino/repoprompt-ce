@@ -21,9 +21,11 @@ contain multiple update items during the transition; this does not require extra
    using the same validated dual-identity ACL as the bridge. The journal contains a random attempt
    identifier and the exact closed account catalog, allowing the successor to discover the committed
    bridge without relying on mutable preferences.
-3. `P` copies every present account in `SecureStorageAccountCatalog` from the current Developer ID
-   Keychain service into bridge items scoped by that attempt identifier. New records use create-only
-   writes so an unproven pre-existing ACL cannot be retained.
+3. `P` copies every present account in the frozen version-2 migration catalog from the current
+   Developer ID Keychain service into a bridge service whose name includes that attempt identifier.
+   Service and account are generic-password primary-key attributes, so an orphaned earlier attempt
+   cannot collide with a later attempt. New records use create-only writes so an unproven
+   pre-existing ACL cannot be retained.
 4. Each new bridge item receives a classic macOS Keychain ACL derived from the running legacy-signed
    executable and an embedded executable signed for the successor identity. Before creating that ACL,
    runtime code validates both executables against their exact identifiers, Team IDs, and Developer ID
@@ -34,8 +36,10 @@ contain multiple update items during the transition; this does not require extra
    removed.
 6. Only after every source and bridge value matches does `P` create and verify a committed bridge
    manifest, commit the dual-identity Keychain journal, and select the bridge as the canonical backend.
-7. Later launches verify the committed bridge manifest instead of decrypting the full credential
-   catalog. Later legacy builds copy its committed ACL when they need to create a new bridge item.
+7. Later launches authenticate the journal and bridge manifest by inspecting their decrypt ACLs and
+   requiring exactly the legacy and successor designated requirements before accepting the JSON.
+   Later builds validate that ACL again before copying it to a new bridge item. The version-2 catalog
+   remains frozen; accounts added to the app later are created in the already-authoritative bridge.
 8. If any read needs interaction, validation or read-back fails, or either manifest cannot be persisted,
    the old secure-storage service remains canonical and Sparkle is paused. Settings surfaces distinguish
    a locked Keychain, cancelled access, authentication failure, and generic verification failure, then
@@ -73,6 +77,8 @@ for the full account catalog. It must demonstrate:
 - the legacy app can create, read, and update bridge items without authorization UI;
 - the successor app can read and update the same items without authorization UI;
 - interrupted writes resume from the dual-identity Keychain journal without losing a newer source value;
+- a lost journal starts a collision-free attempt even when orphaned bridge records remain;
+- forged journal or bridge-manifest ACLs fail closed and are never propagated to new credentials;
 - inaccessible records, forged or missing manifests, invalid runtime anchors, and unknown phase values
   fail closed;
 - a locked Keychain pauses updates visibly and a later unlocked relaunch retries successfully;

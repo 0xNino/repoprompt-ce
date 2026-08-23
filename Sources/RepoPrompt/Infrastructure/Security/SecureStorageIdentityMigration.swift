@@ -155,9 +155,10 @@ struct KeychainSecureStorageIdentityMigrationStateStore: SecureStorageIdentityMi
 
 /// Copies the closed secure-storage inventory into a new service whose item ACL trusts
 /// both signing identities. A legacy-Keychain journal is committed before mutation, so
-/// interrupted attempts can reconcile only items carrying that attempt's random marker.
+/// interrupted attempts can reconcile only items in that attempt's random service.
 final class SecureStorageIdentityMigrationCoordinator {
-    typealias BridgeStoreFactory = (String) -> SecureKeyValueStorageBackend
+    typealias BridgeStoreFactory = (String) throws -> SecureKeyValueStorageBackend
+    typealias AttemptIdentifierGenerator = () -> String
 
     private enum CoordinatorError: Error {
         case manifestEncodingFailed
@@ -171,18 +172,23 @@ final class SecureStorageIdentityMigrationCoordinator {
     private let sourceStore: SecureKeyValueStorageBackend
     private let bridgeStoreFactory: BridgeStoreFactory
     private let stateStore: SecureStorageIdentityMigrationStateStore
+    private let attemptIdentifierGenerator: AttemptIdentifierGenerator
     private let accessMode = KeychainAccessMode.nonInteractive(reason: .launch)
 
     init(
-        accounts: [SecureStorageAccount] = SecureStorageAccountCatalog.allAccounts,
+        accounts: [SecureStorageAccount] = SecureStorageAccountCatalog.identityMigrationV2Accounts,
         sourceStore: SecureKeyValueStorageBackend,
         bridgeStoreFactory: @escaping BridgeStoreFactory,
-        stateStore: SecureStorageIdentityMigrationStateStore
+        stateStore: SecureStorageIdentityMigrationStateStore,
+        attemptIdentifierGenerator: @escaping AttemptIdentifierGenerator = {
+            UUID().uuidString.lowercased()
+        }
     ) {
         self.accounts = accounts
         self.sourceStore = sourceStore
         self.bridgeStoreFactory = bridgeStoreFactory
         self.stateStore = stateStore
+        self.attemptIdentifierGenerator = attemptIdentifierGenerator
     }
 
     func prepareBridge() -> SecureStorageIdentityMigrationReport {
@@ -216,10 +222,17 @@ final class SecureStorageIdentityMigrationCoordinator {
             return failedReport(records: preflightRecords)
         }
 
+        let attemptIdentifier = attemptIdentifierGenerator()
+        guard KeychainService.identityMigrationBridgeServiceName(for: attemptIdentifier) != nil else {
+            return failedReport(
+                records: preflightRecords,
+                error: KeychainACLValidationError.invalidExpectedPrincipalPolicy
+            )
+        }
         let manifest = SecureStorageIdentityMigrationManifest(
             version: SecureStorageIdentityMigrationManifest.currentVersion,
             status: .preparing,
-            attemptIdentifier: UUID().uuidString.lowercased(),
+            attemptIdentifier: attemptIdentifier,
             catalogIdentifiers: expectedCatalogIdentifiers
         )
         do {
@@ -240,9 +253,19 @@ final class SecureStorageIdentityMigrationCoordinator {
     }
 
     private func isStructurallyValid(_ manifest: SecureStorageIdentityMigrationManifest) -> Bool {
+        Self.isStructurallyValid(
+            manifest,
+            expectedCatalogIdentifiers: expectedCatalogIdentifiers
+        )
+    }
+
+    static func isStructurallyValid(
+        _ manifest: SecureStorageIdentityMigrationManifest,
+        expectedCatalogIdentifiers: [String]
+    ) -> Bool {
         manifest.version == SecureStorageIdentityMigrationManifest.currentVersion
-            && !manifest.attemptIdentifier.isEmpty
-            && manifest.catalogIdentifiers == expectedCatalogIdentifiers
+            && KeychainService.identityMigrationBridgeServiceName(for: manifest.attemptIdentifier) != nil
+            && manifest.catalogIdentifiers == expectedCatalogIdentifiers.sorted()
     }
 
     private func readAll(from store: SecureKeyValueStorageBackend) -> [SecureStorageAccount: ReadResult] {
@@ -286,7 +309,12 @@ final class SecureStorageIdentityMigrationCoordinator {
         _ manifest: SecureStorageIdentityMigrationManifest,
         sourceResults suppliedSourceResults: [SecureStorageAccount: ReadResult]? = nil
     ) -> SecureStorageIdentityMigrationReport {
-        let bridgeStore = bridgeStoreFactory(manifest.attemptIdentifier)
+        let bridgeStore: SecureKeyValueStorageBackend
+        do {
+            bridgeStore = try bridgeStoreFactory(manifest.attemptIdentifier)
+        } catch {
+            return blockedReport(error: error)
+        }
         let sourceResults = suppliedSourceResults ?? readAll(from: sourceStore)
         let bridgeResults = readAll(from: bridgeStore)
         let preflightRecords = zipResults(source: sourceResults, bridge: bridgeResults)
@@ -369,8 +397,9 @@ final class SecureStorageIdentityMigrationCoordinator {
                 if sourceValue == bridgeValue {
                     return SecureStorageIdentityMigrationRecord(account: account, state: .verified)
                 }
-                // The random item marker and preparing journal prove this is an
-                // interrupted attempt. The source remains authoritative until commit.
+                // The random attempt-specific service and preparing journal prove
+                // this is an interrupted attempt. The source remains authoritative
+                // until commit.
                 try bridgeStore.save(sourceValue, for: account.identifier, accessMode: accessMode)
                 let verified = try bridgeStore.get(for: account.identifier, accessMode: accessMode)
                 return SecureStorageIdentityMigrationRecord(
@@ -442,7 +471,12 @@ final class SecureStorageIdentityMigrationCoordinator {
     private func verifyCommittedBridge(
         _ manifest: SecureStorageIdentityMigrationManifest
     ) -> SecureStorageIdentityMigrationReport {
-        let bridgeStore = bridgeStoreFactory(manifest.attemptIdentifier)
+        let bridgeStore: SecureKeyValueStorageBackend
+        do {
+            bridgeStore = try bridgeStoreFactory(manifest.attemptIdentifier)
+        } catch {
+            return blockedReport(error: error)
+        }
         guard let encoded = Self.encodeManifest(manifest) else {
             return blockedReport()
         }
@@ -489,6 +523,51 @@ final class SecureStorageIdentityMigrationCoordinator {
     }
 }
 
+enum SecureStorageIdentityMigrationActivationError: Error {
+    case invalidJournal
+    case invalidBridgeManifest
+}
+
+struct SecureStorageIdentityMigrationCommittedBridge {
+    let manifest: SecureStorageIdentityMigrationManifest
+    let store: SecureKeyValueStorageBackend
+}
+
+/// Resolves the committed bridge from authenticated storage. Production stores
+/// validate each item's decrypt ACL before returning its JSON, so structural
+/// equality is only considered after the journal and bridge-manifest authorities
+/// have both been proven.
+struct SecureStorageIdentityMigrationCommittedBridgeResolver {
+    let accounts: [SecureStorageAccount]
+    let stateStore: SecureStorageIdentityMigrationStateStore
+    let bridgeStoreFactory: SecureStorageIdentityMigrationCoordinator.BridgeStoreFactory
+
+    func resolve() throws -> SecureStorageIdentityMigrationCommittedBridge? {
+        guard let manifest = try stateStore.load() else { return nil }
+        guard manifest.status == .committed,
+              SecureStorageIdentityMigrationCoordinator.isStructurallyValid(
+                  manifest,
+                  expectedCatalogIdentifiers: accounts.map(\.identifier)
+              ),
+              let encoded = SecureStorageIdentityMigrationCoordinator.encodeManifest(manifest)
+        else {
+            throw SecureStorageIdentityMigrationActivationError.invalidJournal
+        }
+
+        let bridgeStore = try bridgeStoreFactory(manifest.attemptIdentifier)
+        guard try bridgeStore.get(
+            for: SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount,
+            accessMode: .nonInteractive(reason: .launch)
+        ) == encoded else {
+            throw SecureStorageIdentityMigrationActivationError.invalidBridgeManifest
+        }
+        return SecureStorageIdentityMigrationCommittedBridge(
+            manifest: manifest,
+            store: bridgeStore
+        )
+    }
+}
+
 final class IdentityMigrationRuntimeState: @unchecked Sendable {
     static let shared = IdentityMigrationRuntimeState()
 
@@ -526,6 +605,13 @@ enum SecureStorageIdentityMigrationBootstrap {
         return Phase(rawValue: rawPhase)
     }
 
+    static func preparerCatalogMatchesFrozenCatalog(
+        currentAccounts: [SecureStorageAccount] = SecureStorageAccountCatalog.allAccounts,
+        migrationAccounts: [SecureStorageAccount] = SecureStorageAccountCatalog.identityMigrationV2Accounts
+    ) -> Bool {
+        currentAccounts.map(\.identifier) == migrationAccounts.map(\.identifier)
+    }
+
     static func prepareIfConfigured(bundle: Bundle = .main) {
         IdentityMigrationRuntimeState.shared.setBlockedMessage(nil)
         guard SecureKeyValueStorageFactory.currentDecision().domain == .officialDeveloperID else { return }
@@ -544,7 +630,8 @@ enum SecureStorageIdentityMigrationBootstrap {
     }
 
     private static func prepareLegacyBridge(bundle: Bundle) {
-        guard bundle.bundleIdentifier == RuntimeCodeSigningPolicy.developerIDBundleIdentifier,
+        guard preparerCatalogMatchesFrozenCatalog(),
+              bundle.bundleIdentifier == RuntimeCodeSigningPolicy.developerIDBundleIdentifier,
               let executableURL = bundle.executableURL,
               let resourceURL = bundle.resourceURL,
               let relativeAnchorPath = bundle.object(forInfoDictionaryKey: anchorRelativePathInfoKey) as? String,
@@ -559,123 +646,161 @@ enum SecureStorageIdentityMigrationBootstrap {
                   requirementSource: successorDeveloperIDRequirement
               )
         else {
-            blockUpdates("Updates are paused because the secure credential migration package is incomplete or has an invalid identity anchor.")
+            blockUpdates("Updates are paused because the secure credential migration package is incomplete, its account catalog changed, or it has an invalid identity anchor.")
             return
         }
 
-        let attributeProvider = TrustedApplicationsKeychainAttributeProvider(
-            descriptor: "RepoPrompt CE identity migration bridge",
-            applications: [
-                TrustedApplicationCodeRequirement(
-                    trustedApplicationPath: executableURL.path,
-                    codeURL: bundle.bundleURL,
-                    requirementSource: RuntimeCodeSigningPolicy.developerIDRequirement
-                ),
-                TrustedApplicationCodeRequirement(
-                    trustedApplicationPath: anchorURL.path,
-                    codeURL: anchorURL,
-                    requirementSource: successorDeveloperIDRequirement
-                )
-            ]
-        )
+        let authority: KeychainAccessAuthority
+        do {
+            authority = try KeychainAccessAuthority(
+                descriptor: "RepoPrompt CE identity migration bridge",
+                applications: [
+                    TrustedApplicationCodeRequirement(
+                        trustedApplicationPath: executableURL.path,
+                        codeURL: bundle.bundleURL,
+                        requirementSource: RuntimeCodeSigningPolicy.developerIDRequirement
+                    ),
+                    TrustedApplicationCodeRequirement(
+                        trustedApplicationPath: anchorURL.path,
+                        codeURL: anchorURL,
+                        requirementSource: successorDeveloperIDRequirement
+                    )
+                ]
+            )
+        } catch {
+            blockUpdates(for: error)
+            return
+        }
+        let attributeProvider = authority.creationAttributeProvider
         let stateStore = KeychainSecureStorageIdentityMigrationStateStore(
             store: KeychainService(
                 serviceName: KeychainService.identityMigrationLegacyStateServiceName,
-                itemCreationAttributeProvider: attributeProvider
+                itemCreationAttributeProvider: attributeProvider,
+                itemAccessValidator: authority.accessValidator
             )
         )
         let coordinator = SecureStorageIdentityMigrationCoordinator(
             sourceStore: KeychainService.officialV2Shared,
             bridgeStoreFactory: { attemptIdentifier in
-                bridgeStore(
+                try bridgeStore(
                     attemptIdentifier: attemptIdentifier,
-                    itemCreationAttributeProvider: attributeProvider
+                    itemCreationAttributeProvider: attributeProvider,
+                    itemAccessValidator: authority.accessValidator
                 )
             },
             stateStore: stateStore
         )
         let report = coordinator.prepareBridge()
-        guard report.bridgeReady,
-              let manifest = try? stateStore.load(),
-              manifest.status == .committed
-        else {
+        guard report.bridgeReady else {
             blockUpdates(report.blockedUpdateMessage)
             return
         }
-
-        SecureKeyValueStorageFactory.installOfficialBackendOverride(
-            bridgeStore(
-                attemptIdentifier: manifest.attemptIdentifier,
-                itemCreationAttributeProvider: attributeProvider
-            )
-        )
-    }
-
-    private static func activateCommittedBridgeIfPresent() {
-        let stateStore = KeychainSecureStorageIdentityMigrationStateStore()
-        let manifest: SecureStorageIdentityMigrationManifest?
+        let manifest: SecureStorageIdentityMigrationManifest
         do {
-            manifest = try stateStore.load()
+            guard let loadedManifest = try stateStore.load(),
+                  loadedManifest.status == .committed
+            else {
+                blockUpdates("Updates are paused because the secure credential migration journal is incomplete.")
+                return
+            }
+            manifest = loadedManifest
         } catch {
             blockUpdates(for: error)
             return
         }
-        guard let manifest else { return }
-        guard manifest.version == SecureStorageIdentityMigrationManifest.currentVersion,
-              manifest.status == .committed,
-              !manifest.attemptIdentifier.isEmpty,
-              manifest.catalogIdentifiers == SecureStorageAccountCatalog.allAccounts.map(\.identifier).sorted(),
-              let encoded = SecureStorageIdentityMigrationCoordinator.encodeManifest(manifest)
-        else {
+
+        do {
+            let bridge = try bridgeStore(
+                attemptIdentifier: manifest.attemptIdentifier,
+                itemCreationAttributeProvider: attributeProvider,
+                itemAccessValidator: authority.accessValidator
+            )
+            SecureKeyValueStorageFactory.installOfficialBackendOverride(bridge)
+        } catch {
+            blockUpdates(for: error)
+        }
+    }
+
+    private static func activateCommittedBridgeIfPresent() {
+        let accessValidator: ClassicKeychainACLValidator
+        do {
+            accessValidator = try ClassicKeychainACLValidator(
+                requirementSources: [
+                    RuntimeCodeSigningPolicy.developerIDRequirement,
+                    successorDeveloperIDRequirement
+                ]
+            )
+        } catch {
+            blockUpdates(for: error)
+            return
+        }
+        let stateStore = KeychainSecureStorageIdentityMigrationStateStore(
+            store: KeychainService(
+                serviceName: KeychainService.identityMigrationLegacyStateServiceName,
+                itemAccessValidator: accessValidator
+            )
+        )
+        let resolution: SecureStorageIdentityMigrationCommittedBridge?
+        do {
+            resolution = try SecureStorageIdentityMigrationCommittedBridgeResolver(
+                accounts: SecureStorageAccountCatalog.identityMigrationV2Accounts,
+                stateStore: stateStore,
+                bridgeStoreFactory: { attemptIdentifier in
+                    guard let serviceName = KeychainService.identityMigrationBridgeServiceName(
+                        for: attemptIdentifier
+                    ) else {
+                        throw SecureStorageIdentityMigrationActivationError.invalidJournal
+                    }
+                    return KeychainService(
+                        serviceName: serviceName,
+                        itemAccessValidator: accessValidator
+                    )
+                }
+            ).resolve()
+        } catch {
+            blockUpdates(for: error)
+            return
+        }
+        guard let resolution else { return }
+        let manifest = resolution.manifest
+
+        guard let bridgeServiceName = KeychainService.identityMigrationBridgeServiceName(
+            for: manifest.attemptIdentifier
+        ) else {
             blockUpdates("Updates are paused because the secure credential migration journal is incomplete.")
             return
         }
 
-        let itemIdentityAttributes = bridgeItemIdentityAttributes(manifest.attemptIdentifier)
-        let readOnlyBridge = KeychainService(
-            serviceName: KeychainService.identityMigrationBridgeServiceName,
-            itemIdentityAttributes: itemIdentityAttributes
+        let accessProvider = ExistingKeychainItemAccessAttributeProvider(
+            serviceName: bridgeServiceName,
+            account: SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount,
+            accessValidator: accessValidator
         )
         do {
-            guard try readOnlyBridge.get(
-                for: SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount,
-                accessMode: .nonInteractive(reason: .launch)
-            ) == encoded
-            else {
-                blockUpdates("Updates are paused because the secure credential migration bridge could not be verified.")
-                return
-            }
+            let bridge = try bridgeStore(
+                attemptIdentifier: manifest.attemptIdentifier,
+                itemCreationAttributeProvider: accessProvider,
+                itemAccessValidator: accessValidator
+            )
+            SecureKeyValueStorageFactory.installOfficialBackendOverride(bridge)
         } catch {
             blockUpdates(for: error)
-            return
         }
-
-        let accessProvider = ExistingKeychainItemAccessAttributeProvider(
-            serviceName: KeychainService.identityMigrationBridgeServiceName,
-            account: SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount,
-            itemIdentityAttributes: itemIdentityAttributes
-        )
-        SecureKeyValueStorageFactory.installOfficialBackendOverride(
-            bridgeStore(
-                attemptIdentifier: manifest.attemptIdentifier,
-                itemCreationAttributeProvider: accessProvider
-            )
-        )
     }
 
     private static func bridgeStore(
         attemptIdentifier: String,
-        itemCreationAttributeProvider: KeychainItemCreationAttributeProvider
-    ) -> KeychainService {
-        KeychainService(
-            serviceName: KeychainService.identityMigrationBridgeServiceName,
+        itemCreationAttributeProvider: KeychainItemCreationAttributeProvider,
+        itemAccessValidator: KeychainItemAccessValidator
+    ) throws -> KeychainService {
+        guard let serviceName = KeychainService.identityMigrationBridgeServiceName(for: attemptIdentifier) else {
+            throw KeychainACLValidationError.invalidExpectedPrincipalPolicy
+        }
+        return KeychainService(
+            serviceName: serviceName,
             itemCreationAttributeProvider: itemCreationAttributeProvider,
-            itemIdentityAttributes: bridgeItemIdentityAttributes(attemptIdentifier)
+            itemAccessValidator: itemAccessValidator
         )
-    }
-
-    private static func bridgeItemIdentityAttributes(_ attemptIdentifier: String) -> [String: Any] {
-        [kSecAttrGeneric as String: Data(attemptIdentifier.utf8)]
     }
 
     static func validatedAnchorURL(relativePath: String, resourceURL: URL) -> URL? {

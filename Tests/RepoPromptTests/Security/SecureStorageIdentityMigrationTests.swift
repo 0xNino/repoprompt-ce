@@ -4,6 +4,8 @@ import XCTest
 
 final class SecureStorageIdentityMigrationTests: XCTestCase {
     private let accounts: [SecureStorageAccount] = [.openAIAPI, .anthropicAPI]
+    private let firstAttemptIdentifier = "123e4567-e89b-12d3-a456-426614174000"
+    private let secondAttemptIdentifier = "123e4567-e89b-12d3-a456-426614174001"
 
     func testPreparationCopiesValuesCommitsBothManifestsAndPreservesSource() throws {
         let source = MigrationTestBackend(values: [SecureStorageAccount.openAIAPI.identifier: "secret"])
@@ -40,7 +42,8 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
 
     func testPreflightReadFailureWritesNeitherJournalNorBridge() {
         let source = MigrationTestBackend()
-        source.getErrors[SecureStorageAccount.openAIAPI.identifier] = .interactionNotAllowed
+        source.getErrors[SecureStorageAccount.openAIAPI.identifier] =
+            KeychainService.KeychainError.interactionNotAllowed
         let bridge = MigrationTestBackend()
         let state = TestIdentityMigrationStateStore()
         var factoryCallCount = 0
@@ -61,7 +64,8 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
 
     func testPreflightPreservesCancelledAndAuthenticationFailures() {
         let cancellationSource = MigrationTestBackend()
-        cancellationSource.getErrors[SecureStorageAccount.openAIAPI.identifier] = .userInteractionCancelled
+        cancellationSource.getErrors[SecureStorageAccount.openAIAPI.identifier] =
+            KeychainService.KeychainError.userInteractionCancelled
 
         let cancellationReport = makeCoordinator(
             source: cancellationSource,
@@ -73,7 +77,8 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         XCTAssertTrue(cancellationReport.blockedUpdateMessage?.contains("Keychain access was cancelled") == true)
 
         let authenticationSource = MigrationTestBackend()
-        authenticationSource.getErrors[SecureStorageAccount.openAIAPI.identifier] = .authenticationFailed
+        authenticationSource.getErrors[SecureStorageAccount.openAIAPI.identifier] =
+            KeychainService.KeychainError.authenticationFailed
 
         let authenticationReport = makeCoordinator(
             source: authenticationSource,
@@ -91,7 +96,8 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
             SecureStorageAccount.anthropicAPI.identifier: "anthropic"
         ])
         let bridge = MigrationTestBackend()
-        bridge.createErrors[SecureStorageAccount.anthropicAPI.identifier] = .unexpectedStatus(-1)
+        bridge.createErrors[SecureStorageAccount.anthropicAPI.identifier] =
+            KeychainService.KeychainError.unexpectedStatus(-1)
         let state = TestIdentityMigrationStateStore()
         let coordinator = makeCoordinator(source: source, bridge: bridge, state: state)
 
@@ -114,6 +120,47 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(state.manifest).status, .committed)
     }
 
+    func testLostJournalStartsNewServiceAndIgnoresOrphanedAttemptItems() throws {
+        let source = MigrationTestBackend(values: [
+            SecureStorageAccount.openAIAPI.identifier: "openai",
+            SecureStorageAccount.anthropicAPI.identifier: "anthropic"
+        ])
+        let firstBridge = MigrationTestBackend()
+        firstBridge.createErrors[SecureStorageAccount.anthropicAPI.identifier] =
+            KeychainService.KeychainError.unexpectedStatus(-1)
+        let secondBridge = MigrationTestBackend()
+        let state = TestIdentityMigrationStateStore()
+        var generatedAttempts = [firstAttemptIdentifier, secondAttemptIdentifier]
+        let coordinator = makeCoordinator(
+            source: source,
+            state: state,
+            attemptIdentifierGenerator: { generatedAttempts.removeFirst() }
+        ) { attemptIdentifier in
+            switch attemptIdentifier {
+            case self.firstAttemptIdentifier:
+                firstBridge
+            case self.secondAttemptIdentifier:
+                secondBridge
+            default:
+                throw TestStateError.failed
+            }
+        }
+
+        XCTAssertFalse(coordinator.prepareBridge().bridgeReady)
+        XCTAssertEqual(
+            firstBridge.value(for: SecureStorageAccount.openAIAPI.identifier),
+            "openai"
+        )
+        try state.reset()
+
+        let recoveredReport = coordinator.prepareBridge()
+
+        XCTAssertTrue(recoveredReport.bridgeReady)
+        XCTAssertEqual(secondBridge.value(for: SecureStorageAccount.openAIAPI.identifier), "openai")
+        XCTAssertEqual(secondBridge.value(for: SecureStorageAccount.anthropicAPI.identifier), "anthropic")
+        XCTAssertEqual(state.manifest?.attemptIdentifier, secondAttemptIdentifier)
+    }
+
     func testPreparingJournalRemovesAttemptScopedValueWhenSourceWasDeleted() {
         let manifest = makeManifest(status: .preparing)
         let source = MigrationTestBackend()
@@ -134,7 +181,7 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         let encoded = try XCTUnwrap(SecureStorageIdentityMigrationCoordinator.encodeManifest(manifest))
         XCTAssertEqual(
             encoded,
-            #"{"attemptIdentifier":"attempt-123","catalogIdentifiers":["AnthropicAPI","OpenAIAPI"],"status":"committed","version":2}"#
+            #"{"attemptIdentifier":"123e4567-e89b-12d3-a456-426614174000","catalogIdentifiers":["AnthropicAPI","OpenAIAPI"],"status":"committed","version":2}"#
         )
         let source = MigrationTestBackend()
         let bridge = MigrationTestBackend(values: [
@@ -202,6 +249,75 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         XCTAssertTrue(source.calls.isEmpty)
     }
 
+    func testForgedJournalACLBlocksBeforeBridgeOrCredentialReads() {
+        let source = MigrationTestBackend()
+        let journalBackend = MigrationTestBackend()
+        journalBackend.getErrors[KeychainSecureStorageIdentityMigrationStateStore.account] =
+            KeychainACLValidationError.extraPrincipal
+        var bridgeFactoryCalled = false
+        let coordinator = makeCoordinator(
+            source: source,
+            state: KeychainSecureStorageIdentityMigrationStateStore(store: journalBackend)
+        ) { _ in
+            bridgeFactoryCalled = true
+            return MigrationTestBackend()
+        }
+
+        let report = coordinator.prepareBridge()
+
+        XCTAssertFalse(report.bridgeReady)
+        XCTAssertFalse(bridgeFactoryCalled)
+        XCTAssertTrue(source.calls.isEmpty)
+    }
+
+    func testForgedBridgeManifestACLBlocksCommittedActivation() throws {
+        let manifest = makeManifest(status: .committed)
+        let encoded = try XCTUnwrap(SecureStorageIdentityMigrationCoordinator.encodeManifest(manifest))
+        let bridge = MigrationTestBackend(values: [
+            SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount: encoded
+        ])
+        bridge.getErrors[SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount] =
+            KeychainACLValidationError.extraPrincipal
+        let resolver = SecureStorageIdentityMigrationCommittedBridgeResolver(
+            accounts: accounts,
+            stateStore: TestIdentityMigrationStateStore(manifest: manifest),
+            bridgeStoreFactory: { _ in bridge }
+        )
+
+        XCTAssertThrowsError(try resolver.resolve()) { error in
+            XCTAssertEqual(error as? KeychainACLValidationError, .extraPrincipal)
+        }
+    }
+
+    func testCommittedBridgeRemainsAuthorityWhenRuntimeCatalogAddsAccount() throws {
+        let frozenMigrationAccounts: [SecureStorageAccount] = [.openAIAPI]
+        let futureRuntimeAccount = SecureStorageAccount.anthropicAPI
+        let manifest = SecureStorageIdentityMigrationManifest(
+            version: SecureStorageIdentityMigrationManifest.currentVersion,
+            status: .committed,
+            attemptIdentifier: firstAttemptIdentifier,
+            catalogIdentifiers: frozenMigrationAccounts.map(\.identifier)
+        )
+        let encoded = try XCTUnwrap(SecureStorageIdentityMigrationCoordinator.encodeManifest(manifest))
+        let bridge = MigrationTestBackend(values: [
+            SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount: encoded
+        ])
+        let resolution = try XCTUnwrap(SecureStorageIdentityMigrationCommittedBridgeResolver(
+            accounts: frozenMigrationAccounts,
+            stateStore: TestIdentityMigrationStateStore(manifest: manifest),
+            bridgeStoreFactory: { _ in bridge }
+        ).resolve())
+
+        try resolution.store.save(
+            "future-value",
+            for: futureRuntimeAccount.identifier,
+            accessMode: .nonInteractive(reason: .test)
+        )
+
+        XCTAssertEqual(bridge.value(for: futureRuntimeAccount.identifier), "future-value")
+        XCTAssertEqual(resolution.manifest.catalogIdentifiers, [SecureStorageAccount.openAIAPI.identifier])
+    }
+
     func testPreparingJournalPersistenceFailureLeavesBridgeUntouched() {
         let source = MigrationTestBackend(values: [SecureStorageAccount.openAIAPI.identifier: "secret"])
         let bridge = MigrationTestBackend()
@@ -239,7 +355,8 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
     func testBridgeManifestPersistenceFailureLeavesJournalPreparing() {
         let source = MigrationTestBackend(values: [SecureStorageAccount.openAIAPI.identifier: "secret"])
         let bridge = MigrationTestBackend()
-        bridge.createErrors[SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount] = .unexpectedStatus(-1)
+        bridge.createErrors[SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount] =
+            KeychainService.KeychainError.unexpectedStatus(-1)
         let state = TestIdentityMigrationStateStore()
 
         let report = makeCoordinator(source: source, bridge: bridge, state: state).prepareBridge()
@@ -252,7 +369,8 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
     func testBridgeManifestAuthenticationFailureKeepsSpecificBlockedReason() {
         let source = MigrationTestBackend(values: [SecureStorageAccount.openAIAPI.identifier: "secret"])
         let bridge = MigrationTestBackend()
-        bridge.createErrors[SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount] = .authenticationFailed
+        bridge.createErrors[SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount] =
+            KeychainService.KeychainError.authenticationFailed
         let state = TestIdentityMigrationStateStore()
 
         let report = makeCoordinator(source: source, bridge: bridge, state: state).prepareBridge()
@@ -287,6 +405,17 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         XCTAssertNil(SecureStorageIdentityMigrationBootstrap.configuredPhase(from: 1))
     }
 
+    func testPreparerCatalogGateRejectsDriftFromFrozenMigrationCatalog() {
+        XCTAssertTrue(SecureStorageIdentityMigrationBootstrap.preparerCatalogMatchesFrozenCatalog(
+            currentAccounts: [.openAIAPI],
+            migrationAccounts: [.openAIAPI]
+        ))
+        XCTAssertFalse(SecureStorageIdentityMigrationBootstrap.preparerCatalogMatchesFrozenCatalog(
+            currentAccounts: [.openAIAPI, .anthropicAPI],
+            migrationAccounts: [.openAIAPI]
+        ))
+    }
+
     func testAnchorValidationRejectsSymlinkAndPathEscape() throws {
         let fixture = try makeAnchorFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -309,7 +438,7 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         SecureStorageIdentityMigrationManifest(
             version: SecureStorageIdentityMigrationManifest.currentVersion,
             status: status,
-            attemptIdentifier: "attempt-123",
+            attemptIdentifier: firstAttemptIdentifier,
             catalogIdentifiers: accounts.map(\.identifier).sorted()
         )
     }
@@ -325,13 +454,17 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
     private func makeCoordinator(
         source: SecureKeyValueStorageBackend,
         state: SecureStorageIdentityMigrationStateStore,
+        attemptIdentifierGenerator: @escaping SecureStorageIdentityMigrationCoordinator.AttemptIdentifierGenerator = {
+            UUID().uuidString.lowercased()
+        },
         bridgeFactory: @escaping SecureStorageIdentityMigrationCoordinator.BridgeStoreFactory
     ) -> SecureStorageIdentityMigrationCoordinator {
         SecureStorageIdentityMigrationCoordinator(
             accounts: accounts,
             sourceStore: source,
             bridgeStoreFactory: bridgeFactory,
-            stateStore: state
+            stateStore: state,
+            attemptIdentifierGenerator: attemptIdentifierGenerator
         )
     }
 
@@ -402,10 +535,10 @@ private final class MigrationTestBackend: SecureKeyValueStorageBackend, @uncheck
     }
 
     let persistsValuesAcrossLaunches = true
-    var getErrors: [String: KeychainService.KeychainError] = [:]
-    var saveErrors: [String: KeychainService.KeychainError] = [:]
-    var createErrors: [String: KeychainService.KeychainError] = [:]
-    var deleteErrors: [String: KeychainService.KeychainError] = [:]
+    var getErrors: [String: Error] = [:]
+    var saveErrors: [String: Error] = [:]
+    var createErrors: [String: Error] = [:]
+    var deleteErrors: [String: Error] = [:]
 
     private var values: [String: String]
     private(set) var calls: [Call] = []

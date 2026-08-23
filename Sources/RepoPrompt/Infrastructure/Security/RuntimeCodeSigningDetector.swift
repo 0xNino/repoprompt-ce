@@ -138,6 +138,17 @@ enum RuntimeCodeSigningDetector {
         return requirement
     }
 
+    static func requirementData(from source: String) -> Data? {
+        guard let requirement = requirement(from: source) else { return nil }
+        var data: CFData?
+        guard SecRequirementCopyData(requirement, [], &data) == errSecSuccess,
+              let data
+        else {
+            return nil
+        }
+        return data as Data
+    }
+
     private static func leafCertificateFingerprint(from dictionary: [String: Any]) -> String? {
         guard let certificates = dictionary[kSecCodeInfoCertificates as String] as? [SecCertificate],
               let leafCertificate = certificates.first

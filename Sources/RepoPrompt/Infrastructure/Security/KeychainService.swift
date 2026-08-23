@@ -59,6 +59,43 @@ protocol KeychainItemCreationAttributeProvider {
     func attributesForNewItem() throws -> [String: Any]
 }
 
+protocol KeychainItemAccessValidator {
+    func validate(_ access: AnyObject) throws
+}
+
+protocol SecKeychainItemAccessProvider {
+    func copyAccess(from result: AnyObject) throws -> AnyObject
+}
+
+enum KeychainItemAccessProviderError: Error, LocalizedError, Equatable {
+    case invalidItemReference
+    case accessCopyFailed(status: OSStatus)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidItemReference:
+            "The Keychain item reference is invalid"
+        case let .accessCopyFailed(status):
+            "Could not copy the Keychain access policy (status \(status))"
+        }
+    }
+}
+
+struct SystemSecKeychainItemAccessProvider: SecKeychainItemAccessProvider {
+    func copyAccess(from result: AnyObject) throws -> AnyObject {
+        guard CFGetTypeID(result as CFTypeRef) == SecKeychainItemGetTypeID() else {
+            throw KeychainItemAccessProviderError.invalidItemReference
+        }
+        let item = unsafeBitCast(result, to: SecKeychainItem.self)
+        var access: SecAccess?
+        let status = SecKeychainItemCopyAccess(item, &access)
+        guard status == errSecSuccess, let access else {
+            throw KeychainItemAccessProviderError.accessCopyFailed(status: status)
+        }
+        return access
+    }
+}
+
 enum KeychainItemCreationAttributeError: Error, LocalizedError, Equatable {
     case trustedApplicationCreationFailed(path: String, status: OSStatus)
     case trustedApplicationValidationFailed(path: String)
@@ -85,14 +122,247 @@ enum KeychainItemCreationAttributeError: Error, LocalizedError, Equatable {
     }
 }
 
-/// Builds a classic macOS Keychain ACL from signed executables. The migration preparer
-/// supplies its current executable plus an embedded executable signed for the successor
-/// identity. Security.framework derives the designated requirements; no credential data
-/// or authorization prompt is involved in constructing this policy.
+/// Builds a classic macOS Keychain ACL from exact code requirements after validating
+/// the corresponding signed executables. The migration preparer supplies its current
+/// executable plus an embedded executable signed for the successor identity; no
+/// credential data or authorization prompt is involved in constructing this policy.
 struct TrustedApplicationCodeRequirement {
     let trustedApplicationPath: String
     let codeURL: URL
     let requirementSource: String
+}
+
+enum KeychainACLPrincipal: Equatable {
+    case requirement(Data)
+    case wildcard
+    case malformed
+}
+
+enum KeychainACLValidationError: Error, LocalizedError, Equatable {
+    case invalidExpectedPrincipalPolicy
+    case invalidAccess
+    case decryptACLListMissing
+    case unexpectedDecryptACLCount(Int)
+    case accessACLTypeInvalid
+    case accessACLContentsCopyFailed(status: OSStatus)
+    case wildcardPrincipal
+    case missingPrincipal
+    case extraPrincipal
+    case duplicatePrincipal
+    case malformedPrincipal
+    case trustedApplicationRequirementCopyFailed(status: OSStatus)
+    case trustedApplicationRequirementMissing
+    case requirementDataCopyFailed(status: OSStatus)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidExpectedPrincipalPolicy:
+            "The Keychain ACL principal policy is invalid"
+        case .invalidAccess:
+            "The Keychain access policy is invalid"
+        case .decryptACLListMissing:
+            "The Keychain access policy has no decrypt ACL"
+        case let .unexpectedDecryptACLCount(count):
+            "The Keychain access policy has an unexpected number of decrypt ACLs (\(count))"
+        case .accessACLTypeInvalid:
+            "The Keychain access-control list contains an invalid ACL"
+        case let .accessACLContentsCopyFailed(status):
+            "Could not inspect Keychain ACL contents (status \(status))"
+        case .wildcardPrincipal:
+            "The Keychain access policy contains a wildcard principal"
+        case .missingPrincipal:
+            "The Keychain access policy is missing an expected principal"
+        case .extraPrincipal:
+            "The Keychain access policy contains an unexpected principal"
+        case .duplicatePrincipal:
+            "The Keychain access policy contains a duplicate principal"
+        case .malformedPrincipal:
+            "The Keychain access policy contains a malformed principal"
+        case let .trustedApplicationRequirementCopyFailed(status):
+            "Could not inspect a Keychain trusted-application requirement (status \(status))"
+        case .trustedApplicationRequirementMissing:
+            "The Keychain trusted application has no code requirement"
+        case let .requirementDataCopyFailed(status):
+            "Could not serialize a Keychain trusted-application requirement (status \(status))"
+        }
+    }
+}
+
+/// Security.framework exports these SPIs on macOS, and its implementation is the
+/// only API that creates and exposes the code requirement carried by a
+/// SecTrustedApplication.
+/// SecTrustedApplicationCopyData is deliberately not used: Apple documents that
+/// payload as opaque, and current Security sources return the principal description
+/// (normally a path), not the requirement that grants access.
+@_silgen_name("SecTrustedApplicationCopyRequirement")
+private func SecTrustedApplicationCopyRequirementSPI(
+    _ application: SecTrustedApplication,
+    _ requirement: UnsafeMutablePointer<SecRequirement?>
+) -> OSStatus
+
+@_silgen_name("SecTrustedApplicationCreateFromRequirement")
+private func SecTrustedApplicationCreateFromRequirementSPI(
+    _ description: UnsafePointer<CChar>?,
+    _ requirement: SecRequirement,
+    _ application: UnsafeMutablePointer<SecTrustedApplication?>
+) -> OSStatus
+
+/// Authenticates the one ACL that can decrypt a classic Keychain item. Every
+/// trusted application in that ACL must carry one of the exact expected designated
+/// requirements, with no wildcard, duplicate, missing, or additional principal.
+struct ClassicKeychainACLValidator: KeychainItemAccessValidator {
+    private let expectedPrincipalData: [Data]
+
+    init(requirementSources: [String]) throws {
+        guard !requirementSources.isEmpty else {
+            throw KeychainACLValidationError.invalidExpectedPrincipalPolicy
+        }
+        let principalData = requirementSources.compactMap(RuntimeCodeSigningDetector.requirementData(from:))
+        guard principalData.count == requirementSources.count,
+              Set(principalData).count == principalData.count
+        else {
+            throw KeychainACLValidationError.invalidExpectedPrincipalPolicy
+        }
+        expectedPrincipalData = principalData
+    }
+
+    func validate(_ access: AnyObject) throws {
+        guard CFGetTypeID(access as CFTypeRef) == SecAccessGetTypeID() else {
+            throw KeychainACLValidationError.invalidAccess
+        }
+        let access = unsafeBitCast(access, to: SecAccess.self)
+        guard let aclList = SecAccessCopyMatchingACLList(
+            access,
+            kSecACLAuthorizationDecrypt
+        ) else {
+            throw KeychainACLValidationError.decryptACLListMissing
+        }
+        let aclCount = CFArrayGetCount(aclList)
+        guard aclCount == 1 else {
+            throw KeychainACLValidationError.unexpectedDecryptACLCount(aclCount)
+        }
+
+        var principals: [KeychainACLPrincipal] = []
+        let aclValue = CFArrayGetValueAtIndex(aclList, 0)
+        let aclObject: CFTypeRef = unsafeBitCast(aclValue, to: CFTypeRef.self)
+        guard CFGetTypeID(aclObject) == SecACLGetTypeID() else {
+            throw KeychainACLValidationError.accessACLTypeInvalid
+        }
+        let acl = unsafeBitCast(aclValue, to: SecACL.self)
+        var applications: CFArray?
+        var description: CFString?
+        var promptSelector = SecKeychainPromptSelector(rawValue: 0)
+        let contentsStatus = SecACLCopyContents(
+            acl,
+            &applications,
+            &description,
+            &promptSelector
+        )
+        guard contentsStatus == errSecSuccess else {
+            throw KeychainACLValidationError.accessACLContentsCopyFailed(status: contentsStatus)
+        }
+        guard let applications else {
+            throw KeychainACLValidationError.wildcardPrincipal
+        }
+        guard CFArrayGetCount(applications) > 0 else {
+            throw KeychainACLValidationError.missingPrincipal
+        }
+        for applicationIndex in 0 ..< CFArrayGetCount(applications) {
+            let applicationValue = CFArrayGetValueAtIndex(applications, applicationIndex)
+            let applicationObject: CFTypeRef = unsafeBitCast(
+                applicationValue,
+                to: CFTypeRef.self
+            )
+            guard CFGetTypeID(applicationObject) == SecTrustedApplicationGetTypeID() else {
+                principals.append(.malformed)
+                continue
+            }
+            let application = unsafeBitCast(
+                applicationValue,
+                to: SecTrustedApplication.self
+            )
+            var requirement: SecRequirement?
+            let requirementStatus = SecTrustedApplicationCopyRequirementSPI(
+                application,
+                &requirement
+            )
+            guard requirementStatus == errSecSuccess else {
+                throw KeychainACLValidationError.trustedApplicationRequirementCopyFailed(
+                    status: requirementStatus
+                )
+            }
+            guard let requirement else {
+                throw KeychainACLValidationError.trustedApplicationRequirementMissing
+            }
+            var data: CFData?
+            let dataStatus = SecRequirementCopyData(requirement, [], &data)
+            guard dataStatus == errSecSuccess else {
+                throw KeychainACLValidationError.requirementDataCopyFailed(status: dataStatus)
+            }
+            guard let data, CFDataGetLength(data) > 0 else {
+                principals.append(.malformed)
+                continue
+            }
+            principals.append(.requirement(data as Data))
+        }
+
+        try Self.validate(principals: principals, expected: expectedPrincipalData)
+    }
+
+    static func validate(
+        principals: [KeychainACLPrincipal],
+        expected: [Data]
+    ) throws {
+        guard !expected.isEmpty,
+              Set(expected).count == expected.count
+        else {
+            throw KeychainACLValidationError.invalidExpectedPrincipalPolicy
+        }
+
+        var seen: Set<Data> = []
+        for principal in principals {
+            switch principal {
+            case .wildcard:
+                throw KeychainACLValidationError.wildcardPrincipal
+            case .malformed:
+                throw KeychainACLValidationError.malformedPrincipal
+            case let .requirement(data):
+                guard !data.isEmpty else {
+                    throw KeychainACLValidationError.malformedPrincipal
+                }
+                guard expected.contains(data) else {
+                    throw KeychainACLValidationError.extraPrincipal
+                }
+                guard seen.insert(data).inserted else {
+                    throw KeychainACLValidationError.duplicatePrincipal
+                }
+            }
+        }
+        guard seen == Set(expected) else {
+            throw KeychainACLValidationError.missingPrincipal
+        }
+    }
+}
+
+struct KeychainAccessAuthority {
+    let creationAttributeProvider: TrustedApplicationsKeychainAttributeProvider
+    let accessValidator: ClassicKeychainACLValidator
+
+    init(
+        descriptor: String,
+        applications: [TrustedApplicationCodeRequirement]
+    ) throws {
+        guard applications.count == 2 else {
+            throw KeychainACLValidationError.invalidExpectedPrincipalPolicy
+        }
+        creationAttributeProvider = TrustedApplicationsKeychainAttributeProvider(
+            descriptor: descriptor,
+            applications: applications
+        )
+        accessValidator = try ClassicKeychainACLValidator(
+            requirementSources: applications.map(\.requirementSource)
+        )
+    }
 }
 
 final class TrustedApplicationsKeychainAttributeProvider: KeychainItemCreationAttributeProvider {
@@ -124,11 +394,19 @@ final class TrustedApplicationsKeychainAttributeProvider: KeychainItemCreationAt
                     path: application.trustedApplicationPath
                 )
             }
+            guard let requirement = RuntimeCodeSigningDetector.requirement(
+                from: application.requirementSource
+            ) else {
+                throw KeychainACLValidationError.invalidExpectedPrincipalPolicy
+            }
             var trustedApplication: SecTrustedApplication?
-            let status = SecTrustedApplicationCreateFromPath(
-                application.trustedApplicationPath,
-                &trustedApplication
-            )
+            let status = application.trustedApplicationPath.withCString { description in
+                SecTrustedApplicationCreateFromRequirementSPI(
+                    description,
+                    requirement,
+                    &trustedApplication
+                )
+            }
             guard status == errSecSuccess, let trustedApplication else {
                 throw KeychainItemCreationAttributeError.trustedApplicationCreationFailed(
                     path: application.trustedApplicationPath,
@@ -164,6 +442,25 @@ struct ExistingKeychainItemAccessAttributeProvider: KeychainItemCreationAttribut
     let serviceName: String
     let account: String
     let itemIdentityAttributes: [String: Any]
+    let accessValidator: KeychainItemAccessValidator
+    let itemAccessProvider: SecKeychainItemAccessProvider
+    let secItemClient: SecItemClient
+
+    init(
+        serviceName: String,
+        account: String,
+        itemIdentityAttributes: [String: Any] = [:],
+        accessValidator: KeychainItemAccessValidator,
+        itemAccessProvider: SecKeychainItemAccessProvider = SystemSecKeychainItemAccessProvider(),
+        secItemClient: SecItemClient = SystemSecItemClient()
+    ) {
+        self.serviceName = serviceName
+        self.account = account
+        self.itemIdentityAttributes = itemIdentityAttributes
+        self.accessValidator = accessValidator
+        self.itemAccessProvider = itemAccessProvider
+        self.secItemClient = secItemClient
+    }
 
     func attributesForNewItem() throws -> [String: Any] {
         var query: [String: Any] = [
@@ -176,23 +473,17 @@ struct ExistingKeychainItemAccessAttributeProvider: KeychainItemCreationAttribut
         ]
         query.merge(itemIdentityAttributes) { _, replacement in replacement }
 
-        var result: CFTypeRef?
-        let lookupStatus = SecItemCopyMatching(query as CFDictionary, &result)
+        var result: AnyObject?
+        let lookupStatus = secItemClient.copyMatching(query as CFDictionary, &result)
         guard lookupStatus == errSecSuccess else {
             throw KeychainItemCreationAttributeError.referenceItemLookupFailed(status: lookupStatus)
         }
-        guard let result,
-              CFGetTypeID(result) == SecKeychainItemGetTypeID()
-        else {
+        guard let result else {
             throw KeychainItemCreationAttributeError.referenceItemInvalid
         }
 
-        let item = unsafeBitCast(result, to: SecKeychainItem.self)
-        var access: SecAccess?
-        let accessStatus = SecKeychainItemCopyAccess(item, &access)
-        guard accessStatus == errSecSuccess, let access else {
-            throw KeychainItemCreationAttributeError.referenceItemAccessFailed(status: accessStatus)
-        }
+        let access = try itemAccessProvider.copyAccess(from: result)
+        try accessValidator.validate(access)
         return [kSecAttrAccess as String: access]
     }
 }
@@ -201,7 +492,7 @@ struct ExistingKeychainItemAccessAttributeProvider: KeychainItemCreationAttribut
 final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
     static let legacyCanonicalServiceName = "com.pvncher.repoprompt.ce.keychain"
     static let officialV2ServiceName = "com.pvncher.repoprompt.ce.developer-id.keychain.v2"
-    static let identityMigrationBridgeServiceName = "com.repoprompt.ce.identity-migration.keychain.v1"
+    static let identityMigrationBridgeServiceNamePrefix = "com.repoprompt.ce.identity-migration.keychain.v1."
     static let identityMigrationLegacyStateServiceName = "com.pvncher.repoprompt.ce.identity-migration.state.v2"
     static let localSelfSignedServiceNamePrefix = "com.pvncher.repoprompt.ce.local-self-signed."
     static let debugServiceName = "com.pvncher.repoprompt.ce.debug.keychain"
@@ -224,10 +515,21 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
         KeychainService(serviceName: legacyCanonicalServiceName, secItemClient: secItemClient)
     }
 
+    static func identityMigrationBridgeServiceName(for attemptIdentifier: String) -> String? {
+        guard let uuid = UUID(uuidString: attemptIdentifier),
+              uuid.uuidString.lowercased() == attemptIdentifier
+        else {
+            return nil
+        }
+        return "\(identityMigrationBridgeServiceNamePrefix)\(attemptIdentifier)"
+    }
+
     let serviceName: String
     private let secItemClient: SecItemClient
     private let itemCreationAttributeProvider: KeychainItemCreationAttributeProvider?
     private let itemIdentityAttributes: [String: Any]
+    private let itemAccessValidator: KeychainItemAccessValidator?
+    private let itemAccessProvider: SecKeychainItemAccessProvider
     private let operationLock = NSRecursiveLock()
 
     let persistsValuesAcrossLaunches = true
@@ -236,12 +538,16 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
         serviceName: String = KeychainService.officialV2ServiceName,
         secItemClient: SecItemClient = SystemSecItemClient(),
         itemCreationAttributeProvider: KeychainItemCreationAttributeProvider? = nil,
-        itemIdentityAttributes: [String: Any] = [:]
+        itemIdentityAttributes: [String: Any] = [:],
+        itemAccessValidator: KeychainItemAccessValidator? = nil,
+        itemAccessProvider: SecKeychainItemAccessProvider = SystemSecKeychainItemAccessProvider()
     ) {
         self.serviceName = serviceName
         self.secItemClient = secItemClient
         self.itemCreationAttributeProvider = itemCreationAttributeProvider
         self.itemIdentityAttributes = itemIdentityAttributes
+        self.itemAccessValidator = itemAccessValidator
+        self.itemAccessProvider = itemAccessProvider
     }
 
     private func withLock<T>(_ body: () throws -> T) rethrows -> T {
@@ -257,6 +563,30 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
             query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUISkip
         }
         return query
+    }
+
+    private func validateExistingItem(
+        for key: String,
+        accessMode: KeychainAccessMode
+    ) throws {
+        guard let itemAccessValidator else { return }
+        let referenceQuery = query([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: key,
+            kSecReturnRef as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ], accessMode: accessMode)
+        var result: AnyObject?
+        let status = secItemClient.copyMatching(referenceQuery as CFDictionary, &result)
+        guard status == errSecSuccess else {
+            throw keychainError(for: status)
+        }
+        guard let result else {
+            throw KeychainItemAccessProviderError.invalidItemReference
+        }
+        let access = try itemAccessProvider.copyAccess(from: result)
+        try itemAccessValidator.validate(access)
     }
 
     private func keychainError(for status: OSStatus) -> KeychainError {
@@ -318,6 +648,14 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
                 throw KeychainError.invalidData
             }
 
+            if itemAccessValidator != nil {
+                do {
+                    try validateExistingItem(for: key, accessMode: accessMode)
+                } catch KeychainError.itemNotFound {
+                    // The atomic add below establishes the ACL for a new item.
+                }
+            }
+
             let itemQuery = query([
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: serviceName,
@@ -331,6 +669,9 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
             let updateStatus = secItemClient.update(itemQuery as CFDictionary, attributes as CFDictionary)
             switch updateStatus {
             case errSecSuccess:
+                if itemAccessValidator != nil {
+                    try validateExistingItem(for: key, accessMode: accessMode)
+                }
                 return
             case errSecItemNotFound:
                 break
@@ -383,6 +724,9 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
         guard addStatus == errSecSuccess else {
             throw keychainError(for: addStatus)
         }
+        if itemAccessValidator != nil {
+            try validateExistingItem(for: key, accessMode: accessMode)
+        }
     }
 
     // MARK: - Retrieve from Keychain
@@ -393,6 +737,7 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
         accessMode: KeychainAccessMode = .interactive
     ) throws -> String {
         let data = try withLock {
+            try validateExistingItem(for: key, accessMode: accessMode)
             let itemQuery = query([
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: serviceName,
@@ -424,6 +769,13 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
     /// Delete an item from this service only.
     func delete(for key: String, accessMode: KeychainAccessMode = .interactive) throws {
         try withLock {
+            if itemAccessValidator != nil {
+                do {
+                    try validateExistingItem(for: key, accessMode: accessMode)
+                } catch KeychainError.itemNotFound {
+                    return
+                }
+            }
             let itemQuery = query([
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: serviceName,

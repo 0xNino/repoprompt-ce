@@ -2813,7 +2813,8 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
             "\n    func startUpdater()", 1
         )[0]
         self.assertNotIn("updaterController.startUpdater()", manager_init)
-        self.assertIn("guard sparkleConfigurationValid, !updaterStarted else { return }", sparkle_manager)
+        self.assertIn("switch Self.startDecision(", sparkle_manager)
+        self.assertIn("guard sparkleConfigurationValid, !updaterStarted else { return .ignore }", sparkle_manager)
         self.assertIn(
             "guard updaterStarted, sparkleConfigurationValid, userInitiatedObserverState.activeRequest == nil else {",
             sparkle_manager,
