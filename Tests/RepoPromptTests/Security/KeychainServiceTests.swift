@@ -149,8 +149,8 @@ final class KeychainServiceTests: XCTestCase {
         XCTAssertEqual(addQuery.stringValue(for: kSecAttrAccount), "api-key")
         XCTAssertEqual(addQuery.stringValue(for: kSecUseAuthenticationUI), kSecUseAuthenticationUISkip as String)
         XCTAssertEqual(addQuery.dataValue(for: kSecValueData), Data("stored-value".utf8))
-        XCTAssertEqual(addQuery.stringValue(for: kSecAttrAccessible), kSecAttrAccessibleAfterFirstUnlock as String)
-        XCTAssertEqual(addQuery.boolValue(for: kSecAttrSynchronizable), false)
+        XCTAssertNil(addQuery.stringValue(for: kSecAttrAccessible))
+        XCTAssertNil(addQuery.boolValue(for: kSecAttrSynchronizable))
     }
 
     func testSaveAddsCreationAttributesOnlyWhenCreatingItem() throws {
@@ -170,7 +170,34 @@ final class KeychainServiceTests: XCTestCase {
 
         XCTAssertEqual(provider.callCount, 1)
         XCTAssertEqual(fake.addQueries.first?.stringValue(for: kSecAttrAccess), "test-access-policy")
+        XCTAssertNil(fake.addQueries.first?.stringValue(for: kSecAttrAccessible))
+        XCTAssertNil(fake.addQueries.first?.boolValue(for: kSecAttrSynchronizable))
         XCTAssertNil(fake.updateAttributes.first?.stringValue(for: kSecAttrAccess))
+    }
+
+    func testCreateAddsWithoutUpdatingAndIncludesFixedIdentityAttributes() throws {
+        let marker = Data("attempt-123".utf8)
+        let fake = FakeSecItemClient(
+            copyHandler: { _, _ in errSecItemNotFound },
+            addHandler: { _, _ in errSecSuccess }
+        )
+        let provider = FakeItemCreationAttributeProvider()
+        let service = KeychainService(
+            serviceName: KeychainService.identityMigrationBridgeServiceName,
+            secItemClient: fake,
+            itemCreationAttributeProvider: provider,
+            itemIdentityAttributes: [kSecAttrGeneric as String: marker]
+        )
+
+        try service.create("stored-value", for: "api-key", accessMode: .nonInteractive(reason: .test))
+
+        XCTAssertEqual(fake.operationLog, ["add"])
+        XCTAssertTrue(fake.updateQueries.isEmpty)
+        let addQuery = try XCTUnwrap(fake.addQueries.first)
+        XCTAssertEqual(addQuery.dataValue(for: kSecAttrGeneric), marker)
+        XCTAssertEqual(addQuery.stringValue(for: kSecAttrAccess), "test-access-policy")
+        XCTAssertNil(addQuery.stringValue(for: kSecAttrAccessible))
+        XCTAssertNil(addQuery.boolValue(for: kSecAttrSynchronizable))
     }
 
     func testPersistentServiceNamesAreIsolatedAndLegacyIsRepairOnly() throws {
@@ -180,12 +207,13 @@ final class KeychainServiceTests: XCTestCase {
             KeychainService.legacyCanonicalServiceName,
             KeychainService.officialV2ServiceName,
             KeychainService.identityMigrationBridgeServiceName,
+            KeychainService.identityMigrationLegacyStateServiceName,
             KeychainService.localSelfSignedServiceName(fingerprint: fingerprintA, generation: 1),
             KeychainService.localSelfSignedServiceName(fingerprint: fingerprintA, generation: 2),
             KeychainService.localSelfSignedServiceName(fingerprint: fingerprintB, generation: 1),
             KeychainService.debugServiceName
         ])
-        XCTAssertEqual(names.count, 7)
+        XCTAssertEqual(names.count, 8)
 
         let fake = FakeSecItemClient { _, _ in errSecItemNotFound }
         let legacy = KeychainService.legacyRepairSource(secItemClient: fake)

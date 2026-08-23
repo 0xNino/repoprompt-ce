@@ -198,10 +198,15 @@ jobs:
             exit 1
           }
           successor_certificate="$RUNNER_TEMP/repoprompt-release-successor.p12"
-          anchor_source="release-source/.build/release/RepoPrompt.app/Contents/MacOS/RepoPrompt"
+          anchor_source="trusted-control-plane/Scripts/identity_migration_anchor.c"
           anchor="$RUNNER_TEMP/repoprompt-successor-identity-anchor"
-          [[ -f "$anchor_source" && -x "$anchor_source" ]] || {
-            echo "Missing staged executable for successor identity anchor: $anchor_source" >&2
+          [[ -f "$anchor_source" ]] || {
+            echo "Missing trusted successor identity anchor source: $anchor_source" >&2
+            exit 1
+          }
+          xcrun clang -arch arm64 -arch x86_64 -Os -Wl,-dead_strip -o "$anchor" "$anchor_source"
+          [[ -f "$anchor" && -x "$anchor" ]] || {
+            echo "Failed to build successor identity anchor" >&2
             exit 1
           }
           printf '%s' "$SUCCESSOR_CERTIFICATE_P12_BASE64" | base64 --decode > "$successor_certificate"
@@ -209,11 +214,10 @@ jobs:
             -P "$SUCCESSOR_CERTIFICATE_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          ditto "$anchor_source" "$anchor"
-          chmod 755 "$anchor"
           codesign --force --sign "$SUCCESSOR_SIGN_IDENTITY" --keychain "$KEYCHAIN_PATH" \
             --identifier com.repoprompt.ce --timestamp --options runtime "$anchor"
-          codesign --verify --strict --verbose=2 "$anchor"
+          successor_requirement='anchor apple generic and identifier "com.repoprompt.ce" and certificate leaf[subject.OU] = "69N6K965SF" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
+          codesign --verify --strict --verbose=2 -R="$successor_requirement" "$anchor"
           signature_details="$(codesign -dv --verbose=4 "$anchor" 2>&1)"
           grep -Fx 'Identifier=com.repoprompt.ce' <<< "$signature_details" >/dev/null
           grep -Fx 'TeamIdentifier=69N6K965SF' <<< "$signature_details" >/dev/null

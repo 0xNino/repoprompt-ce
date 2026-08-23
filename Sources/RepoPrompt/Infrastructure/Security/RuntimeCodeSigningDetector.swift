@@ -35,6 +35,22 @@ struct RuntimeLocalSigningExpectation: Equatable {
 }
 
 enum RuntimeCodeSigningDetector {
+    static func validatesStaticCode(at executableURL: URL, requirementSource: String) -> Bool {
+        var staticCode: SecStaticCode?
+        let createStatus = SecStaticCodeCreateWithPath(executableURL as CFURL, [], &staticCode)
+        guard createStatus == errSecSuccess,
+              let staticCode,
+              let requirement = requirement(from: requirementSource)
+        else {
+            return false
+        }
+        return SecStaticCodeCheckValidity(
+            staticCode,
+            SecCSFlags(rawValue: kSecCSStrictValidate),
+            requirement
+        ) == errSecSuccess
+    }
+
     static func currentProcessSigningInfo(
         localSigningExpectation: RuntimeLocalSigningExpectation? = nil
     ) -> RuntimeCodeSigningInfo {
@@ -115,7 +131,7 @@ enum RuntimeCodeSigningDetector {
         )
     }
 
-    private static func requirement(from source: String) -> SecRequirement? {
+    static func requirement(from source: String) -> SecRequirement? {
         var requirement: SecRequirement?
         let status = SecRequirementCreateWithString(source as CFString, [], &requirement)
         guard status == errSecSuccess else { return nil }

@@ -243,6 +243,7 @@ APP_SIGN_ARGS=(){app_signing_body}
         package_source = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
         source = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
 
+        self.assertTrue((SCRIPT_DIR / "identity_migration_anchor.c").is_file())
         self.assertIn('[[ "$BUNDLE_ID" == "com.pvncher.repoprompt.ce" ]]', package_source)
         self.assertIn('[[ "$SIGNING_TEAM_ID" == "648A27MST5" ]]', package_source)
         self.assertIn('[[ "$PACKAGED_IDENTITY_MIGRATION_PHASE" == "$IDENTITY_MIGRATION_PHASE" ]]', package_source)
@@ -254,7 +255,9 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertIn('[[ "$SIGNING_TEAM_ID" == "648A27MST5" ]]', source)
         self.assertIn('IDENTITY_MIGRATION_TARGET_IDENTIFIER="com.repoprompt.ce"', source)
         self.assertIn('IDENTITY_MIGRATION_TARGET_TEAM_ID="69N6K965SF"', source)
-        self.assertIn('codesign --verify --strict --verbose=2 "$identity_migration_anchor"', source)
+        self.assertIn('IDENTITY_MIGRATION_TARGET_REQUIREMENT=', source)
+        self.assertIn('-R="$IDENTITY_MIGRATION_TARGET_REQUIREMENT" "$identity_migration_anchor"', source)
+        self.assertIn('-R="$IDENTITY_MIGRATION_TARGET_REQUIREMENT" "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"', source)
         self.assertIn('[[ "$anchor_identifier" == "$IDENTITY_MIGRATION_TARGET_IDENTIFIER" ]]', source)
         self.assertIn('[[ "$anchor_team" == "$IDENTITY_MIGRATION_TARGET_TEAM_ID" ]]', source)
         self.assertNotIn('codesign --force --sign "$SIGN_IDENTITY"', source.split(
@@ -271,19 +274,20 @@ APP_SIGN_ARGS=(){app_signing_body}
         release_workflow = (workflows / "release.yml").read_text(encoding="utf-8")
         tip_workflow = (workflows / "main-tip.yml").read_text(encoding="utf-8")
 
-        for workflow in (release_workflow, tip_workflow):
-            self.assertIn("identity_migration_phase:", workflow)
-            self.assertIn("default: disabled", workflow)
-            self.assertIn("- legacy-preparer", workflow)
-            self.assertEqual(workflow.count("SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_BASE64"), 1)
-            self.assertEqual(workflow.count("SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_PASSWORD"), 1)
-            self.assertEqual(workflow.count("SUCCESSOR_SIGN_IDENTITY: ${{ vars.SUCCESSOR_SIGN_IDENTITY }}"), 1)
-            self.assertNotIn("SUCCESSOR_DEVELOPER_ID_INSTALLER", workflow)
-            self.assertNotIn("SUCCESSOR_NOTARYTOOL", workflow)
-            self.assertIn("--identifier com.repoprompt.ce", workflow)
-            self.assertIn("grep -Fx 'Identifier=com.repoprompt.ce'", workflow)
-            self.assertIn("grep -Fx 'TeamIdentifier=69N6K965SF'", workflow)
-            self.assertIn('echo "REPOPROMPT_IDENTITY_MIGRATION_ANCHOR=$anchor" >> "$GITHUB_ENV"', workflow)
+        self.assertIn("identity_migration_phase:", release_workflow)
+        self.assertIn("default: disabled", release_workflow)
+        self.assertIn("- legacy-preparer", release_workflow)
+        self.assertEqual(release_workflow.count("SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_BASE64"), 1)
+        self.assertEqual(release_workflow.count("SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_PASSWORD"), 1)
+        self.assertEqual(release_workflow.count("SUCCESSOR_SIGN_IDENTITY: ${{ vars.SUCCESSOR_SIGN_IDENTITY }}"), 1)
+        self.assertNotIn("SUCCESSOR_DEVELOPER_ID_INSTALLER", release_workflow)
+        self.assertNotIn("SUCCESSOR_NOTARYTOOL", release_workflow)
+        self.assertIn("--identifier com.repoprompt.ce", release_workflow)
+        self.assertIn("grep -Fx 'Identifier=com.repoprompt.ce'", release_workflow)
+        self.assertIn("grep -Fx 'TeamIdentifier=69N6K965SF'", release_workflow)
+        self.assertIn('successor_requirement=', release_workflow)
+        self.assertIn('-R="$successor_requirement" "$anchor"', release_workflow)
+        self.assertIn('echo "REPOPROMPT_IDENTITY_MIGRATION_ANCHOR=$anchor" >> "$GITHUB_ENV"', release_workflow)
 
         release_stage = release_workflow.split("\n  stage:", 1)[1].split("\n  publish:", 1)[0]
         release_publish = release_workflow.split("\n  publish:", 1)[1].split("\n  smoke-signed-helper:", 1)[0]
@@ -292,7 +296,12 @@ APP_SIGN_ARGS=(){app_signing_body}
         )[0]
         self.assertNotIn("SUCCESSOR_", release_stage)
         self.assertIn("if: inputs.identity_migration_phase == 'legacy-preparer'", release_anchor)
-        self.assertIn('anchor_source="release-source/.build/release/RepoPrompt.app/Contents/MacOS/RepoPrompt"', release_anchor)
+        self.assertIn('anchor_source="trusted-control-plane/Scripts/identity_migration_anchor.c"', release_anchor)
+        self.assertIn(
+            'xcrun clang -arch arm64 -arch x86_64 -Os -Wl,-dead_strip -o "$anchor" "$anchor_source"',
+            release_anchor,
+        )
+        self.assertNotIn('release-source/.build/release/RepoPrompt.app/Contents/MacOS/RepoPrompt', release_anchor)
         self.assertEqual(
             release_workflow.count("REPOPROMPT_IDENTITY_MIGRATION_PHASE: ${{ inputs.identity_migration_phase }}"),
             3,
@@ -304,29 +313,14 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertIn('rm -f "$RUNNER_TEMP/repoprompt-release-successor.p12"', release_publish)
         self.assertIn('rm -f "$RUNNER_TEMP/repoprompt-successor-identity-anchor"', release_publish)
 
-        tip_stage = tip_workflow.split("\n  stage:", 1)[1].split("\n  sign:", 1)[0]
-        tip_sign = tip_workflow.split("\n  sign:", 1)[1].split("\n  smoke-no-secrets:", 1)[0]
-        tip_anchor = tip_sign.split("      - name: Prepare successor identity migration anchor", 1)[1].split(
-            "      - name: Prepare provisioning profile and notarization key", 1
-        )[0]
-        self.assertNotIn("SUCCESSOR_", tip_stage)
-        self.assertIn(
-            "if: github.event_name == 'workflow_dispatch' && inputs.identity_migration_phase == 'legacy-preparer'",
-            tip_anchor,
-        )
-        self.assertIn('anchor_source="tip-source/.build/release/RepoPrompt.app/Contents/MacOS/RepoPrompt"', tip_anchor)
+        self.assertNotIn("identity_migration_phase:", tip_workflow)
+        self.assertNotIn("legacy-preparer", tip_workflow)
+        self.assertNotIn("SUCCESSOR_", tip_workflow)
+        self.assertNotIn("Prepare successor identity migration anchor", tip_workflow)
         self.assertEqual(
-            tip_workflow.count(
-                "REPOPROMPT_IDENTITY_MIGRATION_PHASE: ${{ inputs.identity_migration_phase || 'disabled' }}"
-            ),
+            tip_workflow.count("REPOPROMPT_IDENTITY_MIGRATION_PHASE: disabled"),
             3,
         )
-        self.assertLess(
-            tip_sign.index("Prepare successor identity migration anchor"),
-            tip_sign.index("Sign and notarize staged tip"),
-        )
-        self.assertIn('rm -f "$RUNNER_TEMP/repoprompt-tip-successor.p12"', tip_sign)
-        self.assertIn('rm -f "$RUNNER_TEMP/repoprompt-tip-successor-identity-anchor"', tip_sign)
 
     def test_codex_v8_entitlement_allowlist_matches_pinned_manifest_policy(self) -> None:
         v8_profile = {

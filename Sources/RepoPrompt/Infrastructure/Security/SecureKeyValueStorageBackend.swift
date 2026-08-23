@@ -9,6 +9,14 @@ protocol SecureKeyValueStorageBackend: AnyObject, Sendable {
         accessMode: KeychainAccessMode
     ) throws
 
+    /// Creates a value only when no item with this backend's identity already exists.
+    /// Migration code uses this to avoid rewriting an unproven pre-existing Keychain ACL.
+    func create(
+        _ value: String,
+        for key: String,
+        accessMode: KeychainAccessMode
+    ) throws
+
     func get(
         for key: String,
         accessMode: KeychainAccessMode
@@ -18,6 +26,21 @@ protocol SecureKeyValueStorageBackend: AnyObject, Sendable {
         for key: String,
         accessMode: KeychainAccessMode
     ) throws
+}
+
+extension SecureKeyValueStorageBackend {
+    func create(
+        _ value: String,
+        for key: String,
+        accessMode: KeychainAccessMode
+    ) throws {
+        do {
+            _ = try get(for: key, accessMode: accessMode)
+            throw KeychainService.KeychainError.duplicateItem
+        } catch KeychainService.KeychainError.itemNotFound {
+            try save(value, for: key, accessMode: accessMode)
+        }
+    }
 }
 
 struct SecureKeyValueStorageSelection {

@@ -19,6 +19,7 @@ ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
 IDENTITY_MIGRATION_ANCHOR_DESTINATION="$APP_BUNDLE/Contents/Resources/IdentityMigration/RepoPromptIdentityAnchor"
 IDENTITY_MIGRATION_TARGET_IDENTIFIER="com.repoprompt.ce"
 IDENTITY_MIGRATION_TARGET_TEAM_ID="69N6K965SF"
+IDENTITY_MIGRATION_TARGET_REQUIREMENT='anchor apple generic and identifier "com.repoprompt.ce" and certificate leaf[subject.OU] = "69N6K965SF" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -98,7 +99,8 @@ legacy-preparer)
         fail "Legacy identity preparer signing requires REPOPROMPT_IDENTITY_MIGRATION_ANCHOR"
     [[ -f "$identity_migration_anchor" && ! -L "$identity_migration_anchor" ]] ||
         fail "Identity migration anchor must be a regular, non-symlink file"
-    codesign --verify --strict --verbose=2 "$identity_migration_anchor"
+    codesign --verify --strict --verbose=2 \
+        -R="$IDENTITY_MIGRATION_TARGET_REQUIREMENT" "$identity_migration_anchor"
     anchor_signature_details="$(codesign -dv --verbose=4 "$identity_migration_anchor" 2>&1)"
     anchor_identifier="$(printf '%s\n' "$anchor_signature_details" | awk -F= '/^Identifier=/{print $2; exit}')"
     anchor_team="$(printf '%s\n' "$anchor_signature_details" | awk -F= '/^TeamIdentifier=/{print $2; exit}')"
@@ -109,6 +111,10 @@ legacy-preparer)
     mkdir -p "$(dirname "$IDENTITY_MIGRATION_ANCHOR_DESTINATION")"
     ditto "$identity_migration_anchor" "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"
     chmod 755 "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"
+    [[ -f "$IDENTITY_MIGRATION_ANCHOR_DESTINATION" && ! -L "$IDENTITY_MIGRATION_ANCHOR_DESTINATION" ]] ||
+        fail "Embedded identity migration anchor must be a regular, non-symlink file"
+    codesign --verify --strict --verbose=2 \
+        -R="$IDENTITY_MIGRATION_TARGET_REQUIREMENT" "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"
     ;;
 *)
     fail "Unsupported RepoPromptIdentityMigrationPhase: $identity_migration_phase"
