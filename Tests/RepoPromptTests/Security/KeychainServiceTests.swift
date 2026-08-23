@@ -153,18 +153,39 @@ final class KeychainServiceTests: XCTestCase {
         XCTAssertEqual(addQuery.boolValue(for: kSecAttrSynchronizable), false)
     }
 
+    func testSaveAddsCreationAttributesOnlyWhenCreatingItem() throws {
+        let fake = FakeSecItemClient(
+            copyHandler: { _, _ in errSecItemNotFound },
+            addHandler: { _, _ in errSecSuccess },
+            updateHandler: { _, _ in errSecItemNotFound }
+        )
+        let provider = FakeItemCreationAttributeProvider()
+        let service = KeychainService(
+            serviceName: KeychainService.identityMigrationBridgeServiceName,
+            secItemClient: fake,
+            itemCreationAttributeProvider: provider
+        )
+
+        try service.save("stored-value", for: "api-key", accessMode: .nonInteractive(reason: .test))
+
+        XCTAssertEqual(provider.callCount, 1)
+        XCTAssertEqual(fake.addQueries.first?.stringValue(for: kSecAttrAccess), "test-access-policy")
+        XCTAssertNil(fake.updateAttributes.first?.stringValue(for: kSecAttrAccess))
+    }
+
     func testPersistentServiceNamesAreIsolatedAndLegacyIsRepairOnly() throws {
         let fingerprintA = String(repeating: "A", count: 64)
         let fingerprintB = String(repeating: "B", count: 64)
         let names = Set([
             KeychainService.legacyCanonicalServiceName,
             KeychainService.officialV2ServiceName,
+            KeychainService.identityMigrationBridgeServiceName,
             KeychainService.localSelfSignedServiceName(fingerprint: fingerprintA, generation: 1),
             KeychainService.localSelfSignedServiceName(fingerprint: fingerprintA, generation: 2),
             KeychainService.localSelfSignedServiceName(fingerprint: fingerprintB, generation: 1),
             KeychainService.debugServiceName
         ])
-        XCTAssertEqual(names.count, 6)
+        XCTAssertEqual(names.count, 7)
 
         let fake = FakeSecItemClient { _, _ in errSecItemNotFound }
         let legacy = KeychainService.legacyRepairSource(secItemClient: fake)
@@ -183,6 +204,15 @@ final class KeychainServiceTests: XCTestCase {
             serviceName: serviceName,
             secItemClient: secItemClient
         )
+    }
+}
+
+private final class FakeItemCreationAttributeProvider: KeychainItemCreationAttributeProvider {
+    private(set) var callCount = 0
+
+    func attributesForNewItem() throws -> [String: Any] {
+        callCount += 1
+        return [kSecAttrAccess as String: "test-access-policy"]
     }
 }
 

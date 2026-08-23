@@ -55,10 +55,62 @@ struct SystemSecItemClient: SecItemClient {
     }
 }
 
+protocol KeychainItemCreationAttributeProvider {
+    func attributesForNewItem() throws -> [String: Any]
+}
+
+enum KeychainItemCreationAttributeError: Error, LocalizedError, Equatable {
+    case trustedApplicationCreationFailed(path: String, status: OSStatus)
+    case accessCreationFailed(status: OSStatus)
+
+    var errorDescription: String? {
+        switch self {
+        case let .trustedApplicationCreationFailed(path, status):
+            "Could not create a Keychain trusted-application requirement for \(path) (status \(status))"
+        case let .accessCreationFailed(status):
+            "Could not create the Keychain access policy (status \(status))"
+        }
+    }
+}
+
+/// Builds a classic macOS Keychain ACL from signed executables. The migration preparer
+/// supplies its current executable plus an embedded executable signed for the successor
+/// identity. Security.framework derives the designated requirements; no credential data
+/// or authorization prompt is involved in constructing this policy.
+struct TrustedApplicationsKeychainAttributeProvider: KeychainItemCreationAttributeProvider {
+    let descriptor: String
+    let executablePaths: [String]
+
+    func attributesForNewItem() throws -> [String: Any] {
+        var trustedApplications: [SecTrustedApplication] = []
+        trustedApplications.reserveCapacity(executablePaths.count)
+
+        for path in executablePaths {
+            var trustedApplication: SecTrustedApplication?
+            let status = SecTrustedApplicationCreateFromPath(path, &trustedApplication)
+            guard status == errSecSuccess, let trustedApplication else {
+                throw KeychainItemCreationAttributeError.trustedApplicationCreationFailed(
+                    path: path,
+                    status: status
+                )
+            }
+            trustedApplications.append(trustedApplication)
+        }
+
+        var access: SecAccess?
+        let status = SecAccessCreate(descriptor as CFString, trustedApplications as CFArray, &access)
+        guard status == errSecSuccess, let access else {
+            throw KeychainItemCreationAttributeError.accessCreationFailed(status: status)
+        }
+        return [kSecAttrAccess as String: access]
+    }
+}
+
 /// Secure storage service for one explicitly selected CE macOS Keychain domain.
 final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
     static let legacyCanonicalServiceName = "com.pvncher.repoprompt.ce.keychain"
     static let officialV2ServiceName = "com.pvncher.repoprompt.ce.developer-id.keychain.v2"
+    static let identityMigrationBridgeServiceName = "com.repoprompt.ce.identity-migration.keychain.v1"
     static let localSelfSignedServiceNamePrefix = "com.pvncher.repoprompt.ce.local-self-signed."
     static let debugServiceName = "com.pvncher.repoprompt.ce.debug.keychain"
 
@@ -82,16 +134,19 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
 
     let serviceName: String
     private let secItemClient: SecItemClient
+    private let itemCreationAttributeProvider: KeychainItemCreationAttributeProvider?
     private let operationLock = NSRecursiveLock()
 
     let persistsValuesAcrossLaunches = true
 
     init(
         serviceName: String = KeychainService.officialV2ServiceName,
-        secItemClient: SecItemClient = SystemSecItemClient()
+        secItemClient: SecItemClient = SystemSecItemClient(),
+        itemCreationAttributeProvider: KeychainItemCreationAttributeProvider? = nil
     ) {
         self.serviceName = serviceName
         self.secItemClient = secItemClient
+        self.itemCreationAttributeProvider = itemCreationAttributeProvider
     }
 
     private func withLock<T>(_ body: () throws -> T) rethrows -> T {
@@ -189,14 +244,20 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
                 throw keychainError(for: updateStatus)
             }
 
-            let addQuery = query([
+            var newItem: [String: Any] = [
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: serviceName,
                 kSecAttrAccount as String: key,
                 kSecValueData as String: data,
                 kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
                 kSecAttrSynchronizable as String: false
-            ], accessMode: accessMode)
+            ]
+            if let itemCreationAttributeProvider {
+                try newItem.merge(itemCreationAttributeProvider.attributesForNewItem()) { _, replacement in
+                    replacement
+                }
+            }
+            let addQuery = query(newItem, accessMode: accessMode)
 
             let addStatus = secItemClient.add(addQuery as CFDictionary, nil)
             guard addStatus == errSecSuccess else {

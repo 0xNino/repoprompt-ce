@@ -26,6 +26,25 @@ struct SecureKeyValueStorageSelection {
 }
 
 enum SecureKeyValueStorageFactory {
+    private final class State: @unchecked Sendable {
+        static let shared = State()
+
+        private let lock = NSLock()
+        private var officialBackendOverride: SecureKeyValueStorageBackend?
+
+        func installOfficialBackendOverride(_ backend: SecureKeyValueStorageBackend) {
+            lock.lock()
+            officialBackendOverride = backend
+            lock.unlock()
+        }
+
+        func officialBackend(fallback: SecureKeyValueStorageBackend) -> SecureKeyValueStorageBackend {
+            lock.lock()
+            defer { lock.unlock() }
+            return officialBackendOverride ?? fallback
+        }
+    }
+
     private static let cachedSelection: SecureKeyValueStorageSelection = {
         let localSigningContext = RuntimeCodeSigningPolicy.currentLocalSigningContext()
         let signingInfo = RuntimeCodeSigningDetector.currentProcessSigningInfo(
@@ -40,11 +59,19 @@ enum SecureKeyValueStorageFactory {
     }()
 
     static func defaultBackend() -> SecureKeyValueStorageBackend {
-        cachedSelection.backend
+        guard cachedSelection.decision.domain == .officialDeveloperID else {
+            return cachedSelection.backend
+        }
+        return State.shared.officialBackend(fallback: cachedSelection.backend)
     }
 
     static func currentDecision() -> RuntimeSecureStorageDecision {
         cachedSelection.decision
+    }
+
+    /// Must be called during process bootstrap, before services capture the default backend.
+    static func installOfficialBackendOverride(_ backend: SecureKeyValueStorageBackend) {
+        State.shared.installOfficialBackendOverride(backend)
     }
 
     static func selection(for decision: RuntimeSecureStorageDecision) -> SecureKeyValueStorageSelection {

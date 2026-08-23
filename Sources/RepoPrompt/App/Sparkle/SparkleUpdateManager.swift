@@ -167,6 +167,11 @@ final class SparkleUpdaterManager: ObservableObject {
 
     func startUpdater() {
         guard sparkleConfigurationValid, !updaterStarted else { return }
+        if let blockedMessage = IdentityMigrationRuntimeState.shared.updatesBlockedMessage() {
+            updatesDisabledMessage = blockedMessage
+            canCheckForUpdates = false
+            return
+        }
 
         // Install observers before activation so no Sparkle event can race registration.
         setupObservers()

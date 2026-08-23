@@ -16,6 +16,9 @@ TRUSTED_SPARKLE_FRAMEWORK="$TRUSTED_ROOT/Vendor/Sparkle/Sparkle.xcframework/maco
 STAGED_SPARKLE_FRAMEWORK="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
 CODEX_BUNDLE="$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
 ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
+IDENTITY_MIGRATION_ANCHOR_DESTINATION="$APP_BUNDLE/Contents/Resources/IdentityMigration/RepoPromptIdentityAnchor"
+IDENTITY_MIGRATION_TARGET_IDENTIFIER="com.repoprompt.ce"
+IDENTITY_MIGRATION_TARGET_TEAM_ID="69N6K965SF"
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -74,6 +77,43 @@ plutil -lint "$app_entitlements"
 plutil -lint "$CODEX_V8_ENTITLEMENTS"
 plutil -replace RepoPromptDebugSecureStorageBackend -string keychain "$APP_BUNDLE/Contents/Info.plist"
 plutil -replace RepoPromptSigningMode -string developer-id "$APP_BUNDLE/Contents/Info.plist"
+
+identity_migration_phase="$(
+    plutil -extract RepoPromptIdentityMigrationPhase raw "$APP_BUNDLE/Contents/Info.plist" 2>/dev/null ||
+        printf 'disabled\n'
+)"
+expected_identity_migration_phase="${REPOPROMPT_IDENTITY_MIGRATION_PHASE:-disabled}"
+[[ "$identity_migration_phase" == "$expected_identity_migration_phase" ]] ||
+    fail "Staged identity migration phase mismatch: expected $expected_identity_migration_phase, got $identity_migration_phase"
+case "$identity_migration_phase" in
+disabled)
+    ;;
+legacy-preparer)
+    [[ "$BUNDLE_ID" == "com.pvncher.repoprompt.ce" ]] ||
+        fail "Legacy identity preparer must retain bundle identifier com.pvncher.repoprompt.ce"
+    [[ "$SIGNING_TEAM_ID" == "648A27MST5" ]] ||
+        fail "Legacy identity preparer must retain signing Team ID 648A27MST5"
+    identity_migration_anchor="${REPOPROMPT_IDENTITY_MIGRATION_ANCHOR:-}"
+    [[ -n "$identity_migration_anchor" ]] ||
+        fail "Legacy identity preparer signing requires REPOPROMPT_IDENTITY_MIGRATION_ANCHOR"
+    [[ -f "$identity_migration_anchor" && ! -L "$identity_migration_anchor" ]] ||
+        fail "Identity migration anchor must be a regular, non-symlink file"
+    codesign --verify --strict --verbose=2 "$identity_migration_anchor"
+    anchor_signature_details="$(codesign -dv --verbose=4 "$identity_migration_anchor" 2>&1)"
+    anchor_identifier="$(printf '%s\n' "$anchor_signature_details" | awk -F= '/^Identifier=/{print $2; exit}')"
+    anchor_team="$(printf '%s\n' "$anchor_signature_details" | awk -F= '/^TeamIdentifier=/{print $2; exit}')"
+    [[ "$anchor_identifier" == "$IDENTITY_MIGRATION_TARGET_IDENTIFIER" ]] ||
+        fail "Identity migration anchor identifier mismatch: expected $IDENTITY_MIGRATION_TARGET_IDENTIFIER, got ${anchor_identifier:-<missing>}"
+    [[ "$anchor_team" == "$IDENTITY_MIGRATION_TARGET_TEAM_ID" ]] ||
+        fail "Identity migration anchor team mismatch: expected $IDENTITY_MIGRATION_TARGET_TEAM_ID, got ${anchor_team:-<missing>}"
+    mkdir -p "$(dirname "$IDENTITY_MIGRATION_ANCHOR_DESTINATION")"
+    ditto "$identity_migration_anchor" "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"
+    chmod 755 "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"
+    ;;
+*)
+    fail "Unsupported RepoPromptIdentityMigrationPhase: $identity_migration_phase"
+    ;;
+esac
 
 # Telemetry is gated on DSN presence: only the official Developer ID publish job receives the
 # protected SENTRY_DSN secret, and only here is it baked into the signed bundle. The value is never

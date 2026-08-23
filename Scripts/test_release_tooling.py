@@ -100,6 +100,11 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn("RepoPromptDebugSecureStorageBackend", info_plist)
         self.assertIn("RepoPromptLocalSigningCertificateSHA256", info_plist)
         self.assertIn("RepoPromptLocalSecureStorageGeneration", info_plist)
+        self.assertEqual(info_plist["RepoPromptIdentityMigrationPhase"], "__IDENTITY_MIGRATION_PHASE__")
+        self.assertEqual(
+            info_plist["RepoPromptIdentityMigrationAnchorRelativePath"],
+            "IdentityMigration/RepoPromptIdentityAnchor",
+        )
         self.assertIn("RepoPromptSentryDSN", info_plist)
         self.assertEqual(info_plist["RepoPromptSentryDSN"], "")
         self.assertIn(
@@ -233,6 +238,95 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertLess(mcp_sign, app_sign)
         self.assertLess(app_sign, outer_sign)
         self.assertNotIn('sign_path "$CODEX_BUNDLE"', source)
+
+    def test_legacy_preparer_requires_verified_future_identity_anchor(self) -> None:
+        package_source = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        source = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
+
+        self.assertIn('[[ "$BUNDLE_ID" == "com.pvncher.repoprompt.ce" ]]', package_source)
+        self.assertIn('[[ "$SIGNING_TEAM_ID" == "648A27MST5" ]]', package_source)
+        self.assertIn('[[ "$PACKAGED_IDENTITY_MIGRATION_PHASE" == "$IDENTITY_MIGRATION_PHASE" ]]', package_source)
+        self.assertIn('plutil -extract RepoPromptIdentityMigrationPhase raw', source)
+        self.assertIn("printf 'disabled\\n'", source)
+        self.assertIn('[[ "$identity_migration_phase" == "$expected_identity_migration_phase" ]]', source)
+        self.assertIn('REPOPROMPT_IDENTITY_MIGRATION_ANCHOR', source)
+        self.assertIn('[[ "$BUNDLE_ID" == "com.pvncher.repoprompt.ce" ]]', source)
+        self.assertIn('[[ "$SIGNING_TEAM_ID" == "648A27MST5" ]]', source)
+        self.assertIn('IDENTITY_MIGRATION_TARGET_IDENTIFIER="com.repoprompt.ce"', source)
+        self.assertIn('IDENTITY_MIGRATION_TARGET_TEAM_ID="69N6K965SF"', source)
+        self.assertIn('codesign --verify --strict --verbose=2 "$identity_migration_anchor"', source)
+        self.assertIn('[[ "$anchor_identifier" == "$IDENTITY_MIGRATION_TARGET_IDENTIFIER" ]]', source)
+        self.assertIn('[[ "$anchor_team" == "$IDENTITY_MIGRATION_TARGET_TEAM_ID" ]]', source)
+        self.assertNotIn('codesign --force --sign "$SIGN_IDENTITY"', source.split(
+            'ditto "$identity_migration_anchor" "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"',
+            1,
+        )[0].split("legacy-preparer)", 1)[1])
+        self.assertLess(
+            source.index('ditto "$identity_migration_anchor" "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"'),
+            source.index('sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"'),
+        )
+
+    def test_release_workflows_gate_legacy_preparer_and_keep_automatic_tip_disabled(self) -> None:
+        workflows = SCRIPT_DIR.parent / ".github" / "workflows"
+        release_workflow = (workflows / "release.yml").read_text(encoding="utf-8")
+        tip_workflow = (workflows / "main-tip.yml").read_text(encoding="utf-8")
+
+        for workflow in (release_workflow, tip_workflow):
+            self.assertIn("identity_migration_phase:", workflow)
+            self.assertIn("default: disabled", workflow)
+            self.assertIn("- legacy-preparer", workflow)
+            self.assertEqual(workflow.count("SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_BASE64"), 1)
+            self.assertEqual(workflow.count("SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_PASSWORD"), 1)
+            self.assertEqual(workflow.count("SUCCESSOR_SIGN_IDENTITY: ${{ vars.SUCCESSOR_SIGN_IDENTITY }}"), 1)
+            self.assertNotIn("SUCCESSOR_DEVELOPER_ID_INSTALLER", workflow)
+            self.assertNotIn("SUCCESSOR_NOTARYTOOL", workflow)
+            self.assertIn("--identifier com.repoprompt.ce", workflow)
+            self.assertIn("grep -Fx 'Identifier=com.repoprompt.ce'", workflow)
+            self.assertIn("grep -Fx 'TeamIdentifier=69N6K965SF'", workflow)
+            self.assertIn('echo "REPOPROMPT_IDENTITY_MIGRATION_ANCHOR=$anchor" >> "$GITHUB_ENV"', workflow)
+
+        release_stage = release_workflow.split("\n  stage:", 1)[1].split("\n  publish:", 1)[0]
+        release_publish = release_workflow.split("\n  publish:", 1)[1].split("\n  smoke-signed-helper:", 1)[0]
+        release_anchor = release_publish.split("      - name: Prepare successor identity migration anchor", 1)[1].split(
+            "      - name: Prepare provisioning profile and notarization key", 1
+        )[0]
+        self.assertNotIn("SUCCESSOR_", release_stage)
+        self.assertIn("if: inputs.identity_migration_phase == 'legacy-preparer'", release_anchor)
+        self.assertIn('anchor_source="release-source/.build/release/RepoPrompt.app/Contents/MacOS/RepoPrompt"', release_anchor)
+        self.assertEqual(
+            release_workflow.count("REPOPROMPT_IDENTITY_MIGRATION_PHASE: ${{ inputs.identity_migration_phase }}"),
+            3,
+        )
+        self.assertLess(
+            release_publish.index("Prepare successor identity migration anchor"),
+            release_publish.index("Sign, notarize, and create draft release"),
+        )
+        self.assertIn('rm -f "$RUNNER_TEMP/repoprompt-release-successor.p12"', release_publish)
+        self.assertIn('rm -f "$RUNNER_TEMP/repoprompt-successor-identity-anchor"', release_publish)
+
+        tip_stage = tip_workflow.split("\n  stage:", 1)[1].split("\n  sign:", 1)[0]
+        tip_sign = tip_workflow.split("\n  sign:", 1)[1].split("\n  smoke-no-secrets:", 1)[0]
+        tip_anchor = tip_sign.split("      - name: Prepare successor identity migration anchor", 1)[1].split(
+            "      - name: Prepare provisioning profile and notarization key", 1
+        )[0]
+        self.assertNotIn("SUCCESSOR_", tip_stage)
+        self.assertIn(
+            "if: github.event_name == 'workflow_dispatch' && inputs.identity_migration_phase == 'legacy-preparer'",
+            tip_anchor,
+        )
+        self.assertIn('anchor_source="tip-source/.build/release/RepoPrompt.app/Contents/MacOS/RepoPrompt"', tip_anchor)
+        self.assertEqual(
+            tip_workflow.count(
+                "REPOPROMPT_IDENTITY_MIGRATION_PHASE: ${{ inputs.identity_migration_phase || 'disabled' }}"
+            ),
+            3,
+        )
+        self.assertLess(
+            tip_sign.index("Prepare successor identity migration anchor"),
+            tip_sign.index("Sign and notarize staged tip"),
+        )
+        self.assertIn('rm -f "$RUNNER_TEMP/repoprompt-tip-successor.p12"', tip_sign)
+        self.assertIn('rm -f "$RUNNER_TEMP/repoprompt-tip-successor-identity-anchor"', tip_sign)
 
     def test_codex_v8_entitlement_allowlist_matches_pinned_manifest_policy(self) -> None:
         v8_profile = {
@@ -2513,6 +2607,34 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("OK: staged release payload matches approved source", result.stdout)
 
+    def test_staged_release_validator_rejects_requested_preparer_for_historical_template(self) -> None:
+        approved, staged, scripts = self.make_staged_release_fixture()
+        template_path = approved / "AppBundle" / "Info.plist.template"
+        historical_template = "\n".join(
+            line
+            for line in template_path.read_text(encoding="utf-8").splitlines()
+            if "RepoPromptIdentityMigration" not in line
+        )
+        template_path.write_text(historical_template + "\n", encoding="utf-8")
+        info_path = staged / ".build" / "release" / "RepoPrompt.app" / "Contents" / "Info.plist"
+        info = plistlib.loads(info_path.read_bytes())
+        info.pop("RepoPromptIdentityMigrationPhase")
+        info.pop("RepoPromptIdentityMigrationAnchorRelativePath")
+        info_path.write_bytes(plistlib.dumps(info))
+
+        result = self.run_staged_validation(
+            approved,
+            staged,
+            scripts,
+            identity_migration_phase="legacy-preparer",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "staged identity migration phase mismatch: expected legacy-preparer, got disabled",
+            result.stderr,
+        )
+
     def test_public_app_validation_uses_approved_manifest_from_extracted_stage_layout(self) -> None:
         for script_name in ("release.sh", "main_tip_release.sh"):
             with self.subTest(script=script_name):
@@ -4365,6 +4487,7 @@ SIGNING_TEAM_ID=648A27MST5
             "__SIGNING_MODE__": "release-candidate-adhoc",
             "__LOCAL_SIGNING_CERTIFICATE_SHA256__": "",
             "__LOCAL_SECURE_STORAGE_GENERATION__": "",
+            "__IDENTITY_MIGRATION_PHASE__": "disabled",
         }.items():
             template = template.replace(key, value)
         (app / "Contents" / "Info.plist").write_text(template, encoding="utf-8")
@@ -4456,6 +4579,7 @@ esac
         approved: Path,
         staged: Path,
         scripts: Path,
+        identity_migration_phase: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.update(
@@ -4468,6 +4592,8 @@ esac
                 **cls.codex_fixture_environment(approved, staged),
             }
         )
+        if identity_migration_phase is not None:
+            env["REPOPROMPT_IDENTITY_MIGRATION_PHASE"] = identity_migration_phase
         return subprocess.run(
             [str(scripts / "validate_staged_release.sh")],
             env=env,

@@ -94,6 +94,11 @@ if [[ -n "$RELEASE_BUILD_NUMBER_OVERRIDE" ]]; then
     BUILD_NUMBER="$RELEASE_BUILD_NUMBER_OVERRIDE"
 fi
 APP_NAME="${APP_NAME:-RepoPrompt}"; DISPLAY_NAME="${DISPLAY_NAME:-RepoPrompt CE}"; BASE_BUNDLE_ID="${BUNDLE_ID:-com.pvncher.repoprompt.ce}"; MARKETING_VERSION="${MARKETING_VERSION:-0.1.0}"; BUILD_NUMBER="${BUILD_NUMBER:-1}"; SIGNING_TEAM_ID="${SIGNING_TEAM_ID:-648A27MST5}"
+IDENTITY_MIGRATION_PHASE="${REPOPROMPT_IDENTITY_MIGRATION_PHASE:-disabled}"
+case "$IDENTITY_MIGRATION_PHASE" in
+disabled | legacy-preparer) ;;
+*) fail "REPOPROMPT_IDENTITY_MIGRATION_PHASE must be disabled or legacy-preparer" ;;
+esac
 ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
 SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/$CONF"
 
@@ -103,6 +108,12 @@ if (( IS_RELEASE )); then
     BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-$BASE_BUNDLE_ID}"
 else
     BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-${DEBUG_BUNDLE_ID:-$BASE_BUNDLE_ID.debug}}"
+fi
+if [[ "$IDENTITY_MIGRATION_PHASE" == "legacy-preparer" ]]; then
+    [[ "$BUNDLE_ID" == "com.pvncher.repoprompt.ce" ]] ||
+        fail "legacy-preparer requires bundle identifier com.pvncher.repoprompt.ce"
+    [[ "$SIGNING_TEAM_ID" == "648A27MST5" ]] ||
+        fail "legacy-preparer requires signing Team ID 648A27MST5"
 fi
 
 phase "Checking build environment"
@@ -320,10 +331,16 @@ phase "Writing Info.plist"
 run python3 - <<PY
 from pathlib import Path
 s=Path('AppBundle/Info.plist.template').read_text()
-for k,v in {'__APP_NAME__':'$APP_NAME','__DISPLAY_NAME__':'$DISPLAY_NAME','__BUNDLE_ID__':'$BUNDLE_ID','__MARKETING_VERSION__':'$MARKETING_VERSION','__BUILD_NUMBER__':'$BUILD_NUMBER','__DEBUG_SECURE_STORAGE_BACKEND__':'$DEBUG_STORAGE_BACKEND_MARKER','__SIGNING_MODE__':'$SIGNING_MODE_MARKER','__LOCAL_SIGNING_CERTIFICATE_SHA256__':'$LOCAL_SIGNING_CERTIFICATE_SHA256','__LOCAL_SECURE_STORAGE_GENERATION__':'$LOCAL_SIGNING_SERVICE_GENERATION'}.items(): s=s.replace(k,v)
+for k,v in {'__APP_NAME__':'$APP_NAME','__DISPLAY_NAME__':'$DISPLAY_NAME','__BUNDLE_ID__':'$BUNDLE_ID','__MARKETING_VERSION__':'$MARKETING_VERSION','__BUILD_NUMBER__':'$BUILD_NUMBER','__DEBUG_SECURE_STORAGE_BACKEND__':'$DEBUG_STORAGE_BACKEND_MARKER','__SIGNING_MODE__':'$SIGNING_MODE_MARKER','__LOCAL_SIGNING_CERTIFICATE_SHA256__':'$LOCAL_SIGNING_CERTIFICATE_SHA256','__LOCAL_SECURE_STORAGE_GENERATION__':'$LOCAL_SIGNING_SERVICE_GENERATION','__IDENTITY_MIGRATION_PHASE__':'$IDENTITY_MIGRATION_PHASE'}.items(): s=s.replace(k,v)
 Path('$APP_BUNDLE/Contents/Info.plist').write_text(s)
 PY
 run plutil -lint "$APP_BUNDLE/Contents/Info.plist"
+PACKAGED_IDENTITY_MIGRATION_PHASE="$(
+    plutil -extract RepoPromptIdentityMigrationPhase raw "$APP_BUNDLE/Contents/Info.plist" 2>/dev/null ||
+        printf 'disabled\n'
+)"
+[[ "$PACKAGED_IDENTITY_MIGRATION_PHASE" == "$IDENTITY_MIGRATION_PHASE" ]] ||
+    fail "Packaged identity migration phase mismatch: requested $IDENTITY_MIGRATION_PHASE, got $PACKAGED_IDENTITY_MIGRATION_PHASE"
 
 if (( USE_LOCAL_SELF_SIGNED_RELEASE )); then
     phase "Rendering local self-signed entitlements"
