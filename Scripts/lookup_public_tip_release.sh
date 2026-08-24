@@ -12,7 +12,12 @@ REPOSITORY="$1"
 TAG="$2"
 ARCHIVE_BASENAME="$3"
 INSTALLATION_TYPE="$4"
-[[ "$INSTALLATION_TYPE" == "application" || "$INSTALLATION_TYPE" == "package" ]] || exit 1
+if [[ "$INSTALLATION_TYPE" != "application" && "$INSTALLATION_TYPE" != "package" ]]; then
+    printf '%s\n' \
+        'GitHub public tip lookup classification=invalid-input status=000 request_id=unavailable rate_limit_remaining=unavailable rate_limit_reset=unavailable retry_after=unavailable' \
+        >&2
+    exit 1
+fi
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/repoprompt-tip-lookup.XXXXXX")"
 RESPONSE_BODY="$TMP_DIR/response.json"
 RESPONSE_HEADERS="$TMP_DIR/response.headers"

@@ -112,10 +112,13 @@ final class SparkleUpdateFeedDelegate: NSObject, SPUUpdaterDelegate {
         didFinishUpdateCycleFor updateCheck: SPUUpdateCheck,
         error: Error?
     ) {
+        // Routine no-update checks are high-volume and would evict the one-time
+        // identity-migration milestones from the bounded diagnostic ledger.
+        guard let error else { return }
         record(
             stage: "update-cycle-finished",
-            outcome: error == nil ? .succeeded : .failed,
-            errorClass: error.map(Self.errorClass)
+            outcome: .failed,
+            errorClass: Self.errorClass(error)
         )
     }
 
@@ -148,22 +151,22 @@ final class SparkleUpdateFeedDelegate: NSObject, SPUUpdaterDelegate {
 
 private extension SPUUserUpdateChoice {
     var diagnosticName: String {
-        switch rawValue {
-        case 0: "skip"
-        case 1: "install"
-        case 2: "dismiss"
-        default: "unknown"
+        switch self {
+        case .skip: "skip"
+        case .install: "install"
+        case .dismiss: "dismiss"
+        @unknown default: "unknown"
         }
     }
 }
 
 private extension SPUUserUpdateStage {
     var diagnosticName: String {
-        switch rawValue {
-        case 0: "not-downloaded"
-        case 1: "downloaded"
-        case 2: "installing"
-        default: "unknown"
+        switch self {
+        case .notDownloaded: "not-downloaded"
+        case .downloaded: "downloaded"
+        case .installing: "installing"
+        @unknown default: "unknown"
         }
     }
 }

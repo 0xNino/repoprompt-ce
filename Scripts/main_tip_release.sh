@@ -23,7 +23,8 @@ ROLLOUT_DECLARATION="$ROOT_DIR/tip-rollout.json"
     fail "Tip identity rollout authority is incomplete"
 eval "$(python3 "$ROLLOUT_TOOL" packaging-context \
     --declaration "$ROLLOUT_DECLARATION" \
-    --policy "$APPLE_IDENTITY_POLICY")"
+    --policy "$APPLE_IDENTITY_POLICY" \
+    --version-env "$ROOT_DIR/version.env")"
 [[ "$ROLLOUT_CHANNEL" == "tip" ]] || fail "Tip release requires a Tip rollout declaration"
 
 TIP_COMMIT="${TIP_COMMIT:-$(git rev-parse HEAD)}"

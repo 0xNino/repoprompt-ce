@@ -83,10 +83,13 @@ jobs:
           }
 
           rollout_declaration="$RUNNER_TEMP/tip-rollout.json"
+          rollout_version_env="$RUNNER_TEMP/tip-version.env"
           git show "$commit:tip-rollout.json" > "$rollout_declaration"
+          git show "$commit:version.env" > "$rollout_version_env"
           eval "$(python3 Scripts/stable_rollout.py packaging-context \
             --declaration "$rollout_declaration" \
-            --policy Scripts/apple_identity_policy.json)"
+            --policy Scripts/apple_identity_policy.json \
+            --version-env "$rollout_version_env")"
           [[ "$ROLLOUT_UPDATE_REPOSITORY" == "$TIP_UPDATE_REPOSITORY" ]] || {
             echo "Configured Tip update repository does not match the reviewed identity policy" >&2
             exit 1
@@ -263,7 +266,8 @@ jobs:
           umask 077
           eval "$(python3 trusted-control-plane/Scripts/stable_rollout.py packaging-context \
             --declaration approved-source/tip-rollout.json \
-            --policy trusted-control-plane/Scripts/apple_identity_policy.json)"
+            --policy trusted-control-plane/Scripts/apple_identity_policy.json \
+            --version-env approved-source/version.env)"
           if [[ "$ROLLOUT_IDENTITY" == "successor" ]]; then
             CERTIFICATE_P12_BASE64="$SUCCESSOR_CERTIFICATE_P12_BASE64"
             CERTIFICATE_P12_PASSWORD="$SUCCESSOR_CERTIFICATE_P12_PASSWORD"
@@ -319,8 +323,9 @@ jobs:
           umask 077
           eval "$(python3 trusted-control-plane/Scripts/stable_rollout.py packaging-context \
             --declaration approved-source/tip-rollout.json \
-            --policy trusted-control-plane/Scripts/apple_identity_policy.json)"
-          [[ "$SUCCESSOR_SIGN_IDENTITY" == "Developer ID Application: Samuel Baron (69N6K965SF)" ]] || {
+            --policy trusted-control-plane/Scripts/apple_identity_policy.json \
+            --version-env approved-source/version.env)"
+          [[ "$SUCCESSOR_SIGN_IDENTITY" == "$EXPECTED_SUCCESSOR_SIGN_IDENTITY" ]] || {
             echo "Successor signing identity does not match the reviewed identity policy" >&2
             exit 1
           }

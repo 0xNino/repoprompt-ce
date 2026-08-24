@@ -258,7 +258,13 @@ def validate_item_shape(
             f"{ROLE_INSTALLATION_TYPE[role]} for the {role} role"
         )
     enclosure_name = item.get("enclosureName")
-    if not isinstance(enclosure_name, str) or not enclosure_name.endswith(ROLE_ENCLOSURE_SUFFIX[role]):
+    if channel == "stable":
+        expected_name = expected_enclosure_name(app_name, marketing, build, role)
+        if enclosure_name != expected_name:
+            raise RolloutError(
+                f"appcast item {position} enclosure name must be {expected_name}, got {enclosure_name!r}"
+            )
+    elif not isinstance(enclosure_name, str) or not enclosure_name.endswith(ROLE_ENCLOSURE_SUFFIX[role]):
         raise RolloutError(f"appcast item {position} enclosure name has the wrong role suffix")
     if item.get("url") != enclosure_url(update_repository(policy, channel), tag, enclosure_name):
         raise RolloutError(f"appcast item {position} enclosure URL mismatch: {item.get('url')!r}")
@@ -573,9 +579,19 @@ def run_current_role(args: argparse.Namespace) -> None:
 def run_packaging_context(args: argparse.Namespace) -> None:
     policy = load_policy(Path(args.policy))
     declaration = load_declaration(Path(args.declaration))
+    version = load_version_env(Path(args.version_env))
     role = declaration["currentRole"]
     identity_name = ROLE_IDENTITY[role]
     identity = policy["identities"][identity_name]
+    if version["BUNDLE_ID"] != identity["bundleIdentifier"]:
+        raise RolloutError(
+            f"version.env BUNDLE_ID does not match the {identity_name} identity policy"
+        )
+    if version["SIGNING_TEAM_ID"] != identity["teamIdentifier"]:
+        raise RolloutError(
+            f"version.env SIGNING_TEAM_ID does not match the {identity_name} identity policy"
+        )
+    successor = policy["identities"]["successor"]
     values = {
         "ROLLOUT_CHANNEL": declaration["channel"],
         "ROLLOUT_ROLE": role,
@@ -587,6 +603,7 @@ def run_packaging_context(args: argparse.Namespace) -> None:
         "ROLLOUT_ENCLOSURE_SUFFIX": ROLE_ENCLOSURE_SUFFIX[role],
         "EXPECTED_SIGN_IDENTITY": identity["developerIDApplicationIdentityName"],
         "EXPECTED_INSTALLER_IDENTITY": identity.get("developerIDInstallerIdentityName", ""),
+        "EXPECTED_SUCCESSOR_SIGN_IDENTITY": successor["developerIDApplicationIdentityName"],
         "ROLLOUT_UPDATE_REPOSITORY": update_repository(policy, declaration["channel"]),
         "ROLLOUT_FEED_URL": policy["sparkle"][
             "tipFeedURL" if declaration["channel"] == "tip" else "stableFeedURL"
@@ -672,6 +689,7 @@ def build_parser() -> argparse.ArgumentParser:
     packaging_context = subparsers.add_parser("packaging-context")
     packaging_context.add_argument("--declaration", required=True)
     packaging_context.add_argument("--policy", required=True)
+    packaging_context.add_argument("--version-env", required=True)
     packaging_context.set_defaults(func=run_packaging_context)
 
     predecessor_values = subparsers.add_parser("predecessor-values")

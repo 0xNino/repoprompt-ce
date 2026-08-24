@@ -11,6 +11,7 @@ struct IdentityTransitionDiagnosticEvent: Codable, Equatable {
         case started
         case succeeded
         case skipped
+        case alreadyCompleted = "already-completed"
         case blocked
         case failed
         case cancelled
@@ -97,7 +98,8 @@ final class IdentityTransitionDiagnostics: @unchecked Sendable {
     }
 
     func record(_ event: IdentityTransitionDiagnosticEvent) {
-        print("[IdentityTransition] subsystem=\(event.subsystem.rawValue) stage=\(event.stage) outcome=\(event.outcome.rawValue)")
+        let line = "[IdentityTransition] subsystem=\(event.subsystem.rawValue) stage=\(event.stage) outcome=\(event.outcome.rawValue)\n"
+        FileHandle.standardError.write(Data(line.utf8))
         guard let fileURL else { return }
 
         lock.lock()

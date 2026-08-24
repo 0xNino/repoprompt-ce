@@ -711,14 +711,14 @@ enum SecureStorageIdentityMigrationBootstrap {
         IdentityMigrationRuntimeState.shared.setBlockedMessage(nil)
         let domain = SecureKeyValueStorageFactory.currentDecision().domain
         let phase = configuredPhase(from: bundle.object(forInfoDictionaryKey: phaseInfoKey))
-        recordDiagnostic(
-            stage: "bootstrap",
-            outcome: .started,
-            bundle: bundle,
-            domain: domain
-        )
         switch domain {
         case .officialDeveloperID:
+            recordDiagnostic(
+                stage: "bootstrap",
+                outcome: .started,
+                bundle: bundle,
+                domain: domain
+            )
             guard let phase else {
                 recordDiagnostic(
                     stage: "configuration",
@@ -736,6 +736,12 @@ enum SecureStorageIdentityMigrationBootstrap {
                 prepareLegacyBridge(bundle: bundle)
             }
         case .successorOfficialDeveloperID:
+            recordDiagnostic(
+                stage: "bootstrap",
+                outcome: .started,
+                bundle: bundle,
+                domain: domain
+            )
             if let blockedMessage = successorBlockedMessage(forPhase: phase) {
                 recordDiagnostic(
                     stage: "configuration",
@@ -750,12 +756,7 @@ enum SecureStorageIdentityMigrationBootstrap {
             // authenticated committed bridge it must stay ephemeral and say so.
             activateCommittedBridgeIfPresent(bridgeRequired: true, bundle: bundle)
         case .localSelfSigned, .appleDevelopmentDebug, .ephemeral:
-            recordDiagnostic(
-                stage: "bootstrap",
-                outcome: .skipped,
-                bundle: bundle,
-                domain: domain
-            )
+            return
         }
     }
 

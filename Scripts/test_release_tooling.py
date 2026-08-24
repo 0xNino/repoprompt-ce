@@ -10,6 +10,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -4530,6 +4531,58 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
+
+    @staticmethod
+    def shell_assignments(output: str) -> dict[str, str]:
+        assignments = {}
+        for line in output.splitlines():
+            token = shlex.split(line)
+            if len(token) != 1 or "=" not in token[0]:
+                raise AssertionError(f"unexpected packaging-context output: {line!r}")
+            key, value = token[0].split("=", 1)
+            assignments[key] = value
+        return assignments
+
+    def test_packaging_context_rejects_version_identity_mismatch_before_packaging(self) -> None:
+        root = SCRIPT_DIR.parent
+        legacy = self.rollout(
+            "packaging-context",
+            "--declaration", str(self.TIP_DECLARATION),
+            "--policy", str(self.POLICY),
+            "--version-env", str(root / "version.env"),
+        )
+        self.assertEqual(legacy.returncode, 0, legacy.stderr)
+        context = self.shell_assignments(legacy.stdout)
+        policy = json.loads(self.POLICY.read_text(encoding="utf-8"))
+        self.assertEqual(context["ROLLOUT_ROLE"], "legacy")
+        self.assertEqual(context["BUNDLE_ID"], "com.pvncher.repoprompt.ce")
+        self.assertEqual(
+            context["EXPECTED_SUCCESSOR_SIGN_IDENTITY"],
+            policy["identities"]["successor"]["developerIDApplicationIdentityName"],
+        )
+
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        transition = self.make_declaration(
+            temp_dir,
+            "transition",
+            [
+                {
+                    "role": "preparer",
+                    "tag": "tip-preparer",
+                    "rolloutManifestSha256": "0" * 64,
+                }
+            ],
+            channel="tip",
+        )
+        mismatch = self.rollout(
+            "packaging-context",
+            "--declaration", str(transition),
+            "--policy", str(self.POLICY),
+            "--version-env", str(root / "version.env"),
+        )
+        self.assertNotEqual(mismatch.returncode, 0)
+        self.assertIn("version.env BUNDLE_ID does not match", mismatch.stderr)
 
     def chain_predecessors(self, role: str) -> list[dict]:
         placeholder = "0" * 64
