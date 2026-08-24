@@ -41,10 +41,28 @@ struct SecureStorageIdentityMigrationRecord: Equatable, Identifiable {
     }
 }
 
+enum SecureStorageIdentityMigrationStage: String, Equatable {
+    case journalLoad = "journal-load"
+    case journalValidation = "journal-validation"
+    case sourcePreflight = "source-preflight"
+    case attemptIdentifier = "attempt-identifier"
+    case journalCreate = "journal-create"
+    case bridgeOpen = "bridge-open"
+    case bridgePreflight = "bridge-preflight"
+    case bridgeReconcile = "bridge-reconcile"
+    case bridgeVerify = "bridge-verify"
+    case bridgeManifestPersist = "bridge-manifest-persist"
+    case journalCommit = "journal-commit"
+    case committedBridgeOpen = "committed-bridge-open"
+    case committedBridgeVerify = "committed-bridge-verify"
+    case ready
+}
+
 struct SecureStorageIdentityMigrationReport: Equatable {
     let records: [SecureStorageIdentityMigrationRecord]
     let bridgeReady: Bool
     let blockingState: SecureStorageIdentityMigrationRecordState?
+    let stage: SecureStorageIdentityMigrationStage
 
     var blockedUpdateMessage: String? {
         guard !bridgeReady else { return nil }
@@ -207,11 +225,13 @@ final class SecureStorageIdentityMigrationCoordinator {
             // has been committed, the journal is the only pointer to it, so destructive
             // reset-and-retry could silently restart migration from stale source data.
             // Fail closed and keep the journal item intact for manual recovery.
-            return blockedReport(error: error)
+            return blockedReport(error: error, stage: .journalLoad)
         }
 
         if let existingManifest {
-            guard isStructurallyValid(existingManifest) else { return blockedReport() }
+            guard isStructurallyValid(existingManifest) else {
+                return blockedReport(stage: .journalValidation)
+            }
             switch existingManifest.status {
             case .preparing:
                 return resumePreparation(existingManifest)
@@ -223,14 +243,15 @@ final class SecureStorageIdentityMigrationCoordinator {
         let sourceResults = readAll(from: sourceStore)
         let preflightRecords = recordsForReadFailures(sourceResults)
         guard preflightRecords.allSatisfy(\.state.isReady) else {
-            return failedReport(records: preflightRecords)
+            return failedReport(records: preflightRecords, stage: .sourcePreflight)
         }
 
         let attemptIdentifier = attemptIdentifierGenerator()
         guard KeychainService.identityMigrationBridgeServiceName(for: attemptIdentifier) != nil else {
             return failedReport(
                 records: preflightRecords,
-                error: KeychainACLValidationError.invalidExpectedPrincipalPolicy
+                error: KeychainACLValidationError.invalidExpectedPrincipalPolicy,
+                stage: .attemptIdentifier
             )
         }
         let manifest = SecureStorageIdentityMigrationManifest(
@@ -242,7 +263,7 @@ final class SecureStorageIdentityMigrationCoordinator {
         do {
             try stateStore.create(manifest)
         } catch {
-            return failedReport(records: preflightRecords, error: error)
+            return failedReport(records: preflightRecords, error: error, stage: .journalCreate)
         }
         return resumePreparation(manifest, sourceResults: sourceResults)
     }
@@ -317,13 +338,13 @@ final class SecureStorageIdentityMigrationCoordinator {
         do {
             bridgeStore = try bridgeStoreFactory(manifest.attemptIdentifier)
         } catch {
-            return blockedReport(error: error)
+            return blockedReport(error: error, stage: .bridgeOpen)
         }
         let sourceResults = suppliedSourceResults ?? readAll(from: sourceStore)
         let bridgeResults = readAll(from: bridgeStore)
         let preflightRecords = zipResults(source: sourceResults, bridge: bridgeResults)
         guard preflightRecords.allSatisfy(\.state.isReady) else {
-            return failedReport(records: preflightRecords)
+            return failedReport(records: preflightRecords, stage: .bridgePreflight)
         }
 
         var records: [SecureStorageIdentityMigrationRecord] = []
@@ -335,28 +356,37 @@ final class SecureStorageIdentityMigrationCoordinator {
             records.append(reconcile(account, source: source, bridge: bridge, bridgeStore: bridgeStore))
         }
         guard records.allSatisfy(\.state.isReady) else {
-            return failedReport(records: records)
+            return failedReport(records: records, stage: .bridgeReconcile)
         }
 
         if let verificationFailure = verifyValuesMatch(bridgeStore: bridgeStore) {
-            return failedReport(records: records, blockingState: verificationFailure)
+            return failedReport(
+                records: records,
+                blockingState: verificationFailure,
+                stage: .bridgeVerify
+            )
         }
 
         let committedManifest = manifest.changingStatus(to: .committed)
         do {
             try persistBridgeManifest(committedManifest, bridgeStore: bridgeStore)
         } catch {
-            return failedReport(records: records, error: error)
+            return failedReport(
+                records: records,
+                error: error,
+                stage: .bridgeManifestPersist
+            )
         }
         do {
             try stateStore.save(committedManifest)
         } catch {
-            return failedReport(records: records, error: error)
+            return failedReport(records: records, error: error, stage: .journalCommit)
         }
         return SecureStorageIdentityMigrationReport(
             records: records,
             bridgeReady: true,
-            blockingState: nil
+            blockingState: nil,
+            stage: .ready
         )
     }
 
@@ -479,7 +509,7 @@ final class SecureStorageIdentityMigrationCoordinator {
         do {
             bridgeStore = try bridgeStoreFactory(manifest.attemptIdentifier)
         } catch {
-            return blockedReport(error: error)
+            return blockedReport(error: error, stage: .committedBridgeOpen)
         }
         let records: [SecureStorageIdentityMigrationRecord]
         do {
@@ -490,12 +520,13 @@ final class SecureStorageIdentityMigrationCoordinator {
                 accessMode: accessMode
             )
         } catch {
-            return blockedReport(error: error)
+            return blockedReport(error: error, stage: .committedBridgeVerify)
         }
         return SecureStorageIdentityMigrationReport(
             records: records,
             bridgeReady: true,
-            blockingState: nil
+            blockingState: nil,
+            stage: .ready
         )
     }
 
@@ -509,19 +540,24 @@ final class SecureStorageIdentityMigrationCoordinator {
     private func failedReport(
         records: [SecureStorageIdentityMigrationRecord],
         error: Error? = nil,
-        blockingState: SecureStorageIdentityMigrationRecordState? = nil
+        blockingState: SecureStorageIdentityMigrationRecordState? = nil,
+        stage: SecureStorageIdentityMigrationStage
     ) -> SecureStorageIdentityMigrationReport {
         SecureStorageIdentityMigrationReport(
             records: records,
             bridgeReady: false,
             blockingState: error.map {
                 SecureStorageIdentityMigrationRecordState.failureState(for: $0)
-            } ?? blockingState
+            } ?? blockingState,
+            stage: stage
         )
     }
 
-    private func blockedReport(error: Error? = nil) -> SecureStorageIdentityMigrationReport {
-        failedReport(records: [], error: error)
+    private func blockedReport(
+        error: Error? = nil,
+        stage: SecureStorageIdentityMigrationStage
+    ) -> SecureStorageIdentityMigrationReport {
+        failedReport(records: [], error: error, stage: stage)
     }
 }
 
@@ -675,28 +711,51 @@ enum SecureStorageIdentityMigrationBootstrap {
         IdentityMigrationRuntimeState.shared.setBlockedMessage(nil)
         let domain = SecureKeyValueStorageFactory.currentDecision().domain
         let phase = configuredPhase(from: bundle.object(forInfoDictionaryKey: phaseInfoKey))
+        recordDiagnostic(
+            stage: "bootstrap",
+            outcome: .started,
+            bundle: bundle,
+            domain: domain
+        )
         switch domain {
         case .officialDeveloperID:
             guard let phase else {
+                recordDiagnostic(
+                    stage: "configuration",
+                    outcome: .blocked,
+                    bundle: bundle,
+                    domain: domain
+                )
                 blockUpdates(unrecognizedConfigurationMessage)
                 return
             }
             switch phase {
             case .disabled:
-                activateCommittedBridgeIfPresent(bridgeRequired: false)
+                activateCommittedBridgeIfPresent(bridgeRequired: false, bundle: bundle)
             case .legacyPreparer:
                 prepareLegacyBridge(bundle: bundle)
             }
         case .successorOfficialDeveloperID:
             if let blockedMessage = successorBlockedMessage(forPhase: phase) {
+                recordDiagnostic(
+                    stage: "configuration",
+                    outcome: .blocked,
+                    bundle: bundle,
+                    domain: domain
+                )
                 blockUpdates(blockedMessage)
                 return
             }
             // The successor identity has no legacy storage fallback: without an
             // authenticated committed bridge it must stay ephemeral and say so.
-            activateCommittedBridgeIfPresent(bridgeRequired: true)
+            activateCommittedBridgeIfPresent(bridgeRequired: true, bundle: bundle)
         case .localSelfSigned, .appleDevelopmentDebug, .ephemeral:
-            return
+            recordDiagnostic(
+                stage: "bootstrap",
+                outcome: .skipped,
+                bundle: bundle,
+                domain: domain
+            )
         }
     }
 
@@ -717,6 +776,12 @@ enum SecureStorageIdentityMigrationBootstrap {
                   requirementSource: RuntimeCodeSigningPolicy.successorDeveloperIDRequirement
               )
         else {
+            recordDiagnostic(
+                stage: "preparer-validation",
+                outcome: .blocked,
+                bundle: bundle,
+                domain: .officialDeveloperID
+            )
             blockUpdates("Updates are paused because the secure credential migration package is incomplete, its account catalog changed, or it has an invalid identity anchor.")
             return
         }
@@ -739,6 +804,13 @@ enum SecureStorageIdentityMigrationBootstrap {
                 ]
             )
         } catch {
+            recordDiagnostic(
+                stage: "preparer-authority",
+                outcome: .blocked,
+                bundle: bundle,
+                domain: .officialDeveloperID,
+                error: error
+            )
             blockUpdates(for: error)
             return
         }
@@ -762,6 +834,13 @@ enum SecureStorageIdentityMigrationBootstrap {
             stateStore: stateStore
         )
         let report = coordinator.prepareBridge()
+        recordDiagnostic(
+            stage: report.stage.rawValue,
+            outcome: report.bridgeReady ? .succeeded : .blocked,
+            bundle: bundle,
+            domain: .officialDeveloperID,
+            recordStateCounts: report.diagnosticStateCounts
+        )
         guard report.bridgeReady else {
             blockUpdates(report.blockedUpdateMessage)
             return
@@ -771,11 +850,24 @@ enum SecureStorageIdentityMigrationBootstrap {
             guard let loadedManifest = try stateStore.load(),
                   loadedManifest.status == .committed
             else {
+                recordDiagnostic(
+                    stage: "post-commit-journal-load",
+                    outcome: .blocked,
+                    bundle: bundle,
+                    domain: .officialDeveloperID
+                )
                 blockUpdates("Updates are paused because the secure credential migration journal is incomplete.")
                 return
             }
             manifest = loadedManifest
         } catch {
+            recordDiagnostic(
+                stage: "post-commit-journal-load",
+                outcome: .blocked,
+                bundle: bundle,
+                domain: .officialDeveloperID,
+                error: error
+            )
             blockUpdates(for: error)
             return
         }
@@ -787,12 +879,31 @@ enum SecureStorageIdentityMigrationBootstrap {
                 itemAccessValidator: authority.accessValidator
             )
             SecureKeyValueStorageFactory.installOfficialBackendOverride(bridge)
+            recordDiagnostic(
+                stage: "preparer-activation",
+                outcome: .succeeded,
+                bundle: bundle,
+                domain: .officialDeveloperID
+            )
         } catch {
+            recordDiagnostic(
+                stage: "preparer-activation",
+                outcome: .blocked,
+                bundle: bundle,
+                domain: .officialDeveloperID,
+                error: error
+            )
             blockUpdates(for: error)
         }
     }
 
-    private static func activateCommittedBridgeIfPresent(bridgeRequired: Bool) {
+    private static func activateCommittedBridgeIfPresent(
+        bridgeRequired: Bool,
+        bundle: Bundle
+    ) {
+        let domain: RuntimeSecureStorageDomain = bridgeRequired
+            ? .successorOfficialDeveloperID
+            : .officialDeveloperID
         let accessValidator: ClassicKeychainACLValidator
         do {
             accessValidator = try ClassicKeychainACLValidator(
@@ -802,6 +913,13 @@ enum SecureStorageIdentityMigrationBootstrap {
                 ]
             )
         } catch {
+            recordDiagnostic(
+                stage: "activation-authority",
+                outcome: .blocked,
+                bundle: bundle,
+                domain: domain,
+                error: error
+            )
             blockUpdates(for: error)
             return
         }
@@ -829,10 +947,23 @@ enum SecureStorageIdentityMigrationBootstrap {
                 }
             ).resolve()
         } catch {
+            recordDiagnostic(
+                stage: "committed-bridge-resolve",
+                outcome: .blocked,
+                bundle: bundle,
+                domain: domain,
+                error: error
+            )
             blockUpdates(for: error)
             return
         }
         guard let resolution else {
+            recordDiagnostic(
+                stage: "committed-bridge-resolve",
+                outcome: bridgeRequired ? .blocked : .skipped,
+                bundle: bundle,
+                domain: domain
+            )
             if bridgeRequired {
                 blockUpdates(successorMissingBridgeMessage)
             }
@@ -843,6 +974,12 @@ enum SecureStorageIdentityMigrationBootstrap {
         guard let bridgeServiceName = KeychainService.identityMigrationBridgeServiceName(
             for: manifest.attemptIdentifier
         ) else {
+            recordDiagnostic(
+                stage: "committed-bridge-service",
+                outcome: .blocked,
+                bundle: bundle,
+                domain: domain
+            )
             blockUpdates("Updates are paused because the secure credential migration journal is incomplete.")
             return
         }
@@ -859,7 +996,20 @@ enum SecureStorageIdentityMigrationBootstrap {
                 itemAccessValidator: accessValidator
             )
             SecureKeyValueStorageFactory.installOfficialBackendOverride(bridge)
+            recordDiagnostic(
+                stage: "committed-bridge-activation",
+                outcome: .succeeded,
+                bundle: bundle,
+                domain: domain
+            )
         } catch {
+            recordDiagnostic(
+                stage: "committed-bridge-activation",
+                outcome: .blocked,
+                bundle: bundle,
+                domain: domain,
+                error: error
+            )
             blockUpdates(for: error)
         }
     }
@@ -911,8 +1061,64 @@ enum SecureStorageIdentityMigrationBootstrap {
         let report = SecureStorageIdentityMigrationReport(
             records: [],
             bridgeReady: false,
-            blockingState: SecureStorageIdentityMigrationRecordState.failureState(for: error)
+            blockingState: SecureStorageIdentityMigrationRecordState.failureState(for: error),
+            stage: .committedBridgeVerify
         )
         blockUpdates(report.blockedUpdateMessage)
+    }
+
+    private static func recordDiagnostic(
+        stage: String,
+        outcome: IdentityTransitionDiagnosticEvent.Outcome,
+        bundle: Bundle,
+        domain: RuntimeSecureStorageDomain,
+        recordStateCounts: [String: Int]? = nil,
+        error: Error? = nil
+    ) {
+        IdentityTransitionDiagnostics.shared.record(
+            subsystem: .secureStorage,
+            stage: stage,
+            outcome: outcome,
+            bundle: bundle,
+            secureStorageDomain: domain,
+            recordStateCounts: recordStateCounts,
+            errorClass: error.map(diagnosticErrorClass)
+        )
+    }
+
+    private static func diagnosticErrorClass(_ error: Error) -> String {
+        switch SecureStorageIdentityMigrationRecordState.failureState(for: error) {
+        case .interactionRequired: "interaction-required"
+        case .userInteractionCancelled: "cancelled"
+        case .authenticationFailed: "authentication-failed"
+        case .absent, .copied, .verified, .failed: "other"
+        }
+    }
+}
+
+private extension SecureStorageIdentityMigrationReport {
+    var diagnosticStateCounts: [String: Int] {
+        var counts: [String: Int] = [:]
+        for record in records {
+            counts[record.state.diagnosticName, default: 0] += 1
+        }
+        if let blockingState {
+            counts["blocking-\(blockingState.diagnosticName)", default: 0] += 1
+        }
+        return counts
+    }
+}
+
+private extension SecureStorageIdentityMigrationRecordState {
+    var diagnosticName: String {
+        switch self {
+        case .absent: "absent"
+        case .copied: "copied"
+        case .verified: "verified"
+        case .interactionRequired: "interaction-required"
+        case .userInteractionCancelled: "cancelled"
+        case .authenticationFailed: "authentication-failed"
+        case .failed: "failed"
+        }
     }
 }

@@ -3,10 +3,8 @@ set -euo pipefail
 
 # Builder/validator for the notarized Apple identity-transition package (T).
 #
-# DORMANT BY DESIGN: no protected workflow references this script, release.sh
-# refuses the transition artifact role, and promote_release.sh keeps the
-# transition role locked. Publishing a transition package stays impossible
-# until successor rollout enablement deliberately wires it up.
+# Stable remains dormant. The Tip dress rehearsal is the only protected caller
+# and must opt in explicitly for the transition role.
 
 MODE="${1:-}"
 if [[ $# -gt 0 ]]; then shift; fi
@@ -39,8 +37,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-[[ "${GITHUB_ACTIONS:-}" != "true" ]] ||
-    fail "build_identity_transition_pkg.sh is dormant and must not run inside protected workflows until successor rollout enablement"
+[[ "${REPOPROMPT_ENABLE_IDENTITY_TRANSITION_PKG:-}" == "1" ]] ||
+    fail "identity transition package construction requires explicit Tip rollout enablement"
 
 validate_successor_app() {
     local app="$1"
@@ -125,8 +123,8 @@ build_transition_pkg() {
 
     local payload_build
     payload_build="$(plutil -extract CFBundleVersion raw "$app/Contents/Info.plist")"
-    [[ "$payload_build" =~ ^[0-9]+$ ]] ||
-        fail "Transition payload build number must be numeric, got $payload_build"
+    [[ "$payload_build" =~ ^[0-9]{1,4}(\.[0-9]{1,2}){0,2}$ ]] ||
+        fail "Transition payload build number must be a valid CFBundleVersion, got $payload_build"
 
     local component_pkg="$TMP_DIR/transition-component.pkg"
     pkgbuild \

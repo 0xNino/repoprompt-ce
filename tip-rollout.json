@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "channel": "tip",
+  "currentRole": "legacy",
+  "eligibilityProfile": "tip-identity-dress-rehearsal-v1",
+  "expectedMigrationPhase": "disabled",
+  "expectedSigningIdentity": "legacy",
+  "predecessors": []
+}

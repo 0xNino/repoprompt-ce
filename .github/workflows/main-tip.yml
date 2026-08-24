@@ -11,6 +11,10 @@ on:
         description: Commit SHA on protected main to publish as tip
         required: false
         type: string
+      confirm_identity_rollout_role:
+        description: For preparer/transition/successor, enter the exact checked-in role
+        required: false
+        type: string
 
 concurrency:
   group: >-
@@ -43,6 +47,10 @@ jobs:
       tag: ${{ steps.tip.outputs.tag }}
       tooling-commit: ${{ steps.tip.outputs.tooling-commit }}
       should-publish: ${{ steps.tip.outputs.should-publish }}
+      rollout-role: ${{ steps.tip.outputs.rollout-role }}
+      rollout-identity: ${{ steps.tip.outputs.rollout-identity }}
+      migration-phase: ${{ steps.tip.outputs.migration-phase }}
+      installation-type: ${{ steps.tip.outputs.installation-type }}
     steps:
       - name: Check out trusted tooling
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -57,6 +65,7 @@ jobs:
           REQUESTED_COMMIT: ${{ inputs.commit || github.event.workflow_run.head_sha }}
           TIP_UPDATE_REPOSITORY: ${{ vars.TIP_UPDATE_REPOSITORY || 'repoprompt/repoprompt-ce-tip-updates' }}
           TIP_GH_TOKEN: ${{ github.token }}
+          CONFIRMED_ROLLOUT_ROLE: ${{ inputs.confirm_identity_rollout_role }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin main
@@ -73,25 +82,32 @@ jobs:
             exit 1
           }
 
+          rollout_declaration="$RUNNER_TEMP/tip-rollout.json"
+          git show "$commit:tip-rollout.json" > "$rollout_declaration"
+          eval "$(python3 Scripts/stable_rollout.py packaging-context \
+            --declaration "$rollout_declaration" \
+            --policy Scripts/apple_identity_policy.json)"
+          [[ "$ROLLOUT_UPDATE_REPOSITORY" == "$TIP_UPDATE_REPOSITORY" ]] || {
+            echo "Configured Tip update repository does not match the reviewed identity policy" >&2
+            exit 1
+          }
+
+          should_publish=true
+          if [[ "$ROLLOUT_ROLE" != "legacy" ]]; then
+            if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
+              should_publish=false
+              echo "Identity rollout role $ROLLOUT_ROLE requires an explicit workflow dispatch; skipping automatic publication."
+            elif [[ "$CONFIRMED_ROLLOUT_ROLE" != "$ROLLOUT_ROLE" ]]; then
+              echo "confirm_identity_rollout_role must exactly match checked-in role $ROLLOUT_ROLE" >&2
+              exit 1
+            fi
+          fi
+
           stable_appcast="$RUNNER_TEMP/stable-appcast.xml"
           curl --fail --location --retry 3 --silent --show-error \
             https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml \
             --output "$stable_appcast"
-          stable_build_number="$(python3 - "$stable_appcast" <<'PYTHON'
-          import sys
-          import xml.etree.ElementTree as ET
-
-          root = ET.parse(sys.argv[1]).getroot()
-          versions = [
-              (element.text or "").strip()
-              for element in root.iter()
-              if element.tag.rsplit("}", 1)[-1] == "version"
-          ]
-          if len(versions) != 1 or not versions[0].isdigit():
-              raise SystemExit("Stable appcast must contain exactly one numeric sparkle:version")
-          print(versions[0])
-          PYTHON
-          )"
+          stable_build_number="$(python3 Scripts/stable_rollout.py max-build --appcast "$stable_appcast")"
           (( ${#stable_build_number} <= 4 )) || {
             echo "Stable build number exceeds CFBundleVersion's four-digit major component" >&2
             exit 1
@@ -100,23 +116,24 @@ jobs:
           archive_basename="RepoPrompt-tip-$short_sha-$build_number"
           tag="tip-$short_sha"
 
-          lookup_classification="$(./Scripts/lookup_public_tip_release.sh \
-            "$TIP_UPDATE_REPOSITORY" \
-            "$tag" \
-            "$archive_basename")"
-          case "$lookup_classification" in
-            found)
-              should_publish=false
-              echo "Existing tip release response classification=complete; skipping rebuild."
-              ;;
-            not-found)
-              should_publish=true
-              ;;
-            *)
-              echo "GitHub public tip lookup classification=unexpected-helper-output" >&2
-              exit 1
-              ;;
-          esac
+          if [[ "$should_publish" == "true" ]]; then
+            lookup_classification="$(./Scripts/lookup_public_tip_release.sh \
+              "$TIP_UPDATE_REPOSITORY" \
+              "$tag" \
+              "$archive_basename" \
+              "$ROLLOUT_INSTALLATION_TYPE")"
+            case "$lookup_classification" in
+              found)
+                should_publish=false
+                echo "Existing tip release response classification=complete; skipping rebuild."
+                ;;
+              not-found) ;;
+              *)
+                echo "GitHub public tip lookup classification=unexpected-helper-output" >&2
+                exit 1
+                ;;
+            esac
+          fi
           {
             echo "commit=$commit"
             echo "short-sha=$short_sha"
@@ -124,6 +141,10 @@ jobs:
             echo "tag=$tag"
             echo "tooling-commit=$(git rev-parse HEAD)"
             echo "should-publish=$should_publish"
+            echo "rollout-role=$ROLLOUT_ROLE"
+            echo "rollout-identity=$ROLLOUT_IDENTITY"
+            echo "migration-phase=$REPOPROMPT_IDENTITY_MIGRATION_PHASE"
+            echo "installation-type=$ROLLOUT_INSTALLATION_TYPE"
           } >> "$GITHUB_OUTPUT"
 
   stage:
@@ -158,9 +179,6 @@ jobs:
           TIP_TAG: ${{ needs.setup.outputs.tag }}
           REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
           REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/tip-source
-          # Tip is rolling and cannot preserve a migration phase across automatic
-          # workflow_run publishes. Preparers are Stable-only release artifacts.
-          REPOPROMPT_IDENTITY_MIGRATION_PHASE: disabled
           # Link Sentry and preserve dSYMs without exposing DSN or auth in this stage.
           REPOPROMPT_ENABLE_SENTRY: "1"
         run: ./trusted-control-plane/Scripts/main_tip_release.sh stage
@@ -211,7 +229,7 @@ jobs:
         env:
           RELEASE_COMMIT: ${{ needs.setup.outputs.commit }}
           REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE: ${{ needs.setup.outputs.build-number }}
-          REPOPROMPT_IDENTITY_MIGRATION_PHASE: disabled
+          REPOPROMPT_IDENTITY_MIGRATION_PHASE: ${{ needs.setup.outputs.migration-phase }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -226,15 +244,41 @@ jobs:
             REPOPROMPT_APPROVED_SOURCE_ROOT=approved-source \
             ./trusted-control-plane/Scripts/validate_staged_release.sh
 
-      - name: Import Developer ID certificate
+      - name: Import role-selected Developer ID certificates
         env:
-          CERTIFICATE_P12_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_BASE64 }}
-          CERTIFICATE_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          ROLLOUT_ROLE: ${{ needs.setup.outputs.rollout-role }}
+          ROLLOUT_IDENTITY: ${{ needs.setup.outputs.rollout-identity }}
+          LEGACY_CERTIFICATE_P12_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          LEGACY_CERTIFICATE_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          SUCCESSOR_CERTIFICATE_P12_BASE64: ${{ secrets.SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          SUCCESSOR_CERTIFICATE_P12_PASSWORD: ${{ secrets.SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          SUCCESSOR_INSTALLER_P12_BASE64: ${{ secrets.SUCCESSOR_DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          SUCCESSOR_INSTALLER_P12_PASSWORD: ${{ secrets.SUCCESSOR_DEVELOPER_ID_INSTALLER_P12_PASSWORD }}
           CI_KEYCHAIN_PASSWORD: ${{ secrets.CI_KEYCHAIN_PASSWORD }}
-          CONFIGURED_SIGN_IDENTITY: ${{ vars.SIGN_IDENTITY }}
+          CONFIGURED_LEGACY_SIGN_IDENTITY: ${{ vars.SIGN_IDENTITY }}
+          CONFIGURED_SUCCESSOR_SIGN_IDENTITY: ${{ vars.SUCCESSOR_SIGN_IDENTITY }}
+          CONFIGURED_SUCCESSOR_INSTALLER_IDENTITY: ${{ vars.SUCCESSOR_INSTALLER_IDENTITY }}
         run: |
           set -euo pipefail
           umask 077
+          eval "$(python3 trusted-control-plane/Scripts/stable_rollout.py packaging-context \
+            --declaration approved-source/tip-rollout.json \
+            --policy trusted-control-plane/Scripts/apple_identity_policy.json)"
+          if [[ "$ROLLOUT_IDENTITY" == "successor" ]]; then
+            CERTIFICATE_P12_BASE64="$SUCCESSOR_CERTIFICATE_P12_BASE64"
+            CERTIFICATE_P12_PASSWORD="$SUCCESSOR_CERTIFICATE_P12_PASSWORD"
+            CONFIGURED_SIGN_IDENTITY="$CONFIGURED_SUCCESSOR_SIGN_IDENTITY"
+          else
+            CERTIFICATE_P12_BASE64="$LEGACY_CERTIFICATE_P12_BASE64"
+            CERTIFICATE_P12_PASSWORD="$LEGACY_CERTIFICATE_P12_PASSWORD"
+            CONFIGURED_SIGN_IDENTITY="$CONFIGURED_LEGACY_SIGN_IDENTITY"
+          fi
+          : "${CERTIFICATE_P12_BASE64:?Application signing certificate is not configured for this identity}"
+          : "${CERTIFICATE_P12_PASSWORD:?Application signing certificate password is not configured for this identity}"
+          [[ "$CONFIGURED_SIGN_IDENTITY" == "$EXPECTED_SIGN_IDENTITY" ]] || {
+            echo "Configured signing identity must match the reviewed identity policy" >&2
+            exit 1
+          }
           KEYCHAIN_PATH="$RUNNER_TEMP/repoprompt-tip.keychain-db"
           CERTIFICATE_PATH="$RUNNER_TEMP/repoprompt-tip.p12"
           printf '%s' "$CERTIFICATE_P12_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
@@ -244,18 +288,75 @@ jobs:
           security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" -P "$CERTIFICATE_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychains -d user -s "$KEYCHAIN_PATH"
+          if [[ "$ROLLOUT_ROLE" == "transition" ]]; then
+            : "${SUCCESSOR_INSTALLER_P12_BASE64:?Successor Developer ID Installer certificate is not configured}"
+            : "${SUCCESSOR_INSTALLER_P12_PASSWORD:?Successor Developer ID Installer password is not configured}"
+            [[ "$CONFIGURED_SUCCESSOR_INSTALLER_IDENTITY" == "$EXPECTED_INSTALLER_IDENTITY" ]] || {
+              echo "Configured installer identity must match the reviewed identity policy" >&2
+              exit 1
+            }
+            installer_certificate="$RUNNER_TEMP/repoprompt-tip-installer.p12"
+            printf '%s' "$SUCCESSOR_INSTALLER_P12_BASE64" | base64 --decode > "$installer_certificate"
+            security import "$installer_certificate" -k "$KEYCHAIN_PATH" \
+              -P "$SUCCESSOR_INSTALLER_P12_PASSWORD" -T /usr/bin/productbuild -T /usr/bin/security
+            security set-key-partition-list -S apple-tool:,apple:,codesign:,productbuild: \
+              -s -k "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+            rm -f "$installer_certificate"
+            echo "INSTALLER_IDENTITY=$EXPECTED_INSTALLER_IDENTITY" >> "$GITHUB_ENV"
+          fi
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
-          echo "SIGN_IDENTITY=${CONFIGURED_SIGN_IDENTITY:-Developer ID Application: Eric Provencher (648A27MST5)}" >> "$GITHUB_ENV"
+          echo "SIGN_IDENTITY=$CONFIGURED_SIGN_IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Prepare successor identity migration anchor
+        if: needs.setup.outputs.rollout-role == 'preparer'
+        env:
+          SUCCESSOR_CERTIFICATE_P12_BASE64: ${{ secrets.SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          SUCCESSOR_CERTIFICATE_P12_PASSWORD: ${{ secrets.SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          SUCCESSOR_SIGN_IDENTITY: ${{ vars.SUCCESSOR_SIGN_IDENTITY }}
+          CI_KEYCHAIN_PASSWORD: ${{ secrets.CI_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          eval "$(python3 trusted-control-plane/Scripts/stable_rollout.py packaging-context \
+            --declaration approved-source/tip-rollout.json \
+            --policy trusted-control-plane/Scripts/apple_identity_policy.json)"
+          [[ "$SUCCESSOR_SIGN_IDENTITY" == "Developer ID Application: Samuel Baron (69N6K965SF)" ]] || {
+            echo "Successor signing identity does not match the reviewed identity policy" >&2
+            exit 1
+          }
+          successor_certificate="$RUNNER_TEMP/repoprompt-tip-successor.p12"
+          anchor="$RUNNER_TEMP/repoprompt-successor-identity-anchor"
+          xcrun clang -arch arm64 -arch x86_64 -Os -Wl,-dead_strip \
+            -o "$anchor" trusted-control-plane/Scripts/identity_migration_anchor.c
+          printf '%s' "$SUCCESSOR_CERTIFICATE_P12_BASE64" | base64 --decode > "$successor_certificate"
+          security import "$successor_certificate" -k "$KEYCHAIN_PATH" \
+            -P "$SUCCESSOR_CERTIFICATE_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          codesign --force --sign "$SUCCESSOR_SIGN_IDENTITY" --keychain "$KEYCHAIN_PATH" \
+            --identifier com.repoprompt.ce --timestamp --options runtime "$anchor"
+          codesign --verify --strict --verbose=2 \
+            -R='anchor apple generic and identifier "com.repoprompt.ce" and certificate leaf[subject.OU] = "69N6K965SF" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists' \
+            "$anchor"
+          echo "REPOPROMPT_IDENTITY_MIGRATION_ANCHOR=$anchor" >> "$GITHUB_ENV"
 
       - name: Prepare provisioning profile and notarization key
         env:
-          PROVISIONING_PROFILE_BASE64: ${{ secrets.REPOPROMPT_CE_PROVISIONING_PROFILE_BASE64 }}
+          ROLLOUT_IDENTITY: ${{ needs.setup.outputs.rollout-identity }}
+          LEGACY_PROVISIONING_PROFILE_BASE64: ${{ secrets.REPOPROMPT_CE_PROVISIONING_PROFILE_BASE64 }}
+          SUCCESSOR_PROVISIONING_PROFILE_BASE64: ${{ secrets.SUCCESSOR_REPOPROMPT_CE_PROVISIONING_PROFILE_BASE64 }}
           NOTARYTOOL_PRIVATE_KEY_BASE64: ${{ secrets.NOTARYTOOL_PRIVATE_KEY_BASE64 }}
         run: |
           set -euo pipefail
           umask 077
           SECRETS_DIR="$RUNNER_TEMP/repoprompt-tip-secrets"
           mkdir -p "$SECRETS_DIR"
+          if [[ "$ROLLOUT_IDENTITY" == "successor" ]]; then
+            PROVISIONING_PROFILE_BASE64="$SUCCESSOR_PROVISIONING_PROFILE_BASE64"
+          else
+            PROVISIONING_PROFILE_BASE64="$LEGACY_PROVISIONING_PROFILE_BASE64"
+          fi
+          : "${PROVISIONING_PROFILE_BASE64:?Provisioning profile is not configured for this identity}"
           printf '%s' "$PROVISIONING_PROFILE_BASE64" | base64 --decode > "$SECRETS_DIR/repoprompt-ce.provisionprofile"
           printf '%s' "$NOTARYTOOL_PRIVATE_KEY_BASE64" | base64 --decode > "$SECRETS_DIR/notarytool-private-key.p8"
           echo "REPOPROMPT_PROVISIONING_PROFILE=$SECRETS_DIR/repoprompt-ce.provisionprofile" >> "$GITHUB_ENV"
@@ -293,7 +394,7 @@ jobs:
           REPOPROMPT_APPROVED_SOURCE_ROOT: ${{ github.workspace }}/approved-source
           REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE: ${{ needs.setup.outputs.build-number }}
           REPOPROMPT_ENABLE_SENTRY: "1"
-          REPOPROMPT_IDENTITY_MIGRATION_PHASE: disabled
+          REPOPROMPT_IDENTITY_MIGRATION_PHASE: ${{ needs.setup.outputs.migration-phase }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}
           REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
@@ -309,6 +410,8 @@ jobs:
           security delete-keychain "$RUNNER_TEMP/repoprompt-tip.keychain-db" || true
           rm -rf "$RUNNER_TEMP/repoprompt-tip-secrets"
           rm -f "$RUNNER_TEMP/repoprompt-tip.p12"
+          rm -f "$RUNNER_TEMP/repoprompt-tip-successor.p12"
+          rm -f "$RUNNER_TEMP/repoprompt-successor-identity-anchor"
 
       - name: Upload signed tip assets for smoke and publish
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -317,10 +420,12 @@ jobs:
           path: |
             tip-source/dist/*.zip
             tip-source/dist/*.dmg
+            tip-source/dist/*.pkg
             tip-source/dist/appcast.xml
             tip-source/dist/SHA256SUMS
             tip-source/dist/*-artifact-manifest.json
             tip-source/dist/*-metadata.json
+            tip-source/dist/identity-rollout.json
           if-no-files-found: error
           retention-days: 1
 
@@ -349,18 +454,27 @@ jobs:
 
       - name: Verify and smoke signed tip
         env:
+          ROLLOUT_INSTALLATION_TYPE: ${{ needs.setup.outputs.installation-type }}
           REPOPROMPT_PACKAGED_SMOKE_TIMEOUT: "240"
           REPOPROMPT_PACKAGED_SMOKE_HELPER_TIMEOUT: "60"
           REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR: ${{ runner.temp }}/tip-smoke-diagnostics
         run: |
           set -euo pipefail
           shopt -s nullglob
-          archives=(signed-tip/*.zip)
           manifests=(signed-tip/*-artifact-manifest.json)
-          [[ "${#archives[@]}" == "1" ]] || { echo "Expected one signed tip ZIP" >&2; exit 1; }
           [[ "${#manifests[@]}" == "1" ]] || { echo "Expected one signed tip manifest" >&2; exit 1; }
           mkdir extracted
-          ditto -x -k "${archives[0]}" extracted
+          if [[ "$ROLLOUT_INSTALLATION_TYPE" == "package" ]]; then
+            packages=(signed-tip/*.pkg)
+            [[ "${#packages[@]}" == "1" ]] || { echo "Expected one signed Tip transition PKG" >&2; exit 1; }
+            REPOPROMPT_ENABLE_IDENTITY_TRANSITION_PKG=1 \
+              ./trusted-control-plane/Scripts/build_identity_transition_pkg.sh validate \
+              "${packages[0]}" --expanded-payload-dir extracted
+          else
+            archives=(signed-tip/*.zip)
+            [[ "${#archives[@]}" == "1" ]] || { echo "Expected one signed Tip ZIP" >&2; exit 1; }
+            ditto -x -k "${archives[0]}" extracted
+          fi
           env -i \
             PATH=/usr/bin:/bin:/usr/sbin:/sbin \
             HOME="$HOME" \

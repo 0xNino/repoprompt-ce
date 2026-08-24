@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$#" != 3 ]]; then
+if [[ "$#" != 4 ]]; then
     printf '%s\n' \
         'GitHub public tip lookup classification=invalid-input status=000 request_id=unavailable rate_limit_remaining=unavailable rate_limit_reset=unavailable retry_after=unavailable' \
         >&2
@@ -11,6 +11,8 @@ fi
 REPOSITORY="$1"
 TAG="$2"
 ARCHIVE_BASENAME="$3"
+INSTALLATION_TYPE="$4"
+[[ "$INSTALLATION_TYPE" == "application" || "$INSTALLATION_TYPE" == "package" ]] || exit 1
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/repoprompt-tip-lookup.XXXXXX")"
 RESPONSE_BODY="$TMP_DIR/response.json"
 RESPONSE_HEADERS="$TMP_DIR/response.headers"
@@ -61,7 +63,7 @@ PYTHON
 }
 
 classify_found_body() {
-    python3 - "$RESPONSE_BODY" "$ARCHIVE_BASENAME" <<'PYTHON'
+    python3 - "$RESPONSE_BODY" "$ARCHIVE_BASENAME" "$INSTALLATION_TYPE" <<'PYTHON'
 import json
 import sys
 
@@ -71,14 +73,18 @@ try:
     if not isinstance(release, dict):
         raise ValueError
     archive_basename = sys.argv[2]
+    installation_type = sys.argv[3]
     expected = {
-        f"{archive_basename}.zip",
-        f"{archive_basename}.dmg",
         "appcast.xml",
         "SHA256SUMS",
+        "identity-rollout.json",
         f"{archive_basename}-artifact-manifest.json",
         f"{archive_basename}-metadata.json",
     }
+    if installation_type == "package":
+        expected.add(f"{archive_basename}.pkg")
+    else:
+        expected.update({f"{archive_basename}.zip", f"{archive_basename}.dmg"})
     assets = release.get("assets", [])
     if not isinstance(assets, list) or not all(isinstance(asset, dict) for asset in assets):
         raise ValueError

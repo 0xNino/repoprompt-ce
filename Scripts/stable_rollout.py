@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Single Stable rollout authority for the Apple identity transition.
+"""Single rollout authority for the Apple identity transition.
 
-Owns the reviewed declaration (`release-rollout.json`), the generated immutable
-rollout manifest (`dist/<archive-basename>-stable-rollout.json`), and the
-accumulated Stable appcast. Version/build/bundle/team values are never
+Owns reviewed channel declarations, generated immutable rollout manifests, and
+the accumulated Stable or Tip appcast. Version/build/bundle/team values are never
 duplicated in the declaration; they are derived from `version.env` and
 `Scripts/apple_identity_policy.json` and cross-checked here.
 
@@ -26,6 +25,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shlex
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -37,6 +37,7 @@ MANIFEST_SCHEMA_VERSION = 1
 POLICY_SCHEMA_VERSION = 1
 
 ROLES = ("legacy", "preparer", "transition", "successor")
+CHANNELS = ("stable", "tip")
 WORKFLOW_ALLOWED_ROLES = ("legacy", "preparer")
 ROLE_IDENTITY = {
     "legacy": "legacy",
@@ -122,7 +123,14 @@ def load_policy(path: Path) -> dict:
     sparkle = policy.get("sparkle")
     if not isinstance(sparkle, dict) or not all(
         isinstance(sparkle.get(key), str) and sparkle.get(key)
-        for key in ("stableFeedURL", "sparklePublicEdDSAValue", "updateRepository", "minimumSystemVersion")
+        for key in (
+            "stableFeedURL",
+            "tipFeedURL",
+            "sparklePublicEdDSAValue",
+            "updateRepository",
+            "tipUpdateRepository",
+            "minimumSystemVersion",
+        )
     ):
         raise RolloutError("apple identity policy is missing sparkle invariants")
     return policy
@@ -137,8 +145,8 @@ def load_declaration(path: Path) -> dict:
         )
     if declaration["schemaVersion"] != DECLARATION_SCHEMA_VERSION:
         raise RolloutError("rollout declaration schema version mismatch")
-    if declaration["channel"] != "stable":
-        raise RolloutError("rollout declaration channel must be stable")
+    if declaration["channel"] not in CHANNELS:
+        raise RolloutError(f"rollout declaration channel must be one of {', '.join(CHANNELS)}")
     role = declaration["currentRole"]
     if role not in ROLES:
         raise RolloutError(f"unknown rollout role: {role!r}")
@@ -162,8 +170,12 @@ def load_declaration(path: Path) -> dict:
             )
         if entry["role"] not in ROLES:
             raise RolloutError(f"predecessor {position} has unknown role {entry['role']!r}")
-        if not isinstance(entry["tag"], str) or not entry["tag"].startswith("v"):
-            raise RolloutError(f"predecessor {position} tag must look like v<marketing-version>")
+        if not isinstance(entry["tag"], str) or not entry["tag"]:
+            raise RolloutError(f"predecessor {position} tag must be a nonempty string")
+        if declaration["channel"] == "stable" and not entry["tag"].startswith("v"):
+            raise RolloutError(f"predecessor {position} Stable tag must look like v<marketing-version>")
+        if declaration["channel"] == "tip" and not entry["tag"].startswith("tip-"):
+            raise RolloutError(f"predecessor {position} Tip tag must start with tip-")
         digest = entry["rolloutManifestSha256"]
         if not isinstance(digest, str) or len(digest) != 64 or not all(c in "0123456789abcdef" for c in digest):
             raise RolloutError(f"predecessor {position} rolloutManifestSha256 must be lowercase hex sha256")
@@ -191,19 +203,39 @@ def load_version_env(path: Path) -> dict[str, str]:
     return values
 
 
-def expected_enclosure_name(app_name: str, marketing: str, build: str, role: str) -> str:
-    return f"{app_name}-{marketing}-{build}{ROLE_ENCLOSURE_SUFFIX[role]}"
+def expected_enclosure_name(
+    app_name: str,
+    marketing: str,
+    build: str,
+    role: str,
+    enclosure_basename: str | None = None,
+) -> str:
+    basename = enclosure_basename or f"{app_name}-{marketing}-{build}"
+    return f"{basename}{ROLE_ENCLOSURE_SUFFIX[role]}"
 
 
-def rollout_manifest_name(app_name: str, marketing: str, build: str) -> str:
+def rollout_manifest_name(app_name: str, marketing: str, build: str, channel: str) -> str:
+    if channel == "tip":
+        return "identity-rollout.json"
     return f"{app_name}-{marketing}-{build}-stable-rollout.json"
+
+
+def update_repository(policy: dict, channel: str) -> str:
+    key = "tipUpdateRepository" if channel == "tip" else "updateRepository"
+    return policy["sparkle"][key]
 
 
 def enclosure_url(update_repository: str, tag: str, name: str) -> str:
     return f"https://github.com/{update_repository}/releases/download/{tag}/{name}"
 
 
-def validate_item_shape(item: dict, position: int, policy: dict, app_name: str) -> None:
+def validate_item_shape(
+    item: dict,
+    position: int,
+    policy: dict,
+    app_name: str,
+    channel: str,
+) -> None:
     minimum_system = policy["sparkle"]["minimumSystemVersion"]
     role = item.get("role")
     if role not in ROLES:
@@ -212,8 +244,10 @@ def validate_item_shape(item: dict, position: int, policy: dict, app_name: str) 
     marketing = str(item.get("marketingVersion", ""))
     parse_build(build, f"item {position} build number")
     tag = item.get("tag", "")
-    if tag != f"v{marketing}":
-        raise RolloutError(f"appcast item {position} tag must be v{marketing}, got {tag!r}")
+    if channel == "stable" and tag != f"v{marketing}":
+        raise RolloutError(f"appcast item {position} Stable tag must be v{marketing}, got {tag!r}")
+    if channel == "tip" and not str(tag).startswith("tip-"):
+        raise RolloutError(f"appcast item {position} Tip tag must start with tip-, got {tag!r}")
     if item.get("minimumSystemVersion") != minimum_system:
         raise RolloutError(
             f"appcast item {position} minimumSystemVersion must be exactly {minimum_system}"
@@ -223,12 +257,10 @@ def validate_item_shape(item: dict, position: int, policy: dict, app_name: str) 
             f"appcast item {position} installation type must be "
             f"{ROLE_INSTALLATION_TYPE[role]} for the {role} role"
         )
-    expected_name = expected_enclosure_name(app_name, marketing, build, role)
-    if item.get("enclosureName") != expected_name:
-        raise RolloutError(
-            f"appcast item {position} enclosure name must be {expected_name}, got {item.get('enclosureName')!r}"
-        )
-    if item.get("url") != enclosure_url(policy["sparkle"]["updateRepository"], tag, expected_name):
+    enclosure_name = item.get("enclosureName")
+    if not isinstance(enclosure_name, str) or not enclosure_name.endswith(ROLE_ENCLOSURE_SUFFIX[role]):
+        raise RolloutError(f"appcast item {position} enclosure name has the wrong role suffix")
+    if item.get("url") != enclosure_url(update_repository(policy, channel), tag, enclosure_name):
         raise RolloutError(f"appcast item {position} enclosure URL mismatch: {item.get('url')!r}")
     size = item.get("enclosureSize")
     if not isinstance(size, int) or size <= 0:
@@ -276,11 +308,16 @@ def render_appcast(manifest: dict) -> str:
         f'xmlns:sparkle="{SPARKLE_NAMESPACE}" '
         f'xmlns:repoprompt="{ROLLOUT_NAMESPACE}">',
         "  <channel>",
-        "    <title>RepoPrompt CE Stable</title>",
+        f"    <title>RepoPrompt CE {manifest['channel'].title()}</title>",
     ]
     for item in manifest["appcastItems"]:
         lines.append("    <item>")
-        lines.append(f"      <title>Version {xml_escape(str(item['marketingVersion']))}</title>")
+        title = (
+            f"Tip build {item['buildNumber']}"
+            if manifest["channel"] == "tip"
+            else f"Version {item['marketingVersion']}"
+        )
+        lines.append(f"      <title>{xml_escape(str(title))}</title>")
         lines.append(
             f"      <repoprompt:rolloutRole>{xml_escape(item['role'])}</repoprompt:rolloutRole>"
         )
@@ -341,6 +378,11 @@ def load_predecessor_manifests(
                 f"expected {entry['rolloutManifestSha256']}, got {digest}"
             )
         manifest = load_manifest(path)
+        if manifest.get("channel") != declaration["channel"]:
+            raise RolloutError(
+                f"predecessor {position} channel mismatch: declaration says {declaration['channel']}, "
+                f"manifest says {manifest.get('channel')}"
+            )
         if manifest.get("currentRole") != entry["role"]:
             raise RolloutError(
                 f"predecessor {position} manifest role mismatch: declaration says {entry['role']}, "
@@ -352,7 +394,7 @@ def load_predecessor_manifests(
                 f"manifest says {manifest.get('sourceTag')}"
             )
         current_item = manifest["appcastItems"][0]
-        validate_item_shape(current_item, position, policy, app_name)
+        validate_item_shape(current_item, position, policy, app_name, declaration["channel"])
         loaded.append(manifest)
     return loaded
 
@@ -362,6 +404,7 @@ def build_manifest(args: argparse.Namespace) -> tuple[dict, str]:
     declaration = load_declaration(Path(args.declaration))
     version = load_version_env(Path(args.version_env))
     role = declaration["currentRole"]
+    channel = declaration["channel"]
 
     allowed_roles = tuple(args.allowed_roles.split(",")) if args.allowed_roles else ROLES
     if role not in allowed_roles:
@@ -370,17 +413,18 @@ def build_manifest(args: argparse.Namespace) -> tuple[dict, str]:
         )
 
     identity = policy["identities"][ROLE_IDENTITY[role]]
-    if ROLE_IDENTITY[role] == "legacy":
-        if version["BUNDLE_ID"] != identity["bundleIdentifier"]:
-            raise RolloutError("version.env BUNDLE_ID does not match the legacy identity policy")
-        if version["SIGNING_TEAM_ID"] != identity["teamIdentifier"]:
-            raise RolloutError("version.env SIGNING_TEAM_ID does not match the legacy identity policy")
+    if version["BUNDLE_ID"] != identity["bundleIdentifier"]:
+        raise RolloutError(f"version.env BUNDLE_ID does not match the {ROLE_IDENTITY[role]} identity policy")
+    if version["SIGNING_TEAM_ID"] != identity["teamIdentifier"]:
+        raise RolloutError(f"version.env SIGNING_TEAM_ID does not match the {ROLE_IDENTITY[role]} identity policy")
 
     marketing = version["MARKETING_VERSION"]
     build = version["BUILD_NUMBER"]
     app_name = version["APP_NAME"]
-    if args.release_tag != f"v{marketing}":
-        raise RolloutError(f"release tag must be v{marketing}, got {args.release_tag}")
+    if channel == "stable" and args.release_tag != f"v{marketing}":
+        raise RolloutError(f"Stable release tag must be v{marketing}, got {args.release_tag}")
+    if channel == "tip" and not args.release_tag.startswith("tip-"):
+        raise RolloutError(f"Tip release tag must start with tip-, got {args.release_tag}")
     if args.migration_phase != ROLE_MIGRATION_PHASE[role]:
         raise RolloutError(
             f"migration phase must be {ROLE_MIGRATION_PHASE[role]} for the {role} role, "
@@ -388,7 +432,9 @@ def build_manifest(args: argparse.Namespace) -> tuple[dict, str]:
         )
 
     enclosure = Path(args.enclosure)
-    expected_name = expected_enclosure_name(app_name, marketing, build, role)
+    expected_name = expected_enclosure_name(
+        app_name, marketing, build, role, args.enclosure_basename
+    )
     if enclosure.name != expected_name:
         raise RolloutError(f"enclosure must be named {expected_name}, got {enclosure.name}")
     if not args.enclosure_signature.strip():
@@ -403,7 +449,7 @@ def build_manifest(args: argparse.Namespace) -> tuple[dict, str]:
     current_item = {
         "role": role,
         "tag": tag,
-        "url": enclosure_url(policy["sparkle"]["updateRepository"], tag, expected_name),
+        "url": enclosure_url(update_repository(policy, channel), tag, expected_name),
         "buildNumber": build,
         "marketingVersion": marketing,
         "minimumSystemVersion": policy["sparkle"]["minimumSystemVersion"],
@@ -428,16 +474,17 @@ def build_manifest(args: argparse.Namespace) -> tuple[dict, str]:
             app_name,
             str(predecessor_item["marketingVersion"]),
             str(predecessor_item["buildNumber"]),
+            channel,
         )
         items.append(predecessor_item)
 
     for position, item in enumerate(items, start=1):
-        validate_item_shape(item, position, policy, app_name)
+        validate_item_shape(item, position, policy, app_name, channel)
     validate_item_ladder(items)
 
     manifest = {
         "schemaVersion": MANIFEST_SCHEMA_VERSION,
-        "channel": "stable",
+        "channel": channel,
         "sourceTag": tag,
         "releaseCommit": args.release_commit,
         "currentRole": role,
@@ -448,7 +495,7 @@ def build_manifest(args: argparse.Namespace) -> tuple[dict, str]:
         "buildNumber": build,
         "migrationPhase": args.migration_phase,
         "eligibilityProfile": declaration["eligibilityProfile"],
-        "updateRepository": policy["sparkle"]["updateRepository"],
+        "updateRepository": update_repository(policy, channel),
         "appArtifactManifest": {
             "name": app_artifact_manifest.name,
             "sha256": sha256_file(app_artifact_manifest),
@@ -467,7 +514,7 @@ def run_generate(args: argparse.Namespace) -> None:
     )
     Path(args.appcast_output).write_text(appcast, encoding="utf-8")
     print(
-        f"OK: generated stable rollout manifest and appcast with {len(manifest['appcastItems'])} "
+        f"OK: generated {manifest['channel']} rollout manifest and appcast with {len(manifest['appcastItems'])} "
         f"item(s) for the {manifest['currentRole']} role."
     )
 
@@ -495,7 +542,7 @@ def run_validate(args: argparse.Namespace) -> None:
     if actual_appcast != expected_appcast:
         raise RolloutError("accumulated appcast does not match the generated rollout manifest")
     print(
-        f"OK: stable rollout manifest and appcast validated with "
+        f"OK: {expected_manifest['channel']} rollout manifest and appcast validated with "
         f"{len(expected_manifest['appcastItems'])} item(s)."
     )
 
@@ -503,6 +550,8 @@ def run_validate(args: argparse.Namespace) -> None:
 def run_workflow_guard(args: argparse.Namespace) -> None:
     load_policy(Path(args.policy))
     declaration = load_declaration(Path(args.declaration))
+    if declaration["channel"] != "stable":
+        raise RolloutError("protected Stable workflows require a Stable rollout declaration")
     role = declaration["currentRole"]
     if role not in WORKFLOW_ALLOWED_ROLES:
         raise RolloutError(
@@ -519,6 +568,38 @@ def run_workflow_guard(args: argparse.Namespace) -> None:
 
 def run_current_role(args: argparse.Namespace) -> None:
     print(load_declaration(Path(args.declaration))["currentRole"])
+
+
+def run_packaging_context(args: argparse.Namespace) -> None:
+    policy = load_policy(Path(args.policy))
+    declaration = load_declaration(Path(args.declaration))
+    role = declaration["currentRole"]
+    identity_name = ROLE_IDENTITY[role]
+    identity = policy["identities"][identity_name]
+    values = {
+        "ROLLOUT_CHANNEL": declaration["channel"],
+        "ROLLOUT_ROLE": role,
+        "ROLLOUT_IDENTITY": identity_name,
+        "BUNDLE_ID": identity["bundleIdentifier"],
+        "SIGNING_TEAM_ID": identity["teamIdentifier"],
+        "REPOPROMPT_IDENTITY_MIGRATION_PHASE": ROLE_MIGRATION_PHASE[role],
+        "ROLLOUT_INSTALLATION_TYPE": ROLE_INSTALLATION_TYPE[role],
+        "ROLLOUT_ENCLOSURE_SUFFIX": ROLE_ENCLOSURE_SUFFIX[role],
+        "EXPECTED_SIGN_IDENTITY": identity["developerIDApplicationIdentityName"],
+        "EXPECTED_INSTALLER_IDENTITY": identity.get("developerIDInstallerIdentityName", ""),
+        "ROLLOUT_UPDATE_REPOSITORY": update_repository(policy, declaration["channel"]),
+        "ROLLOUT_FEED_URL": policy["sparkle"][
+            "tipFeedURL" if declaration["channel"] == "tip" else "stableFeedURL"
+        ],
+    }
+    for key, value in values.items():
+        print(f"{key}={shlex.quote(value)}")
+
+
+def run_predecessor_values(args: argparse.Namespace) -> None:
+    declaration = load_declaration(Path(args.declaration))
+    for entry in declaration["predecessors"]:
+        print("\t".join((entry["role"], entry["tag"], entry["rolloutManifestSha256"])))
 
 
 def run_max_build(args: argparse.Namespace) -> None:
@@ -572,6 +653,7 @@ def add_shared_generate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--app-artifact-manifest", required=True)
     parser.add_argument("--predecessor-manifest", action="append", default=[])
     parser.add_argument("--allowed-roles")
+    parser.add_argument("--enclosure-basename")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -586,6 +668,15 @@ def build_parser() -> argparse.ArgumentParser:
     current_role = subparsers.add_parser("current-role")
     current_role.add_argument("--declaration", required=True)
     current_role.set_defaults(func=run_current_role)
+
+    packaging_context = subparsers.add_parser("packaging-context")
+    packaging_context.add_argument("--declaration", required=True)
+    packaging_context.add_argument("--policy", required=True)
+    packaging_context.set_defaults(func=run_packaging_context)
+
+    predecessor_values = subparsers.add_parser("predecessor-values")
+    predecessor_values.add_argument("--declaration", required=True)
+    predecessor_values.set_defaults(func=run_predecessor_values)
 
     generate = subparsers.add_parser("generate")
     add_shared_generate_arguments(generate)

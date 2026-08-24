@@ -3324,12 +3324,12 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
         self.assertLess(sign_staged, assert_telemetry)
         self.assertLess(assert_telemetry, upload_symbols)
         self.assertLess(upload_symbols, create_distribution)
-        generate_appcast = sign_tip.index('"$TRUSTED_ROOT/Vendor/Sparkle/bin/generate_appcast"')
-        validate_appcast = sign_tip.index("validate_generated_tip_appcast")
-        write_checksums = sign_tip.index('shasum -a 256', validate_appcast)
-        self.assertLess(generate_appcast, validate_appcast)
-        self.assertLess(validate_appcast, write_checksums)
-        self.assertIn('fail "Tip appcast enclosure is missing an EdDSA signature"', tip_script)
+        generate_appcast = sign_tip.index("generate_tip_rollout_appcast")
+        write_checksums = sign_tip.index('shasum -a 256', generate_appcast)
+        self.assertLess(generate_appcast, write_checksums)
+        self.assertIn('python3 "$ROLLOUT_TOOL" generate', tip_script)
+        self.assertIn('--allowed-roles legacy,preparer,transition,successor', tip_script)
+        self.assertIn('--manifest-output "$ROLLOUT_MANIFEST"', tip_script)
         self.assertIn('fail "Tip Sparkle private key does not match the app bundle SUPublicEDKey"', tip_script)
         self.assertIn('fail "Tip Sparkle private key does not reproduce the generated appcast signature"', tip_script)
         self.assertIn('"$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_signature.swift"', tip_script)
@@ -3449,6 +3449,7 @@ expected = [
     f"{archive}.dmg",
     "appcast.xml",
     "SHA256SUMS",
+    "identity-rollout.json",
     f"{archive}-artifact-manifest.json",
     f"{archive}-metadata.json",
 ]
@@ -3515,7 +3516,13 @@ sys.stdout.write(str(status))
                 if tip_gh_token:
                     env["TIP_GH_TOKEN"] = tip_gh_token
                 result = subprocess.run(
-                    [str(helper), "example/public-tip", "tip-fixture", archive_basename],
+                    [
+                        str(helper),
+                        "example/public-tip",
+                        "tip-fixture",
+                        archive_basename,
+                        "application",
+                    ],
                     env=env,
                     text=True,
                     capture_output=True,
@@ -3543,188 +3550,22 @@ sys.stdout.write(str(status))
                         r"retry_after=[^ ]+$",
                     )
 
-    def test_generated_tip_appcast_validation_executes_crypto_and_rejects_missing_signature(self) -> None:
-        root = SCRIPT_DIR.parent
-        temp_dir = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, temp_dir, True)
-        app_bundle = temp_dir / "RepoPrompt.app"
-        info_plist = app_bundle / "Contents" / "Info.plist"
-        archive = temp_dir / "RepoPrompt-tip-fixture.zip"
-        appcast = temp_dir / "appcast.xml"
-        private_key_file = temp_dir / "private-key"
-        validator_tmp_dir = temp_dir / "validator-tmp"
-        info_plist.parent.mkdir(parents=True)
-        archive.write_text("signed tip archive\n", encoding="utf-8")
-        private_key = base64.b64encode(bytes(range(32))).decode("ascii")
-        private_key_file.write_text(private_key, encoding="utf-8")
-        public_key = self.run_checked(
-            ["xcrun", "swift", str(SCRIPT_DIR / "derive_sparkle_public_key.swift"), str(private_key_file)]
-        ).stdout.strip()
-        info_plist.write_bytes(plistlib.dumps({"SUPublicEDKey": public_key}))
-        signature = self.run_checked(
-            [
-                str(root / "Vendor" / "Sparkle" / "bin" / "sign_update"),
-                "--ed-key-file",
-                str(private_key_file),
-                "-p",
-                str(archive),
-            ]
-        ).stdout.strip()
+    def test_tip_appcast_generation_uses_shared_rollout_authority_and_crypto_verifier(self) -> None:
+        tip_script = (SCRIPT_DIR / "main_tip_release.sh").read_text(encoding="utf-8")
+        generator = tip_script.split("generate_tip_rollout_appcast() {", 1)[1].split("\n}", 1)[0]
 
-        expected_title = "Tip build 1.2.3 · v9.8.7 · commit 0123456789ab"
-        def write_appcast(
-            enclosure_signature: str,
-            *,
-            marketing_version: str = "9.8.7",
-            title: str = expected_title,
-            release_notes_link: str | None = None,
-        ) -> None:
-            release_notes_xml = (
-                f"      <sparkle:releaseNotesLink>{release_notes_link}</sparkle:releaseNotesLink>\n"
-                if release_notes_link is not None
-                else ""
-            )
-            appcast.write_text(
-                f"""<?xml version="1.0" encoding="utf-8"?>
-<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
-  <channel>
-    <item>
-      <title>{title}</title>
-      <sparkle:version>1.2.3</sparkle:version>
-      <sparkle:shortVersionString>{marketing_version}</sparkle:shortVersionString>
-{release_notes_xml}      <enclosure url="https://example.invalid/tip/{archive.name}"
-                 length="{archive.stat().st_size}"
-                 sparkle:edSignature="{enclosure_signature}" />
-    </item>
-  </channel>
-</rss>
-""",
-                encoding="utf-8",
-            )
-
-        env = os.environ.copy()
-        env.update(
-            {
-                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
-                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(SCRIPT_DIR),
-                "TIP_COMMIT": "0123456789abcdef" * 2 + "01234567",
-                "TIP_SHORT_SHA": "0123456789ab",
-                "TIP_BUILD_NUMBER": "1.2.3",
-                "TIP_DOWNLOAD_URL_PREFIX": "https://example.invalid/tip/",
-                "SPARKLE_PRIVATE_KEY": private_key,
-                "VALIDATOR_APP_BUNDLE": str(app_bundle),
-                "VALIDATOR_UPDATE_ZIP": str(archive),
-                "VALIDATOR_APPCAST": str(appcast),
-                "VALIDATOR_TMP_DIR": str(validator_tmp_dir),
-            }
-        )
-        command = [
-            "bash",
-            "-c",
-            """source "$1"
-APP_BUNDLE="$VALIDATOR_APP_BUNDLE"
-UPDATE_ZIP="$VALIDATOR_UPDATE_ZIP"
-APPCAST="$VALIDATOR_APPCAST"
-TMP_DIR="$VALIDATOR_TMP_DIR"
-mkdir -p "$TMP_DIR"
-MARKETING_VERSION="9.8.7"
-validate_generated_tip_appcast""",
-            "tip-appcast-validation",
-            str(SCRIPT_DIR / "main_tip_release.sh"),
-        ]
-
-        write_appcast(signature)
-        accepted = subprocess.run(command, env=env, text=True, capture_output=True)
-        self.assertEqual(accepted.returncode, 0, accepted.stderr)
-
-        duplicate_version_tree = ET.parse(appcast)
-        duplicate_version_item = duplicate_version_tree.getroot().find("./channel/item")
-        self.assertIsNotNone(duplicate_version_item)
-        assert duplicate_version_item is not None
-        ET.SubElement(
-            duplicate_version_item,
-            "{http://www.andymatuschak.org/xml-namespaces/sparkle}version",
-        ).text = "999"
-        duplicate_version_tree.write(appcast, encoding="utf-8", xml_declaration=True)
-        rejected_duplicate_version = subprocess.run(command, env=env, text=True, capture_output=True)
-        self.assertNotEqual(rejected_duplicate_version.returncode, 0)
-        self.assertIn(
-            "tip appcast item must contain exactly one sparkle:version",
-            rejected_duplicate_version.stderr,
-        )
-
-        write_appcast(signature, marketing_version="9.8.8")
-        wrong_marketing = subprocess.run(command, env=env, text=True, capture_output=True)
-        self.assertNotEqual(wrong_marketing.returncode, 0)
-        self.assertIn(
-            "Tip appcast marketing version mismatch: expected 9.8.7, got 9.8.8",
-            wrong_marketing.stderr,
-        )
-
-        write_appcast(signature, title="Wrong tip title")
-        wrong_title = subprocess.run(command, env=env, text=True, capture_output=True)
-        self.assertNotEqual(wrong_title.returncode, 0)
-        self.assertIn("Tip appcast presentation title mismatch: Wrong tip title", wrong_title.stderr)
-
-        write_appcast(signature, release_notes_link="https://example.invalid/tip/details")
-        embedded_release_page = subprocess.run(command, env=env, text=True, capture_output=True)
-        self.assertNotEqual(embedded_release_page.returncode, 0)
-        self.assertIn(
-            "tip appcast item must not contain sparkle:releaseNotesLink",
-            embedded_release_page.stderr,
-        )
-
-        write_appcast("")
-        rejected_signature = subprocess.run(command, env=env, text=True, capture_output=True)
-        self.assertNotEqual(rejected_signature.returncode, 0)
-        self.assertIn("Tip appcast enclosure is missing an EdDSA signature", rejected_signature.stderr)
-
-    def test_tip_appcast_label_changes_display_metadata_without_changing_comparison_version(self) -> None:
-        temp_dir = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, temp_dir, True)
-        appcast = temp_dir / "appcast.xml"
-        appcast.write_text(
-            """<?xml version="1.0" encoding="utf-8"?>
-<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
-  <channel><item><title>Version 9.8.7</title>
-    <sparkle:version>29.8.52</sparkle:version>
-    <sparkle:shortVersionString>9.8.7</sparkle:shortVersionString>
-    <sparkle:releaseNotesLink>https://github.com/example/release</sparkle:releaseNotesLink>
-    <description>Embedded release content</description>
-  </item></channel>
-</rss>
-""",
-            encoding="utf-8",
-        )
-        command = [
-            "bash",
-            "-c",
-            """source "$1"
-APPCAST="$2"
-MARKETING_VERSION="9.8.7"
-TIP_BUILD_NUMBER="29.8.52"
-TIP_SHORT_SHA="abc1234def56"
-label_generated_tip_appcast""",
-            "tip-appcast-label",
-            str(SCRIPT_DIR / "main_tip_release.sh"),
-            str(appcast),
-        ]
-
-        labeled = subprocess.run(command, text=True, capture_output=True)
-        self.assertEqual(labeled.returncode, 0, labeled.stderr)
-        item = ET.parse(appcast).getroot().find("./channel/item")
-        self.assertIsNotNone(item)
-        assert item is not None
-        sparkle = "http://www.andymatuschak.org/xml-namespaces/sparkle"
-        self.assertEqual(item.findtext(f"{{{sparkle}}}version"), "29.8.52")
-        self.assertEqual(item.findtext(f"{{{sparkle}}}shortVersionString"), "9.8.7")
-        self.assertNotEqual(
-            item.findtext(f"{{{sparkle}}}shortVersionString"),
-            item.findtext(f"{{{sparkle}}}version"),
-        )
-        self.assertEqual(item.findtext("title"), "Tip build 29.8.52 · v9.8.7 · commit abc1234def56")
-        self.assertIsNone(item.find(f"{{{sparkle}}}releaseNotesLink"))
-        self.assertIsNone(item.find("description"))
+        self.assertIn('python3 "$ROLLOUT_TOOL" predecessor-values', generator)
+        self.assertIn('python3 "$ROLLOUT_TOOL" generate', generator)
+        self.assertIn('--declaration "$ROLLOUT_DECLARATION"', generator)
+        self.assertIn('--policy "$APPLE_IDENTITY_POLICY"', generator)
+        self.assertIn('--enclosure-basename "$ARCHIVE_BASENAME"', generator)
+        self.assertIn('--appcast-output "$APPCAST"', generator)
+        self.assertIn('--manifest-output "$ROLLOUT_MANIFEST"', generator)
+        self.assertIn('"$SIGN_UPDATE" --ed-key-file - -p "$ENCLOSURE"', generator)
+        self.assertIn('verify_sparkle_signature.swift', generator)
+        self.assertNotIn("validate_generated_tip_appcast", tip_script)
+        self.assertNotIn("label_generated_tip_appcast", tip_script)
+        self.assertNotIn("generate_appcast", generator)
 
     def test_release_sentry_runtime_wiring_uses_protected_dsn_and_stable_resolution(self) -> None:
         root = SCRIPT_DIR.parent
@@ -4674,13 +4515,14 @@ esac
 
 
 class IdentityTransitionReleaseToolingTests(unittest.TestCase):
-    """PR02 done-when coverage: the reviewed rollout declaration plus
-    Scripts/stable_rollout.py stay the single Stable rollout authority while
-    transition/successor publication remains dormant."""
+    """Shared rollout-authority coverage for the Stable safety lock and
+    the explicitly dispatched Tip identity dress rehearsal."""
 
     POLICY = SCRIPT_DIR / "apple_identity_policy.json"
     DECLARATION = SCRIPT_DIR.parent / "release-rollout.json"
+    TIP_DECLARATION = SCRIPT_DIR.parent / "tip-rollout.json"
     UPDATE_REPOSITORY = "repoprompt/repoprompt-ce-updates"
+    TIP_UPDATE_REPOSITORY = "repoprompt/repoprompt-ce-tip-updates"
 
     def rollout(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -4705,21 +4547,22 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
         directory: Path,
         role: str,
         predecessors: list[dict] | None = None,
+        channel: str = "stable",
         **overrides: object,
     ) -> Path:
         phase = {"legacy": "disabled", "preparer": "legacy-preparer"}.get(role, "disabled")
         identity = "successor" if role in ("transition", "successor") else "legacy"
         declaration = {
             "schemaVersion": 1,
-            "channel": "stable",
+            "channel": channel,
             "currentRole": role,
-            "eligibilityProfile": "stable-rollout-v1",
+            "eligibilityProfile": f"{channel}-rollout-v1",
             "expectedMigrationPhase": phase,
             "expectedSigningIdentity": identity,
             "predecessors": predecessors or [],
         }
         declaration.update(overrides)
-        path = directory / f"release-rollout-{role}.json"
+        path = directory / f"{channel}-rollout-{role}.json"
         path.write_text(json.dumps(declaration, indent=2) + "\n", encoding="utf-8")
         return path
 
@@ -4731,32 +4574,46 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
         build: str,
         predecessors: list[dict] | None = None,
         predecessor_manifests: list[Path] | None = None,
+        channel: str = "stable",
+        release_tag: str | None = None,
+        enclosure_basename: str | None = None,
     ) -> dict:
         release_dir = directory / f"{role}-{build}"
         release_dir.mkdir(parents=True, exist_ok=True)
         version_env = release_dir / "version.env"
+        successor_identity = role in ("transition", "successor")
         version_env.write_text(
             "APP_NAME=RepoPrompt\n"
             f"MARKETING_VERSION={marketing}\n"
             f"BUILD_NUMBER={build}\n"
-            "BUNDLE_ID=com.pvncher.repoprompt.ce\n"
-            "SIGNING_TEAM_ID=648A27MST5\n",
+            f"BUNDLE_ID={'com.repoprompt.ce' if successor_identity else 'com.pvncher.repoprompt.ce'}\n"
+            f"SIGNING_TEAM_ID={'69N6K965SF' if successor_identity else '648A27MST5'}\n",
             encoding="utf-8",
         )
         suffix = ".pkg" if role == "transition" else ".zip"
-        enclosure = release_dir / f"RepoPrompt-{marketing}-{build}{suffix}"
+        enclosure = release_dir / f"{enclosure_basename or f'RepoPrompt-{marketing}-{build}'}{suffix}"
         enclosure.write_text(f"enclosure {role} {build}\n", encoding="utf-8")
         app_manifest = release_dir / f"RepoPrompt-{marketing}-{build}-artifact-manifest.json"
         app_manifest.write_text('{"schema_version":1}\n', encoding="utf-8")
-        declaration = self.make_declaration(release_dir, role, predecessors)
+        declaration = self.make_declaration(
+            release_dir,
+            role,
+            predecessors,
+            channel=channel,
+        )
         appcast = release_dir / "appcast.xml"
-        manifest = release_dir / f"RepoPrompt-{marketing}-{build}-stable-rollout.json"
+        manifest = release_dir / (
+            "identity-rollout.json"
+            if channel == "tip"
+            else f"RepoPrompt-{marketing}-{build}-stable-rollout.json"
+        )
+        release_tag = release_tag or (f"tip-{build}" if channel == "tip" else f"v{marketing}")
         arguments = [
             "generate",
             "--declaration", str(declaration),
             "--policy", str(self.POLICY),
             "--version-env", str(version_env),
-            "--release-tag", f"v{marketing}",
+            "--release-tag", release_tag,
             "--release-commit", f"commit-{build}",
             "--migration-phase", "legacy-preparer" if role == "preparer" else "disabled",
             "--enclosure", str(enclosure),
@@ -4765,6 +4622,8 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             "--appcast-output", str(appcast),
             "--manifest-output", str(manifest),
         ]
+        if enclosure_basename:
+            arguments += ["--enclosure-basename", enclosure_basename]
         for predecessor_manifest in predecessor_manifests or []:
             arguments += ["--predecessor-manifest", str(predecessor_manifest)]
         result = self.rollout(*arguments)
@@ -4879,12 +4738,36 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             info_template,
         )
         self.assertEqual(sparkle["updateRepository"], self.UPDATE_REPOSITORY)
+        self.assertEqual(sparkle["tipUpdateRepository"], "repoprompt/repoprompt-ce-tip-updates")
+        self.assertEqual(
+            sparkle["tipFeedURL"],
+            "https://github.com/repoprompt/repoprompt-ce-tip-updates/releases/latest/download/appcast.xml",
+        )
+        self.assertEqual(
+            legacy["developerIDApplicationIdentityName"],
+            "Developer ID Application: Eric Provencher (648A27MST5)",
+        )
+        self.assertEqual(
+            successor["developerIDApplicationIdentityName"],
+            "Developer ID Application: Samuel Baron (69N6K965SF)",
+        )
+        self.assertEqual(
+            successor["developerIDInstallerIdentityName"],
+            "Developer ID Installer: Samuel Baron (69N6K965SF)",
+        )
 
         declaration = json.loads(self.DECLARATION.read_text(encoding="utf-8"))
         self.assertEqual(declaration["currentRole"], "legacy")
         self.assertEqual(declaration["predecessors"], [])
         self.assertEqual(declaration["expectedMigrationPhase"], "disabled")
         self.assertEqual(declaration["expectedSigningIdentity"], "legacy")
+
+        tip_declaration = json.loads(self.TIP_DECLARATION.read_text(encoding="utf-8"))
+        self.assertEqual(tip_declaration["channel"], "tip")
+        self.assertEqual(tip_declaration["currentRole"], "legacy")
+        self.assertEqual(tip_declaration["predecessors"], [])
+        self.assertEqual(tip_declaration["expectedMigrationPhase"], "disabled")
+        self.assertEqual(tip_declaration["expectedSigningIdentity"], "legacy")
 
     def test_single_legacy_release_generates_one_deterministic_application_item(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -4952,6 +4835,99 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
         rows = [line.split("\t") for line in siblings.stdout.splitlines()]
         self.assertEqual([(row[1], row[2]) for row in rows], [("transition", "v1.5.0"), ("preparer", "v1.2.0")])
         self.assertEqual(rows[0][7], "RepoPrompt-1.5.0-150-stable-rollout.json")
+
+    def test_tip_pts_ladder_reuses_one_feed_and_accumulates_top_level_items(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+
+        preparer = self.make_release(
+            temp_dir,
+            "preparer",
+            "1.2.0",
+            "100.1.1",
+            channel="tip",
+            release_tag="tip-preparer",
+            enclosure_basename="RepoPrompt-tip-preparer-100.1.1",
+        )
+        self.assertEqual(preparer["result"].returncode, 0, preparer["result"].stderr)
+        transition = self.make_release(
+            temp_dir,
+            "transition",
+            "1.2.0",
+            "100.1.2",
+            predecessors=[
+                {
+                    "role": "preparer",
+                    "tag": "tip-preparer",
+                    "rolloutManifestSha256": hashlib.sha256(
+                        preparer["manifest"].read_bytes()
+                    ).hexdigest(),
+                }
+            ],
+            predecessor_manifests=[preparer["manifest"]],
+            channel="tip",
+            release_tag="tip-transition",
+            enclosure_basename="RepoPrompt-tip-transition-100.1.2",
+        )
+        self.assertEqual(transition["result"].returncode, 0, transition["result"].stderr)
+        successor = self.make_release(
+            temp_dir,
+            "successor",
+            "1.2.0",
+            "100.1.3",
+            predecessors=[
+                {
+                    "role": "transition",
+                    "tag": "tip-transition",
+                    "rolloutManifestSha256": hashlib.sha256(
+                        transition["manifest"].read_bytes()
+                    ).hexdigest(),
+                },
+                {
+                    "role": "preparer",
+                    "tag": "tip-preparer",
+                    "rolloutManifestSha256": hashlib.sha256(
+                        preparer["manifest"].read_bytes()
+                    ).hexdigest(),
+                },
+            ],
+            predecessor_manifests=[transition["manifest"], preparer["manifest"]],
+            channel="tip",
+            release_tag="tip-successor",
+            enclosure_basename="RepoPrompt-tip-successor-100.1.3",
+        )
+        self.assertEqual(successor["result"].returncode, 0, successor["result"].stderr)
+
+        appcast = successor["appcast"].read_text(encoding="utf-8")
+        self.assertEqual(appcast.count("<item>"), 3)
+        self.assertEqual(
+            re.findall(r"<repoprompt:rolloutRole>([a-z]+)</repoprompt:rolloutRole>", appcast),
+            ["successor", "transition", "preparer"],
+        )
+        self.assertEqual(
+            re.findall(r"<sparkle:version>([0-9.]+)</sparkle:version>", appcast),
+            ["100.1.3", "100.1.2", "100.1.1"],
+        )
+        self.assertEqual(appcast.count('sparkle:installationType="package"'), 1)
+        self.assertNotIn(self.UPDATE_REPOSITORY + "/releases", appcast)
+        for tag, basename, suffix in (
+            ("tip-successor", "RepoPrompt-tip-successor-100.1.3", ".zip"),
+            ("tip-transition", "RepoPrompt-tip-transition-100.1.2", ".pkg"),
+            ("tip-preparer", "RepoPrompt-tip-preparer-100.1.1", ".zip"),
+        ):
+            self.assertIn(
+                f"https://github.com/{self.TIP_UPDATE_REPOSITORY}/releases/download/"
+                f"{tag}/{basename}{suffix}",
+                appcast,
+            )
+
+        manifest = json.loads(successor["manifest"].read_text(encoding="utf-8"))
+        self.assertEqual(manifest["channel"], "tip")
+        self.assertEqual(manifest["currentRole"], "successor")
+        self.assertEqual(
+            [entry["rolloutManifestName"] for entry in manifest["appcastItems"][1:]],
+            ["identity-rollout.json", "identity-rollout.json"],
+        )
 
     def test_rollout_tampering_and_invalid_ladders_fail_closed(self) -> None:
         temp_dir, preparer, transition, successor = self.make_pts_ladder()
@@ -5055,7 +5031,7 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             self.assertIn("mismatch", result.stderr)
             successor["manifest"].write_text(manifest_text, encoding="utf-8")
 
-    def test_protected_surfaces_reject_dormant_roles_and_siblings(self) -> None:
+    def test_stable_surfaces_stay_locked_while_tip_requires_explicit_role_dispatch(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
 
@@ -5082,7 +5058,10 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
         tip_workflow = (workflows_dir / "main-tip.yml").read_text(encoding="utf-8")
         self.assertEqual(release_workflow.count("stable_rollout.py workflow-guard"), 2)
         self.assertEqual(promote_workflow.count("stable_rollout.py workflow-guard"), 1)
-        self.assertNotIn("stable_rollout.py", tip_workflow)
+        self.assertIn("tip-rollout.json", tip_workflow)
+        self.assertIn("stable_rollout.py packaging-context", tip_workflow)
+        self.assertIn("confirm_identity_rollout_role", tip_workflow)
+        self.assertIn('if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]', tip_workflow)
         self.assertNotIn("release-rollout.json", tip_workflow)
 
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
@@ -5122,14 +5101,16 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
                 )
                 self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
-        # Tip isolation: exactly-one-item validation, legacy/disabled phase, and
-        # the separate tip updater repository stay untouched.
+        # Tip reuses its existing workflow, repository, feed, and appcast name;
+        # role changes add accumulated top-level items rather than a sibling feed.
         tip_script = (SCRIPT_DIR / "main_tip_release.sh").read_text(encoding="utf-8")
-        self.assertIn("tip appcast must contain exactly one item", tip_script)
+        self.assertIn("generate_tip_rollout_appcast", tip_script)
+        self.assertIn("identity-rollout.json", tip_script)
         self.assertIn("repoprompt-ce-tip-updates", tip_script)
-        self.assertIn("REPOPROMPT_IDENTITY_MIGRATION_PHASE: disabled", tip_workflow)
+        self.assertNotIn("tip-transition-appcast.xml", tip_script)
+        self.assertNotIn("tip-successor-appcast.xml", tip_script)
 
-    def test_transition_pkg_builder_stays_dormant_with_exact_payload_proof(self) -> None:
+    def test_transition_pkg_builder_requires_explicit_tip_enablement(self) -> None:
         script = (SCRIPT_DIR / "build_identity_transition_pkg.sh").read_text(encoding="utf-8")
         for marker in (
             "plutil -replace 0.BundleIsRelocatable -bool false",
@@ -5146,7 +5127,6 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
         self.assertNotIn("allow-unstapled", script)
 
         env = dict(os.environ)
-        env["GITHUB_ACTIONS"] = "true"
         refused = subprocess.run(
             ["bash", str(SCRIPT_DIR / "build_identity_transition_pkg.sh"), "validate", "/nonexistent.pkg"],
             text=True,
@@ -5154,7 +5134,18 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             env=env,
         )
         self.assertNotEqual(refused.returncode, 0)
-        self.assertIn("dormant", refused.stderr)
+        self.assertIn("explicit Tip rollout enablement", refused.stderr)
+
+        env["REPOPROMPT_ENABLE_IDENTITY_TRANSITION_PKG"] = "1"
+        enabled = subprocess.run(
+            ["bash", str(SCRIPT_DIR / "build_identity_transition_pkg.sh"), "validate", "/nonexistent.pkg"],
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+        self.assertNotEqual(enabled.returncode, 0)
+        self.assertNotIn("explicit Tip rollout enablement", enabled.stderr)
+        self.assertIn("Missing required file: /nonexistent.pkg", enabled.stderr)
 
 
 if __name__ == "__main__":

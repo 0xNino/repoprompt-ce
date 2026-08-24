@@ -52,4 +52,118 @@ final class SparkleUpdateFeedDelegate: NSObject, SPUUpdaterDelegate {
     func feedURLString(for updater: SPUUpdater) -> String? {
         UpdateChannel.load().feedURLString
     }
+
+    func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+        record(stage: "update-found", outcome: .succeeded, item: item)
+    }
+
+    func updater(
+        _ updater: SPUUpdater,
+        userDidMake choice: SPUUserUpdateChoice,
+        forUpdate item: SUAppcastItem,
+        state: SPUUserUpdateState
+    ) {
+        record(
+            stage: "user-choice-\(choice.diagnosticName)-\(state.stage.diagnosticName)",
+            outcome: .selected,
+            item: item
+        )
+    }
+
+    func updater(
+        _ updater: SPUUpdater,
+        willDownloadUpdate item: SUAppcastItem,
+        with request: NSMutableURLRequest
+    ) {
+        record(stage: "download-started", outcome: .started, item: item)
+    }
+
+    func updater(_ updater: SPUUpdater, didDownloadUpdate item: SUAppcastItem) {
+        record(stage: "download-finished", outcome: .succeeded, item: item)
+    }
+
+    func updater(
+        _ updater: SPUUpdater,
+        failedToDownloadUpdate item: SUAppcastItem,
+        error: Error
+    ) {
+        record(
+            stage: "download-finished",
+            outcome: .failed,
+            item: item,
+            errorClass: Self.errorClass(error)
+        )
+    }
+
+    func userDidCancelDownload(_ updater: SPUUpdater) {
+        record(stage: "download-finished", outcome: .cancelled)
+    }
+
+    func updater(_ updater: SPUUpdater, willInstallUpdate item: SUAppcastItem) {
+        record(stage: "install-started", outcome: .started, item: item)
+    }
+
+    func updaterWillRelaunchApplication(_ updater: SPUUpdater) {
+        record(stage: "relaunch-started", outcome: .started)
+    }
+
+    func updater(
+        _ updater: SPUUpdater,
+        didFinishUpdateCycleFor updateCheck: SPUUpdateCheck,
+        error: Error?
+    ) {
+        record(
+            stage: "update-cycle-finished",
+            outcome: error == nil ? .succeeded : .failed,
+            errorClass: error.map(Self.errorClass)
+        )
+    }
+
+    private func record(
+        stage: String,
+        outcome: IdentityTransitionDiagnosticEvent.Outcome,
+        item: SUAppcastItem? = nil,
+        errorClass: String? = nil
+    ) {
+        IdentityTransitionDiagnostics.shared.record(
+            subsystem: .sparkle,
+            stage: stage,
+            outcome: outcome,
+            targetDisplayVersion: item?.displayVersionString,
+            targetBuildVersion: item?.versionString,
+            errorClass: errorClass
+        )
+    }
+
+    private static func errorClass(_ error: Error) -> String {
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain {
+            return nsError.code == NSURLErrorCancelled ? "cancelled" : "network"
+        }
+        return nsError.domain.localizedCaseInsensitiveContains("sparkle")
+            ? "sparkle"
+            : "other"
+    }
+}
+
+private extension SPUUserUpdateChoice {
+    var diagnosticName: String {
+        switch rawValue {
+        case 0: "skip"
+        case 1: "install"
+        case 2: "dismiss"
+        default: "unknown"
+        }
+    }
+}
+
+private extension SPUUserUpdateStage {
+    var diagnosticName: String {
+        switch rawValue {
+        case 0: "not-downloaded"
+        case 1: "downloaded"
+        case 2: "installing"
+        default: "unknown"
+        }
+    }
 }
