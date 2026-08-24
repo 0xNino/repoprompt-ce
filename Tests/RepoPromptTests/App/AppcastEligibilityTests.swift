@@ -101,7 +101,7 @@ final class AppcastEligibilityTests: XCTestCase {
             date: nil,
             description: nil,
             releaseNotesURL: nil,
-            downloadURL: nil,
+            downloadURL: "https://example.com/update.zip",
             minimumSystemVersion: nil,
             minimumAutoupdateVersion: "150",
             installationType: nil
@@ -123,7 +123,7 @@ final class AppcastEligibilityTests: XCTestCase {
                 date: nil,
                 description: nil,
                 releaseNotesURL: nil,
-                downloadURL: nil,
+                downloadURL: "https://example.com/update.zip",
                 minimumSystemVersion: nil,
                 minimumAutoupdateVersion: nil,
                 installationType: installationType
@@ -191,5 +191,122 @@ final class AppcastEligibilityTests: XCTestCase {
 
         XCTAssertTrue(AppcastParser().parseItems(data: Data(truncated.utf8)).isEmpty)
         XCTAssertNil(AppcastParser().parse(data: Data(truncated.utf8), context: context(build: "1")))
+    }
+
+    func testItemsWithoutValidEnclosureURLAreNotPassivelyEligible() throws {
+        let xml = """
+        <?xml version="1.0" encoding="utf-8"?>
+        <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+            <channel>
+                <item>
+                    <sparkle:shortVersionString>4.0.0</sparkle:shortVersionString>
+                    <sparkle:version>400</sparkle:version>
+                </item>
+                <item>
+                    <sparkle:shortVersionString>3.9.0</sparkle:shortVersionString>
+                    <sparkle:version>390</sparkle:version>
+                    <enclosure url="" />
+                </item>
+                <item>
+                    <sparkle:shortVersionString>3.8.0</sparkle:shortVersionString>
+                    <sparkle:version>380</sparkle:version>
+                    <enclosure url="not a valid url" />
+                </item>
+                <item>
+                    <sparkle:shortVersionString>3.7.0</sparkle:shortVersionString>
+                    <sparkle:version>370</sparkle:version>
+                    <enclosure url="relative/path.zip" />
+                </item>
+                <item>
+                    <sparkle:shortVersionString>3.6.0</sparkle:shortVersionString>
+                    <sparkle:version>360</sparkle:version>
+                    <enclosure url="https://example.com/RepoPrompt-3.6.0.zip" />
+                </item>
+            </channel>
+        </rss>
+        """
+
+        let items = AppcastParser().parseItems(data: Data(xml.utf8))
+        XCTAssertEqual(items.count, 5)
+
+        // Missing, empty, malformed, and schemeless/hostless enclosures are all
+        // excluded; the highest item with a downloadable enclosure wins.
+        let selected = try XCTUnwrap(AppcastParser.select(from: items, context: context(build: "1")))
+        XCTAssertEqual(selected.buildNumber, "360")
+
+        // Application and package enclosures both remain supported.
+        XCTAssertTrue(
+            AppcastItemEligibility.hasValidEnclosureURL(
+                AppcastVersion(
+                    version: "1.0.0",
+                    buildNumber: "100",
+                    title: nil,
+                    date: nil,
+                    description: nil,
+                    releaseNotesURL: nil,
+                    downloadURL: "https://example.com/Transition.pkg",
+                    minimumSystemVersion: nil,
+                    minimumAutoupdateVersion: nil,
+                    installationType: "package"
+                )
+            )
+        )
+    }
+
+    func testMalformedBuildFailsClosedAndValidBuildsBeatMarketingOnlyItems() throws {
+        let xml = """
+        <?xml version="1.0" encoding="utf-8"?>
+        <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+            <channel>
+                <item>
+                    <sparkle:shortVersionString>9.9.9</sparkle:shortVersionString>
+                    <sparkle:version>9999x</sparkle:version>
+                    <enclosure url="https://example.com/RepoPrompt-9.9.9.zip" />
+                </item>
+                <item>
+                    <sparkle:shortVersionString>99.0.0</sparkle:shortVersionString>
+                    <enclosure url="https://example.com/RepoPrompt-99.0.0.zip" />
+                </item>
+                <item>
+                    <sparkle:shortVersionString>1.0.0</sparkle:shortVersionString>
+                    <sparkle:version>100</sparkle:version>
+                    <enclosure url="https://example.com/RepoPrompt-1.0.0.zip" />
+                </item>
+            </channel>
+        </rss>
+        """
+
+        let items = AppcastParser().parseItems(data: Data(xml.utf8))
+        XCTAssertEqual(items.count, 3)
+
+        // The malformed build fails closed even though it reads "highest";
+        // the buildless marketing-only item never outranks a valid build.
+        let selected = try XCTUnwrap(AppcastParser.select(from: items, context: context(build: "1")))
+        XCTAssertEqual(selected.buildNumber, "100")
+    }
+
+    func testAllBuildlessLegacyItemsFallBackToMarketingComparison() throws {
+        let xml = """
+        <?xml version="1.0" encoding="utf-8"?>
+        <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+            <channel>
+                <item>
+                    <sparkle:shortVersionString>1.2.3</sparkle:shortVersionString>
+                    <enclosure url="https://example.com/RepoPrompt-1.2.3.zip" />
+                </item>
+                <item>
+                    <sparkle:shortVersionString>1.10.0</sparkle:shortVersionString>
+                    <enclosure url="https://example.com/RepoPrompt-1.10.0.zip" />
+                </item>
+            </channel>
+        </rss>
+        """
+
+        let items = AppcastParser().parseItems(data: Data(xml.utf8))
+        XCTAssertEqual(items.count, 2)
+
+        let selected = try XCTUnwrap(AppcastParser.select(from: items, context: context(build: "1")))
+        XCTAssertEqual(selected.version, "1.10.0")
+        XCTAssertNil(selected.buildNumber)
     }
 }

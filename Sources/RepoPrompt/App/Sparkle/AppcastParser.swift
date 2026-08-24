@@ -36,6 +36,12 @@ enum AppcastItemEligibility {
     static let supportedInstallationTypes: Set<String> = ["application", "package"]
 
     static func isEligible(_ item: AppcastVersion, context: AppcastEligibilityContext) -> Bool {
+        // A passively advertised update must have a downloadable enclosure.
+        guard hasValidEnclosureURL(item) else { return false }
+        // A present but malformed Sparkle build cannot be ordered deterministically.
+        if let buildNumber = item.buildNumber {
+            guard SparkleBuildVersion(buildNumber) != nil else { return false }
+        }
         if let installationType = item.installationType {
             guard supportedInstallationTypes.contains(installationType) else { return false }
         }
@@ -50,6 +56,16 @@ enum AppcastItemEligibility {
                   currentBuild >= required
             else { return false }
         }
+        return true
+    }
+
+    static func hasValidEnclosureURL(_ item: AppcastVersion) -> Bool {
+        guard let rawURL = item.downloadURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawURL.isEmpty,
+              let url = URL(string: rawURL),
+              url.scheme != nil,
+              url.host != nil
+        else { return false }
         return true
     }
 }
@@ -101,24 +117,25 @@ final class AppcastParser: NSObject, XMLParserDelegate {
         return versions
     }
 
-    /// Filters items for eligibility first, then returns the update with the
-    /// highest numeric Sparkle build, falling back to marketing-version
-    /// comparison for legacy appcasts.
+    /// Filters items for eligibility first, then selects deterministically:
+    /// when any eligible item carries a valid numeric Sparkle build, the
+    /// greatest valid build wins; marketing-version comparison is used only
+    /// when every eligible legacy item omits a build number.
     static func select(
         from items: [AppcastVersion],
         context: AppcastEligibilityContext
     ) -> AppcastVersion? {
-        items
-            .filter { AppcastItemEligibility.isEligible($0, context: context) }
-            .max { lhs, rhs in
-                if let lhsBuild = lhs.buildNumber.flatMap(SparkleBuildVersion.init),
-                   let rhsBuild = rhs.buildNumber.flatMap(SparkleBuildVersion.init)
-                {
-                    return lhsBuild < rhsBuild
-                }
-                if SparkleVersionComparison.isVersion(lhs.version, newerThan: rhs.version) { return false }
-                return SparkleVersionComparison.isVersion(rhs.version, newerThan: lhs.version)
-            }
+        let eligible = items.filter { AppcastItemEligibility.isEligible($0, context: context) }
+        let numbered = eligible.compactMap { item in
+            item.buildNumber.flatMap(SparkleBuildVersion.init).map { (item: item, build: $0) }
+        }
+        if !numbered.isEmpty {
+            return numbered.max { $0.build < $1.build }?.item
+        }
+        return eligible.max { lhs, rhs in
+            if SparkleVersionComparison.isVersion(lhs.version, newerThan: rhs.version) { return false }
+            return SparkleVersionComparison.isVersion(rhs.version, newerThan: lhs.version)
+        }
     }
 
     // MARK: - Private Helpers

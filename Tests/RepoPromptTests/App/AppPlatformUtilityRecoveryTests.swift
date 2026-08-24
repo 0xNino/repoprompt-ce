@@ -188,10 +188,12 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
                 <item>
                     <sparkle:shortVersionString>1.0.27</sparkle:shortVersionString>
                     <sparkle:version>28</sparkle:version>
+                    <enclosure url="https://example.com/RepoPrompt-1.0.27-28.zip" />
                 </item>
                 <item>
                     <sparkle:shortVersionString>1.0.27</sparkle:shortVersionString>
                     <sparkle:version>412</sparkle:version>
+                    <enclosure url="https://example.com/RepoPrompt-1.0.27-412.zip" />
                 </item>
             </channel>
         </rss>
