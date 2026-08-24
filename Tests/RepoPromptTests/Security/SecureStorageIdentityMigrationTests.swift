@@ -25,6 +25,7 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         XCTAssertEqual(bridge.value(for: SecureStorageAccount.openAIAPI.identifier), "secret")
         XCTAssertFalse(source.calls.contains { $0.operation == .delete })
         XCTAssertEqual(state.savedManifests.map(\.status), [.preparing, .committed])
+        XCTAssertEqual(state.createdManifests.map(\.status), [.preparing])
 
         let committed = try XCTUnwrap(state.manifest)
         XCTAssertEqual(committed.version, SecureStorageIdentityMigrationManifest.currentVersion)
@@ -120,7 +121,7 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(state.manifest).status, .committed)
     }
 
-    func testLostJournalStartsNewServiceAndIgnoresOrphanedAttemptItems() throws {
+    func testLostJournalStartsNewServiceAndIgnoresOrphanedAttemptItems() {
         let source = MigrationTestBackend(values: [
             SecureStorageAccount.openAIAPI.identifier: "openai",
             SecureStorageAccount.anthropicAPI.identifier: "anthropic"
@@ -151,7 +152,7 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
             firstBridge.value(for: SecureStorageAccount.openAIAPI.identifier),
             "openai"
         )
-        try state.reset()
+        state.simulateJournalLoss()
 
         let recoveredReport = coordinator.prepareBridge()
 
@@ -176,7 +177,7 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         })
     }
 
-    func testCommittedManifestUsesSingleBridgeManifestRead() throws {
+    func testCommittedManifestVerifiesFullBridgeProjectionWithoutSourceReads() throws {
         let manifest = makeManifest(status: .committed)
         let encoded = try XCTUnwrap(SecureStorageIdentityMigrationCoordinator.encodeManifest(manifest))
         XCTAssertEqual(
@@ -192,9 +193,139 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         let report = makeCoordinator(source: source, bridge: bridge, state: state).prepareBridge()
 
         XCTAssertTrue(report.bridgeReady)
-        XCTAssertTrue(report.records.isEmpty)
+        // The committed projection classifies every cataloged account explicitly;
+        // both accounts are absent from the bridge here, which is acceptable.
+        XCTAssertEqual(report.records.map(\.state), [.absent, .absent])
         XCTAssertTrue(source.calls.isEmpty)
-        XCTAssertEqual(bridge.calls.map(\.key), [SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount])
+        // Reads touch the bridge service only: the manifest plus each account.
+        XCTAssertEqual(
+            bridge.calls.map(\.key),
+            [SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount] + accounts.map(\.identifier)
+        )
+    }
+
+    func testCommittedProjectionAccountReadFailureBlocksWithSpecificReason() throws {
+        let manifest = makeManifest(status: .committed)
+        let encoded = try XCTUnwrap(SecureStorageIdentityMigrationCoordinator.encodeManifest(manifest))
+        let bridge = MigrationTestBackend(values: [
+            SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount: encoded
+        ])
+        bridge.getErrors[SecureStorageAccount.openAIAPI.identifier] =
+            KeychainService.KeychainError.interactionNotAllowed
+        let source = MigrationTestBackend()
+        let state = TestIdentityMigrationStateStore(manifest: manifest)
+
+        let report = makeCoordinator(source: source, bridge: bridge, state: state).prepareBridge()
+
+        XCTAssertFalse(report.bridgeReady)
+        XCTAssertEqual(report.blockingState, .interactionRequired)
+        XCTAssertTrue(report.blockedUpdateMessage?.contains("login Keychain is locked or unavailable") == true)
+        XCTAssertTrue(source.calls.isEmpty)
+    }
+
+    func testResolverRejectsCommittedBridgeWithUnreadableAccountProjection() throws {
+        let manifest = makeManifest(status: .committed)
+        let encoded = try XCTUnwrap(SecureStorageIdentityMigrationCoordinator.encodeManifest(manifest))
+        let bridge = MigrationTestBackend(values: [
+            SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount: encoded
+        ])
+        bridge.getErrors[SecureStorageAccount.anthropicAPI.identifier] =
+            KeychainService.KeychainError.authenticationFailed
+        let resolver = SecureStorageIdentityMigrationCommittedBridgeResolver(
+            accounts: accounts,
+            stateStore: TestIdentityMigrationStateStore(manifest: manifest),
+            bridgeStoreFactory: { _ in bridge }
+        )
+
+        XCTAssertThrowsError(try resolver.resolve()) { error in
+            guard case KeychainService.KeychainError.authenticationFailed = error else {
+                return XCTFail("Expected authenticationFailed, got \(error)")
+            }
+        }
+    }
+
+    func testCommittedProjectionReportsVerifiedRecordsForPresentValues() throws {
+        let manifest = makeManifest(status: .committed)
+        let encoded = try XCTUnwrap(SecureStorageIdentityMigrationCoordinator.encodeManifest(manifest))
+        let bridge = MigrationTestBackend(values: [
+            SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount: encoded,
+            SecureStorageAccount.openAIAPI.identifier: "openai-secret"
+        ])
+        let state = TestIdentityMigrationStateStore(manifest: manifest)
+
+        let report = makeCoordinator(
+            source: MigrationTestBackend(),
+            bridge: bridge,
+            state: state
+        ).prepareBridge()
+
+        XCTAssertTrue(report.bridgeReady)
+        XCTAssertEqual(report.records.map(\.state), [.verified, .absent])
+        XCTAssertEqual(report.records.map(\.account), accounts)
+    }
+
+    func testCommittedProjectionRejectsMismatchedBridgeManifestWithoutDestructiveRecovery() throws {
+        let manifest = makeManifest(status: .committed)
+        let foreignManifest = SecureStorageIdentityMigrationManifest(
+            version: SecureStorageIdentityMigrationManifest.currentVersion,
+            status: .committed,
+            attemptIdentifier: secondAttemptIdentifier,
+            catalogIdentifiers: accounts.map(\.identifier).sorted()
+        )
+        let planted = try XCTUnwrap(SecureStorageIdentityMigrationCoordinator.encodeManifest(foreignManifest))
+        let bridge = MigrationTestBackend(values: [
+            SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount: planted
+        ])
+        let source = MigrationTestBackend(values: [SecureStorageAccount.openAIAPI.identifier: "secret"])
+
+        let report = makeCoordinator(
+            source: source,
+            bridge: bridge,
+            state: TestIdentityMigrationStateStore(manifest: manifest)
+        ).prepareBridge()
+
+        // A bridge manifest from a different attempt must not activate, and the
+        // mismatch must not trigger recovery writes against source or bridge.
+        XCTAssertFalse(report.bridgeReady)
+        XCTAssertEqual(report.blockingState, .failed)
+        XCTAssertTrue(source.calls.isEmpty)
+        XCTAssertTrue(bridge.calls.allSatisfy { $0.operation == .get })
+    }
+
+    func testResolverRejectsPlantedPreparingManifestInBridgeSlot() throws {
+        let manifest = makeManifest(status: .committed)
+        let planted = try XCTUnwrap(
+            SecureStorageIdentityMigrationCoordinator.encodeManifest(makeManifest(status: .preparing))
+        )
+        let bridge = MigrationTestBackend(values: [
+            SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount: planted
+        ])
+        let resolver = SecureStorageIdentityMigrationCommittedBridgeResolver(
+            accounts: accounts,
+            stateStore: TestIdentityMigrationStateStore(manifest: manifest),
+            bridgeStoreFactory: { _ in bridge }
+        )
+
+        XCTAssertThrowsError(try resolver.resolve()) { error in
+            guard case SecureStorageIdentityMigrationActivationError.invalidBridgeManifest = error else {
+                return XCTFail("Expected invalidBridgeManifest, got \(error)")
+            }
+        }
+    }
+
+    func testSuccessorPhaseGateBlocksEverythingExceptDisabled() {
+        XCTAssertNil(SecureStorageIdentityMigrationBootstrap.successorBlockedMessage(forPhase: .disabled))
+        XCTAssertEqual(
+            SecureStorageIdentityMigrationBootstrap.successorBlockedMessage(forPhase: .legacyPreparer),
+            SecureStorageIdentityMigrationBootstrap.successorUnsupportedPhaseMessage
+        )
+        XCTAssertEqual(
+            SecureStorageIdentityMigrationBootstrap.successorBlockedMessage(forPhase: nil),
+            SecureStorageIdentityMigrationBootstrap.unrecognizedConfigurationMessage
+        )
+        XCTAssertTrue(
+            SecureStorageIdentityMigrationBootstrap.successorMissingBridgeMessage.contains("previous RepoPrompt CE version")
+        )
     }
 
     func testCommittedJournalWithoutMatchingBridgeManifestBlocks() {
@@ -335,7 +466,7 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
         XCTAssertTrue(bridge.calls.isEmpty)
     }
 
-    func testCorruptJournalIsResetAndMigrationRetriesFromIntactSource() {
+    func testCorruptJournalFailsClosedWithoutResetOrCredentialAccess() {
         let journalBackend = MigrationTestBackend(values: [
             KeychainSecureStorageIdentityMigrationStateStore.account: "not-json"
         ])
@@ -345,11 +476,47 @@ final class SecureStorageIdentityMigrationTests: XCTestCase {
 
         let report = makeCoordinator(source: source, bridge: bridge, state: state).prepareBridge()
 
-        XCTAssertTrue(report.bridgeReady)
-        XCTAssertEqual(bridge.value(for: SecureStorageAccount.openAIAPI.identifier), "secret")
-        XCTAssertTrue(journalBackend.calls.contains {
-            $0.operation == .delete && $0.key == KeychainSecureStorageIdentityMigrationStateStore.account
-        })
+        // A corrupt journal may be the only pointer to an already-committed bridge.
+        // It must never be deleted or replaced by a fresh attempt from stale source data.
+        XCTAssertFalse(report.bridgeReady)
+        XCTAssertNotNil(report.blockedUpdateMessage)
+        XCTAssertTrue(source.calls.isEmpty)
+        XCTAssertTrue(bridge.calls.isEmpty)
+        XCTAssertFalse(journalBackend.calls.contains { $0.operation == .delete })
+        XCTAssertFalse(journalBackend.calls.contains { $0.operation == .save })
+        XCTAssertFalse(journalBackend.calls.contains { $0.operation == .create })
+        XCTAssertEqual(journalBackend.value(for: KeychainSecureStorageIdentityMigrationStateStore.account), "not-json")
+    }
+
+    func testFreshAttemptJournalWriteIsCreateOnlyAndCannotOverwrite() throws {
+        // Keychain-backed store: an existing journal item must reject create-only writes.
+        let journalBackend = MigrationTestBackend(values: [
+            KeychainSecureStorageIdentityMigrationStateStore.account: "existing-journal"
+        ])
+        let store = KeychainSecureStorageIdentityMigrationStateStore(store: journalBackend)
+
+        XCTAssertThrowsError(try store.create(makeManifest(status: .preparing))) { error in
+            guard case KeychainService.KeychainError.duplicateItem = error else {
+                return XCTFail("Expected duplicateItem, got \(error)")
+            }
+        }
+        XCTAssertEqual(
+            journalBackend.value(for: KeychainSecureStorageIdentityMigrationStateStore.account),
+            "existing-journal"
+        )
+
+        // Coordinator: a journal that appears between load and create blocks the attempt.
+        let state = TestIdentityMigrationStateStore(
+            createError: KeychainService.KeychainError.duplicateItem
+        )
+        let source = MigrationTestBackend(values: [SecureStorageAccount.openAIAPI.identifier: "secret"])
+        let bridge = MigrationTestBackend()
+
+        let report = makeCoordinator(source: source, bridge: bridge, state: state).prepareBridge()
+
+        XCTAssertFalse(report.bridgeReady)
+        XCTAssertTrue(state.savedManifests.isEmpty)
+        XCTAssertTrue(bridge.calls.isEmpty)
     }
 
     func testBridgeManifestPersistenceFailureLeavesJournalPreparing() {
@@ -488,22 +655,40 @@ private enum TestStateError: Error {
 private final class TestIdentityMigrationStateStore: SecureStorageIdentityMigrationStateStore {
     private(set) var manifest: SecureStorageIdentityMigrationManifest?
     private(set) var savedManifests: [SecureStorageIdentityMigrationManifest] = []
+    private(set) var createdManifests: [SecureStorageIdentityMigrationManifest] = []
     var loadError: Error?
+    var createError: Error?
     var saveFailuresRemaining: Int
 
     init(
         manifest: SecureStorageIdentityMigrationManifest? = nil,
         loadError: Error? = nil,
+        createError: Error? = nil,
         saveFailuresRemaining: Int = 0
     ) {
         self.manifest = manifest
         self.loadError = loadError
+        self.createError = createError
         self.saveFailuresRemaining = saveFailuresRemaining
     }
 
     func load() throws -> SecureStorageIdentityMigrationManifest? {
         if let loadError { throw loadError }
         return manifest
+    }
+
+    func create(_ manifest: SecureStorageIdentityMigrationManifest) throws {
+        if let createError { throw createError }
+        if saveFailuresRemaining > 0 {
+            saveFailuresRemaining -= 1
+            throw TestStateError.failed
+        }
+        guard self.manifest == nil else {
+            throw KeychainService.KeychainError.duplicateItem
+        }
+        createdManifests.append(manifest)
+        savedManifests.append(manifest)
+        self.manifest = manifest
     }
 
     func save(_ manifest: SecureStorageIdentityMigrationManifest) throws {
@@ -515,7 +700,9 @@ private final class TestIdentityMigrationStateStore: SecureStorageIdentityMigrat
         self.manifest = manifest
     }
 
-    func reset() throws {
+    /// Test-only stand-in for out-of-band journal deletion. Production code has
+    /// no destructive journal reset API.
+    func simulateJournalLoss() {
         manifest = nil
     }
 }
