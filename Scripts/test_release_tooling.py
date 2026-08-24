@@ -271,7 +271,7 @@ APP_SIGN_ARGS=(){app_signing_body}
             source.index('sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"'),
         )
 
-    def test_release_workflows_gate_legacy_preparer_and_keep_automatic_tip_disabled(self) -> None:
+    def test_release_workflows_gate_stable_preparer_and_require_explicit_nonlegacy_tip_dispatch(self) -> None:
         workflows = SCRIPT_DIR.parent / ".github" / "workflows"
         release_workflow = (workflows / "release.yml").read_text(encoding="utf-8")
         tip_workflow = (workflows / "main-tip.yml").read_text(encoding="utf-8")
@@ -316,12 +316,17 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertIn('rm -f "$RUNNER_TEMP/repoprompt-successor-identity-anchor"', release_publish)
 
         self.assertNotIn("identity_migration_phase:", tip_workflow)
-        self.assertNotIn("legacy-preparer", tip_workflow)
-        self.assertNotIn("SUCCESSOR_", tip_workflow)
-        self.assertNotIn("Prepare successor identity migration anchor", tip_workflow)
+        self.assertIn("confirm_identity_rollout_role:", tip_workflow)
+        self.assertIn('if [[ "$ROLLOUT_ROLE" != "legacy" ]]', tip_workflow)
+        self.assertIn('if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]', tip_workflow)
+        self.assertIn('[[ "$CONFIRMED_ROLLOUT_ROLE" != "$ROLLOUT_ROLE" ]]', tip_workflow)
+        self.assertIn("Prepare successor identity migration anchor", tip_workflow)
+        self.assertIn("if: needs.setup.outputs.rollout-role == 'preparer'", tip_workflow)
         self.assertEqual(
-            tip_workflow.count("REPOPROMPT_IDENTITY_MIGRATION_PHASE: disabled"),
-            3,
+            tip_workflow.count(
+                "REPOPROMPT_IDENTITY_MIGRATION_PHASE: ${{ needs.setup.outputs.migration-phase }}"
+            ),
+            2,
         )
 
     def test_codex_v8_entitlement_allowlist_matches_pinned_manifest_policy(self) -> None:
@@ -4282,7 +4287,9 @@ extension Data {
         ):
             directory.mkdir(parents=True, exist_ok=True)
         for name in (
+            "apple_identity_policy.json",
             "load_release_metadata.sh",
+            "stable_rollout.py",
             "validate_embedded_mcp_helper_layout.sh",
             "validate_app_architectures.sh",
             "write_app_artifact_manifest.py",
@@ -4465,6 +4472,9 @@ esac
                 **cls.codex_fixture_environment(approved, staged),
             }
         )
+        tip_declaration = staged / "tip-rollout.json"
+        if script_name == "main_tip_release.sh":
+            shutil.copy2(SCRIPT_DIR.parent / "tip-rollout.json", tip_declaration)
         result = subprocess.run(
             [
                 "bash",
@@ -4479,6 +4489,7 @@ esac
             text=True,
             capture_output=True,
         )
+        tip_declaration.unlink(missing_ok=True)
         return result, capture
 
     def make_git_remote(self) -> tuple[Path, Path]:
