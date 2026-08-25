@@ -254,7 +254,10 @@ updates the stable appcast.
 
 `Publish Tip` can be notified automatically after successful CI on `main` or dispatched manually. The
 automatic `workflow_run` path publishes only the legacy role; it skips every nonlegacy role before
-staging. A nonlegacy role is published only by an explicit dispatch whose
+staging. During migration, an automatic nonlegacy run intentionally fails visibly in a read-only
+terminal diagnostic: nothing is built, signed, or published. A complete immutable-release dedupe
+remains green and records a concise no-op summary. This is diagnostic truthfulness, not publication.
+A nonlegacy role is published only by an explicit dispatch whose
 `confirm_identity_rollout_role` exactly matches the checked-in role. The protected role-aware
 credential preflight runs before the secret-free build, and the environment approval is therefore a
 manual gate before any expensive staging work. After P is reviewed, advance the declaration with its
@@ -272,12 +275,19 @@ space without forcing stable releases to adopt repository-sized build numbers.
 The source commit count must remain at or below `9999`; replace this encoding
 before the repository reaches that limit.
 
-The workflow uses GitHub concurrency to allow one active and one pending run.
-New successful `main` runs replace an older pending run while an active signing
-or notarization run finishes. Before compiling, it uses the workflow's read-only
-`github.token` to check for a complete release for the immutable `tip-<shortsha>`
-tag and skips an already-published commit. The protected update-repository token
-remains confined to the publishing job.
+The workflow uses separate rolling/superseding GitHub concurrency lanes: successful
+automatic `main` notifications use `main-tip-channel`, and explicit dispatches use
+`main-tip-dispatch-channel`. Newer runs replace older work only within their own lane, so an
+automatic success cannot supersede a dispatch; failed-CI notifications use unique run-specific
+groups. Different lanes may build concurrently. The `publish` job is separately serialized
+across lanes once it reaches that job, but its job-level `cancel-in-progress: false` does not
+override workflow-level cancellation in the source lane. A duplicate immutable
+`tip-<shortsha>` tag publish may safely fail rather than corrupt the feed. An older run for a
+different commit that publishes late can move the Tip latest pointer backward; this bounded risk
+is especially relevant outside migration-role gating, and the existing next publish recovers it.
+Before compiling, it uses the workflow's read-only `github.token` to check for a complete
+release for the immutable `tip-<shortsha>` tag and skips an already-published commit. The protected
+update-repository token remains confined to the publishing job.
 
 Configure protected GitHub Actions environments named `release` and `tip-release`, with maintainer
 approval and protected-branch restrictions. Before the rehearsal, store this one-time identity
