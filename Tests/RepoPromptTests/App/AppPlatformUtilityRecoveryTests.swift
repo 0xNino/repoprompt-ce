@@ -153,7 +153,7 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
         </rss>
         """
 
-        let version = try XCTUnwrap(AppcastParser().parse(data: Data(xml.utf8)))
+        let version = try XCTUnwrap(AppcastParser().parse(data: Data(xml.utf8), context: Self.permissiveAppcastContext))
 
         XCTAssertEqual(version.version, "2.1.20")
         XCTAssertEqual(version.buildNumber, "320")
@@ -188,20 +188,27 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
                 <item>
                     <sparkle:shortVersionString>1.0.27</sparkle:shortVersionString>
                     <sparkle:version>28</sparkle:version>
+                    <enclosure url="https://example.com/RepoPrompt-1.0.27-28.zip" />
                 </item>
                 <item>
                     <sparkle:shortVersionString>1.0.27</sparkle:shortVersionString>
                     <sparkle:version>412</sparkle:version>
+                    <enclosure url="https://example.com/RepoPrompt-1.0.27-412.zip" />
                 </item>
             </channel>
         </rss>
         """
 
-        let version = try XCTUnwrap(AppcastParser().parse(data: Data(xml.utf8)))
+        let version = try XCTUnwrap(AppcastParser().parse(data: Data(xml.utf8), context: Self.permissiveAppcastContext))
 
         XCTAssertEqual(version.version, "1.0.27")
         XCTAssertEqual(version.buildNumber, "412")
     }
+
+    private static let permissiveAppcastContext = AppcastEligibilityContext(
+        currentBuildNumber: "1",
+        osVersion: SparkleBuildVersion(major: 99, minor: 0, patch: 0)
+    )
 
     func testTipBuildVersionSortsBetweenAdjacentStableBuilds() throws {
         let currentStable = try XCTUnwrap(SparkleBuildVersion("28"))

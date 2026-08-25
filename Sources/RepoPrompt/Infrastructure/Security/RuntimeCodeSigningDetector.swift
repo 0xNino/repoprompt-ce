@@ -93,6 +93,9 @@ enum RuntimeCodeSigningDetector {
         let leafCertificateSHA256 = leafCertificateFingerprint(from: dictionary)
 
         guard let developerIDRequirement = requirement(from: RuntimeCodeSigningPolicy.developerIDRequirement),
+              let successorDeveloperIDRequirement = requirement(
+                  from: RuntimeCodeSigningPolicy.successorDeveloperIDRequirement
+              ),
               let debugRequirement = requirement(from: RuntimeCodeSigningPolicy.appleDevelopmentDebugRequirement)
         else {
             return RuntimeCodeSigningInfo(
@@ -108,6 +111,13 @@ enum RuntimeCodeSigningDetector {
         var validatedDomains: Set<RuntimeCodeSigningDomain> = []
         if SecCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), developerIDRequirement) == errSecSuccess {
             validatedDomains.insert(.developerID)
+        }
+        if SecCodeCheckValidity(
+            code,
+            SecCSFlags(rawValue: kSecCSStrictValidate),
+            successorDeveloperIDRequirement
+        ) == errSecSuccess {
+            validatedDomains.insert(.successorDeveloperID)
         }
         if SecCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), debugRequirement) == errSecSuccess {
             validatedDomains.insert(.appleDevelopmentDebug)

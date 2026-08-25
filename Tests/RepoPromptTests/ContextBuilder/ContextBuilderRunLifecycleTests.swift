@@ -690,6 +690,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
             WindowStatesManager.shared.registerWindowState(window)
             defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            await window.workspaceManager.awaitInitialized()
 
             let root = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ContextBuilderCleanupCommitTests-\(UUID().uuidString)")
@@ -807,11 +808,6 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 windowID: window.windowID,
                 runID: transitioningRunID
             )
-            var transitioningContext = try XCTUnwrap(
-                window.mcpServer.tabContextByConnectionID[transitioningConnectionID]
-            )
-            transitioningContext.promptText = transitioningPrompt
-            window.mcpServer.tabContextByConnectionID[transitioningConnectionID] = transitioningContext
 
             let transitioningConnection = ContextBuilderCleanupTestConnection(
                 pendingRequestCount: 1,
@@ -829,6 +825,11 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 purpose: .discoverRun,
                 windowID: window.windowID
             )
+            try await ServerNetworkManager.withConnectionID(transitioningConnectionID) {
+                try await window.mcpServer.updateCurrentTabContext(toolName: "lifecycle-test") { context in
+                    context.promptText = transitioningPrompt
+                }
+            }
 
             let handoffWaitStarted = LifecycleTestGate()
             let commitAfterPublication = LifecycleTestGate()
@@ -871,6 +872,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                             isStillCurrent: { true },
                             deferRunMappingCleanupUntilCaller: true
                         )
+                        XCTAssertEqual(outcome.committedTab?.tab.promptText, transitioningPrompt)
                         return outcome.outcome == .committed
                     },
                     beforeTerminationRequest: {},

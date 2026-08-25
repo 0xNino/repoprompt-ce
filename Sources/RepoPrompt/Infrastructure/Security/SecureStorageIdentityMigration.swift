@@ -87,8 +87,10 @@ struct SecureStorageIdentityMigrationManifest: Codable, Equatable {
 
 protocol SecureStorageIdentityMigrationStateStore {
     func load() throws -> SecureStorageIdentityMigrationManifest?
+    /// Creates the journal only when no journal item exists yet. A fresh attempt must
+    /// never overwrite an existing journal written by another actor or launch.
+    func create(_ manifest: SecureStorageIdentityMigrationManifest) throws
     func save(_ manifest: SecureStorageIdentityMigrationManifest) throws
-    func reset() throws
 }
 
 /// A Keychain item is the durable migration journal and authority. Production preparers
@@ -129,26 +131,31 @@ struct KeychainSecureStorageIdentityMigrationStateStore: SecureStorageIdentityMi
         return manifest
     }
 
+    func create(_ manifest: SecureStorageIdentityMigrationManifest) throws {
+        let value = try encodedManifestValue(manifest)
+        try store.create(value, for: Self.account, accessMode: accessMode)
+        try verifyPersistedValue(value)
+    }
+
     func save(_ manifest: SecureStorageIdentityMigrationManifest) throws {
+        let value = try encodedManifestValue(manifest)
+        try store.save(value, for: Self.account, accessMode: accessMode)
+        try verifyPersistedValue(value)
+    }
+
+    private func encodedManifestValue(_ manifest: SecureStorageIdentityMigrationManifest) throws -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(manifest)
         guard let value = String(data: data, encoding: .utf8) else {
             throw StoreError.invalidManifest
         }
-        try store.save(value, for: Self.account, accessMode: accessMode)
-        guard try store.get(for: Self.account, accessMode: accessMode) == value else {
-            throw StoreError.verificationFailed
-        }
+        return value
     }
 
-    func reset() throws {
-        try store.delete(for: Self.account, accessMode: accessMode)
-        do {
-            _ = try store.get(for: Self.account, accessMode: accessMode)
+    private func verifyPersistedValue(_ value: String) throws {
+        guard try store.get(for: Self.account, accessMode: accessMode) == value else {
             throw StoreError.verificationFailed
-        } catch KeychainService.KeychainError.itemNotFound {
-            return
         }
     }
 }
@@ -195,14 +202,11 @@ final class SecureStorageIdentityMigrationCoordinator {
         let existingManifest: SecureStorageIdentityMigrationManifest?
         do {
             existingManifest = try stateStore.load()
-        } catch KeychainSecureStorageIdentityMigrationStateStore.StoreError.invalidManifest {
-            do {
-                try stateStore.reset()
-            } catch {
-                return blockedReport(error: error)
-            }
-            return prepareBridge()
         } catch {
+            // An unreadable or undecodable journal is an authority failure. After a bridge
+            // has been committed, the journal is the only pointer to it, so destructive
+            // reset-and-retry could silently restart migration from stale source data.
+            // Fail closed and keep the journal item intact for manual recovery.
             return blockedReport(error: error)
         }
 
@@ -236,7 +240,7 @@ final class SecureStorageIdentityMigrationCoordinator {
             catalogIdentifiers: expectedCatalogIdentifiers
         )
         do {
-            try stateStore.save(manifest)
+            try stateStore.create(manifest)
         } catch {
             return failedReport(records: preflightRecords, error: error)
         }
@@ -477,21 +481,19 @@ final class SecureStorageIdentityMigrationCoordinator {
         } catch {
             return blockedReport(error: error)
         }
-        guard let encoded = Self.encodeManifest(manifest) else {
-            return blockedReport()
-        }
+        let records: [SecureStorageIdentityMigrationRecord]
         do {
-            guard try bridgeStore.get(
-                for: Self.bridgeManifestAccount,
+            records = try SecureStorageIdentityMigrationCommittedProjection.verify(
+                manifest: manifest,
+                accounts: accounts,
+                bridgeStore: bridgeStore,
                 accessMode: accessMode
-            ) == encoded else {
-                return blockedReport()
-            }
+            )
         } catch {
             return blockedReport(error: error)
         }
         return SecureStorageIdentityMigrationReport(
-            records: [],
+            records: records,
             bridgeReady: true,
             blockingState: nil
         )
@@ -528,6 +530,48 @@ enum SecureStorageIdentityMigrationActivationError: Error {
     case invalidBridgeManifest
 }
 
+/// Shared verification of a committed bridge's full projection under the frozen
+/// version-2 manifest contract, expressed in the existing record states:
+/// - the journal manifest must be committed and must cover exactly the expected
+///   account catalog;
+/// - the bridge-manifest item must equal the committed journal encoding
+///   byte-for-byte -- any other present value (a mismatched attempt or a planted
+///   preparing manifest) is rejected as an invalid bridge manifest;
+/// - every cataloged account resolves to an explicit record state: a readable
+///   value is `.verified` (readability is the strongest value contract the frozen
+///   digest-free schema allows), a missing item is `.absent`, and any other read
+///   failure propagates so callers surface its specific blocked reason instead of
+///   silently accepting an unreadable projection.
+enum SecureStorageIdentityMigrationCommittedProjection {
+    static func verify(
+        manifest: SecureStorageIdentityMigrationManifest,
+        accounts: [SecureStorageAccount],
+        bridgeStore: SecureKeyValueStorageBackend,
+        accessMode: KeychainAccessMode
+    ) throws -> [SecureStorageIdentityMigrationRecord] {
+        guard manifest.status == .committed,
+              manifest.catalogIdentifiers == accounts.map(\.identifier).sorted(),
+              let encoded = SecureStorageIdentityMigrationCoordinator.encodeManifest(manifest)
+        else {
+            throw SecureStorageIdentityMigrationActivationError.invalidJournal
+        }
+        guard try bridgeStore.get(
+            for: SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount,
+            accessMode: accessMode
+        ) == encoded else {
+            throw SecureStorageIdentityMigrationActivationError.invalidBridgeManifest
+        }
+        return try accounts.map { account in
+            do {
+                _ = try bridgeStore.get(for: account.identifier, accessMode: accessMode)
+                return SecureStorageIdentityMigrationRecord(account: account, state: .verified)
+            } catch KeychainService.KeychainError.itemNotFound {
+                return SecureStorageIdentityMigrationRecord(account: account, state: .absent)
+            }
+        }
+    }
+}
+
 struct SecureStorageIdentityMigrationCommittedBridge {
     let manifest: SecureStorageIdentityMigrationManifest
     let store: SecureKeyValueStorageBackend
@@ -548,19 +592,18 @@ struct SecureStorageIdentityMigrationCommittedBridgeResolver {
               SecureStorageIdentityMigrationCoordinator.isStructurallyValid(
                   manifest,
                   expectedCatalogIdentifiers: accounts.map(\.identifier)
-              ),
-              let encoded = SecureStorageIdentityMigrationCoordinator.encodeManifest(manifest)
+              )
         else {
             throw SecureStorageIdentityMigrationActivationError.invalidJournal
         }
 
         let bridgeStore = try bridgeStoreFactory(manifest.attemptIdentifier)
-        guard try bridgeStore.get(
-            for: SecureStorageIdentityMigrationCoordinator.bridgeManifestAccount,
+        _ = try SecureStorageIdentityMigrationCommittedProjection.verify(
+            manifest: manifest,
+            accounts: accounts,
+            bridgeStore: bridgeStore,
             accessMode: .nonInteractive(reason: .launch)
-        ) == encoded else {
-            throw SecureStorageIdentityMigrationActivationError.invalidBridgeManifest
-        }
+        )
         return SecureStorageIdentityMigrationCommittedBridge(
             manifest: manifest,
             store: bridgeStore
@@ -590,14 +633,30 @@ final class IdentityMigrationRuntimeState: @unchecked Sendable {
 enum SecureStorageIdentityMigrationBootstrap {
     static let phaseInfoKey = "RepoPromptIdentityMigrationPhase"
     static let anchorRelativePathInfoKey = "RepoPromptIdentityMigrationAnchorRelativePath"
-    static let successorBundleIdentifier = "com.repoprompt.ce"
-    static let successorTeamIdentifier = "69N6K965SF"
-    static let successorDeveloperIDRequirement =
-        "anchor apple generic and identifier \"\(successorBundleIdentifier)\" and certificate leaf[subject.OU] = \"\(successorTeamIdentifier)\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
 
     enum Phase: String {
         case disabled
         case legacyPreparer = "legacy-preparer"
+    }
+
+    static let unrecognizedConfigurationMessage =
+        "Updates are paused because this build has an unrecognized secure credential migration configuration."
+    static let successorUnsupportedPhaseMessage =
+        "Updates are paused because this build has an unsupported secure credential migration configuration."
+    static let successorMissingBridgeMessage =
+        "Updates are paused because this Mac's credentials have not finished migrating from the previous RepoPrompt CE version. Open the previous RepoPrompt CE version to complete credential migration, then relaunch this app. Your existing credentials were not deleted."
+
+    /// Pure phase gate for a successor-identity launch. Returns nil when bridge
+    /// activation may proceed, or the stable blocked guidance otherwise.
+    static func successorBlockedMessage(forPhase phase: Phase?) -> String? {
+        switch phase {
+        case .disabled:
+            nil
+        case .legacyPreparer:
+            successorUnsupportedPhaseMessage
+        case nil:
+            unrecognizedConfigurationMessage
+        }
     }
 
     static func configuredPhase(from value: Any?) -> Phase? {
@@ -614,18 +673,30 @@ enum SecureStorageIdentityMigrationBootstrap {
 
     static func prepareIfConfigured(bundle: Bundle = .main) {
         IdentityMigrationRuntimeState.shared.setBlockedMessage(nil)
-        guard SecureKeyValueStorageFactory.currentDecision().domain == .officialDeveloperID else { return }
-        guard let phase = configuredPhase(from: bundle.object(forInfoDictionaryKey: phaseInfoKey))
-        else {
-            blockUpdates("Updates are paused because this build has an unrecognized secure credential migration configuration.")
+        let domain = SecureKeyValueStorageFactory.currentDecision().domain
+        let phase = configuredPhase(from: bundle.object(forInfoDictionaryKey: phaseInfoKey))
+        switch domain {
+        case .officialDeveloperID:
+            guard let phase else {
+                blockUpdates(unrecognizedConfigurationMessage)
+                return
+            }
+            switch phase {
+            case .disabled:
+                activateCommittedBridgeIfPresent(bridgeRequired: false)
+            case .legacyPreparer:
+                prepareLegacyBridge(bundle: bundle)
+            }
+        case .successorOfficialDeveloperID:
+            if let blockedMessage = successorBlockedMessage(forPhase: phase) {
+                blockUpdates(blockedMessage)
+                return
+            }
+            // The successor identity has no legacy storage fallback: without an
+            // authenticated committed bridge it must stay ephemeral and say so.
+            activateCommittedBridgeIfPresent(bridgeRequired: true)
+        case .localSelfSigned, .appleDevelopmentDebug, .ephemeral:
             return
-        }
-
-        switch phase {
-        case .disabled:
-            activateCommittedBridgeIfPresent()
-        case .legacyPreparer:
-            prepareLegacyBridge(bundle: bundle)
         }
     }
 
@@ -643,7 +714,7 @@ enum SecureStorageIdentityMigrationBootstrap {
               ),
               RuntimeCodeSigningDetector.validatesStaticCode(
                   at: anchorURL,
-                  requirementSource: successorDeveloperIDRequirement
+                  requirementSource: RuntimeCodeSigningPolicy.successorDeveloperIDRequirement
               )
         else {
             blockUpdates("Updates are paused because the secure credential migration package is incomplete, its account catalog changed, or it has an invalid identity anchor.")
@@ -663,7 +734,7 @@ enum SecureStorageIdentityMigrationBootstrap {
                     TrustedApplicationCodeRequirement(
                         trustedApplicationPath: anchorURL.path,
                         codeURL: anchorURL,
-                        requirementSource: successorDeveloperIDRequirement
+                        requirementSource: RuntimeCodeSigningPolicy.successorDeveloperIDRequirement
                     )
                 ]
             )
@@ -721,13 +792,13 @@ enum SecureStorageIdentityMigrationBootstrap {
         }
     }
 
-    private static func activateCommittedBridgeIfPresent() {
+    private static func activateCommittedBridgeIfPresent(bridgeRequired: Bool) {
         let accessValidator: ClassicKeychainACLValidator
         do {
             accessValidator = try ClassicKeychainACLValidator(
                 requirementSources: [
                     RuntimeCodeSigningPolicy.developerIDRequirement,
-                    successorDeveloperIDRequirement
+                    RuntimeCodeSigningPolicy.successorDeveloperIDRequirement
                 ]
             )
         } catch {
@@ -761,7 +832,12 @@ enum SecureStorageIdentityMigrationBootstrap {
             blockUpdates(for: error)
             return
         }
-        guard let resolution else { return }
+        guard let resolution else {
+            if bridgeRequired {
+                blockUpdates(successorMissingBridgeMessage)
+            }
+            return
+        }
         let manifest = resolution.manifest
 
         guard let bridgeServiceName = KeychainService.identityMigrationBridgeServiceName(

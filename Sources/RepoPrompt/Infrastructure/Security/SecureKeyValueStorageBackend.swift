@@ -82,10 +82,21 @@ enum SecureKeyValueStorageFactory {
     }()
 
     static func defaultBackend() -> SecureKeyValueStorageBackend {
-        guard cachedSelection.decision.domain == .officialDeveloperID else {
+        guard officialOverrideApplies(to: cachedSelection.decision.domain) else {
             return cachedSelection.backend
         }
         return State.shared.officialBackend(fallback: cachedSelection.backend)
+    }
+
+    /// The committed identity-migration bridge override is only meaningful for the two
+    /// official Developer ID identities; every other domain keeps its dedicated backend.
+    static func officialOverrideApplies(to domain: RuntimeSecureStorageDomain) -> Bool {
+        switch domain {
+        case .officialDeveloperID, .successorOfficialDeveloperID:
+            true
+        case .localSelfSigned, .appleDevelopmentDebug, .ephemeral:
+            false
+        }
     }
 
     static func currentDecision() -> RuntimeSecureStorageDecision {
@@ -101,6 +112,10 @@ enum SecureKeyValueStorageFactory {
         let backend: SecureKeyValueStorageBackend = switch decision.domain {
         case .officialDeveloperID:
             KeychainService.officialV2Shared
+        case .successorOfficialDeveloperID:
+            // The successor identity has no legacy fallback service. It stays ephemeral
+            // until bootstrap installs an authenticated committed-bridge override.
+            EphemeralSecureKeyValueStore.shared
         case .localSelfSigned:
             if let fingerprint = decision.localCertificateFingerprint,
                let generation = decision.localServiceGeneration,
