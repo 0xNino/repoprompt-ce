@@ -33,6 +33,14 @@ All three roles use the same Tip feed and `appcast.xml`; the rollout manifest is
 `identity-rollout.json` asset name. No sibling feed or Sparkle key is introduced. Automatic
 `workflow_run` notifications skip every nonlegacy role. Each nonlegacy role requires an explicit
 `workflow_dispatch` with `confirm_identity_rollout_role` exactly equal to the checked-in role.
+Tip workflow uses separate rolling/superseding lanes: newer runs replace older work only within
+the same lane, so automatic successes cannot evict explicit dispatches; failed-CI notifications
+use unique groups. Different lanes may build concurrently. The `publish` job is separately
+serialized across lanes once it reaches that job, but its job-level `cancel-in-progress: false`
+does not override workflow-level cancellation in the source lane. A duplicate immutable
+`tip-<shortsha>` tag publish may safely fail rather than corrupt the feed. An older run for a
+different commit that publishes late can move the latest pointer backward; this bounded risk is
+especially relevant outside migration-role gating, and the existing next publish recovers it.
 
 ## Release ladder
 
