@@ -235,20 +235,32 @@ Stable: https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/down
 Tip:    https://github.com/repoprompt/repoprompt-ce-tip-updates/releases/latest/download/appcast.xml
 ```
 
-The initial Tip channel shares the CE Sparkle EdDSA key and Developer ID identity
-with stable releases, but it publishes only to the separate tip update
-repository. Tip workflows must never write to `repoprompt-ce-updates`, must not
-use `v*` tags, and must not feed into `Promote Release`. Stable promotion remains
-the only path that updates the stable appcast.
+The Tip channel uses the same CE Sparkle EdDSA key and the same application/feed contract as
+stable, but publishes only to the separate tip update repository. It is currently the controlled
+`P → T → S` identity-transition rehearsal:
 
-`Publish Tip` runs after successful CI on `main` and can also be dispatched
-manually. It stages the tip source without secrets, signs and notarizes without
-executing packaged app/helper code, runs the PR #441 hardened packaged smoke on a
-fresh no-secret runner, then publishes a normal GitHub release in the dedicated
-tip update repository using an immutable tag shaped like `tip-<shortsha>`. The
-release is marked latest inside the tip-only repository so GitHub's
-`releases/latest/download/appcast.xml` URL resolves for opted-in clients. Do not
-mark the tip release as a prerelease: GitHub excludes prereleases from
+| Role | Application identity | Artifact | Feed contents |
+| --- | --- | --- | --- |
+| P / `preparer` | Legacy | ZIP, `legacy-preparer` phase | P only |
+| T / `transition` | Successor | Notarized successor-Installer-signed PKG | T and retained P |
+| S / `successor` | Successor | Notarized ZIP/DMG | S, retained T, and retained P |
+
+`tip-rollout.json` is the checked-in authority for the current role, expected identity, migration
+phase, and predecessor manifest digests. Every role uses the same Tip feed URL and `appcast.xml`
+asset, with retained top-level entries in that appcast; there are no transition/successor sibling
+feeds and no Sparkle-key change. Tip workflows must never write to `repoprompt-ce-updates`, must not
+use `v*` tags, and must not feed into `Promote Release`. Stable promotion remains the only path that
+updates the stable appcast.
+
+`Publish Tip` can be notified automatically after successful CI on `main` or dispatched manually. The
+automatic `workflow_run` path publishes only the legacy role; it skips every nonlegacy role before
+staging. A nonlegacy role is published only by an explicit dispatch whose
+`confirm_identity_rollout_role` exactly matches the checked-in role. The protected role-aware
+credential preflight runs before the secret-free build, and the environment approval is therefore a
+manual gate before any expensive staging work. After P is reviewed, advance the declaration with its
+exact `identity-rollout.json` digest before dispatching T; advance it again with T and P digests before
+S. Each published role uses an immutable `tip-<shortsha>` tag and the tip-only repository's latest
+release; do not mark the release as a prerelease because GitHub excludes prereleases from
 `releases/latest`.
 
 Tip `CFBundleVersion` values sort between adjacent stable builds. The workflow
@@ -267,14 +279,25 @@ or notarization run finishes. Before compiling, it uses the workflow's read-only
 tag and skips an already-published commit. The protected update-repository token
 remains confined to the publishing job.
 
-Configure a protected GitHub Actions environment named `tip-release`. It can use
-the same Developer ID, provisioning, notarization, and Sparkle secrets as stable
-initially, but it needs a separate `TIP_UPDATE_REPOSITORY_TOKEN` scoped only to
-the tip update repository. Optionally set repository variable
-`TIP_UPDATE_REPOSITORY`; it defaults to `repoprompt/repoprompt-ce-tip-updates`.
-The publishing script fails closed if this variable points at the source repo or
-the stable update repo. Tip artifacts also include a small `*-metadata.json` asset
-recording the source commit, immutable tag, marketing version, and build number.
+Configure protected GitHub Actions environments named `release` and `tip-release`, with maintainer
+approval and protected-branch restrictions. Before the rehearsal, store this one-time identity
+inventory in both environments:
+
+| Material | Legacy/preparer selection | Transition/successor selection |
+| --- | --- | --- |
+| Application P12/password | `DEVELOPER_ID_APPLICATION_P12_BASE64` / `DEVELOPER_ID_APPLICATION_P12_PASSWORD` | `SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_BASE64` / `SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_PASSWORD` |
+| Provisioning profile | `REPOPROMPT_CE_PROVISIONING_PROFILE_BASE64` | `SUCCESSOR_REPOPROMPT_CE_PROVISIONING_PROFILE_BASE64` |
+| Notarytool private key/key ID/issuer | `NOTARYTOOL_PRIVATE_KEY_BASE64` / `NOTARYTOOL_KEY_ID` / `NOTARYTOOL_ISSUER_ID` | `SUCCESSOR_NOTARYTOOL_PRIVATE_KEY_BASE64` / `SUCCESSOR_NOTARYTOOL_KEY_ID` / `SUCCESSOR_NOTARYTOOL_ISSUER_ID` |
+| Transition Installer P12/password | not used | `SUCCESSOR_DEVELOPER_ID_INSTALLER_P12_BASE64` / `SUCCESSOR_DEVELOPER_ID_INSTALLER_P12_PASSWORD` |
+
+Also retain `CI_KEYCHAIN_PASSWORD`, `SPARKLE_PRIVATE_KEY`, the Sentry credentials/configuration,
+and the environment-specific update-repository token. The workflows derive application and Installer
+identity labels from `Scripts/apple_identity_policy.json` through `stable_rollout.py
+packaging-context`; do not configure `SIGN_IDENTITY`, `SUCCESSOR_SIGN_IDENTITY`, or an installer-name
+alias as a second authority. The Tip publishing script fails closed if `TIP_UPDATE_REPOSITORY`
+points at the source or stable update repository. Tip artifacts also include a small
+`*-metadata.json` asset recording the source commit, immutable tag, marketing version, and build
+number.
 
 Tip builds use the same Sentry-linked binary and symbolication policy as stable
 releases. The secret-free stage enables Sentry linking and carries release dSYMs
@@ -542,19 +565,11 @@ Sentry event detail:
 Relaunch the app once without the argument so the SDK can flush the cached native
 crash report.
 
-The optional `SIGN_IDENTITY` environment variable defaults to:
-
-```text
-Developer ID Application: Eric Provencher (648A27MST5)
-```
-
-The provisioning profile must authorize:
-
-```text
-648A27MST5.com.pvncher.repoprompt.ce
-```
-
-The release script validates that identifier before signing.
+Official workflows do not take an application or Installer identity label from a GitHub Actions
+string variable. They derive the expected labels from `Scripts/apple_identity_policy.json` through
+`stable_rollout.py packaging-context`, then validate the imported identity in the ephemeral keychain
+before signing. The selected provisioning profile must match the role-selected bundle/team pair; the
+release tooling validates that identifier before signing.
 
 `PUBLIC_UPDATE_REPOSITORY_TOKEN` is intentionally separate from the workflow's
 source-repository `github.token`. Keep its repository scope narrow: the

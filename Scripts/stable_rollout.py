@@ -10,6 +10,7 @@ Commands:
 - ``workflow-guard``: protected workflows call this to reject transition or
   successor roles, sibling predecessors, and the successor identity.
 - ``current-role``: print the declared role for shell callers.
+- ``packaging-context``: emit policy-derived bundle, team, application, and installer identity labels.
 - ``generate``: assemble the accumulated appcast plus rollout manifest.
 - ``validate``: prove a reviewed appcast/manifest pair against the declaration,
   policy, version metadata, and enclosure/app-manifest digests.
@@ -117,9 +118,19 @@ def load_policy(path: Path) -> dict:
         entry = policy.get("identities", {}).get(identity)
         if not isinstance(entry, dict) or not all(
             isinstance(entry.get(key), str) and entry.get(key)
-            for key in ("bundleIdentifier", "teamIdentifier", "developerIDRequirement")
+            for key in (
+                "bundleIdentifier",
+                "teamIdentifier",
+                "developerIDRequirement",
+                "developerIDApplicationIdentityName",
+            )
         ):
             raise RolloutError(f"apple identity policy is missing the {identity} identity")
+    successor = policy["identities"]["successor"]
+    if not isinstance(successor.get("developerIDInstallerIdentityName"), str) or not successor[
+        "developerIDInstallerIdentityName"
+    ]:
+        raise RolloutError("apple identity policy is missing the successor installer identity")
     sparkle = policy.get("sparkle")
     if not isinstance(sparkle, dict) or not all(
         isinstance(sparkle.get(key), str) and sparkle.get(key)

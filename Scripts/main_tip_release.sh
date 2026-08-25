@@ -329,9 +329,7 @@ sign_tip() {
     [[ "$SIGN_IDENTITY" == "$EXPECTED_SIGN_IDENTITY" ]] ||
         fail "SIGN_IDENTITY does not match the reviewed $ROLLOUT_IDENTITY identity"
     if [[ "$ROLLOUT_ROLE" == "transition" ]]; then
-        require_env INSTALLER_IDENTITY
-        [[ "$INSTALLER_IDENTITY" == "$EXPECTED_INSTALLER_IDENTITY" ]] ||
-            fail "INSTALLER_IDENTITY does not match the reviewed successor installer identity"
+        require_env EXPECTED_INSTALLER_IDENTITY
     fi
     [[ "$RELEASE_COMMIT" == "$TIP_COMMIT" ]] || fail "RELEASE_COMMIT must match TIP_COMMIT"
     [[ -d "$APP_BUNDLE" ]] || fail "Missing staged tip app bundle: $APP_BUNDLE"
@@ -378,7 +376,7 @@ sign_tip() {
             "$CONTROL_PLANE_SCRIPTS_DIR/build_identity_transition_pkg.sh" build \
             --app "$APP_BUNDLE" \
             --output "$TRANSITION_PKG" \
-            --installer-identity "$INSTALLER_IDENTITY"
+              --installer-identity "$EXPECTED_INSTALLER_IDENTITY"
         checksum_assets+=("$(basename "$TRANSITION_PKG")")
     else
         local distribution_dir="$TMP_DIR/distribution"

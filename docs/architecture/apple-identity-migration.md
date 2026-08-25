@@ -12,7 +12,27 @@ storage, then use a notarized transition installer to cross the application iden
 | Successor | `com.repoprompt.ce` | `69N6K965SF` |
 
 The existing Sparkle EdDSA key and the Stable and Tip feed URLs remain unchanged. Each channel may
-contain multiple update items during the transition; this does not require extra feeds.
+contain multiple update items during the transition; this does not require extra feeds. The application
+and installer identity labels are policy data in `Scripts/apple_identity_policy.json`; protected
+workflows use `Scripts/stable_rollout.py packaging-context` and do not require duplicated GitHub
+Actions identity-name variables.
+
+## Tip rehearsal
+
+The checked-in Tip declaration is the controlled `P → T → S` rehearsal:
+
+- **P (preparer)** is a legacy-identity ZIP with `legacy-preparer` migration phase and no
+  predecessors. It carries the successor-signed anchor needed to prove the future identity, but its
+  application, profile, and notary credentials remain legacy-selected.
+- **T (transition)** is a successor-identity, successor-Installer-signed and notarized `.pkg`. Its
+  appcast retains P as the immediately older top-level item.
+- **S (successor)** is a successor-identity ZIP/DMG. Its appcast retains both T and P as top-level
+  items and supplies the normal rollback window.
+
+All three roles use the same Tip feed and `appcast.xml`; the rollout manifest is the same
+`identity-rollout.json` asset name. No sibling feed or Sparkle key is introduced. Automatic
+`workflow_run` notifications skip every nonlegacy role. Each nonlegacy role requires an explicit
+`workflow_dispatch` with `confirm_identity_rollout_role` exactly equal to the checked-in role.
 
 ## Release ladder
 
@@ -65,8 +85,25 @@ trusted control-plane checkout. The minimal executable is never launched; it avo
 copy of the main app binary while still giving Security.framework a successor-signed designated
 requirement on both supported architectures.
 
-Preparers are Stable-only artifacts. The rolling Tip workflow always packages, validates, and signs
-with phase `disabled`; it has no migration-phase input or access to successor signing secrets.
+The Tip workflow performs the rehearsal under the protected `tip-release` environment. Its cheap
+role-aware credential preflight runs before the secret-free build and checks the policy projection plus
+the role-selected application P12/password, provisioning profile, and notarytool private key/key ID/
+issuer. The transition role additionally requires the successor Installer P12/password. The preparer
+role separately requires the successor application P12/password only to create and verify the embedded
+successor anchor. After every P12 import, the signing job verifies that the policy-derived identity is
+present and usable in the ephemeral keychain before any `codesign` or `productbuild` call.
+
+## Manual gates and next operator action
+
+The manual gates are ordered: approve and dispatch P first, inspect its signed/notarized ZIP and
+retained `identity-rollout.json`, then update the declaration with P's exact manifest digest before
+dispatching T. After T is verified, update the declaration with both exact predecessor digests before
+dispatching S. Never publish a nonlegacy role from an automatic `workflow_run` notification.
+
+The next operator action after this change is merged to protected `main`: dispatch **Publish Tip**
+with `commit` set to that exact main SHA and `confirm_identity_rollout_role=preparer`. Do not rely on
+the automatic CI notification for P. Subsequent T and S dispatches require the checked-in declaration
+and exact role confirmation to be advanced and reviewed first.
 
 ## Required proof gate
 
