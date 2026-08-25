@@ -242,6 +242,19 @@ jobs:
           CI_KEYCHAIN_PASSWORD: ${{ secrets.CI_KEYCHAIN_PASSWORD }}
         run: |
           set -euo pipefail
+          umask 077
+          PREFLIGHT_KEYCHAIN_PATH="$RUNNER_TEMP/repoprompt-tip-preflight.keychain-db"
+          CERTIFICATE_PATH="$RUNNER_TEMP/repoprompt-tip-preflight.p12"
+          SUCCESSOR_CERTIFICATE_PATH="$RUNNER_TEMP/repoprompt-tip-preflight-successor.p12"
+          INSTALLER_CERTIFICATE_PATH="$RUNNER_TEMP/repoprompt-tip-preflight-installer.p12"
+          preflight_keychain_created=0
+          cleanup_preflight_credentials() {
+            rm -f "$CERTIFICATE_PATH" "$SUCCESSOR_CERTIFICATE_PATH" "$INSTALLER_CERTIFICATE_PATH"
+            if (( preflight_keychain_created )); then
+              security delete-keychain "$PREFLIGHT_KEYCHAIN_PATH" || true
+            fi
+          }
+          trap cleanup_preflight_credentials EXIT
           fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
           require_value() {
             local name="$1"
@@ -292,11 +305,13 @@ jobs:
           require_value NOTARYTOOL_PRIVATE_KEY_BASE64
           require_value NOTARYTOOL_KEY_ID
           require_value NOTARYTOOL_ISSUER_ID
+
           decode_value "application certificate" "$CERTIFICATE_P12_BASE64"
           decode_value "provisioning profile" "$PROVISIONING_PROFILE_BASE64"
           decode_value "notarytool private key" "$NOTARYTOOL_PRIVATE_KEY_BASE64"
 
           if [[ "$ROLLOUT_ROLE" == "preparer" ]]; then
+            require_value EXPECTED_SUCCESSOR_SIGN_IDENTITY
             require_value SUCCESSOR_CERTIFICATE_P12_BASE64
             require_value SUCCESSOR_CERTIFICATE_P12_PASSWORD
             decode_value "successor anchor certificate" "$SUCCESSOR_CERTIFICATE_P12_BASE64"
@@ -306,6 +321,43 @@ jobs:
             require_value SUCCESSOR_INSTALLER_P12_BASE64
             require_value SUCCESSOR_INSTALLER_P12_PASSWORD
             decode_value "successor installer certificate" "$SUCCESSOR_INSTALLER_P12_BASE64"
+          fi
+
+          printf '%s' "$CERTIFICATE_P12_BASE64" | base64 --decode > "$CERTIFICATE_PATH" || fail "application certificate"
+          security create-keychain -p "$CI_KEYCHAIN_PASSWORD" "$PREFLIGHT_KEYCHAIN_PATH"
+          preflight_keychain_created=1
+          security set-keychain-settings -lut 21600 "$PREFLIGHT_KEYCHAIN_PATH"
+          security unlock-keychain -p "$CI_KEYCHAIN_PASSWORD" "$PREFLIGHT_KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -k "$PREFLIGHT_KEYCHAIN_PATH" -P "$CERTIFICATE_P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security \
+            >/dev/null 2>&1 || fail "application certificate"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$CI_KEYCHAIN_PASSWORD" "$PREFLIGHT_KEYCHAIN_PATH" \
+            >/dev/null 2>&1 || fail "application certificate"
+          security find-identity -v -p codesigning "$PREFLIGHT_KEYCHAIN_PATH" |
+            grep -F "\"$EXPECTED_SIGN_IDENTITY\"" >/dev/null || fail "application signing identity"
+
+          if [[ "$ROLLOUT_ROLE" == "preparer" ]]; then
+            printf '%s' "$SUCCESSOR_CERTIFICATE_P12_BASE64" | base64 --decode > "$SUCCESSOR_CERTIFICATE_PATH" || fail "successor application certificate"
+            security import "$SUCCESSOR_CERTIFICATE_PATH" -k "$PREFLIGHT_KEYCHAIN_PATH" -P "$SUCCESSOR_CERTIFICATE_P12_PASSWORD" \
+              -T /usr/bin/codesign -T /usr/bin/security \
+              >/dev/null 2>&1 || fail "successor application certificate"
+            security set-key-partition-list -S apple-tool:,apple:,codesign: \
+              -s -k "$CI_KEYCHAIN_PASSWORD" "$PREFLIGHT_KEYCHAIN_PATH" \
+              >/dev/null 2>&1 || fail "successor application certificate"
+            security find-identity -v -p codesigning "$PREFLIGHT_KEYCHAIN_PATH" |
+              grep -F "\"$EXPECTED_SUCCESSOR_SIGN_IDENTITY\"" >/dev/null || fail "successor application signing identity"
+          fi
+          if [[ "$ROLLOUT_ROLE" == "transition" ]]; then
+            printf '%s' "$SUCCESSOR_INSTALLER_P12_BASE64" | base64 --decode > "$INSTALLER_CERTIFICATE_PATH" || fail "successor installer certificate"
+            security import "$INSTALLER_CERTIFICATE_PATH" -k "$PREFLIGHT_KEYCHAIN_PATH" -P "$SUCCESSOR_INSTALLER_P12_PASSWORD" \
+              -T /usr/bin/productbuild -T /usr/bin/security \
+              >/dev/null 2>&1 || fail "successor installer certificate"
+            security set-key-partition-list -S apple-tool:,apple:,codesign:,productbuild: \
+              -s -k "$CI_KEYCHAIN_PASSWORD" "$PREFLIGHT_KEYCHAIN_PATH" \
+              >/dev/null 2>&1 || fail "successor installer certificate"
+            security find-identity -v -p basic "$PREFLIGHT_KEYCHAIN_PATH" |
+              grep -F "\"$EXPECTED_INSTALLER_IDENTITY\"" >/dev/null || fail "successor installer identity"
           fi
           printf 'OK: Tip %s credential/configuration preflight passed.\n' "$ROLLOUT_ROLE"
 
