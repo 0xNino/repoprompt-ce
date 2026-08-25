@@ -3378,6 +3378,46 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
         self.assertIn("TIP_GH_TOKEN: ${{ secrets.TIP_UPDATE_REPOSITORY_TOKEN }}", publish_job)
         self.assertEqual(tip_workflow.count("TIP_UPDATE_REPOSITORY_TOKEN"), 1)
 
+    def test_tip_no_release_diagnostic_contract_is_truthful_and_read_only(self) -> None:
+        workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")
+        setup_job = workflow.split("\n  setup:", 1)[1].split("\n  automatic-tip-dormant:", 1)[0]
+        resolve_step = setup_job.split("      - name: Resolve protected main commit", 1)[1]
+        diagnostic_job = workflow.split("\n  automatic-tip-dormant:", 1)[1].split(
+            "\n  credential-preflight:", 1
+        )[0]
+
+        self.assertIn("skip-reason: ${{ steps.tip.outputs.skip-reason }}", setup_job)
+        for marker in (
+            'skip_reason=""',
+            'skip_reason="role-requires-dispatch"',
+            'skip_reason="already-published"',
+            'echo "skip-reason=$skip_reason"',
+            "## Tip publication deduplicated",
+            "GITHUB_STEP_SUMMARY",
+        ):
+            self.assertIn(marker, resolve_step)
+        self.assertIn(
+            "    if: >-\n"
+            "      github.event_name == 'workflow_run' &&\n"
+            "      needs.setup.outputs.should-publish != 'true' &&\n"
+            "      needs.setup.outputs.skip-reason == 'role-requires-dispatch'",
+            diagnostic_job,
+        )
+        self.assertIn("name: Automatic Tip Publication Dormant (Dispatch Required)", diagnostic_job)
+        self.assertIn("runs-on: ubuntu-latest", diagnostic_job)
+        self.assertIn("    permissions:\n      contents: read", diagnostic_job)
+        for marker in (
+            "GITHUB_STEP_SUMMARY",
+            "ROLLOUT_ROLE: ${{ needs.setup.outputs.rollout-role }}",
+            "TIP_COMMIT: ${{ needs.setup.outputs.commit }}",
+            "TIP_TAG: ${{ needs.setup.outputs.tag }}",
+            "Nothing was built, signed, or published.",
+            "dispatch the Publish Tip workflow manually",
+            "::error::",
+            "exit 1",
+        ):
+            self.assertIn(marker, diagnostic_job)
+
     def test_public_tip_release_lookup_helper_handles_github_outcomes_safely(self) -> None:
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, True)

@@ -254,7 +254,10 @@ updates the stable appcast.
 
 `Publish Tip` can be notified automatically after successful CI on `main` or dispatched manually. The
 automatic `workflow_run` path publishes only the legacy role; it skips every nonlegacy role before
-staging. A nonlegacy role is published only by an explicit dispatch whose
+staging. During migration, an automatic nonlegacy run intentionally fails visibly in a read-only
+terminal diagnostic: nothing is built, signed, or published. A complete immutable-release dedupe
+remains green and records a concise no-op summary. This is diagnostic truthfulness, not publication.
+A nonlegacy role is published only by an explicit dispatch whose
 `confirm_identity_rollout_role` exactly matches the checked-in role. The protected role-aware
 credential preflight runs before the secret-free build, and the environment approval is therefore a
 manual gate before any expensive staging work. After P is reviewed, advance the declaration with its

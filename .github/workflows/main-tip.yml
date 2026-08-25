@@ -46,6 +46,7 @@ jobs:
       tag: ${{ steps.tip.outputs.tag }}
       tooling-commit: ${{ steps.tip.outputs.tooling-commit }}
       should-publish: ${{ steps.tip.outputs.should-publish }}
+      skip-reason: ${{ steps.tip.outputs.skip-reason }}
       rollout-role: ${{ steps.tip.outputs.rollout-role }}
       rollout-identity: ${{ steps.tip.outputs.rollout-identity }}
       migration-phase: ${{ steps.tip.outputs.migration-phase }}
@@ -95,9 +96,11 @@ jobs:
           }
 
           should_publish=true
+          skip_reason=""
           if [[ "$ROLLOUT_ROLE" != "legacy" ]]; then
             if [[ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
               should_publish=false
+              skip_reason="role-requires-dispatch"
               echo "Identity rollout role $ROLLOUT_ROLE requires an explicit workflow dispatch; skipping automatic publication."
             elif [[ "$CONFIRMED_ROLLOUT_ROLE" != "$ROLLOUT_ROLE" ]]; then
               echo "confirm_identity_rollout_role must exactly match checked-in role $ROLLOUT_ROLE" >&2
@@ -127,7 +130,13 @@ jobs:
             case "$lookup_classification" in
               found)
                 should_publish=false
+                skip_reason="already-published"
                 echo "Existing tip release response classification=complete; skipping rebuild."
+                {
+                  echo "## Tip publication deduplicated"
+                  echo
+                  echo "Complete immutable release $tag for commit $commit is already published. No build, signing, or publication was performed."
+                } >> "$GITHUB_STEP_SUMMARY"
                 ;;
               not-found) ;;
               *)
@@ -143,11 +152,47 @@ jobs:
             echo "tag=$tag"
             echo "tooling-commit=$(git rev-parse HEAD)"
             echo "should-publish=$should_publish"
+            echo "skip-reason=$skip_reason"
             echo "rollout-role=$ROLLOUT_ROLE"
             echo "rollout-identity=$ROLLOUT_IDENTITY"
             echo "migration-phase=$REPOPROMPT_IDENTITY_MIGRATION_PHASE"
             echo "installation-type=$ROLLOUT_INSTALLATION_TYPE"
           } >> "$GITHUB_OUTPUT"
+
+  automatic-tip-dormant:
+    name: Automatic Tip Publication Dormant (Dispatch Required)
+    needs: setup
+    if: >-
+      github.event_name == 'workflow_run' &&
+      needs.setup.outputs.should-publish != 'true' &&
+      needs.setup.outputs.skip-reason == 'role-requires-dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Report suppressed automatic publication
+        env:
+          ROLLOUT_ROLE: ${{ needs.setup.outputs.rollout-role }}
+          TIP_COMMIT: ${{ needs.setup.outputs.commit }}
+          TIP_TAG: ${{ needs.setup.outputs.tag }}
+        run: |
+          set -euo pipefail
+          commit="${TIP_COMMIT:-unresolved}"
+          tag="${TIP_TAG:-unresolved}"
+          {
+            echo "## Automatic Tip Publication Dormant (Dispatch Required)"
+            echo
+            echo "- Rollout role: $ROLLOUT_ROLE"
+            echo "- Commit: $commit"
+            echo "- Tag: $tag"
+            echo
+            echo "This automatic workflow_run was intentionally suppressed because the nonlegacy rollout role requires an explicit dispatch."
+            echo "Nothing was built, signed, or published."
+            echo
+            echo "To publish this role, dispatch the Publish Tip workflow manually from protected main with commit=$commit and confirm_identity_rollout_role=$ROLLOUT_ROLE."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Automatic Tip publication is dormant; rollout role $ROLLOUT_ROLE requires an explicit workflow dispatch."
+          exit 1
 
   credential-preflight:
     name: Preflight Tip Rollout Credentials
