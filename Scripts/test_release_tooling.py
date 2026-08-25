@@ -281,7 +281,9 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertIn("- legacy-preparer", release_workflow)
         self.assertEqual(release_workflow.count("SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_BASE64"), 1)
         self.assertEqual(release_workflow.count("SUCCESSOR_DEVELOPER_ID_APPLICATION_P12_PASSWORD"), 1)
-        self.assertEqual(release_workflow.count("SUCCESSOR_SIGN_IDENTITY: ${{ vars.SUCCESSOR_SIGN_IDENTITY }}"), 1)
+        self.assertNotIn("SUCCESSOR_SIGN_IDENTITY: ${{ vars.SUCCESSOR_SIGN_IDENTITY }}", release_workflow)
+        self.assertNotIn("vars.SIGN_IDENTITY", release_workflow)
+        self.assertIn("EXPECTED_SUCCESSOR_SIGN_IDENTITY", release_workflow)
         self.assertNotIn("SUCCESSOR_DEVELOPER_ID_INSTALLER", release_workflow)
         self.assertNotIn("SUCCESSOR_NOTARYTOOL", release_workflow)
         self.assertIn("--identifier com.repoprompt.ce", release_workflow)
@@ -289,7 +291,7 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertIn("grep -Fx 'TeamIdentifier=69N6K965SF'", release_workflow)
         self.assertIn('successor_requirement=', release_workflow)
         self.assertIn('-R="$successor_requirement" "$anchor"', release_workflow)
-        self.assertIn('echo "REPOPROMPT_IDENTITY_MIGRATION_ANCHOR=$anchor" >> "$GITHUB_ENV"', release_workflow)
+        self.assertIn('printf \'REPOPROMPT_IDENTITY_MIGRATION_ANCHOR=%s\\n\' "$anchor" >> "$GITHUB_ENV"', release_workflow)
 
         release_stage = release_workflow.split("\n  stage:", 1)[1].split("\n  publish:", 1)[0]
         release_publish = release_workflow.split("\n  publish:", 1)[1].split("\n  smoke-signed-helper:", 1)[0]
@@ -3354,7 +3356,7 @@ values.write_text("\\n".join(remaining), encoding="utf-8")
 
     def test_main_tip_setup_uses_read_only_github_token_for_release_lookup_helper(self) -> None:
         tip_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")
-        setup_job = tip_workflow.split("\n  setup:", 1)[1].split("\n  stage:", 1)[0]
+        setup_job = tip_workflow.split("\n  setup:", 1)[1].split("\n  credential-preflight:", 1)[0]
         after_setup = tip_workflow.split("\n  stage:", 1)[1]
         before_publish, publish_job = tip_workflow.split("\n  publish:", 1)
 
@@ -4565,7 +4567,7 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
         self.assertEqual(legacy.returncode, 0, legacy.stderr)
         context = self.shell_assignments(legacy.stdout)
         policy = json.loads(self.POLICY.read_text(encoding="utf-8"))
-        self.assertEqual(context["ROLLOUT_ROLE"], "legacy")
+        self.assertEqual(context["ROLLOUT_ROLE"], "preparer")
         self.assertEqual(context["BUNDLE_ID"], "com.pvncher.repoprompt.ce")
         self.assertEqual(
             context["EXPECTED_SUCCESSOR_SIGN_IDENTITY"],
@@ -4759,6 +4761,104 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
             arguments += ["--allowed-roles", allowed_roles]
         return arguments
 
+    def test_tip_workflow_preflights_role_credentials_before_secret_free_stage(self) -> None:
+        workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")
+        preflight = workflow.split("\n  credential-preflight:", 1)[1].split("\n  stage:", 1)[0]
+        stage = workflow.split("\n  stage:", 1)[1].split("\n  sign:", 1)[0]
+
+        self.assertIn("needs: setup", preflight)
+        self.assertIn("environment: tip-release", preflight)
+        self.assertIn("stable_rollout.py packaging-context", preflight)
+        self.assertIn('case "$ROLLOUT_IDENTITY" in', preflight)
+        for secret_name in (
+            "SUCCESSOR_NOTARYTOOL_PRIVATE_KEY_BASE64",
+            "SUCCESSOR_NOTARYTOOL_KEY_ID",
+            "SUCCESSOR_NOTARYTOOL_ISSUER_ID",
+        ):
+            self.assertIn(f"{secret_name}: ${{{{ secrets.{secret_name} }}}}", preflight)
+        for secret_name in (
+            "SUCCESSOR_DEVELOPER_ID_INSTALLER_P12_BASE64",
+            "SUCCESSOR_DEVELOPER_ID_INSTALLER_P12_PASSWORD",
+        ):
+            self.assertIn(f"secrets.{secret_name}", preflight)
+        self.assertIn('decode_value "application certificate"', preflight)
+        self.assertIn('decode_value "notarytool private key"', preflight)
+        self.assertIn('if [[ "$ROLLOUT_ROLE" == "transition" ]]', preflight)
+        self.assertIn('if [[ "$ROLLOUT_ROLE" == "preparer" ]]', preflight)
+        self.assertIn("needs:\n      - setup\n      - credential-preflight", stage)
+        self.assertLess(workflow.index("credential-preflight:"), workflow.index("\n  stage:"))
+        self.assertLess(workflow.index("\n  stage:"), workflow.index("\n  sign:"))
+        self.assertNotIn("TIP_UPDATE_REPOSITORY_TOKEN", preflight)
+
+    def test_tip_signing_uses_policy_labels_and_role_selected_notary_credentials(self) -> None:
+        workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "main-tip.yml").read_text(encoding="utf-8")
+        import_step = workflow.split("      - name: Import role-selected Developer ID certificates", 1)[1].split(
+            "      - name: Prepare successor identity migration anchor", 1
+        )[0]
+        anchor_step = workflow.split("      - name: Prepare successor identity migration anchor", 1)[1].split(
+            "      - name: Prepare provisioning profile and notarization key", 1
+        )[0]
+        notary_step = workflow.split("      - name: Prepare provisioning profile and notarization key", 1)[1].split(
+            "      - name: Install Sentry CLI", 1
+        )[0]
+
+        for stale_name in (
+            "CONFIGURED_LEGACY_SIGN_IDENTITY",
+            "CONFIGURED_SUCCESSOR_SIGN_IDENTITY",
+            "CONFIGURED_SUCCESSOR_INSTALLER_IDENTITY",
+            "SUCCESSOR_INSTALLER_IDENTITY",
+            "SUCCESSOR_SIGN_IDENTITY: ${{ vars.SUCCESSOR_SIGN_IDENTITY }}",
+            "SIGN_IDENTITY: ${{ vars.SIGN_IDENTITY }}",
+        ):
+            self.assertNotIn(stale_name, workflow)
+        self.assertIn('verify_identity codesigning "$EXPECTED_SIGN_IDENTITY" application', import_step)
+        self.assertIn('verify_identity basic "$EXPECTED_INSTALLER_IDENTITY" installer', import_step)
+        self.assertIn('security import "$installer_certificate" -k "$KEYCHAIN_PATH"', import_step)
+        self.assertIn('printf \'SIGN_IDENTITY=%s\\n\' "$EXPECTED_SIGN_IDENTITY"', import_step)
+        self.assertIn('grep -F "\\\"$EXPECTED_SUCCESSOR_SIGN_IDENTITY\\\""', anchor_step)
+        self.assertIn('codesign --force --sign "$EXPECTED_SUCCESSOR_SIGN_IDENTITY"', anchor_step)
+        for secret_name in (
+            "NOTARYTOOL_PRIVATE_KEY_BASE64",
+            "NOTARYTOOL_KEY_ID",
+            "NOTARYTOOL_ISSUER_ID",
+            "SUCCESSOR_NOTARYTOOL_PRIVATE_KEY_BASE64",
+            "SUCCESSOR_NOTARYTOOL_KEY_ID",
+            "SUCCESSOR_NOTARYTOOL_ISSUER_ID",
+        ):
+            self.assertIn(f"secrets.{secret_name}", notary_step)
+        self.assertIn('case "$ROLLOUT_IDENTITY" in', notary_step)
+        self.assertIn("printf 'NOTARYTOOL_KEY_ID=%s\\n'", notary_step)
+        self.assertIn("printf 'NOTARYTOOL_ISSUER_ID=%s\\n'", notary_step)
+        self.assertNotIn("\n          NOTARYTOOL_KEY_ID: ${{ secrets.NOTARYTOOL_KEY_ID }}", workflow)
+        self.assertNotIn("\n          NOTARYTOOL_ISSUER_ID: ${{ secrets.NOTARYTOOL_ISSUER_ID }}", workflow)
+        self.assertNotIn("\n          INSTALLER_IDENTITY=", workflow)
+
+    def test_packaging_context_projects_policy_application_and_installer_labels(self) -> None:
+        _temp_dir, preparer, transition, successor = self.make_pts_ladder()
+        policy = json.loads(self.POLICY.read_text(encoding="utf-8"))
+        for role, release, identity_name in (
+            ("preparer", preparer, "legacy"),
+            ("transition", transition, "successor"),
+            ("successor", successor, "successor"),
+        ):
+            with self.subTest(role=role):
+                result = self.rollout(
+                    "packaging-context",
+                    "--declaration", str(release["declaration"]),
+                    "--policy", str(self.POLICY),
+                    "--version-env", str(release["version_env"]),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                context = self.shell_assignments(result.stdout)
+                identity = policy["identities"][identity_name]
+                self.assertEqual(context["EXPECTED_SIGN_IDENTITY"], identity["developerIDApplicationIdentityName"])
+                expected_installer = (
+                    policy["identities"]["successor"]["developerIDInstallerIdentityName"]
+                    if identity_name == "successor"
+                    else ""
+                )
+                self.assertEqual(context["EXPECTED_INSTALLER_IDENTITY"], expected_installer)
+
     def test_policy_declaration_and_requirement_authorities_agree(self) -> None:
         policy = json.loads(self.POLICY.read_text(encoding="utf-8"))
         runtime_policy = (
@@ -4828,9 +4928,9 @@ class IdentityTransitionReleaseToolingTests(unittest.TestCase):
 
         tip_declaration = json.loads(self.TIP_DECLARATION.read_text(encoding="utf-8"))
         self.assertEqual(tip_declaration["channel"], "tip")
-        self.assertEqual(tip_declaration["currentRole"], "legacy")
+        self.assertEqual(tip_declaration["currentRole"], "preparer")
         self.assertEqual(tip_declaration["predecessors"], [])
-        self.assertEqual(tip_declaration["expectedMigrationPhase"], "disabled")
+        self.assertEqual(tip_declaration["expectedMigrationPhase"], "legacy-preparer")
         self.assertEqual(tip_declaration["expectedSigningIdentity"], "legacy")
 
     def test_single_legacy_release_generates_one_deterministic_application_item(self) -> None:
