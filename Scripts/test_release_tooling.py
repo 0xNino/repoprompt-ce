@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import plistlib
+import re
 import shutil
 import socket
 import stat
@@ -4670,6 +4671,490 @@ esac
     @staticmethod
     def run_checked(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=True)
+
+
+class IdentityTransitionReleaseToolingTests(unittest.TestCase):
+    """PR02 done-when coverage: the reviewed rollout declaration plus
+    Scripts/stable_rollout.py stay the single Stable rollout authority while
+    transition/successor publication remains dormant."""
+
+    POLICY = SCRIPT_DIR / "apple_identity_policy.json"
+    DECLARATION = SCRIPT_DIR.parent / "release-rollout.json"
+    UPDATE_REPOSITORY = "repoprompt/repoprompt-ce-updates"
+
+    def rollout(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "stable_rollout.py"), *args],
+            text=True,
+            capture_output=True,
+        )
+
+    def chain_predecessors(self, role: str) -> list[dict]:
+        placeholder = "0" * 64
+        if role == "transition":
+            return [{"role": "preparer", "tag": "v0.1.0", "rolloutManifestSha256": placeholder}]
+        if role == "successor":
+            return [
+                {"role": "transition", "tag": "v0.2.0", "rolloutManifestSha256": placeholder},
+                {"role": "preparer", "tag": "v0.1.0", "rolloutManifestSha256": placeholder},
+            ]
+        return []
+
+    def make_declaration(
+        self,
+        directory: Path,
+        role: str,
+        predecessors: list[dict] | None = None,
+        **overrides: object,
+    ) -> Path:
+        phase = {"legacy": "disabled", "preparer": "legacy-preparer"}.get(role, "disabled")
+        identity = "successor" if role in ("transition", "successor") else "legacy"
+        declaration = {
+            "schemaVersion": 1,
+            "channel": "stable",
+            "currentRole": role,
+            "eligibilityProfile": "stable-rollout-v1",
+            "expectedMigrationPhase": phase,
+            "expectedSigningIdentity": identity,
+            "predecessors": predecessors or [],
+        }
+        declaration.update(overrides)
+        path = directory / f"release-rollout-{role}.json"
+        path.write_text(json.dumps(declaration, indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def make_release(
+        self,
+        directory: Path,
+        role: str,
+        marketing: str,
+        build: str,
+        predecessors: list[dict] | None = None,
+        predecessor_manifests: list[Path] | None = None,
+    ) -> dict:
+        release_dir = directory / f"{role}-{build}"
+        release_dir.mkdir(parents=True, exist_ok=True)
+        version_env = release_dir / "version.env"
+        version_env.write_text(
+            "APP_NAME=RepoPrompt\n"
+            f"MARKETING_VERSION={marketing}\n"
+            f"BUILD_NUMBER={build}\n"
+            "BUNDLE_ID=com.pvncher.repoprompt.ce\n"
+            "SIGNING_TEAM_ID=648A27MST5\n",
+            encoding="utf-8",
+        )
+        suffix = ".pkg" if role == "transition" else ".zip"
+        enclosure = release_dir / f"RepoPrompt-{marketing}-{build}{suffix}"
+        enclosure.write_text(f"enclosure {role} {build}\n", encoding="utf-8")
+        app_manifest = release_dir / f"RepoPrompt-{marketing}-{build}-artifact-manifest.json"
+        app_manifest.write_text('{"schema_version":1}\n', encoding="utf-8")
+        declaration = self.make_declaration(release_dir, role, predecessors)
+        appcast = release_dir / "appcast.xml"
+        manifest = release_dir / f"RepoPrompt-{marketing}-{build}-stable-rollout.json"
+        arguments = [
+            "generate",
+            "--declaration", str(declaration),
+            "--policy", str(self.POLICY),
+            "--version-env", str(version_env),
+            "--release-tag", f"v{marketing}",
+            "--release-commit", f"commit-{build}",
+            "--migration-phase", "legacy-preparer" if role == "preparer" else "disabled",
+            "--enclosure", str(enclosure),
+            "--enclosure-signature", f"sig-{role}-{build}",
+            "--app-artifact-manifest", str(app_manifest),
+            "--appcast-output", str(appcast),
+            "--manifest-output", str(manifest),
+        ]
+        for predecessor_manifest in predecessor_manifests or []:
+            arguments += ["--predecessor-manifest", str(predecessor_manifest)]
+        result = self.rollout(*arguments)
+        return {
+            "result": result,
+            "dir": release_dir,
+            "version_env": version_env,
+            "declaration": declaration,
+            "enclosure": enclosure,
+            "app_manifest": app_manifest,
+            "appcast": appcast,
+            "manifest": manifest,
+            "arguments": arguments,
+        }
+
+    def make_pts_ladder(self) -> tuple[Path, dict, dict, dict]:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        preparer = self.make_release(temp_dir, "preparer", "1.2.0", "120")
+        self.assertEqual(preparer["result"].returncode, 0, preparer["result"].stderr)
+        transition = self.make_release(
+            temp_dir,
+            "transition",
+            "1.5.0",
+            "150",
+            predecessors=[
+                {
+                    "role": "preparer",
+                    "tag": "v1.2.0",
+                    "rolloutManifestSha256": hashlib.sha256(preparer["manifest"].read_bytes()).hexdigest(),
+                }
+            ],
+            predecessor_manifests=[preparer["manifest"]],
+        )
+        self.assertEqual(transition["result"].returncode, 0, transition["result"].stderr)
+        successor = self.make_release(
+            temp_dir,
+            "successor",
+            "2.0.0",
+            "200",
+            predecessors=[
+                {
+                    "role": "transition",
+                    "tag": "v1.5.0",
+                    "rolloutManifestSha256": hashlib.sha256(transition["manifest"].read_bytes()).hexdigest(),
+                },
+                {
+                    "role": "preparer",
+                    "tag": "v1.2.0",
+                    "rolloutManifestSha256": hashlib.sha256(preparer["manifest"].read_bytes()).hexdigest(),
+                },
+            ],
+            predecessor_manifests=[transition["manifest"], preparer["manifest"]],
+        )
+        self.assertEqual(successor["result"].returncode, 0, successor["result"].stderr)
+        return temp_dir, preparer, transition, successor
+
+    def validate_arguments(self, release: dict, allowed_roles: str | None = None) -> list[str]:
+        arguments = list(release["arguments"])
+        arguments[0] = "validate"
+        generate_only = arguments.index("--appcast-output")
+        arguments[generate_only : generate_only + 4] = [
+            "--appcast", str(release["appcast"]),
+            "--manifest", str(release["manifest"]),
+        ]
+        signature_index = arguments.index("--enclosure-signature")
+        del arguments[signature_index : signature_index + 2]
+        if allowed_roles:
+            arguments += ["--allowed-roles", allowed_roles]
+        return arguments
+
+    def test_policy_declaration_and_requirement_authorities_agree(self) -> None:
+        policy = json.loads(self.POLICY.read_text(encoding="utf-8"))
+        runtime_policy = (
+            SCRIPT_DIR.parent
+            / "Sources/RepoPrompt/Infrastructure/Security/RuntimeCodeSigningPolicy.swift"
+        ).read_text(encoding="utf-8")
+        info_template = (SCRIPT_DIR.parent / "AppBundle/Info.plist.template").read_text(encoding="utf-8")
+        sign_staged = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
+        pkg_builder = (SCRIPT_DIR / "build_identity_transition_pkg.sh").read_text(encoding="utf-8")
+
+        legacy = policy["identities"]["legacy"]
+        successor = policy["identities"]["successor"]
+        requirement_template = (
+            'anchor apple generic and identifier "{bundle}" and certificate '
+            'leaf[subject.OU] = "{team}" and certificate '
+            "leaf[field.1.2.840.113635.100.6.1.13] exists"
+        )
+        for identity in (legacy, successor):
+            self.assertEqual(
+                identity["developerIDRequirement"],
+                requirement_template.format(
+                    bundle=identity["bundleIdentifier"], team=identity["teamIdentifier"]
+                ),
+            )
+        self.assertIn(f'developerIDBundleIdentifier = "{legacy["bundleIdentifier"]}"', runtime_policy)
+        self.assertIn(f'signingTeamIdentifier = "{legacy["teamIdentifier"]}"', runtime_policy)
+        self.assertIn(
+            f'successorDeveloperIDBundleIdentifier = "{successor["bundleIdentifier"]}"', runtime_policy
+        )
+        self.assertIn(f'successorSigningTeamIdentifier = "{successor["teamIdentifier"]}"', runtime_policy)
+        self.assertIn(
+            f"IDENTITY_MIGRATION_TARGET_REQUIREMENT='{successor['developerIDRequirement']}'", sign_staged
+        )
+        self.assertIn(f"SUCCESSOR_APP_REQUIREMENT='{successor['developerIDRequirement']}'", pkg_builder)
+
+        sparkle = policy["sparkle"]
+        self.assertIn(f"<string>{sparkle['stableFeedURL']}</string>", info_template)
+        self.assertIn(f"<string>{sparkle['sparklePublicEdDSAValue']}</string>", info_template)
+        self.assertIn(
+            f"<key>LSMinimumSystemVersion</key><string>{sparkle['minimumSystemVersion']}</string>",
+            info_template,
+        )
+        self.assertEqual(sparkle["updateRepository"], self.UPDATE_REPOSITORY)
+
+        declaration = json.loads(self.DECLARATION.read_text(encoding="utf-8"))
+        self.assertEqual(declaration["currentRole"], "legacy")
+        self.assertEqual(declaration["predecessors"], [])
+        self.assertEqual(declaration["expectedMigrationPhase"], "disabled")
+        self.assertEqual(declaration["expectedSigningIdentity"], "legacy")
+
+    def test_single_legacy_release_generates_one_deterministic_application_item(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        release = self.make_release(temp_dir, "legacy", "1.0.0", "1")
+        self.assertEqual(release["result"].returncode, 0, release["result"].stderr)
+
+        appcast = release["appcast"].read_text(encoding="utf-8")
+        self.assertEqual(appcast.count("<item>"), 1)
+        self.assertIn("<repoprompt:rolloutRole>legacy</repoprompt:rolloutRole>", appcast)
+        self.assertIn("<sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>", appcast)
+        self.assertNotIn("minimumAutoupdateVersion", appcast)
+        self.assertNotIn("installationType", appcast)
+        self.assertIn(
+            f"https://github.com/{self.UPDATE_REPOSITORY}/releases/download/v1.0.0/RepoPrompt-1.0.0-1.zip",
+            appcast,
+        )
+
+        first_manifest = release["manifest"].read_text(encoding="utf-8")
+        rerun = self.rollout(*release["arguments"])
+        self.assertEqual(rerun.returncode, 0, rerun.stderr)
+        self.assertEqual(release["manifest"].read_text(encoding="utf-8"), first_manifest)
+        self.assertEqual(release["appcast"].read_text(encoding="utf-8"), appcast)
+
+        validated = self.rollout(*self.validate_arguments(release, allowed_roles="legacy,preparer"))
+        self.assertEqual(validated.returncode, 0, validated.stderr)
+
+        preparer = self.make_release(temp_dir, "preparer", "1.1.0", "2")
+        self.assertEqual(preparer["result"].returncode, 0, preparer["result"].stderr)
+        self.assertEqual(preparer["appcast"].read_text(encoding="utf-8").count("<item>"), 1)
+
+    def test_synthetic_pts_fixtures_produce_deterministic_aggregate_appcast(self) -> None:
+        _temp_dir, preparer, transition, successor = self.make_pts_ladder()
+
+        appcast = successor["appcast"].read_text(encoding="utf-8")
+        self.assertEqual(appcast.count("<item>"), 3)
+        roles = re.findall(r"<repoprompt:rolloutRole>([a-z]+)</repoprompt:rolloutRole>", appcast)
+        self.assertEqual(roles, ["successor", "transition", "preparer"])
+        builds = re.findall(r"<sparkle:version>([0-9.]+)</sparkle:version>", appcast)
+        self.assertEqual(builds, ["200", "150", "120"])
+        ladders = re.findall(
+            r"<sparkle:minimumAutoupdateVersion>([0-9.]+)</sparkle:minimumAutoupdateVersion>", appcast
+        )
+        self.assertEqual(ladders, ["150", "120"])
+        self.assertEqual(appcast.count("<sparkle:minimumSystemVersion>14.0<"), 3)
+        self.assertEqual(appcast.count('sparkle:installationType="package"'), 1)
+        for tag, name in (
+            ("v2.0.0", "RepoPrompt-2.0.0-200.zip"),
+            ("v1.5.0", "RepoPromptTransition".replace("RepoPromptTransition", "RepoPrompt-1.5.0-150.pkg")),
+            ("v1.2.0", "RepoPrompt-1.2.0-120.zip"),
+        ):
+            self.assertIn(
+                f"https://github.com/{self.UPDATE_REPOSITORY}/releases/download/{tag}/{name}", appcast
+            )
+
+        validated = self.rollout(
+            *self.validate_arguments(successor, allowed_roles="successor,transition,preparer")
+        )
+        self.assertEqual(validated.returncode, 0, validated.stderr)
+
+        max_build = self.rollout("max-build", "--appcast", str(successor["appcast"]))
+        self.assertEqual(max_build.stdout.strip(), "200")
+
+        siblings = self.rollout("sibling-values", "--manifest", str(successor["manifest"]))
+        rows = [line.split("\t") for line in siblings.stdout.splitlines()]
+        self.assertEqual([(row[1], row[2]) for row in rows], [("transition", "v1.5.0"), ("preparer", "v1.2.0")])
+        self.assertEqual(rows[0][7], "RepoPrompt-1.5.0-150-stable-rollout.json")
+
+    def test_rollout_tampering_and_invalid_ladders_fail_closed(self) -> None:
+        temp_dir, preparer, transition, successor = self.make_pts_ladder()
+
+        def successor_validate() -> subprocess.CompletedProcess[str]:
+            return self.rollout(
+                *self.validate_arguments(successor, allowed_roles="successor,transition,preparer")
+            )
+
+        with self.subTest("predecessor manifest byte flip breaks the SHA-256 binding"):
+            original = preparer["manifest"].read_text(encoding="utf-8")
+            preparer["manifest"].write_text(original.replace("sig-preparer-120", "sig-tampered"), encoding="utf-8")
+            result = successor_validate()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("rollout manifest digest mismatch", result.stderr)
+            preparer["manifest"].write_text(original, encoding="utf-8")
+
+        with self.subTest("enclosure mutation breaks the digest binding"):
+            successor["enclosure"].write_text("tampered enclosure\n", encoding="utf-8")
+            result = successor_validate()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("mismatch", result.stderr)
+            successor["enclosure"].write_text("enclosure successor 200\n", encoding="utf-8")
+
+        with self.subTest("appcast text drift from the manifest is rejected"):
+            appcast_text = successor["appcast"].read_text(encoding="utf-8")
+            successor["appcast"].write_text(
+                appcast_text.replace(
+                    "<sparkle:minimumAutoupdateVersion>150<", "<sparkle:minimumAutoupdateVersion>149<", 1
+                ),
+                encoding="utf-8",
+            )
+            result = successor_validate()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("accumulated appcast does not match", result.stderr)
+            successor["appcast"].write_text(appcast_text, encoding="utf-8")
+
+        invalid_declarations = [
+            ("unknown role", {"currentRole": "beta"}, "unknown rollout role"),
+            (
+                "duplicate roles",
+                {
+                    "predecessors": [
+                        {"role": "preparer", "tag": "v1.2.0", "rolloutManifestSha256": "0" * 64},
+                        {"role": "preparer", "tag": "v1.1.0", "rolloutManifestSha256": "0" * 64},
+                    ],
+                    "currentRole": "successor",
+                    "expectedSigningIdentity": "successor",
+                },
+                "not an allowed newest-first rollout chain",
+            ),
+            (
+                "legacy cannot carry siblings",
+                {
+                    "predecessors": [
+                        {"role": "preparer", "tag": "v1.2.0", "rolloutManifestSha256": "0" * 64}
+                    ]
+                },
+                "not an allowed newest-first rollout chain",
+            ),
+            ("wrong phase for role", {"expectedMigrationPhase": "legacy-preparer"}, "must be disabled"),
+            ("wrong identity for role", {"expectedSigningIdentity": "successor"}, "must be legacy"),
+        ]
+        for label, overrides, expected_error in invalid_declarations:
+            with self.subTest(label):
+                declaration = self.make_declaration(temp_dir, "legacy", **overrides)
+                result = self.rollout("current-role", "--declaration", str(declaration))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+
+        with self.subTest("out-of-order builds are rejected"):
+            older_with_higher_build = self.make_release(temp_dir, "preparer", "9.9.9", "999")
+            self.assertEqual(older_with_higher_build["result"].returncode, 0)
+            broken = self.make_release(
+                temp_dir,
+                "transition",
+                "1.6.0",
+                "160",
+                predecessors=[
+                    {
+                        "role": "preparer",
+                        "tag": "v9.9.9",
+                        "rolloutManifestSha256": hashlib.sha256(
+                            older_with_higher_build["manifest"].read_bytes()
+                        ).hexdigest(),
+                    }
+                ],
+                predecessor_manifests=[older_with_higher_build["manifest"]],
+            )
+            self.assertNotEqual(broken["result"].returncode, 0)
+            self.assertIn("strictly ordered newest-first", broken["result"].stderr)
+
+        with self.subTest("manifest field tampering is rejected with the exact field"):
+            manifest_text = successor["manifest"].read_text(encoding="utf-8")
+            successor["manifest"].write_text(
+                manifest_text.replace('"installationType": "package"', '"installationType": "application"'),
+                encoding="utf-8",
+            )
+            result = successor_validate()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("mismatch", result.stderr)
+            successor["manifest"].write_text(manifest_text, encoding="utf-8")
+
+    def test_protected_surfaces_reject_dormant_roles_and_siblings(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+
+        for role in ("legacy", "preparer"):
+            with self.subTest(allowed=role):
+                declaration = self.make_declaration(temp_dir, role)
+                result = self.rollout(
+                    "workflow-guard", "--declaration", str(declaration), "--policy", str(self.POLICY)
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+        for role in ("transition", "successor"):
+            with self.subTest(rejected=role):
+                declaration = self.make_declaration(temp_dir, role, self.chain_predecessors(role))
+                result = self.rollout(
+                    "workflow-guard", "--declaration", str(declaration), "--policy", str(self.POLICY)
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"reject the {role} rollout role", result.stderr)
+
+        workflows_dir = SCRIPT_DIR.parent / ".github" / "workflows"
+        release_workflow = (workflows_dir / "release.yml").read_text(encoding="utf-8")
+        promote_workflow = (workflows_dir / "release-promote.yml").read_text(encoding="utf-8")
+        tip_workflow = (workflows_dir / "main-tip.yml").read_text(encoding="utf-8")
+        self.assertEqual(release_workflow.count("stable_rollout.py workflow-guard"), 2)
+        self.assertEqual(promote_workflow.count("stable_rollout.py workflow-guard"), 1)
+        self.assertNotIn("stable_rollout.py", tip_workflow)
+        self.assertNotIn("release-rollout.json", tip_workflow)
+
+        release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
+        promote_script = (SCRIPT_DIR / "promote_release.sh").read_text(encoding="utf-8")
+        self.assertIn("require_dormant_rollout_declaration", release_script)
+        self.assertIn("resolve_release_artifact_role", promote_script)
+        for script_text in (release_script, promote_script):
+            self.assertNotIn("REPOPROMPT_IDENTITY_TRANSITION_TOOLING_UNLOCK", script_text)
+            self.assertNotIn("REPOPROMPT_RELEASE_ARTIFACT_ROLE", script_text)
+            self.assertNotIn("REPOPROMPT_PREDECESSOR_APPCAST", script_text)
+
+        # Behavioral: a transition declaration in the tagged source fails
+        # promotion before any release lookup or mutation.
+        fixture_root = temp_dir / "transition-source"
+        fixture_root.mkdir()
+        shutil.copy2(SCRIPT_DIR.parent / "version.env", fixture_root / "version.env")
+        transition_declaration = self.make_declaration(
+            fixture_root, "transition", self.chain_predecessors("transition")
+        )
+        shutil.move(str(transition_declaration), fixture_root / "release-rollout.json")
+        env = dict(os.environ)
+        env["REPOPROMPT_RELEASE_SOURCE_ROOT"] = str(fixture_root)
+        env["REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR"] = str(SCRIPT_DIR)
+        result = subprocess.run(
+            ["bash", str(SCRIPT_DIR / "promote_release.sh"), "verify"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dormant until successor rollout enablement", result.stderr)
+
+        for script_name in ("release.sh", "promote_release.sh", "build_identity_transition_pkg.sh", "main_tip_release.sh"):
+            with self.subTest(syntax=script_name):
+                syntax = subprocess.run(
+                    ["bash", "-n", str(SCRIPT_DIR / script_name)], text=True, capture_output=True
+                )
+                self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+        # Tip isolation: exactly-one-item validation, legacy/disabled phase, and
+        # the separate tip updater repository stay untouched.
+        tip_script = (SCRIPT_DIR / "main_tip_release.sh").read_text(encoding="utf-8")
+        self.assertIn("tip appcast must contain exactly one item", tip_script)
+        self.assertIn("repoprompt-ce-tip-updates", tip_script)
+        self.assertIn("REPOPROMPT_IDENTITY_MIGRATION_PHASE: disabled", tip_workflow)
+
+    def test_transition_pkg_builder_stays_dormant_with_exact_payload_proof(self) -> None:
+        script = (SCRIPT_DIR / "build_identity_transition_pkg.sh").read_text(encoding="utf-8")
+        for marker in (
+            "plutil -replace 0.BundleIsRelocatable -bool false",
+            "plutil -replace 0.BundleHasStrictIdentifier -bool false",
+            "plutil -replace 0.BundleIsVersionChecked -bool false",
+            "plutil -replace 0.BundleOverwriteAction -string upgrade",
+            'TRANSITION_INSTALL_LOCATION="/Applications"',
+            "pkgutil --expand-full",
+            "xcrun stapler validate",
+            'diff -qr "$expected_app" "$payload_app"',
+        ):
+            self.assertIn(marker, script)
+        self.assertNotIn("skip-notarization", script)
+        self.assertNotIn("allow-unstapled", script)
+
+        env = dict(os.environ)
+        env["GITHUB_ACTIONS"] = "true"
+        refused = subprocess.run(
+            ["bash", str(SCRIPT_DIR / "build_identity_transition_pkg.sh"), "validate", "/nonexistent.pkg"],
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("dormant", refused.stderr)
 
 
 if __name__ == "__main__":

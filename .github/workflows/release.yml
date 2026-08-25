@@ -72,6 +72,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Reject dormant rollout roles and sibling publication
+        run: |
+          python3 trusted-control-plane/Scripts/stable_rollout.py workflow-guard \
+            --declaration release-source/release-rollout.json \
+            --policy trusted-control-plane/Scripts/apple_identity_policy.json
+
       - name: Build and stage approved source
         env:
           GH_TOKEN: ${{ github.token }}
@@ -128,6 +134,12 @@ jobs:
           path: approved-source
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Reject dormant rollout roles and sibling publication
+        run: |
+          python3 trusted-control-plane/Scripts/stable_rollout.py workflow-guard \
+            --declaration approved-source/release-rollout.json \
+            --policy trusted-control-plane/Scripts/apple_identity_policy.json
 
       - name: Verify and expand staged release source
         env:

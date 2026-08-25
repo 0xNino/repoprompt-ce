@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -59,6 +61,15 @@ class ReleasePromotionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("OK: anonymous release smoke passed for v1.0.0.", result.stdout)
+        # Application-style roles (legacy/preparer) must still anonymously fetch
+        # and byte-compare the source DMG; the fetch under the role predicate is
+        # immediately followed by cmp, so a skipped download here would mean the
+        # DMG verification silently regressed to a no-op.
+        tool_calls = tools.read_text(encoding="utf-8")
+        self.assertIn(
+            "curl GET https://github.com/repoprompt/repoprompt-ce/releases/download/v1.0.0/RepoPrompt-1.0.0-1.dmg",
+            tool_calls,
+        )
         calls = capture.read_text(encoding="utf-8").splitlines()
         create = next(index for index, line in enumerate(calls) if "release create v1.0.0" in line)
         publish_update = next(
@@ -150,7 +161,7 @@ class ReleasePromotionTests(unittest.TestCase):
         result, _capture, _tools = self.run_promotion("verify", duplicate_appcast_item=True)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("appcast must contain exactly one item", result.stderr)
+        self.assertIn("accumulated appcast does not match the generated rollout manifest", result.stderr)
 
     def test_verify_rejects_mismatched_dmg_app(self) -> None:
         result, _capture, _tools = self.run_promotion("verify", mismatched_dmg_app=True)
@@ -191,7 +202,7 @@ class ReleasePromotionTests(unittest.TestCase):
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Appcast enclosure URL mismatch", result.stderr)
+        self.assertIn("accumulated appcast does not match the generated rollout manifest", result.stderr)
 
     def test_verify_rejects_tag_that_disagrees_with_release_metadata(self) -> None:
         result, _capture, _tools = self.run_promotion("verify", release_tag="v1.0.1")
@@ -253,6 +264,8 @@ class ReleasePromotionTests(unittest.TestCase):
         shutil.copy2(SCRIPT_DIR / "validate_packaged_legal.sh", scripts / "validate_packaged_legal.sh")
         shutil.copy2(SCRIPT_DIR / "load_release_metadata.sh", scripts / "load_release_metadata.sh")
         shutil.copy2(SCRIPT_DIR / "verify_sparkle_signature.swift", scripts / "verify_sparkle_signature.swift")
+        shutil.copy2(SCRIPT_DIR / "stable_rollout.py", scripts / "stable_rollout.py")
+        shutil.copy2(SCRIPT_DIR / "apple_identity_policy.json", scripts / "apple_identity_policy.json")
         (scripts / "codex_runtime_artifact.py").write_text(
             "#!/usr/bin/env python3\nimport os\nimport sys\nfrom pathlib import Path\n\nargs = sys.argv[1:]\nexpected_manifest = Path(os.environ[\"FAKE_CODEX_MANIFEST\"])\nif len(args) != 9 or args[:6] != [\n    \"--manifest\",\n    str(expected_manifest),\n    \"verify-bundle\",\n    \"--arch\",\n    \"all\",\n    \"--bundle\",\n] or args[7:] != [\"--signed-team-identifier\", \"648A27MST5\"]:\n    print(f\"ERROR: unexpected Codex verifier arguments: {args!r}\", file=sys.stderr)\n    raise SystemExit(64)\nbundle = Path(args[6])\nif not expected_manifest.is_file():\n    print(f\"ERROR: missing approved Codex manifest: {expected_manifest}\", file=sys.stderr)\n    raise SystemExit(65)\nexpected_targets = {\"aarch64-apple-darwin\", \"x86_64-apple-darwin\"}\nif not bundle.is_dir() or {path.name for path in bundle.iterdir()} != expected_targets:\n    print(f\"ERROR: missing embedded Codex package targets: {bundle}\", file=sys.stderr)\n    raise SystemExit(66)\nexpected_suffix = Path(\"Contents/Resources/BundledRuntimes/Codex\")\nif tuple(bundle.parts[-len(expected_suffix.parts):]) != expected_suffix.parts:\n    print(f\"ERROR: unexpected embedded Codex bundle path: {bundle}\", file=sys.stderr)\n    raise SystemExit(67)\nwith Path(os.environ[\"FAKE_TOOL_CAPTURE\"]).open(\"a\", encoding=\"utf-8\") as handle:\n    handle.write(\"codex \" + \" \".join(args) + \"\\n\")\nprint(\"OK: fixture Codex bundle contract.\")\n",
             encoding="utf-8",
@@ -282,6 +295,22 @@ class ReleasePromotionTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        (root / "release-rollout.json").write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "channel": "stable",
+                    "currentRole": "legacy",
+                    "eligibilityProfile": "stable-rollout-v1",
+                    "expectedMigrationPhase": "disabled",
+                    "expectedSigningIdentity": "legacy",
+                    "predecessors": [],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         (app / "Contents" / "Info.plist").write_text("fixture plist\n", encoding="utf-8")
         self.write_stub(
             app / "Contents" / "MacOS",
@@ -307,28 +336,39 @@ class ReleasePromotionTests(unittest.TestCase):
         zip_path.write_text("fixture zip\n", encoding="utf-8")
         dmg_path.write_text("fixture dmg\n", encoding="utf-8")
         artifact_manifest_path.write_text('{"schema_version":1}\n', encoding="utf-8")
-        item = textwrap.dedent(
-            f"""\
-            <item>
-              <sparkle:version>1</sparkle:version>
-              <sparkle:shortVersionString>1.0.0</sparkle:shortVersionString>
-              <enclosure url="{enclosure_url}" length="{zip_path.stat().st_size}" sparkle:edSignature="fixture-signature" />
-            </item>
-            """
+        rollout_manifest_path = assets / "RepoPrompt-1.0.0-1-stable-rollout.json"
+        subprocess.run(
+            [
+                sys.executable,
+                str(scripts / "stable_rollout.py"),
+                "generate",
+                "--declaration", str(root / "release-rollout.json"),
+                "--policy", str(scripts / "apple_identity_policy.json"),
+                "--version-env", str(root / "version.env"),
+                "--release-tag", "v1.0.0",
+                "--release-commit", "fixture-release-commit",
+                "--migration-phase", "disabled",
+                "--enclosure", str(zip_path),
+                "--enclosure-signature", "fixture-signature",
+                "--app-artifact-manifest", str(artifact_manifest_path),
+                "--appcast-output", str(appcast_path),
+                "--manifest-output", str(rollout_manifest_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
         )
-        appcast_path.write_text(
-            textwrap.dedent(
-                f"""\
-                <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
-                  <channel>
-                    {item}
-                    {item if duplicate_appcast_item else ""}
-                  </channel>
-                </rss>
-                """
-            ),
-            encoding="utf-8",
+        canonical_enclosure_url = (
+            "https://github.com/repoprompt/repoprompt-ce-updates/"
+            "releases/download/v1.0.0/RepoPrompt-1.0.0-1.zip"
         )
+        appcast_text = appcast_path.read_text(encoding="utf-8")
+        if duplicate_appcast_item:
+            item_block = appcast_text[appcast_text.index("    <item>") : appcast_text.index("    </item>") + len("    </item>")]
+            appcast_text = appcast_text.replace(item_block, item_block + "\n" + item_block, 1)
+        if enclosure_url != canonical_enclosure_url:
+            appcast_text = appcast_text.replace(canonical_enclosure_url, enclosure_url)
+        appcast_path.write_text(appcast_text, encoding="utf-8")
         previous_appcast.write_text(
             textwrap.dedent(
                 f"""\
@@ -342,7 +382,7 @@ class ReleasePromotionTests(unittest.TestCase):
         checksums_path.write_text(
             "".join(
                 f"{self.sha256(path)}  {path.name}\n"
-                for path in (zip_path, dmg_path, appcast_path, artifact_manifest_path)
+                for path in (zip_path, dmg_path, appcast_path, artifact_manifest_path, rollout_manifest_path)
             ),
             encoding="utf-8",
         )
@@ -362,11 +402,11 @@ class ReleasePromotionTests(unittest.TestCase):
             "gh",
             """\
             printf '%s\\n' "$*" >> "$FAKE_GH_CAPTURE"
-            source_assets='[{"name":"RepoPrompt-1.0.0-1.zip"},{"name":"RepoPrompt-1.0.0-1.dmg"},{"name":"appcast.xml"},{"name":"SHA256SUMS"},{"name":"RepoPrompt-1.0.0-1-artifact-manifest.json"}]'
+            source_assets='[{"name":"RepoPrompt-1.0.0-1.zip"},{"name":"RepoPrompt-1.0.0-1.dmg"},{"name":"appcast.xml"},{"name":"SHA256SUMS"},{"name":"RepoPrompt-1.0.0-1-artifact-manifest.json"},{"name":"RepoPrompt-1.0.0-1-stable-rollout.json"}]'
             if [[ "$FAKE_EXTRA_SOURCE_ASSET" == "true" ]]; then
-                source_assets='[{"name":"RepoPrompt-1.0.0-1.zip"},{"name":"RepoPrompt-1.0.0-1.dmg"},{"name":"appcast.xml"},{"name":"SHA256SUMS"},{"name":"RepoPrompt-1.0.0-1-artifact-manifest.json"},{"name":"unexpected.txt"}]'
+                source_assets='[{"name":"RepoPrompt-1.0.0-1.zip"},{"name":"RepoPrompt-1.0.0-1.dmg"},{"name":"appcast.xml"},{"name":"SHA256SUMS"},{"name":"RepoPrompt-1.0.0-1-artifact-manifest.json"},{"name":"RepoPrompt-1.0.0-1-stable-rollout.json"},{"name":"unexpected.txt"}]'
             fi
-            update_assets='[{"name":"RepoPrompt-1.0.0-1.zip"},{"name":"appcast.xml"},{"name":"SHA256SUMS"},{"name":"RepoPrompt-1.0.0-1-artifact-manifest.json"}]'
+            update_assets='[{"name":"RepoPrompt-1.0.0-1.zip"},{"name":"appcast.xml"},{"name":"SHA256SUMS"},{"name":"RepoPrompt-1.0.0-1-artifact-manifest.json"},{"name":"RepoPrompt-1.0.0-1-stable-rollout.json"}]'
             if [[ "$1" == "release" && "$2" == "view" && "$*" == *"--repo repoprompt/repoprompt-ce "* ]]; then
                 printf '{"tagName":"v1.0.0","isDraft":%s,"isPrerelease":false,"assets":%s,"body":"Release-Commit: `fixture-release-commit`"}\\n' "$FAKE_SOURCE_IS_DRAFT" "$source_assets"
             elif [[ "$1" == "release" && "$2" == "view" && "$*" == *"--repo repoprompt/repoprompt-ce-updates "* ]]; then
@@ -392,6 +432,7 @@ class ReleasePromotionTests(unittest.TestCase):
                 cp "$FAKE_ASSET_DIR"/appcast.xml "$target/"
                 cp "$FAKE_ASSET_DIR"/SHA256SUMS "$target/"
                 cp "$FAKE_ASSET_DIR"/RepoPrompt-1.0.0-1-artifact-manifest.json "$target/"
+                cp "$FAKE_ASSET_DIR"/RepoPrompt-1.0.0-1-stable-rollout.json "$target/"
                 if [[ "$*" != *"--repo repoprompt/repoprompt-ce-updates "* ]]; then
                     cp "$FAKE_ASSET_DIR"/RepoPrompt-1.0.0-1.dmg "$target/"
                 fi
@@ -556,6 +597,7 @@ class ReleasePromotionTests(unittest.TestCase):
                 */RepoPrompt-1.0.0-1.dmg) cp "$FAKE_ASSET_DIR/RepoPrompt-1.0.0-1.dmg" "$output" ;;
                 */SHA256SUMS) cp "$FAKE_ASSET_DIR/SHA256SUMS" "$output" ;;
                 */RepoPrompt-1.0.0-1-artifact-manifest.json) cp "$FAKE_ASSET_DIR/RepoPrompt-1.0.0-1-artifact-manifest.json" "$output" ;;
+                */RepoPrompt-1.0.0-1-stable-rollout.json) cp "$FAKE_ASSET_DIR/RepoPrompt-1.0.0-1-stable-rollout.json" "$output" ;;
                 *) printf 'unexpected curl URL: %s\\n' "$url" >&2; exit 1 ;;
             esac
             """,
