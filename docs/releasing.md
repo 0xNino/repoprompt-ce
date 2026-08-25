@@ -260,7 +260,11 @@ remains green and records a concise no-op summary. This is diagnostic truthfulne
 A nonlegacy role is published only by an explicit dispatch whose
 `confirm_identity_rollout_role` exactly matches the checked-in role. The protected role-aware
 credential preflight runs before the secret-free build, and the environment approval is therefore a
-manual gate before any expensive staging work. After P is reviewed, advance the declaration with its
+manual gate before any expensive staging work.
+It uses a separate ephemeral keychain to import and verify each role-required P12
+without changing the runner user's keychain search list or exporting credential state
+to later steps.
+After P is reviewed, advance the declaration with its
 exact `identity-rollout.json` digest before dispatching T; advance it again with T and P digests before
 S. Each published role uses an immutable `tip-<shortsha>` tag and the tip-only repository's latest
 release; do not mark the release as a prerelease because GitHub excludes prereleases from
