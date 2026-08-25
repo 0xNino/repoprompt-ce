@@ -339,10 +339,25 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertIn("trap cleanup_preflight_credentials EXIT", preflight_run)
         self.assertIn('rm -f "$CERTIFICATE_PATH"', preflight_run)
         self.assertIn('security delete-keychain "$PREFLIGHT_KEYCHAIN_PATH" || true', preflight_run)
+        self.assertIn('rm -f "$PREFLIGHT_KEYCHAIN_PATH"', preflight_run)
+        self.assertLess(
+            preflight_run.index('security delete-keychain "$PREFLIGHT_KEYCHAIN_PATH" || true'),
+            preflight_run.index('rm -f "$PREFLIGHT_KEYCHAIN_PATH"'),
+        )
         self.assertLess(
             preflight_run.index("trap cleanup_preflight_credentials EXIT"),
             preflight_run.index("base64 --decode"),
         )
+        self.assertNotIn(">/dev/null 2>&1 || fail", preflight_run)
+        for noun_fragment in (
+            "application certificate",
+            "successor application certificate",
+            "successor installer certificate",
+            "application signing identity",
+            "successor application signing identity",
+            "successor installer identity",
+        ):
+            self.assertNotIn(f'|| fail "{noun_fragment}"', preflight_run)
         self.assertIn(
             'security import "$CERTIFICATE_PATH" -k "$PREFLIGHT_KEYCHAIN_PATH" -P "$CERTIFICATE_P12_PASSWORD"',
             preflight_run,
